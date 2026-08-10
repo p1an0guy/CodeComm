@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,7 +26,6 @@ import (
 )
 
 const (
-	probeTimeout                  = 10 * time.Second
 	probeSessionID                = "018f47de-89ab-7def-8123-0123456789ab"
 	probeWorkspaceID              = "018f47de-89ab-7def-8123-1123456789ab"
 	probeSignerDeviceID           = "ccdv1:phase1"
@@ -613,16 +613,42 @@ func waitForObservedLeaderID(t *testing.T, observer *probeNode, id raft.ServerID
 	})
 }
 
+// probeTimeout bounds every wait in this package. It is a variable rather than a
+// constant because the spike runs subprocess voters that must spawn, bind TCP,
+// and open bbolt before they can participate, and GitHub's Windows runners are
+// markedly slower at process creation and file I/O than the Linux and macOS
+// ones. A budget tuned for a fast machine turns an ordinary slow start into a
+// spurious consensus failure, which is worse than a slow test: it reports a
+// safety problem where none exists.
+//
+// The election parameters themselves are deliberately NOT scaled — those are the
+// library behavior under test. Only the harness's patience changes.
+var probeTimeout = platformProbeTimeout()
+
+func platformProbeTimeout() time.Duration {
+	if override := os.Getenv("CODECOMM_PHASE1_PROBE_TIMEOUT"); override != "" {
+		if parsed, err := time.ParseDuration(override); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return 45 * time.Second
+	}
+	return 15 * time.Second
+}
+
 func eventually(t *testing.T, description string, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(probeTimeout)
+	start := time.Now()
+	deadline := start.Add(probeTimeout)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", description)
+	t.Fatalf("timed out waiting for %s after %s (budget %s, GOOS=%s)",
+		description, time.Since(start).Round(time.Millisecond), probeTimeout, runtime.GOOS)
 }
 
 func applyCommand(t *testing.T, node *probeNode, command probeCommand) (uint64, applyResult) {

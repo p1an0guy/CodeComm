@@ -1,18 +1,16 @@
 # Phase 1 Status
 
-Status: In progress — initial gate closed pending the CI run for 65300d1  
+Status: In progress — initial gate closed on Linux and macOS; Windows Raft timing pending  
 Last updated: 2026-08-10  
 Scope: the initial Raft/store/JCS/local-IPC gate in `docs/IMPLEMENTATION.md` §2. The broader authoritative
 Phase 1 exit in design §13 remains open.
 
 ## Initial gate
 
-CI history is the evidence of record. Run 31425461366 (commit bb68e68) turned the three OS test
-jobs, the race detector, the JCS differential fuzz smoke, and the vulnerability scan **green on
-Linux, macOS, and Windows**; the stable-store trace job then failed on a workflow defect
-(`strace: invalid system call 'pwrite'`, since x86-64 exposes only `pwrite64`), fixed in 65300d1
-by tracing the `%desc` syscall class. Every row below is cross-platform except where it names a
-platform.
+CI history is the evidence of record. Run 31427994463 (commit 046a1cc) turned the **stable-store
+sync-ordering job green**, closing the durability gate on real Linux `strace` evidence, alongside
+the race detector, JCS differential fuzz smoke, vulnerability scan, and the Linux and macOS test
+jobs. Windows remains outstanding on Raft harness timing, not on library behavior (below).
 
 Two CI failures were test-side defects rather than defects in the behavior under test, and both are
 worth recording because they would have recurred:
@@ -22,7 +20,16 @@ worth recording because they would have recurred:
   only on a warm cache — the test asserted on cache state, not on the dependency;
 - the Windows DACL check compared `descriptor.String()` against a full SID, but Windows renders
   well-known SIDs as two-letter SDDL abbreviations (CI runs as the built-in Administrator, `LA`).
-  It now compares parsed ACEs, which additionally bounds the trustee count.
+  It now compares parsed ACEs, which additionally bounds the trustee count;
+- the strace marker matchers required exact rendered lines including byte counts, but strace
+  truncates strings (`-s`, default 32) and a short write is legal, so the durability proof failed on
+  formatting rather than on ordering. Markers are now content-anchored regexes;
+- a dependency-contract test that shelled out to `go doc -all` cost ~50 s on a cold module cache and
+  starved the subprocess-voter timing test in the same package on the slower Windows runner. The
+  contract now reads `go.mod` and sources directly (0.3 s), and the harness's wait budget scales by
+  platform (45 s on Windows, 15 s elsewhere, `CODECOMM_PHASE1_PROBE_TIMEOUT` to override) while the
+  Raft election parameters under test are deliberately left unscaled. A timeout now reports elapsed
+  time, budget, and GOOS so a genuine hang is distinguishable from a slow machine.
 
 | Question | Result | Evidence |
 |---|---|---|
