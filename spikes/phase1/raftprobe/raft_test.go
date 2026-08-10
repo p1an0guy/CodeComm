@@ -398,10 +398,35 @@ func newProbeNodeAt(t *testing.T, root, id, blockKind, bindAddress string) *prob
 
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(id)
-	config.HeartbeatTimeout = 300 * time.Millisecond
-	config.ElectionTimeout = 300 * time.Millisecond
+	// These are the library's real timing parameters, deliberately kept short so
+	// elections and transfers complete quickly. One consequence is load-bearing
+	// and was found by CI rather than by reading the source: hashicorp/raft bounds
+	// LeadershipTransferToServer by ElectionTimeout (raft.go, v1.7.3), so a target
+	// that cannot be brought current within one election timeout fails the
+	// transfer outright. On slower hosts — GitHub's Windows runners, or any host
+	// under I/O contention — 300 ms is not enough for a freshly started
+	// subprocess voter to catch up, and the transfer times out even though
+	// consensus is healthy.
+	//
+	// Design §3 step 3.3 depends on targeted transfer during voter-set
+	// reconciliation, so production MUST NOT inherit these spike values: it needs
+	// an ElectionTimeout that accommodates a catching-up target, or it must
+	// transfer only to a voter already proven current (which §3 in fact requires
+	// via the checkpoint proof). Recorded in phase-1-status.md as a library
+	// constraint on §3.
+	electionTimeout := 300 * time.Millisecond
+	if runtime.GOOS == "windows" {
+		electionTimeout = 2 * time.Second
+	}
+	if override := os.Getenv("CODECOMM_PHASE1_ELECTION_TIMEOUT"); override != "" {
+		if parsed, err := time.ParseDuration(override); err == nil && parsed > 0 {
+			electionTimeout = parsed
+		}
+	}
+	config.HeartbeatTimeout = electionTimeout
+	config.ElectionTimeout = electionTimeout
 	config.CommitTimeout = 20 * time.Millisecond
-	config.LeaderLeaseTimeout = 150 * time.Millisecond
+	config.LeaderLeaseTimeout = electionTimeout / 2
 	config.SnapshotInterval = 20 * time.Second
 	config.SnapshotThreshold = 4
 	config.TrailingLogs = 1

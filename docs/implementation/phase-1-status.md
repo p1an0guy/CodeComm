@@ -35,7 +35,7 @@ worth recording because they would have recurred:
 |---|---|---|
 | No pre-commit index dependency | GO | `ApplyLog` constructs a future with no index/term; the real three-voter test submits bytes without ordering fields and learns the index only from FSM apply / the completed future |
 | Apply barrier reaches local FSM | GO | A blocked FSM prevents `Barrier().Error()` from completing; releasing apply makes state visible before the barrier returns |
-| Targeted transfer and 3-voter crash/restart | GO on all three OSes | A real TCP voter in a separate process becomes leader, is force-killed, the surviving majority elects and commits, and the voter restarts at the same store/address, catches up the offline commit, and accepts another targeted transfer. This is not standalone persisted-FSM replay |
+| Targeted transfer and 3-voter crash/restart | GO on all three OSes, with a recorded library constraint | A real TCP voter in a separate process becomes leader, is force-killed, the surviving majority elects and commits, and the voter restarts at the same store/address, catches up the offline commit, and accepts another targeted transfer. This is not standalone persisted-FSM replay. **Library constraint found by CI, not by source review:** `hashicorp/raft` v1.7.3 bounds `LeadershipTransferToServer` by `ElectionTimeout` (raft.go:728,749), so a target that cannot be brought current within one election timeout fails the transfer outright rather than waiting. A 300 ms election timeout was insufficient for a freshly started subprocess voter on GitHub's Windows runner while consensus itself was healthy. See the §3 implication below |
 | Staged-nonvoter proof without `matchIndex` | GO for the Raft API; integration open | A compacted leader adds a nonvoter; the target installs a file snapshot, withholds proof while blocked, validates every checkpoint-cut field including `log.Index-1`, then emits the exact proof after apply. The production SQLite transaction and authenticated closed endpoint remain Phase 1 work |
 | Production stable-store fsync/crash behavior | GO pending 65300d1 CI | Static review proves `StoreLogs → bbolt.Tx.Commit`, dirty-page and metadata `fdatasync`/`File.Sync` when both `NoSync` flags are false, and error propagation. A post-ack subprocess kill proves process-crash reopen. Linux `strace` verification asserts same-DB-FD `data write → sync → metadata write → sync → ACK` and merges per-thread trace files, because `-ff` splits a Go process across threads so the writes, syncs, and acknowledgement land in different files. `TestStoreLogsPropagatesSyncFailure` proves a store that cannot grow reports the failure instead of acknowledging it (RLIMIT_FSIZE injection, with a healthy baseline write first so the test cannot pass by never working). `TestFirstStoreCreationSyncsParentDirectory` pins CodeComm's obligation to fsync the parent directory after creating a session's first store file, since fsync on a new file does not make its directory entry durable and a process-kill test cannot see the difference. Genuine power-cut evidence remains out of scope for a spike |
 | RFC 8785 primitive | GO on all three OSes; typed protocol integration open | Byte/depth-bounded strict token decode, official corpus plus Appendix B number edges, UTF-16 ordering, ±(2^53-1), Unicode/duplicate/trailing/non-finite negatives, and differential fuzzing against an independent implementation. This generic spike is not the closed typed protocol decoder; schema item/string bounds and decode-once integration remain |
@@ -55,6 +55,24 @@ The Raft tests use real loopback TCP transports, subprocess death/restart, `raft
 file snapshots, elections, configuration entries, and FSM execution. They do not mock Raft or its
 store. The probe package is outside `internal/consensus` so production code cannot treat a spike as
 accepted production code.
+
+## Design implication for §3
+
+Design §3 step 3.3 transfers leadership to a target voter during voter-set
+reconciliation. Because the library bounds that transfer by `ElectionTimeout`, production MUST NOT
+inherit the spike's short timing values, and one of the following must hold:
+
+- `ElectionTimeout` is large enough to accommodate a catching-up target on the slowest supported
+  host; or
+- leadership transfers only to a voter already proven current.
+
+§3 already requires the second by construction — a target must echo the checkpoint proof (four cut
+values plus its recomputed projection accumulator) before it is eligible, and §3's eligibility rule
+additionally admits voters already in the live configuration. So the design is sound as written; the
+constraint is a **caution against choosing an aggressive `ElectionTimeout` in production config**,
+and a reason the reconciliation integration test in Phase 3 must assert transfer success on the
+slowest platform rather than only on Linux. Not an ADR-level change; recorded here and in the
+spike's inline comment.
 
 ## Pinned review set
 
