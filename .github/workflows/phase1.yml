@@ -1,0 +1,86 @@
+name: phase-1
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Verify modules
+        run: go mod verify
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go test -race ./...
+
+  stable-store-syscall:
+    name: Stable-store sync ordering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Build stable-store probe
+        run: go test -c -o "$RUNNER_TEMP/raftprobe.test" ./spikes/phase1/raftprobe
+      - name: Trace StoreLogs acknowledgement
+        run: |
+          strace -ff -qq -e trace=fdatasync,fsync,pwrite64,write \
+            -o "$RUNNER_TEMP/codecomm-store-trace" \
+            "$RUNNER_TEMP/raftprobe.test" \
+            -test.run='^TestSynchronousStableStoreSurvivesProcessKillAfterAcknowledgement$' \
+            -test.count=1
+          go run ./spikes/phase1/raftprobe/cmd/verify-fsync-trace \
+            "$RUNNER_TEMP"/codecomm-store-trace.*
+
+  fuzz-smoke:
+    name: JCS differential fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go test ./internal/codec -run=^$ -fuzz=FuzzCanonicalizeDifferential -fuzztime=30s
+
+  vulnerability-scan:
+    name: Go vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 -test ./...

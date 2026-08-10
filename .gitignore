@@ -1,0 +1,19 @@
+# Build and test output
+/bin/
+/dist/
+/coverage/
+*.coverprofile
+*.test
+
+# Local tools and scratch data
+/.cache/
+/.tmp/
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Machine-local agent configuration
+.claude/settings.local.json

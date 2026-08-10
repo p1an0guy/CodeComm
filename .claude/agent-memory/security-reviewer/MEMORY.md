@@ -1,0 +1,2 @@
+- [CodeComm review scope](feedback_codecomm_review_scope.md) — critique specification/disclosure of CodeComm's settled decisions, never the decisions themselves
+- [CodeComm actor_type boundary](project_codecomm-actor-type-boundary.md) — operator-only verbs are a local daemon property, not reducer-enforceable; check envelope construction
