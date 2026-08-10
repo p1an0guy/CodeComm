@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +105,41 @@ func TestVerifyTraceFilesMergesPerThreadFiles(t *testing.T) {
 	incomplete := write("u.100", begin+"pwrite64(7, \"data\", 4096, 0) = 4096\n")
 	if err := verifyTraceFiles([]string{incomplete, write("u.101", ack)}); err == nil {
 		t.Fatal("acknowledgement without a completed sync sequence must fail even when split")
+	}
+}
+
+// CI traces the %desc syscall class rather than an enumerated list, because
+// naming a syscall the running kernel lacks (pwrite on x86-64) makes strace exit
+// before tracing anything. The verifier must therefore ignore unrelated
+// descriptor traffic while still pinning the ordering to the database fd.
+func TestVerifyTraceFilesIgnoresUnrelatedDescriptorTraffic(t *testing.T) {
+	const trace = `1234 openat(AT_FDCWD, "/tmp/raft.db", O_RDWR|O_CREAT, 0600) = 7
+1234 write(2, "CODECOMM_STORE_LOGS_BEGIN\n", 26) = 26
+1234 read(3, "x", 1) = 1
+1234 pwrite64(7, "data", 4096, 0) = 4096
+1234 write(5, "unrelated log\n", 14) = 14
+1234 fdatasync(7) = 0
+1240 pwrite64(7, "meta", 4096, 4096) = 4096
+1240 fstat(7, {st_size=8192}) = 0
+1240 fdatasync(7) = 0
+1234 write(1, "ACK\n", 4) = 4
+1234 close(7) = 0
+`
+	path := filepath.Join(t.TempDir(), "desc.txt")
+	if err := os.WriteFile(path, []byte(trace), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyTraceFiles([]string{path}); err != nil {
+		t.Fatalf("noisy but correctly ordered trace should verify: %v", err)
+	}
+
+	// The same noise must not hide a sync of the wrong descriptor.
+	bad := strings.Replace(trace, "1234 fdatasync(7) = 0", "1234 fdatasync(9) = 0", 1)
+	badPath := filepath.Join(t.TempDir(), "desc_bad.txt")
+	if err := os.WriteFile(badPath, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyTraceFiles([]string{badPath}); err == nil {
+		t.Fatal("a sync of the wrong descriptor must fail even amid unrelated traffic")
 	}
 }

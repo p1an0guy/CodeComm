@@ -55,7 +55,12 @@ jobs:
         run: go test -c -o "$RUNNER_TEMP/raftprobe.test" ./spikes/phase1/raftprobe
       - name: Trace StoreLogs acknowledgement
         run: |
-          strace -f -qq -e trace=fdatasync,fsync,pwrite,pwrite64,write \
+          # Trace by syscall class, not an enumerated list: `pwrite` is not a
+          # valid name on x86-64 (only pwrite64 exists), and naming a syscall the
+          # running kernel lacks makes strace exit before tracing anything. The
+          # %desc class covers every descriptor operation on every architecture;
+          # the verifier filters to the writes and syncs it needs.
+          strace -f -qq -e trace=%desc \
             -o "$RUNNER_TEMP/codecomm-store-trace" \
             "$RUNNER_TEMP/raftprobe.test" \
             -test.run='^TestSynchronousStableStoreSurvivesProcessKillAfterAcknowledgement$' \
