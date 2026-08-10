@@ -143,3 +143,47 @@ func TestVerifyTraceFilesIgnoresUnrelatedDescriptorTraffic(t *testing.T) {
 		t.Fatal("a sync of the wrong descriptor must fail even amid unrelated traffic")
 	}
 }
+
+// strace truncates traced strings (-s, default 32) and a write is permitted to
+// be short, so pinning the marker lines to an exact rendering — byte count and
+// return value included — made the ordering proof fail on formatting rather than
+// on durability. These shapes must all verify.
+func TestVerifyTraceFilesToleratesMarkerRenderingVariation(t *testing.T) {
+	body := "pwrite64(7, \"data\"..., 4096, 0) = 4096\n" +
+		"fdatasync(7) = 0\n" +
+		"pwrite64(7, \"meta\"..., 4096, 4096) = 4096\n" +
+		"fdatasync(7) = 0\n"
+
+	for name, trace := range map[string]string{
+		"truncated markers": "write(2, \"CODECOMM_STORE_LOGS_BEGIN\"..., 26) = 26\n" + body +
+			"write(1, \"ACK\"..., 4) = 4\n",
+		"short write": "write(2, \"CODECOMM_STORE_LOGS_BEGIN\\n\", 26) = 26\n" + body +
+			"write(1, \"ACK\\n\", 4) = 3\n",
+		"pid prefixed": "4242 write(2, \"CODECOMM_STORE_LOGS_BEGIN\\n\", 26) = 26\n" +
+			"4242 pwrite64(7, \"data\", 4096, 0) = 4096\n" +
+			"4242 fdatasync(7) = 0\n" +
+			"4250 pwrite64(7, \"meta\", 4096, 4096) = 4096\n" +
+			"4250 fdatasync(7) = 0\n" +
+			"4242 write(1, \"ACK\\n\", 4) = 4\n",
+	} {
+		path := filepath.Join(t.TempDir(), "trace.txt")
+		if err := os.WriteFile(path, []byte(trace), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := verifyTraceFiles([]string{path}); err != nil {
+			t.Errorf("%s should verify: %v", name, err)
+		}
+	}
+
+	// Tolerating the rendering must not tolerate a missing sync.
+	unsynced := "write(2, \"CODECOMM_STORE_LOGS_BEGIN\"..., 26) = 26\n" +
+		"pwrite64(7, \"data\"..., 4096, 0) = 4096\n" +
+		"write(1, \"ACK\"..., 4) = 4\n"
+	path := filepath.Join(t.TempDir(), "unsynced.txt")
+	if err := os.WriteFile(path, []byte(unsynced), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyTraceFiles([]string{path}); err == nil {
+		t.Fatal("an acknowledgement with no sync must fail regardless of marker rendering")
+	}
+}

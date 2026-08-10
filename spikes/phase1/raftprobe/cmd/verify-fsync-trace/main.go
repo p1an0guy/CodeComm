@@ -7,7 +7,6 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 // strace renders the positional-write syscall as pwrite64 on most Linux
@@ -15,14 +14,15 @@ import (
 // strace builds. Accepting the family keeps the ordering proof from silently
 // degrading into "no trace contained the acknowledgement" on a runner whose
 // strace names the syscall differently.
-const (
-	beginMarker = `write(2, "CODECOMM_STORE_LOGS_BEGIN\n"`
-	ackMarker   = `write(1, "ACK\n", 4) = 4`
-)
-
+// Match the markers by content on the expected descriptor rather than by an
+// exact rendered line. strace truncates strings (-s, default 32), may annotate
+// or split writes, and a short write is legal, so pinning the byte count and
+// return value made the proof fail on formatting rather than on ordering.
 var (
-	successfulPwrite = regexp.MustCompile(`\b(?:pwrite64|pwrite|pwritev2|pwritev)\((\d+),.*\)\s+= ([1-9]\d*)(?:\s|$)`)
-	successfulSync   = regexp.MustCompile(`\b(?:fdatasync|fsync|fdatasync64|fsync64)\((\d+)\)\s+= 0(?:\s|$)`)
+	beginMarkerPattern = regexp.MustCompile(`\bwrite\(2, "CODECOMM_STORE_LOGS_BEGIN`)
+	ackMarkerPattern   = regexp.MustCompile(`\bwrite\(1, "ACK`)
+	successfulPwrite   = regexp.MustCompile(`\b(?:pwrite64|pwrite|pwritev2|pwritev)\((\d+),.*\)\s+= ([1-9]\d*)(?:\s|$)`)
+	successfulSync     = regexp.MustCompile(`\b(?:fdatasync|fsync|fdatasync64|fsync64)\((\d+)\)\s+= 0(?:\s|$)`)
 )
 
 func main() {
@@ -82,10 +82,10 @@ func collectEvents(paths []string) ([]traceEvent, error) {
 			lineNumber++
 			line := scanner.Text()
 			switch {
-			case strings.Contains(line, beginMarker):
+			case beginMarkerPattern.MatchString(line):
 				sawBegin = true
 				events = append(events, traceEvent{kind: "begin", file: path, line: lineNumber})
-			case strings.Contains(line, ackMarker):
+			case ackMarkerPattern.MatchString(line):
 				events = append(events, traceEvent{kind: "ack", file: path, line: lineNumber})
 			case successfulPwrite.MatchString(line):
 				fd, _ := strconv.Atoi(successfulPwrite.FindStringSubmatch(line)[1])
@@ -163,20 +163,4 @@ func verifyOrdering(events []traceEvent) error {
 		}
 	}
 	return errors.New("traces contained the StoreLogs marker but no acknowledgement")
-}
-
-func unusedTraceHasBeginMarker(path string) (bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), `write(2, "CODECOMM_STORE_LOGS_BEGIN\n"`) {
-			return true, nil
-		}
-	}
-	return false, scanner.Err()
 }
