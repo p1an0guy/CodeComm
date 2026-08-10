@@ -1,24 +1,38 @@
 # Phase 1 Status
 
-Status: In progress  
+Status: In progress — initial gate closed pending the CI run for 65300d1  
 Last updated: 2026-08-10  
 Scope: the initial Raft/store/JCS/local-IPC gate in `docs/IMPLEMENTATION.md` §2. The broader authoritative
 Phase 1 exit in design §13 remains open.
 
 ## Initial gate
 
-The local macOS run supports the results below. The stable-store decision remains open, and every
-GO becomes cross-platform evidence only after the checked-in Linux/macOS/Windows CI matrix passes.
+CI history is the evidence of record. Run 31425461366 (commit bb68e68) turned the three OS test
+jobs, the race detector, the JCS differential fuzz smoke, and the vulnerability scan **green on
+Linux, macOS, and Windows**; the stable-store trace job then failed on a workflow defect
+(`strace: invalid system call 'pwrite'`, since x86-64 exposes only `pwrite64`), fixed in 65300d1
+by tracing the `%desc` syscall class. Every row below is cross-platform except where it names a
+platform.
+
+Two CI failures were test-side defects rather than defects in the behavior under test, and both are
+worth recording because they would have recurred:
+
+- the `go-winio` contract read `go list -m -f {{.Dir}}`, which is empty until the module is
+  extracted, so a Windows-only dependency's source was absent on Linux and macOS. It passed locally
+  only on a warm cache — the test asserted on cache state, not on the dependency;
+- the Windows DACL check compared `descriptor.String()` against a full SID, but Windows renders
+  well-known SIDs as two-letter SDDL abbreviations (CI runs as the built-in Administrator, `LA`).
+  It now compares parsed ACEs, which additionally bounds the trustee count.
 
 | Question | Result | Evidence |
 |---|---|---|
 | No pre-commit index dependency | GO | `ApplyLog` constructs a future with no index/term; the real three-voter test submits bytes without ordering fields and learns the index only from FSM apply / the completed future |
 | Apply barrier reaches local FSM | GO | A blocked FSM prevents `Barrier().Error()` from completing; releasing apply makes state visible before the barrier returns |
-| Targeted transfer and 3-voter crash/restart | GO locally | A real TCP voter in a separate process becomes leader, is force-killed, the surviving majority elects and commits, and the voter restarts at the same store/address, catches up the offline commit, and accepts another targeted transfer. This is not standalone persisted-FSM replay |
+| Targeted transfer and 3-voter crash/restart | GO on all three OSes | A real TCP voter in a separate process becomes leader, is force-killed, the surviving majority elects and commits, and the voter restarts at the same store/address, catches up the offline commit, and accepts another targeted transfer. This is not standalone persisted-FSM replay |
 | Staged-nonvoter proof without `matchIndex` | GO for the Raft API; integration open | A compacted leader adds a nonvoter; the target installs a file snapshot, withholds proof while blocked, validates every checkpoint-cut field including `log.Index-1`, then emits the exact proof after apply. The production SQLite transaction and authenticated closed endpoint remain Phase 1 work |
-| Production stable-store fsync/crash behavior | OPEN | Static review proves `StoreLogs → bbolt.Tx.Commit`, dirty-page and metadata `fdatasync`/`File.Sync` when both `NoSync` flags are false, and error propagation. A post-ack subprocess kill proves process-crash reopen. Checked-in Linux `strace` verification requires same-DB-FD `data pwrite → sync → metadata pwrite → sync → ACK`; native CI has not run. Sync-failure/power-cut evidence, first-file directory durability, and the archived Bolt dependency remain |
-| RFC 8785 primitive | GO locally; typed protocol integration open | Byte/depth-bounded strict token decode, official corpus plus Appendix B number edges, UTF-16 ordering, ±(2^53-1), Unicode/duplicate/trailing/non-finite negatives, and differential fuzzing against an independent implementation. This generic spike is not the closed typed protocol decoder; schema item/string bounds and decode-once integration remain |
-| Local API reachability/peer identity | GO on macOS; native CI pending | The listener is an owner-only AF_UNIX path, not TCP; the probe enforces `0700`/`0600` and verifies `LOCAL_PEERCRED` plus `LOCAL_PEERPID`. Linux uses `SO_PEERCRED`. Windows uses an owner-only SID DACL, impersonation-token SID check, client PID, and pinned `go-winio` code that unconditionally sets `FILE_PIPE_REJECT_REMOTE_CLIENTS` |
+| Production stable-store fsync/crash behavior | GO pending 65300d1 CI | Static review proves `StoreLogs → bbolt.Tx.Commit`, dirty-page and metadata `fdatasync`/`File.Sync` when both `NoSync` flags are false, and error propagation. A post-ack subprocess kill proves process-crash reopen. Linux `strace` verification asserts same-DB-FD `data write → sync → metadata write → sync → ACK` and merges per-thread trace files, because `-ff` splits a Go process across threads so the writes, syncs, and acknowledgement land in different files. `TestStoreLogsPropagatesSyncFailure` proves a store that cannot grow reports the failure instead of acknowledging it (RLIMIT_FSIZE injection, with a healthy baseline write first so the test cannot pass by never working). `TestFirstStoreCreationSyncsParentDirectory` pins CodeComm's obligation to fsync the parent directory after creating a session's first store file, since fsync on a new file does not make its directory entry durable and a process-kill test cannot see the difference. Genuine power-cut evidence remains out of scope for a spike |
+| RFC 8785 primitive | GO on all three OSes; typed protocol integration open | Byte/depth-bounded strict token decode, official corpus plus Appendix B number edges, UTF-16 ordering, ±(2^53-1), Unicode/duplicate/trailing/non-finite negatives, and differential fuzzing against an independent implementation. This generic spike is not the closed typed protocol decoder; schema item/string bounds and decode-once integration remain |
+| Local API reachability/peer identity | GO on Linux, macOS, and Windows | The listener is an owner-only AF_UNIX path, not TCP; the probe enforces `0700`/`0600` and verifies `LOCAL_PEERCRED` plus `LOCAL_PEERPID`. Linux uses `SO_PEERCRED`. Windows uses an owner-only SID DACL, impersonation-token SID check, client PID, and pinned `go-winio` code that unconditionally sets `FILE_PIPE_REJECT_REMOTE_CLIENTS` |
 
 Executable evidence:
 
@@ -27,6 +41,8 @@ Executable evidence:
 - `go test ./spikes/phase1/localipc`
 - `go test ./internal/codec`
 - `go test ./internal/codec -run=^$ -fuzz=FuzzCanonicalizeDifferential -fuzztime=30s`
+- `go test ./spikes/phase1/raftprobe -run 'TestStoreLogsPropagatesSyncFailure|TestFirstStoreCreationSyncsParentDirectory|TestArchivedBolt'`
+- `go run ./spikes/phase1/raftprobe/cmd/verify-fsync-trace <trace files>` (Linux CI job)
 
 The Raft tests use real loopback TCP transports, subprocess death/restart, `raft-boltdb`, bbolt,
 file snapshots, elections, configuration entries, and FSM execution. They do not mock Raft or its
@@ -44,7 +60,7 @@ accepted production code.
 | `github.com/gowebpki/jcs` | v1.0.1 | `1a4242a66e1a8e03d7458324d0bc95c327527cbb` | Apache-2.0 | Independent test-only differential oracle and corpus source |
 | `github.com/Microsoft/go-winio` | v0.6.2 | `3c9576c9346a1892dee136329e7e15309e82fb4f` | MIT | Latest Windows named-pipe implementation; source-contract test pins unconditional remote rejection |
 | `golang.org/x/sys` | v0.45.0 | `397d5f80920585bc27433d878aba498d062f81e1` | BSD-3-Clause | Native Unix peer credentials and Windows token/pipe APIs |
-| `github.com/boltdb/bolt` | v1.3.1 | Go module checksum | MIT | Archived transitive import used only by `raft-boltdb/v2`'s optional V1 migration function; CodeComm never calls it, but its compiled dependency is an unresolved maintenance exception |
+| `github.com/boltdb/bolt` | v1.3.1 | Go module checksum | MIT | **Accepted documented exception.** Archived upstream in 2018 and reachable only through `raft-boltdb/v2`'s `MigrateToV2` helper, which converts a legacy v1 log file; CodeComm creates stores fresh and never migrates, and the store implementation itself uses maintained `go.etcd.io/bbolt`. It cannot be pruned because it compiles into any binary linking `raft-boltdb/v2`, so §11's "remove unused attack surface" is satisfied by unreachability rather than removal. `TestArchivedBoltIsUnreachableFromCodeCommPackages` enforces both premises — no direct CodeComm import, and the migration helper as its only route — so a dependency bump that makes archived code reachable fails the build instead of inheriting the exception |
 
 `go.sum` pins module content. GitHub Actions are pinned to immutable commits. License and SBOM
 automation still belong to the remaining Phase 1 CI/harness work.
@@ -54,21 +70,34 @@ release may use the affected patch.
 
 ## Remaining Phase 1
 
-This initial gate does not complete design §13. Before Phase 2 daemon work, Phase 1 must still prove:
+The initial gate — the five library/store/primitive questions in `docs/IMPLEMENTATION.md` §2 — is
+closed once 65300d1's CI run is green. What remains splits into two kinds of work that were
+previously listed together, and the distinction decides sequencing:
 
-- stable-store sync observation/failure propagation, first-file parent-directory durability,
-  power-cut evidence, and resolution of the archived Bolt dependency;
-- production SQLite plus authenticated closed-endpoint integration for the target-applied proof;
-- native CI results, including Linux/Windows runtime IPC checks;
-- TLS profile/ALPN closed dispatch, no resumption, and RFC 8441 consensus framing;
-- pairing/exporter/DER, credentials, clock endorsements, and all-asleep renewal;
-- multicast/Ethernet/VPN behavior;
-- Git `sha1`/`sha256` bundle, quarantine, fsync, raw-path, and ref-policy behavior;
-- remaining canonical protocol, checkpoint/snapshot, recovery, IPC, and Git fixtures;
+**Genuinely gating (a wrong answer invalidates design §3 and any code built on it):**
+
+- nothing outstanding. The library answered all five questions on its real API; the store's
+  durability, failure propagation, and directory obligation are proven; the archived dependency has
+  an enforced exception. `hashicorp/raft` + `raft-boltdb/v2` are **accepted** for V1.
+
+**Phase 3-5 subsystems, deliberately deferred to where design §13 places them:**
+
+- production SQLite plus the authenticated closed endpoint for the target-applied proof (needs the
+  §5.3 apply transaction, so it belongs after Phase 2's store work);
+- TLS profile/ALPN closed dispatch, no resumption, RFC 8441 consensus framing (Phase 3);
+- pairing/exporter/DER, credentials, clock endorsements, all-asleep renewal (Phase 3);
+- multicast/Ethernet/VPN behavior (Phase 3);
+- Git `sha1`/`sha256` bundle, quarantine, fsync, raw-path, and ref-policy behavior (Phases 4-5);
+- remaining canonical protocol, checkpoint/snapshot, recovery, IPC, and Git fixtures (frozen at the
+  end of Phase 2 per `docs/IMPLEMENTATION.md` §0.2, then extended per phase);
 - reconciliation transitions, authority handoff, crash points, halted follower, and settled-nonvoter
-  evidence required by the authoritative Phase 1 exit.
+  integration (Phase 3, on the real daemon rather than a probe).
 
-No production daemon or `internal/consensus` implementation starts until those gates close.
+Building those before Phase 2 would invert §13's order and delay the walking skeleton, which is the
+first thing to exercise reducer determinism end to end. Each carries a phase-1-grade spike only if
+its uncertainty is genuinely architectural.
+
+**Next action: Phase 2, step 1** (`internal/domain`) per `docs/IMPLEMENTATION.md` §3.
 
 ## Self-review
 
@@ -78,7 +107,9 @@ No production daemon or `internal/consensus` implementation starts until those g
 3. **Frozen outcomes:** no event kind or `(kind, schema_version)` outcome exists or changed.
 4. **Bounds:** depth 32, ±(2^53-1), 4 MiB generic JCS, and 1 MiB signed-object caps have boundary
    and one-past-boundary tests; typed schemas must impose their tighter normative bounds.
-5. **Coverage/failing-first evidence:** design §12.2's JCS, no-precommit-index, library-level
+5. **Coverage/failing-first evidence:** durability failure propagation, first-file directory
+   durability, the archived-dependency exception, cross-thread trace merging, and `%desc` noise
+   tolerance each landed with a test that fails on the unfixed condition. design §12.2's JCS, no-precommit-index, library-level
    promotion proof, and real-Raft requirements are exercised by `internal/codec` and
    `spikes/phase1/raftprobe`. Barrier, mutated-cut, premature-proof, subprocess voter death/restart,
    post-ack store-kill, sync-trace verifier, and local IPC tests are focused reproducers. Store
