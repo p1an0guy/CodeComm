@@ -12,14 +12,22 @@ import (
 )
 
 func TestGoWinIOAlwaysRejectsRemoteNamedPipeClients(t *testing.T) {
+	// `go list` reports an empty `.Dir` until the module is extracted into the
+	// module cache. go-winio is Windows-only, so a plain `go test ./...` on Linux
+	// or macOS never extracts it and this contract would silently depend on a
+	// warm cache. Download first so the check is cache-state independent.
+	if output, err := exec.Command("go", "mod", "download", "github.com/Microsoft/go-winio").CombinedOutput(); err != nil {
+		t.Fatalf("download go-winio module: %v\n%s", err, output)
+	}
+
 	command := exec.Command("go", "list", "-m", "-f", "{{.Version}}\n{{.Dir}}", "github.com/Microsoft/go-winio")
 	output, err := command.Output()
 	if err != nil {
 		t.Fatalf("locate go-winio module: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("unexpected go list output %q", output)
+	if len(lines) != 2 || lines[1] == "" {
+		t.Fatalf("unexpected go list output %q; module directory unavailable", output)
 	}
 	if lines[0] != "v0.6.2" {
 		t.Fatalf("go-winio version = %q, want reviewed v0.6.2", lines[0])
