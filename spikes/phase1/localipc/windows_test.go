@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
@@ -18,11 +18,49 @@ import (
 type acceptedPipePeer struct {
 	pid  uint32
 	sid  string
-	dacl string
+	dacl *windows.SECURITY_DESCRIPTOR
 	err  error
 }
 
 var impersonateNamedPipeClient = windows.NewLazySystemDLL("advapi32.dll").NewProc("ImpersonateNamedPipeClient")
+
+// assertOwnerOnlyDACL proves a descriptor grants exactly one ACCESS_ALLOWED ACE,
+// to want, with inheritance blocked. It inspects parsed ACEs rather than
+// descriptor.String(), because Windows canonicalizes well-known SIDs to
+// two-letter SDDL abbreviations on render ("LA" for the built-in Administrator
+// that CI runs as), so substring checks against a full SID give false failures
+// while also failing to bound the total number of trustees.
+func assertOwnerOnlyDACL(t *testing.T, descriptor *windows.SECURITY_DESCRIPTOR, want *windows.SID, label string) {
+	t.Helper()
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatalf("%s: read parsed DACL: %v", label, err)
+	}
+	if dacl == nil {
+		t.Fatalf("%s: DACL is absent; a NULL DACL grants everyone access", label)
+	}
+	control, _, err := descriptor.Control()
+	if err != nil {
+		t.Fatalf("%s: read descriptor control bits: %v", label, err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		t.Fatalf("%s: DACL is not protected; inherited ACEs may widen access (control=%#x)", label, control)
+	}
+	if dacl.AceCount != 1 {
+		t.Fatalf("%s: DACL grants %d trustees, want exactly one", label, dacl.AceCount)
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(dacl, 0, &ace); err != nil {
+		t.Fatalf("%s: read DACL ACE 0: %v", label, err)
+	}
+	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+		t.Fatalf("%s: DACL ACE 0 type = %#x, want ACCESS_ALLOWED", label, ace.Header.AceType)
+	}
+	granted := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+	if !granted.Equals(want) {
+		t.Fatalf("%s: DACL grants %q, want %q", label, granted.String(), want.String())
+	}
+}
 
 func TestNamedPipeIsOwnerOnlyRejectsRemoteAndIdentifiesPeer(t *testing.T) {
 	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
@@ -35,11 +73,7 @@ func TestNamedPipeIsOwnerOnlyRejectsRemoteAndIdentifiesPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse owner-only DACL: %v", err)
 	}
-	rendered := descriptor.String()
-	if !strings.Contains(rendered, sid) || strings.Contains(rendered, ";;;WD)") ||
-		strings.Contains(rendered, ";;;AU)") || strings.Contains(rendered, ";;;BU)") {
-		t.Fatalf("named-pipe DACL is not current-user-only: %q", rendered)
-	}
+	assertOwnerOnlyDACL(t, descriptor, tokenUser.User.Sid, "constructed")
 
 	pipePath := fmt.Sprintf(`\\.\pipe\codecomm-phase1-%d-%d`, os.Getpid(), time.Now().UnixNano())
 	listener, err := winio.ListenPipe(pipePath, &winio.PipeConfig{
@@ -97,7 +131,7 @@ func TestNamedPipeIsOwnerOnlyRejectsRemoteAndIdentifiesPeer(t *testing.T) {
 			accepted <- acceptedPipePeer{err: err}
 			return
 		}
-		accepted <- acceptedPipePeer{pid: pid, sid: clientSID, dacl: appliedDescriptor.String()}
+		accepted <- acceptedPipePeer{pid: pid, sid: clientSID, dacl: appliedDescriptor}
 	}()
 
 	timeout := 5 * time.Second
@@ -137,10 +171,7 @@ func TestNamedPipeIsOwnerOnlyRejectsRemoteAndIdentifiesPeer(t *testing.T) {
 	if result.sid != sid {
 		t.Fatalf("peer SID = %q, want %q", result.sid, sid)
 	}
-	if !strings.Contains(result.dacl, sid) || strings.Contains(result.dacl, ";;;WD)") ||
-		strings.Contains(result.dacl, ";;;AU)") || strings.Contains(result.dacl, ";;;BU)") {
-		t.Fatalf("applied named-pipe DACL is not current-user-only: %q", result.dacl)
-	}
+	assertOwnerOnlyDACL(t, result.dacl, tokenUser.User.Sid, "applied")
 	if listener.Addr().Network() != "pipe" || listener.Addr().String() != pipePath {
 		t.Fatalf("named-pipe listener address = %s %q", listener.Addr().Network(), listener.Addr())
 	}

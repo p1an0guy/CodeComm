@@ -74,3 +74,35 @@ func TestVerifyTraceFilesRequiresTwoSuccessfulSyncsBeforeAck(t *testing.T) {
 		})
 	}
 }
+
+// A trace split across per-thread files is the normal shape under strace -ff,
+// because the Go runtime moves goroutines between OS threads: the StoreLogs
+// writes/syncs and the acknowledgement land in different files. The verifier
+// must merge them, while still rejecting every genuine ordering violation.
+func TestVerifyTraceFilesMergesPerThreadFiles(t *testing.T) {
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	const begin = "write(2, \"CODECOMM_STORE_LOGS_BEGIN\\n\", 26) = 26\n"
+	const ack = "write(1, \"ACK\\n\", 4) = 4\n"
+
+	ordered := write("t.100", begin+
+		"pwrite64(7, \"data\", 4096, 0) = 4096\n"+
+		"fdatasync(7) = 0\n"+
+		"pwrite64(7, \"meta\", 4096, 4096) = 4096\n"+
+		"fdatasync(7) = 0\n")
+	acknowledged := write("t.101", ack)
+	if err := verifyTraceFiles([]string{ordered, acknowledged}); err != nil {
+		t.Fatalf("split ordered trace should verify: %v", err)
+	}
+
+	incomplete := write("u.100", begin+"pwrite64(7, \"data\", 4096, 0) = 4096\n")
+	if err := verifyTraceFiles([]string{incomplete, write("u.101", ack)}); err == nil {
+		t.Fatal("acknowledgement without a completed sync sequence must fail even when split")
+	}
+}

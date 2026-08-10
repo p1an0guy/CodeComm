@@ -55,13 +55,13 @@ jobs:
         run: go test -c -o "$RUNNER_TEMP/raftprobe.test" ./spikes/phase1/raftprobe
       - name: Trace StoreLogs acknowledgement
         run: |
-          strace -ff -qq -e trace=fdatasync,fsync,pwrite64,write \
+          strace -f -qq -e trace=fdatasync,fsync,pwrite,pwrite64,write \
             -o "$RUNNER_TEMP/codecomm-store-trace" \
             "$RUNNER_TEMP/raftprobe.test" \
             -test.run='^TestSynchronousStableStoreSurvivesProcessKillAfterAcknowledgement$' \
             -test.count=1
           go run ./spikes/phase1/raftprobe/cmd/verify-fsync-trace \
-            "$RUNNER_TEMP"/codecomm-store-trace.*
+            "$RUNNER_TEMP"/codecomm-store-trace*
 
   fuzz-smoke:
     name: JCS differential fuzz smoke
