@@ -1,16 +1,30 @@
 # Phase 1 Status
 
-Status: In progress — initial gate closed on Linux and macOS; Windows Raft timing pending  
+Status: Initial gate CLOSED — all seven CI jobs green on Linux, macOS, and Windows (run 31428715462, commit 7099dd6)  
 Last updated: 2026-08-10  
-Scope: the initial Raft/store/JCS/local-IPC gate in `docs/IMPLEMENTATION.md` §2. The broader authoritative
-Phase 1 exit in design §13 remains open.
+Scope: the initial Raft/store/JCS/local-IPC gate in `docs/IMPLEMENTATION.md` §2. Design §13's
+broader Phase 1 items are reclassified below as Phase 3-5 subsystem work, since none of them gates
+the architecture.
+
+**Next action: Phase 2, step 1** — `internal/domain` per `docs/IMPLEMENTATION.md` §3.
 
 ## Initial gate
 
-CI history is the evidence of record. Run 31427994463 (commit 046a1cc) turned the **stable-store
-sync-ordering job green**, closing the durability gate on real Linux `strace` evidence, alongside
-the race detector, JCS differential fuzz smoke, vulnerability scan, and the Linux and macOS test
-jobs. Windows remains outstanding on Raft harness timing, not on library behavior (below).
+CI history is the evidence of record. Run **31428715462** (commit 7099dd6) is **green on all seven
+jobs**: the three-OS test matrix, the race detector, the Linux `strace` stable-store sync-ordering
+proof, the JCS differential fuzz smoke, and the vulnerability scan. Every row below is
+cross-platform except where it names a platform.
+
+`hashicorp/raft` v1.7.3 and `raft-boltdb/v2` v2.3.1 are **accepted for V1**. All five gating
+questions in `docs/IMPLEMENTATION.md` §2 are answered on the real API, so no library replacement is
+required and design §3 stands as written.
+
+It took five CI runs to get here, and the pattern is worth recording: every failure but one was the
+harness encoding an assumption about its execution environment that only a real three-OS matrix
+exposes — module-cache warmth, syscall naming, strace output formatting, subprocess speed, and
+cross-package test contention. The exception was the leadership-transfer bound below, which is a
+fact about the dependency. This is the argument for wiring CI before writing daemon code, and that
+surface is now largely spent.
 
 Two CI failures were test-side defects rather than defects in the behavior under test, and both are
 worth recording because they would have recurred:
