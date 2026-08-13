@@ -687,6 +687,27 @@ func replaceCoveredProjections(
 }
 
 func clearGenerationLocalState(conn *sqlite.Conn) error {
+	// Pairing rows are retained as idempotency evidence, but predecessor
+	// secrets must become deletion work before the active lineage changes.
+	if err := execute(
+		conn,
+		`INSERT OR IGNORE INTO pairing_secret_deletions(
+		    invite_id, session_id, reason, queued_at, failure_count
+		)
+		SELECT invite_id, session_id, 'generation_changed', expires_at, 0
+		  FROM pairing_invites
+		 WHERE state IN ('preparing', 'outstanding');`,
+	); err != nil {
+		return fmt.Errorf("store: queue predecessor pairing cleanup: %w", err)
+	}
+	if err := execute(
+		conn,
+		`UPDATE pairing_invites
+		    SET state = 'abandoned', terminal_at = expires_at
+		  WHERE state IN ('preparing', 'outstanding');`,
+	); err != nil {
+		return fmt.Errorf("store: abandon predecessor pairing invites: %w", err)
+	}
 	for _, table := range []string{
 		"agent_resume_tokens",
 		"agent_launches",

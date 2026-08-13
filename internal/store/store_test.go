@@ -45,12 +45,16 @@ var requiredTables = []string{
 	"origin_scopes",
 	"outbox",
 	"owner_recovery_challenges",
+	"pairing_attempts",
+	"pairing_invites",
+	"pairing_secret_deletions",
 	"peer_acks",
 	"peer_endpoints",
 	"plan_current",
 	"plan_revisions",
 	"publications",
 	"raft_command_applications",
+	"raft_snapshot_installs",
 	"replication_attestations",
 	"replication_cursors",
 	"schema_migrations",
@@ -107,28 +111,44 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			}
 		}
 
-		var (
-			versionNumber int64
-			name          string
-			checksum      []byte
-		)
-		err := queryOne(
+		type migrationRow struct {
+			version  int64
+			name     string
+			checksum []byte
+		}
+		var migrations []migrationRow
+		err := query(
 			conn,
-			"SELECT version, name, checksum FROM schema_migrations;",
+			"SELECT version, name, checksum FROM schema_migrations ORDER BY version;",
 			func(stmt *sqlite.Stmt) {
-				versionNumber = stmt.ColumnInt64(0)
-				name = stmt.ColumnText(1)
-				checksum = columnBytes(stmt, 2)
+				migrations = append(migrations, migrationRow{
+					version:  stmt.ColumnInt64(0),
+					name:     stmt.ColumnText(1),
+					checksum: columnBytes(stmt, 2),
+				})
 			},
 		)
 		if err != nil {
 			return err
 		}
-		if versionNumber != 1 || name != "initial" {
-			t.Fatalf("migration row = (%d, %q), want (1, %q)", versionNumber, name, "initial")
+		wantNames := []string{"initial", "phase3_foundations"}
+		if len(migrations) != len(wantNames) {
+			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
 		}
-		if !bytes.Equal(checksum, embeddedMigrations[0].checksum[:]) {
-			t.Fatalf("migration checksum = %x, want %x", checksum, embeddedMigrations[0].checksum)
+		for index, row := range migrations {
+			wantVersion := int64(index + 1)
+			if row.version != wantVersion || row.name != wantNames[index] {
+				t.Fatalf(
+					"migration[%d] = (%d, %q), want (%d, %q)",
+					index, row.version, row.name, wantVersion, wantNames[index],
+				)
+			}
+			if !bytes.Equal(row.checksum, embeddedMigrations[index].checksum[:]) {
+				t.Fatalf(
+					"migration[%d] checksum = %x, want %x",
+					index, row.checksum, embeddedMigrations[index].checksum,
+				)
+			}
 		}
 
 		if err := execute(conn, "PRAGMA writable_schema = ON;"); err != nil {
@@ -194,7 +214,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
 	broken := migrationFromText(
-		2,
+		3,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
@@ -212,7 +232,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 2;", 0)
+		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 3;", 0)
 		return nil
 	})
 	if err != nil {
