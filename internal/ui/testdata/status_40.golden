@@ -1,0 +1,19 @@
+CodeComm  [LIVE]
+Session   018f47de89ab
+Workspace 550e8400e29b
+Device cc124aa2a5  owner / active
+Consensus READY / leader  leader cc12...
+Voters live 1  target 1  quorum 1
+Strong writes available
+Applied term 1  raft 4
+Applied event 2  result 3
+DEGRADED: 1 voter; no voter loss
+tolerated
+
+Agents (1)
+  018f47de  working
+    codex:codexhostile  task 018f47de
+
+Tasks (1)
+  P1 018f47de  in_progress
+    status task  owner 018f47de
