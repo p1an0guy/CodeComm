@@ -128,9 +128,10 @@ client class: `operator` or `agent`. The server independently verifies the endpo
 peer identity, then pins the connection for its lifetime:
 
 - `operator` maps to `actor_type: human` and can reach only the CLI/TUI operation allowlist;
-- a new `agent` bind supplies only the one-use launch selector created by
-  `codecomm agent launch`; resume instead presents the §7.2 capability and restores that exact
-  session.
+- `operator` omits `agent_proof`; `agent` requires exactly one closed proof object,
+  `{"launch_selector":"..."}` or `{"resume_capability":"..."}`. A new bind uses only the one-use
+  selector created by `codecomm agent launch`; resume presents the §7.2 capability and restores
+  that exact session.
 
 `codecomm agent launch` first creates a durable local registration fixing session/workspace,
 immutable `client_kind`/profile, concurrency mode, and a daemon-validated managed-root handle. It
@@ -303,11 +304,15 @@ Agent-originated events require the bound committed agent session and origin sco
 `origin.agent_profile_id` MUST equal that session's immutable profile, including null. The exception
 is `agent.session.started`: it requires `origin.agent_session_id = entity_id`, no existing
 session/scope row, sequence 1, and uses `origin.agent_profile_id` to create the immutable profile. A
-structurally valid first-seen start consumes sequence 1 and creates the scope even if a later role,
-cap, or domain check rejects; that rejected `agent_session_id` is burned and a later launch mints a
-new ID. Only an accepted start creates the agent-session entity. Remote reducers can verify active
-membership, IDs, and every post-start profile match; trusted local construction proves a launch bind
-existed.
+start's actor, prohibited CAS, entity/session equality, and sequence-1 contract validate before
+scope creation; failure consumes nothing. After those structural checks, a first-seen start consumes
+sequence 1 and creates the scope even if a later role, payload, cap, or domain check rejects; that
+rejected `agent_session_id` is generation-wide burned and a later launch mints a new ID. An orphan
+burned scope therefore remains at sequence 1, and another device cannot reuse its ID in that
+generation. Only an accepted start creates the agent-session entity. Remote reducers can verify
+active membership, IDs, and every post-start profile match; trusted local construction proves a
+launch bind existed. A successor generation retains `ended(recovery)` session rows but no predecessor
+scopes (§3.1); those retained IDs remain burned and MUST NOT acquire a new scope.
 `human` and `daemon` events require the boot scope and a null agent session. `human` means a person
 acting through local TUI/CLI/IPC; `daemon` means local daemon initiative. Both attribute solely to
 `device_id` (§2.1).
@@ -388,6 +393,17 @@ and an ID collision do not. `command_result_n` is a closed JCS object containing
 `result_hash`, avoiding a recursive preimage. Canonical outcomes contain only stable status/code and
 bounded typed fields; localized prose is generated later.
 
+The V1 object has exactly these six members and representations:
+
+```json
+{"chain_hash":null,"chain_index":null,"outcome":{},"proposal":{},"proposal_digest":"base64url","result_index":1}
+```
+
+`proposal` is the complete signed event object embedded as JSON, `proposal_digest` is unpadded
+base64url SHA-256 of its exact JCS bytes, and `outcome` is the embedded canonical outcome object.
+An accepted result replaces both nulls with its positive integer event-chain position and unpadded
+base64url 32-byte hash; a rejection leaves both null. No storage-only column enters this preimage.
+
 On first apply, a replica computes the applicable event link, then the result link, in the same
 transaction. An exact duplicate first checks proposal-digest equality and recomputes that row's own
 link before returning it; a changed proposal is `idempotency_conflict`, while a broken row is a
@@ -396,6 +412,10 @@ not pretend to authenticate all predecessors. Snapshot creation/import, event or
 §3.1 recovery, `state recover`, and `state scrub` MUST recompute both complete chains through their
 cut and compare the anchored heads. Incremental checkpoints compare stored heads only; they do not
 rescan unbounded history.
+
+Ingress returns `idempotency_conflict` before Raft when an existing `event_id` has changed bytes. If
+such a collision nevertheless appears in a committed log, the FSM halts before that entry: it does
+not write a second result, a Raft-command binding, or an applied watermark.
 
 Periodically — after `checkpoint_events` accepted events or `checkpoint_interval_seconds` seconds,
 whichever comes first — the leader serializes checkpoint capture with proposal/configuration appends, completes a
@@ -410,6 +430,8 @@ device in the current committed
 `consensus.checkpoint` event constructed from its daemon IPC binding.
 This signer need not be the leader, which keeps portable checkpoint authority verifiable from
 committed state during voter replacement.
+The payload has exactly the fourteen tuple members above plus `authority_signature`; that signature
+is excluded from its own preimage and is strict unpadded base64url for 64 bytes.
 
 At apply, an entry whose term or `log_index - 1` differs from the covered tuple is a deterministic
 `stale_checkpoint` result and the leader retries; no index reservation is needed. If the positions
@@ -438,7 +460,8 @@ intervening records proves nothing. A lone event proves origin, not committed po
    duplicate verifies and returns the chained row without re-evaluation; a changed proposal under
    that ID returns `idempotency_conflict`. A first-seen command rechecks schema/apply support,
    membership, signature/domain/session/scope binding, and expected origin sequence. A valid next
-   sequence is consumed before deterministic role, CAS, transition, depth, and kind-specific checks;
+   sequence is consumed before deterministic role, entity existence/CAS, transition, depth, and
+   remaining kind-specific checks;
    a gap/reuse is itself a rejection and consumes nothing (§5.2).
 6. An accepted command stores the event, extends the event chain, and applies its domain mutations.
    A rejected first-seen command stores the same canonical outcome on every healthy replica and does
@@ -562,9 +585,10 @@ canonical form. Workspace files and Git artifacts are separate data planes.
 
 ### 5.4 Event kinds
 
-This table is the complete V1 `kind` namespace and the authority for what may be committed at
-`schema_version` 1; a kind absent from it is rejected deterministically by every replica
-(§5.3). Entities and their fields are in §6.1.
+This table is the complete V1 `kind` namespace and the authority for what may be emitted at
+`schema_version` 1. Local/leader ingress rejects a kind absent from the binary registry before Raft;
+a replica that nevertheless encounters one in a committed entry halts before that entry under
+§5.5 and writes no rejection. Entities and their fields are in §6.1.
 
 `CAS: yes` means the event MUST carry `expected_entity_version` and is rejected on mismatch;
 `conditional` uses the kind-specific tokens stated below. `Role` is the minimum application role, checked against
@@ -640,6 +664,71 @@ Whenever a payload repeats the subject already encoded by `entity_id` (`device_i
 control path), equality is mandatory; schemas SHOULD omit the duplicate where the operation does not
 need it. Every otherwise-unbounded free-form `reason` in this namespace is 1–1024 UTF-8 bytes.
 
+**Membership wire schemas.** The following are the closed schema-version-1 payloads. Binary values
+are strict unpadded base64url; public keys, digests, and signatures are exactly 32, 32, and 64 bytes.
+All integers are JCS-safe nonnegative integers, and `max_apply_level` is in `1..2^31-1`.
+
+- `membership.device_admitted` has exactly `identity_public_key`, `role`, `daemon_version`,
+  `max_apply_level`, and `initial_epoch_binding`. The binding has exactly `epoch` (1),
+  `epoch_public_key`, `key_digest`, and `binding_signature`; its digest is SHA-256 of the epoch key.
+  The signature is by `identity_public_key` under `codecomm/v1/credential-binding` over
+  `JCS({device_id, epoch, epoch_public_key, session_id})`. Admission validates the binding; the
+  scheduler carries it into the first `credential.authorized`, whose reducer independently validates
+  the complete binding. Admission creates no extra projection row.
+- `membership.version_reported` has exactly `daemon_version` and `max_apply_level`.
+  `membership.role_changed` has exactly `device_id` and `role`; a role equal to the committed role
+  is rejected rather than version-bumped.
+- `membership.owner_recovered` has exactly `recovery_authorization`. That object has exactly
+  `session_id`, `recovery_generation`, `event_id`, `subject_device_id`,
+  `expected_entity_version`, and `signature`. `signature` is excluded from its own preimage and is
+  made by the generation's recovery key under `codecomm/v1/owner-recovery` over the JCS object of
+  the other five fields.
+- `membership.device_revoked` has exactly `device_id`, `reason`, `voter_set`, and
+  `expected_voter_set_version`. A target-voter result is the next smaller legal count, is a strict
+  subset of the prior target, and excludes the subject; it may not introduce a voter. A nonvoter
+  result is byte-identical to the prior sorted target. Active and `requires_readmission` subjects
+  may be revoked; revoked or absent subjects may not. `membership.voter_set_changed` has exactly
+  `voter_set`. An identical target is rejected rather than version-bumped.
+
+`membership.voter_set_activated` has exactly `target_voter_set_version`,
+`expected_authority_voter_set_version`, `voter_set`, `activation_checkpoint_event_id`,
+`activation_proofs`, `prior_authority_signer`, and `prior_authority_handoff`. Proofs are sorted in
+the exact `voter_set` order, one per voter. Each proof is a complete canonical object with exactly:
+
+```text
+session_id, workspace_id, recovery_generation,
+target_voter_set_version, current_authority_voter_set_version, voter_set,
+voter_device_id, live_configuration_index, checkpoint_event_id,
+checkpoint, checkpoint_signature, voter_signature
+```
+
+`checkpoint` is the exact unsigned §5.2.1 object with:
+
+```text
+session_id, workspace_id, recovery_generation,
+authority_voter_set_version, signer_device_id, term,
+covered_applied_log_index, covered_chain_index, covered_chain_hash,
+covered_result_index, covered_result_hash, projection_accumulator,
+digest_version, projection_schema_version
+```
+
+`checkpoint_signature` verifies that object under `codecomm/v1/checkpoint` by its active
+current-authority signer. `voter_signature` is excluded from its own preimage and verifies the
+remaining proof object under `codecomm/v1/voter-activation-proof` by `voter_device_id`. Every proof
+must carry the same target/current-authority versions, sorted target, configuration index,
+checkpoint event ID, checkpoint bytes, and checkpoint signature. The checkpoint's authority version
+must equal the expected current authority, and its `covered_applied_log_index` must be greater than
+or equal to the common `live_configuration_index`, proving the checkpoint follows promotion.
+
+The prior-authority handoff preimage is
+`JCS({session_id, workspace_id, recovery_generation, target_voter_set_version,
+expected_authority_voter_set_version, voter_set, activation_checkpoint_event_id,
+activation_proofs, prior_authority_signer})`, where `activation_proofs` contains the complete
+voter-signed objects above. `prior_authority_handoff` is excluded and verifies under
+`codecomm/v1/voter-authority-handoff` by an active member of the expected current authority. An
+already-activated target is rejected. These exact exclusions make persisted proof bytes sufficient
+for offline handoff-chain verification.
+
 **Audit does not duplicate retained outcomes.** Every accepted domain event and every first-seen
 committed domain rejection projects its auditable fields directly into local `audit_events`.
 `audit.recorded` exists only for an authenticated active member request that was rejected before it
@@ -651,6 +740,8 @@ and report the same request; those are distinct attributed observations, not dup
 
 For `audit.recorded`, `subject_device_id` names the rejected request's authenticated member, not the
 reporting daemon, and `subject_credential_epoch` MUST equal that device's latest committed epoch.
+Its closed payload is exactly `action`, `outcome`, `subject`, `subject_device_id`, and
+`subject_credential_epoch`; the first two use the stable ASCII code grammar and bounds above.
 The event origin names the reporting daemon and the audit view MUST show both reporter and subject:
 subject attribution is that member daemon's signed observation, not independent proof. This is
 acceptable only under V1's non-Byzantine-member protocol assumption and grants no authority.
@@ -754,6 +845,10 @@ accumulator_seed_k = SHA-256("codecomm/v1/projection-accumulator" || 0x00
 All appended values are 32 bytes. A successor changes the accumulator head at the unchanged result
 position; the result index does not restart. Accumulator heads, like chain heads, are compared only
 within one session/generation tuple.
+
+`genesis_records.boundary_transform_digest` stores `initial_state_digest` for generation 0 and
+`post_transform_state_digest` for every successor. It is always the full projection-state digest at
+that generation boundary.
 
 The full state digest covers logical rows, never pages, rowids, DDL order, insertion order, or free
 lists. JCS orders object keys; exact covered-column membership is nevertheless frozen.

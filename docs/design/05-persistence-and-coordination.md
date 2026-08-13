@@ -72,7 +72,7 @@ compare-and-set against that pointer.
 | Field | Type | Notes |
 |---|---|---|
 | `session_id` | UUIDv7 | Primary key; remapped by the §3.1 recovery transform |
-| `plan_revision_id` | UUIDv7? | Null until first selection; must name a retained revision |
+| `plan_revision_id` | UUIDv7? | Null only at `entity_version = 1` before first selection; otherwise names a retained revision |
 | `entity_version` | integer ≥1 | CAS token for `plan.current_selected` |
 
 **Memory record** — durable shared context.
@@ -99,7 +99,7 @@ supersede one that is already superseded, and both rows must have the same
 | `holder_device_id` | `device_id` | From the committed actor binding |
 | `holder_agent_session_id` | `agent_session_id` | Released when that session ends (§6.4) |
 | `scope` | enum: `task`, `path` | |
-| `task_id` | `task_id`? | Required for task scope; optional task association for path scope |
+| `task_id` | `task_id`? | Required for task scope; optional existing-task association for path scope |
 | `path_globs` | sorted unique [string ≤512], 1–32 | Required for path scope and prohibited for task scope; each is an exact canonical path or one terminal-prefix form `dir/**` (§8.4) |
 | `ttl_seconds` | integer | Requested lifetime within committed minimum/maximum; resets on accepted renewal |
 | `status` | enum: `active`, `released` | Released leases remain for audit/CAS history |
@@ -114,6 +114,8 @@ process running as the same OS user from editing a path (§7.2).
 one another, so the reducer compares scopes directly. Task leases intersect on equal `task_id`.
 Acquiring a task-scope lease additionally requires the actor to hold that task; release of the task
 does not silently release the lease, so the holder must release it or session end/expiry does.
+When a path lease carries the optional `task_id`, that task must exist but need not be held by the
+actor; the association supplies activity context and does not grant task or path authority.
 Path syntax is deliberately restricted to exact paths and terminal directory prefixes `dir/**`:
 exact/exact intersects on equality, prefix/exact when the prefix contains it, and prefix/prefix when
 one contains the other. Comparison uses §8.4 canonical case-sensitive bytes, independent of host
@@ -185,6 +187,12 @@ digest-covered with `devices` (§3).
 
 Rows are immutable. The currently acceptable rows are derived from committed intervals and local
 time; old rows remain for certificate, audit, and recovery verification.
+Loading retained predecessor-session rows is not historical authority proof: replay or logical
+snapshot import MUST first verify the event/result chains, authority handoffs, and projection
+accumulator covering those exact rows. A projection loader can recheck identity signatures and
+per-`(session, device)` epoch continuity, but the singleton current `credential_authority` row
+cannot reconstruct prior authority membership or quorum. New authorizations always validate
+against the current activated authority.
 
 **Control-file proposal** — append-only review input, not replicated consent.
 
@@ -236,7 +244,11 @@ live state to `disconnected`, atomically storing that state in `resume_state`. A
 local resume capability it may move `disconnected` only to that stored state and clear
 `resume_state`. `agent.session.ended`, not `state_changed`, enters terminal `ended`, clears
 `resume_state`, and sets `end_reason`. Every mutation CASes the same session version, so resume and
-reaping cannot both win; no transition leaves `ended`.
+reaping cannot both win; no transition leaves `ended`. For `max_active_agent_sessions`, active means
+every non-`ended` row, independent of ephemeral presence or current device status; retained ended
+rows do not count. Every ordinary retained session has its agent origin scope; the sole missing-scope
+case is an `ended(recovery)` historical row carried into a successor after §3.1 drops predecessor
+scopes. Such a row MUST have no successor-generation scope, and its retained ID cannot be rebound.
 
 **Canonical ref** — the replicated repository pointer, initialized to the verified bootstrap
 commit. V1 has one row and never maps it directly to a user's branch.
@@ -359,12 +371,13 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 | Table | Holds |
 |---|---|
 | `schema_migrations` | Applied migration numbers and checksums |
-| `genesis_records` | Initial and successor genesis records, recovery authorizations, and deterministic boundary-transform digests (§3.1) |
+| `genesis_records` | Initial and successor genesis records, recovery authorizations, and the full boundary projection-state digest: initial state for generation 0, post-transform state for successors (§§3.1, 5.6) |
 | `consensus_state` | Nullable/historical `last_raft_applied_log_index`, term, event/result heads, and current projection accumulator/version |
 | `events` | Accepted events exactly as signed (§5.2) |
 | `event_provenance` | Unsigned local `(term, log_index, applied_at, chain_index, chain_hash)` only for accepted events applied by this store's Raft FSM; result-batch/snapshot imports never synthesize it |
 | `chain_checkpoints` | Committed checkpoints with authority signature, both covered chain heads, and projection accumulator (§5.2.1) |
-| `command_results` | One immutable first-seen record per `event_id`: exact proposal/digest, canonical accepted-or-rejected outcome, accepted chain tuple or nulls, dense result index, predecessor hash, and result hash. Retained for the lineage lifetime and included in every FSM/logical snapshot (§5.2.1) |
+| `command_results` | One immutable first-seen record per `event_id`: exact proposal/digest, canonical accepted-or-rejected outcome, exact canonical projection-mutation list, accepted chain tuple or nulls, dense result index, predecessor hash, and result hash. Retained for lineage lifetime, historical replay, and every FSM/logical snapshot (§5.2.1) |
+| `raft_command_applications` | **Local Raft evidence**: one immutable `(recovery_generation, log_index, term, event_id, proposal_digest)` binding for every applied command position, including exact duplicates. It joins `command_results` by event ID/digest; its application generation may differ from that result's immutable first-seen generation after recovery. Written with the FSM transaction and checked in both directions; imports never synthesize it |
 | `replication_attestations` | **Local evidence**: verified signed batch envelope/signature and covered ranges, plus trusted snapshot-root/checkpoint attestations. Exact `results[]` reconstruct from immutable `command_results`; contiguous coverage supports settled-nonvoter backup/recovery (§5.3) |
 | `origin_scopes`, `audit_counters` | Digest-covered protocol projections for strict origin ordering and bounded rejection audit (§§5.2, 5.4, 6.1) |
 | `devices` | Membership, role, enrolled identity keys including revoked and superseded ones (§4.2) |
@@ -417,11 +430,12 @@ result attestations instead.
 The §5.3 Raft-FSM apply transaction writes atomically: accepted event or rejection,
 accepted-event provenance when applicable, `last_raft_applied_log_index`, chain heads and projection
 accumulator, every affected covered protocol/domain row, durable
-chained `command_results`, the accepted event's or committed rejection's audit projection,
-checkpoint row, lease timer metadata, and local outbox removal. A later deterministic decision reads
-nothing outside that transaction. Peer acknowledgements/cursors and Git transfer progress remain
-outside because they cannot affect a reducer. A process that lacks a live same-boot monotonic lease
-timer arms the full committed TTL; persisted wall time is display-only and never shortens it.
+chained `command_results` with exact projection mutations, the local Raft-command binding, the
+accepted event's or committed rejection's audit projection, checkpoint row, lease timer metadata,
+and local outbox removal. A later deterministic decision reads nothing outside that transaction.
+Peer acknowledgements/cursors and Git transfer progress remain outside because they cannot affect a
+reducer. A process that lacks a live same-boot monotonic lease timer arms the full committed TTL;
+persisted wall time is display-only and never shortens it.
 
 A settled-nonvoter import scratch-replays the same deterministic transitions, then atomically writes
 the batch's results/events/projections/heads, local views/timers, cursor, and
@@ -436,7 +450,8 @@ deterministic apply transaction, so if one replica pruned a parent row another s
 same event fails on one and succeeds on the other — a divergence in a fail-closed system.
 Event/projection/command-result/result-chain/accumulator/outbox and, for Raft FSM apply,
 `last_raft_applied_log_index` changes commit atomically. `event_id` and
-`(device_id, scope_id, origin_sequence)` are unique across all results.
+`result_index` are unique across all results; the origin tuple is unique only across accepted
+events because a distinct event that reuses a consumed sequence must retain its committed rejection.
 Committed but unapplied Raft entries replay idempotently after crash. Checkpointing and
 transactional checksummed migrations are daemon-controlled; irreversible migration requires
 verified backup.
@@ -503,8 +518,9 @@ Other entities:
 - Views (derived, never stored): peers/agents, activity, actionable tasks,
   repository/conflicts, and replica watermarks.
 
-Strong task claims require the task's derived `actionable` predicate and intended-device check, then
-use entity CAS; new lease IDs use the deterministic intersection check above. An agent
+Strong task claims apply the common order from §5.3: role, task existence/entity CAS, then the
+derived `actionable` predicate, intended-device constraint, and claim limits. New lease IDs use the
+deterministic intersection check above. An agent
 `task.updated` reducer likewise requires that agent to hold the task or that both owner fields are
 null; this is replicated authorization, not merely MCP filtering. Both claim and lease acquisition
 execute in the replicated state machine and produce one winner. Local serialization does not make a
@@ -514,6 +530,9 @@ No reducer reads a wall clock. On applying `lease.acquired` or `lease.renewed`, 
 arms a monotonic `now + ttl_seconds` timer for that version, whether or not it is leader; only the
 current leader may turn expiry into `lease.released(expired)`. Renewal and expiry race through the
 same CAS, so one wins and a stale timer rejects everywhere. Event volume cannot accelerate expiry.
+Because current leadership is volatile consensus state rather than reducer input, the leader-only
+rule is enforced by the authenticated proposal-ingress/forwarding path before Raft submission.
+Replicas deterministically enforce the daemon actor, lease CAS, and lifecycle transition.
 
 A same-process leadership change may retain the monotonic remaining duration. A daemon restart,
 boot change, missing timer, or snapshot import always arms the **full** TTL from new monotonic now.
@@ -556,6 +575,9 @@ cascade:
 
 Each affected task/lease and the agent session increments its own `entity_version`; the release is
 deterministic on every replica and driven by the committed end event, not the local grace timer.
+If the session or any affected child is already at the maximum entity version, the whole event
+rejects with `entity_version_exhausted`; reducers inspect sorted task IDs before sorted lease IDs, and
+no partial release occurs.
 
 The §3.1 boundary transform performs the same bounded release for every carried old-generation
 session but records `recovery` rather than `session_ended`; it is covered by the successor genesis
@@ -579,3 +601,6 @@ Every override records the acting `device_id` and lands in `audit_events`, so a 
 release is always distinguishable from a voluntary one. None of these are exposed over MCP
 (§7.1): an agent may release *its own* claims and leases, but overriding another session's
 ownership is an operator action available only through the TUI and CLI.
+Daemon-originated `agent.session.ended(operator)` is not an `operator_override` audit class: it can
+end only a session owned by that same daemon, and the accepted end event plus its atomic cascade is
+the durable audit record.

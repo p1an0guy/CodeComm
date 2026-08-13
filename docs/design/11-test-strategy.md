@@ -64,8 +64,9 @@ Required unit/component subjects:
   `event_id` verifies and returns its durable chained outcome after restart, snapshot, recovery
   generation, and arbitrarily later events without re-evaluation; changed proposal bytes return
   `idempotency_conflict` without altering either head;
-- event kinds: every §5.4 kind accepted with a minimal valid payload; an unknown kind
-  rejected identically on all replicas; a payload with an unknown field rejected at
+- event kinds: every §5.4 kind accepted with a minimal valid payload; an unknown kind or unsupported
+  apply level halts before the entry without a result, consumed sequence, or Raft watermark; a
+  payload with an unknown field rejected at
   `schema_version` 1; each kind rejected when proposed by an insufficient role or a
   disallowed `actor_type`; CAS kinds rejected without `expected_entity_version`; create
   kinds rejected when one is supplied;

@@ -124,9 +124,10 @@ the other. Build bottom-up so each layer is testable before the next exists.
 5. **`store`** — schema, migration 0001, the §5.3 step-7 apply transaction with its complete
    enumerated write set, `synchronous=FULL`, and the startup assertion
    `applied_index ≤ last Raft log index`.
-6. **`reducer`** — one kind at a time, in dependency order: `task.*` → `lease.*` →
-   `agent.session.*` → `plan.*`/`memory.*` → `membership.*`/`policy.changed` → `publication.*`/
-   `workspace.conflict.*` → `credential.authorized`/`consensus.checkpoint`/`audit.recorded`.
+6. **`reducer`** — one kind at a time, in dependency order: `task.*` → `activity.recorded` →
+   `lease.*` → `agent.session.*` → `plan.*`/`memory.*` → `membership.*`/`policy.changed` →
+   `control_file.change_proposed` → `publication.*`/`workspace.conflict.*` →
+   `credential.authorized`/`consensus.checkpoint`/`audit.recorded`.
    Each kind lands with its golden reducer-outcome fixture: (prior state, input) → outcome, rejection
    code, resulting accumulator.
 7. **`chain`** — event chain, result chain, checkpoints, projection accumulator. Assert immunity to

@@ -375,14 +375,19 @@ merge. OIDs are algorithm-tagged. Conflicting `paths` are separately sorted in �
 and carried in the event for display/authorization, but excluding them from the ID prevents two Git
 builds from creating duplicate logical rows merely because they report paths differently.
 
-Any daemon may propose detection while the named publication is nonterminal; this guarantees its
-candidate pin still exists before the conflict becomes a retention root. Exact re-detection of an
-existing row is an idempotent no-op even after publication termination and never resets a resolved
-row. A first detection after termination rejects. The same ID with a different immutable tuple is a
-hash/integrity failure; the same ID and tuple with different paths is a detector-compatibility
-failure. Both reject and alarm rather than overwrite or create a second ID. Thus convergence does
-not depend on filesystem case behavior or byte-identical conflict messages, while the golden merge
-corpus still requires supported builds to agree on paths.
+After payload and deterministic-ID validation, the reducer looks up `conflict_id` before consulting
+current publication or canonical state. For an existing row, an exact tuple-and-path re-detection is
+an idempotent no-op even after canonical advancement or publication termination and never resets a
+resolved row. A different immutable tuple rejects with `conflict_immutable_tuple_mismatch`; equal
+tuple but different paths rejects with `conflict_detector_paths_mismatch`. Each rejection carries a
+deterministic local alarm directive with that code; the apply layer MUST materialize at most one
+alarm per committed command-result identity. Directives and alarms are derived local state and MUST
+NOT enter events, replicated projections, projection mutations, the accumulator, or the state
+digest. For an absent row, the named publication MUST be nonterminal and `canonical_commit` MUST
+equal the replicated canonical commit at reduction; otherwise detection rejects. This first-detection
+rule keeps the candidate pin available and rejects stale merge inputs without weakening exact
+re-detection. Thus convergence does not depend on filesystem case behavior or byte-identical
+conflict messages, while the golden merge corpus still requires supported builds to agree on paths.
 
 Staging voters additionally require `base_commit` to be `commit_oid`'s first parent and apply §7.2's
 bounded introduced-history walk. A net tip diff is insufficient: a two-commit history can modify an
@@ -397,9 +402,12 @@ parents and the reviewed resolved tree; V1 does not substitute patch-equivalence
 
 Resolution creates and reviews a new publication declaring the conflict ID. Staging voters verify
 that `canonical_commit` and `candidate_commit` from the committed conflict row are both ancestors of
-the resolution commit and bind that fact into receipts. After apply,
-`workspace.conflict.resolved` CAS-links it; reducers validate the declaration and receipt quorum,
-not a local object store, and set `resolution_kind = publication`. The owner-only force path sets
+the resolution commit and bind that fact into receipts. Accepted `publication.applied` is
+authoritative historical proof that its then-current receipt-age and voter-target quorum checks
+succeeded. `workspace.conflict.resolved` therefore CAS-links only an applied publication that
+declares the conflict and MUST NOT reapply receipt freshness or current-voter-target rules; later
+result-index or voter-target changes cannot invalidate that proof. It then sets
+`resolution_kind = publication`. The owner-only force path sets
 `resolution_kind = forced`, a bounded reason, and no publication ID (§6.4). CodeComm shows graph
 inputs/ours/theirs/paths and never chooses a side or silently deletes an immutable ref.
 

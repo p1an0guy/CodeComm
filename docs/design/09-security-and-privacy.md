@@ -30,8 +30,7 @@ Per §2.1, an authorized member is in scope as an adversary in the following for
 
 **A compromised local OS account is out of scope, and that exclusion is broader than it looks.**
 Every mechanism that authorizes a *local* caller lives inside that boundary: the IPC peer check
-(§5.1), the OS credential store holding the identity signing key — unlocked for the logged-in
-session on macOS and Linux, so any process at that UID signs as the device — `control_file_approvals`
+(§5.1), the OS credential store holding the identity signing key, `control_file_approvals`
 (§8.4, the only per-device consent boundary), and the whole MCP and agent surface. A compromised OS
 account is therefore full and indefinite impersonation of that member device, including owner
 actions if it holds `owner`. Because §10.1 provides no key rotation within a `device_id`, the sole
@@ -39,8 +38,10 @@ remedy is revocation and re-pairing as a new identity; and because every event t
 is validly signed and permanently retained, there is no primitive to bound *when* the compromise
 began — the design has no "events from device D after `chain_index` N are suspect" concept. V1
 therefore treats the OS account as the trust root, and credential-store enrolment MUST use
-per-application ACL scoping where the platform offers it (Keychain ACL, Windows Credential Manager
-scoping) so a different process at the same UID is not automatic. §16 carries this as a risk.
+per-application ACL scoping where the platform offers it (the macOS Keychain executable ACL).
+Windows Credential Manager is user-profile scoped, and common Linux Secret Service providers are
+login-session scoped; target names and item attributes are namespaces, not ACLs. V1 therefore does
+not claim same-user process isolation on those platforms. §16 carries this as a risk.
 The same limitation applies without a full account compromise when a coding agent is allowed to
 launch arbitrary local processes: MCP cannot select `operator`, but an approved shell command can
 invoke the human CLI under the same UID. Client sandbox and command-approval policy, not CodeComm

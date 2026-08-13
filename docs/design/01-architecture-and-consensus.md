@@ -300,6 +300,16 @@ or every eligible owner identity and the recovery key are lost, the session is u
    signatures, signer kinds, canonical selection, and any repository-data-loss confirmation are in
    the final record. No signature transfers to another candidate, key, commit, predecessor head, or
    successor generation.
+
+   The complete record uses these exact store-checked commitment fields:
+   `predecessor_genesis_digest`, `predecessor_chain_index`, `predecessor_chain_hash`,
+   `predecessor_result_index`, `predecessor_result_hash`,
+   `predecessor_projection_accumulator`, `post_transform_state_digest`, `digest_version`, and
+   `projection_schema_version`. Digests/hashes are unpadded base64url 32-byte values; both
+   authorization signatures are unpadded base64url 64-byte values. Recovery verifies both
+   signatures and all genesis semantics before storage; the boundary transaction independently
+   rejects any disagreement between these signed fields and the predecessor heads, installed
+   projections, or active digest versions.
 5. Applies one fixed recovery transform before accepting new events:
    - preserve accepted events/results, immutable plans/memory/control-file proposals, tasks,
      conflicts, enrolled public keys, and publication history; select the confirmed canonical commit;

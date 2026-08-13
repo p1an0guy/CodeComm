@@ -144,7 +144,7 @@ invalidating their filesystem view.
 |---|---|---|
 | `publication_id` | UUIDv7 | Immutable |
 | `proposal_event_id` | UUIDv7 | Immutable; exactly the accepted `publication.proposed` event's `event_id` |
-| `supersedes_publication_id` | UUIDv7? | Existing terminal `rejected`/`withdrawn` publication in this rebase/merge lineage; never an applied or nonterminal row |
+| `supersedes_publication_id` | UUIDv7? | Existing terminal `rejected`/`withdrawn` predecessor with the exact author/root/task binding defined below |
 | `task_id` | `task_id`? | Task this completes, if any |
 | `author_device_id`, `author_agent_session_id` | ids | From the committed actor binding |
 | `base_commit`, `commit_oid`, `tree_oid` | algorithm-tagged Git OIDs | Exact immutable graph transition; `base_commit` is the tip's first parent |
@@ -208,10 +208,24 @@ event bound. The union MUST be nonempty and `tree_oid` MUST differ from `base_co
 empty-path or net no-op publication rejects. Thus an intermediate modify-then-revert still requires authority and cannot smuggle an
 ineligible path or mode; a move names both deleted and added paths. For every declared resolved
 conflict, both committed tips must be ancestors of `commit_oid`. The voter then pins the objects under
-`refs/codecomm/publications/<publication_id>`, durably records them, and signs
-`(session_id, workspace_id, voter_set_version, publication_metadata_digest, voter_device_id,
-staged_result_index)` under `codecomm/v1/git-stage-receipt`; `staged_result_index` is the holder's
-durable applied result head after the pin commits. The metadata digest is SHA-256 over the JCS object
+`refs/codecomm/publications/<publication_id>`, durably records them, and signs exactly:
+
+```text
+receipt_object = {
+  "session_id": session_id,
+  "workspace_id": workspace_id,
+  "voter_set_version": voter_set_version,
+  "publication_metadata_digest": publication_metadata_digest,
+  "voter_device_id": voter_device_id,
+  "staged_result_index": staged_result_index
+}
+receipt_signature = Ed25519(voter_identity_private_key,
+  "codecomm/v1/git-stage-receipt" || 0x00 || JCS(receipt_object))
+```
+
+The object has exactly those six members and no signature member. IDs are JSON strings,
+versions/indices are unsigned JSON integers, and `publication_metadata_digest` is unpadded base64url.
+`staged_result_index` is the holder's durable applied result head after the pin commits. The metadata digest is SHA-256 over the JCS object
 containing exactly `proposal_event_id`, `publication_id`,
 `supersedes_publication_id`, `task_id`, `author_device_id`,
 `author_agent_session_id`, `base_commit`, `commit_oid`, `tree_oid`, `parent_oids`, `paths`,
@@ -260,8 +274,11 @@ through `publication.review` on a device other than the author's. `publication.w
 `proposed|approved → withdrawn` and sets `terminal_source = withdraw`; an agent may withdraw only its own publication, while a human owner
 may withdraw any and an editor only one authored on its device. Rejected and withdrawn publications
 are terminal and distinct in audit/UI. A non-null `supersedes_publication_id` must name an existing
-rejected or withdrawn row and cannot name self; requiring the stale attempt to terminate first keeps
-one forgotten rebase from pinning every prior attempt indefinitely. `publication.applied` succeeds only when the publication is approved,
+rejected or withdrawn row and cannot name self. The successor's `author_device_id`,
+`author_agent_session_id`, `working_root_id`, and `task_id` MUST exactly equal the predecessor's,
+including null `task_id` matching only null. Supersession edges MUST be acyclic; snapshot validation
+MUST reject a cycle. Requiring the stale attempt to terminate first keeps one forgotten rebase from
+pinning every prior attempt indefinitely. `publication.applied` succeeds only when the publication is approved,
 `base_commit` equals the replicated canonical `commit_oid`, and both the publication version and
 `expected_canonical_ref_version` match. One reducer transaction marks the publication applied, sets
 `terminal_source = apply` and `canonical_lineage_member = true`, and advances `canonical_refs`; a

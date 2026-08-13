@@ -122,6 +122,7 @@ defect.
 | Snapshot data-chunk compressed / expanded maximum | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Replication-batch compressed / expanded limit | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Local IPC JSON body maximum | 1 MiB | Local; event payload remains subject to `max_event_bytes` |
+| Local IPC endpoint maximum | Unix socket path: 103 bytes; Windows named-pipe path: 256 ASCII characters | Local; registry-issued endpoint fails before listen/dial when exceeded |
 | Generated context cap | 256 KiB per agent/output file (§7.3) | Local |
 | Context record counts | 200 tasks / 50 memory / 100 activity / 8 devices / 32 active agents | Local maxima subordinate to encoded-byte budgets (§7.3) |
 | SQLite busy timeout | 5 s | Local |
@@ -135,7 +136,7 @@ defect.
 | Peer HTTP limits | 32 KiB headers; 1 MiB JSON body unless an endpoint-specific bound applies; 256 list items/page; 128 active handlers/daemon | Local hard ceilings |
 | Peer HTTP/2 limits | 32 control streams/connection; per peer/direction, 1 consensus and 1 content-control + 2 content-bulk connections | Local hard ceilings; bulk carries one artifact stream; rollover permits one draining predecessor per content slot with no new streams |
 | Connection/stream liveness | 10 s request-header timeout; 120 s idle connection; 30 s stream no-progress timeout; SSE keepalive 15 s | Local; long transfers resume by digest/offset |
-| Local IPC limits | 128 connections and 64 active handlers/daemon; 32 KiB headers; 10 s header and 120 s idle timeout | Local hard ceilings; one non-pipelined request/connection at a time |
+| Local IPC limits | 128 connections and 64 active handlers/daemon; 32 KiB headers; 10 s header and 120 s body/idle timeout | Local hard ceilings; one non-pipelined request/connection at a time |
 | Pending local work | 256 unresolved commands/origin scope, 4,096/session; 64 queued Git transfers/session | Local hard ceilings; refusal occurs before request mapping/signing |
 | Ephemeral state | Presence expires after 30 s; rejection aggregates hold at most 1,024 keys/session, oldest-first | Local |
 | Child-process deadline | Git child 30 min, then 5 s graceful termination before force-kill | Local hard ceiling |
@@ -164,6 +165,7 @@ defect.
 | Git bundle header encoded / record maximum | 1 MiB / 16,384 prerequisite+ref records before PACK | Local hard input bound; publication normalization further requires one final prerequisite and head |
 | Concurrent Git children | 4 per daemon, 12 per installation | Local; queued with backpressure |
 | Coordination-state growth warning threshold | 2 GiB combined `state.db` + `consensus/` | Local — history is unprunable in V1 (§10.1) |
+| Projection-mutation encoding ceiling | 32 MiB | Local hard ceiling above the worst valid 64-claim/256-lease session-end cascade; exceeding it is an implementation/integrity failure, not a replicated domain rejection |
 
 Committed values are set at `host`; only §4.2's mutable allowlist may later change through an
 owner-proposed `policy.changed`. Genesis and every update MUST satisfy these immutable V1 bounds:
