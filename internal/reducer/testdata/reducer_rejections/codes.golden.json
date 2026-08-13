@@ -1,0 +1,518 @@
+[
+  {
+    "name": "CodeActivityTaskNotFound",
+    "wire": "activity_task_not_found"
+  },
+  {
+    "name": "CodeActorNotAllowed",
+    "wire": "actor_not_allowed"
+  },
+  {
+    "name": "CodeAgentClaimLimitReached",
+    "wire": "agent_claim_limit_reached"
+  },
+  {
+    "name": "CodeAgentLeaseLimitReached",
+    "wire": "agent_lease_limit_reached"
+  },
+  {
+    "name": "CodeAgentSessionBindingMismatch",
+    "wire": "agent_session_binding_mismatch"
+  },
+  {
+    "name": "CodeAgentSessionLimitReached",
+    "wire": "agent_session_limit_reached"
+  },
+  {
+    "name": "CodeAgentSessionNotConnected",
+    "wire": "agent_session_not_connected"
+  },
+  {
+    "name": "CodeAgentSessionNotFound",
+    "wire": "agent_session_not_found"
+  },
+  {
+    "name": "CodeAuditCredentialEpochMismatch",
+    "wire": "audit_credential_epoch_mismatch"
+  },
+  {
+    "name": "CodeAuditDepthExceeded",
+    "wire": "audit_depth_exceeded"
+  },
+  {
+    "name": "CodeAuditSubjectNotActive",
+    "wire": "audit_subject_not_active"
+  },
+  {
+    "name": "CodeAuditSubjectNotFound",
+    "wire": "audit_subject_not_found"
+  },
+  {
+    "name": "CodeCanonicalRefVersionExhausted",
+    "wire": "canonical_ref_version_exhausted"
+  },
+  {
+    "name": "CodeCanonicalRefVersionMismatch",
+    "wire": "canonical_ref_version_mismatch"
+  },
+  {
+    "name": "CodeClusterApplyLevelDecrease",
+    "wire": "cluster_apply_level_decrease"
+  },
+  {
+    "name": "CodeClusterApplyLevelUnsupported",
+    "wire": "cluster_apply_level_unsupported"
+  },
+  {
+    "name": "CodeConflictCanonicalCommitMismatch",
+    "wire": "conflict_canonical_commit_mismatch"
+  },
+  {
+    "name": "CodeConflictDetectorPathsMismatch",
+    "wire": "conflict_detector_paths_mismatch"
+  },
+  {
+    "name": "CodeConflictIDMismatch",
+    "wire": "conflict_id_mismatch"
+  },
+  {
+    "name": "CodeConflictImmutableTupleMismatch",
+    "wire": "conflict_immutable_tuple_mismatch"
+  },
+  {
+    "name": "CodeConflictPublicationNotFound",
+    "wire": "conflict_publication_not_found"
+  },
+  {
+    "name": "CodeConflictPublicationTerminal",
+    "wire": "conflict_publication_terminal"
+  },
+  {
+    "name": "CodeConflictResolutionAuthorMismatch",
+    "wire": "conflict_resolution_author_mismatch"
+  },
+  {
+    "name": "CodeConflictResolutionNotApplied",
+    "wire": "conflict_resolution_not_applied"
+  },
+  {
+    "name": "CodeConflictResolutionNotDeclared",
+    "wire": "conflict_resolution_not_declared"
+  },
+  {
+    "name": "CodeConflictResolutionNotFound",
+    "wire": "conflict_resolution_not_found"
+  },
+  {
+    "name": "CodeControlFilePathMismatch",
+    "wire": "control_file_path_mismatch"
+  },
+  {
+    "name": "CodeControlFilePathRequired",
+    "wire": "control_file_path_required"
+  },
+  {
+    "name": "CodeCredentialAuthorityQuorumLost",
+    "wire": "credential_authority_quorum_lost"
+  },
+  {
+    "name": "CodeCredentialAuthorityVersionMismatch",
+    "wire": "credential_authority_version_mismatch"
+  },
+  {
+    "name": "CodeCredentialEndorsementQuorumNotMet",
+    "wire": "credential_endorsement_quorum_not_met"
+  },
+  {
+    "name": "CodeCredentialEpochExhausted",
+    "wire": "credential_epoch_exhausted"
+  },
+  {
+    "name": "CodeCredentialEpochMismatch",
+    "wire": "credential_epoch_mismatch"
+  },
+  {
+    "name": "CodeCredentialKeyDigestMismatch",
+    "wire": "credential_key_digest_mismatch"
+  },
+  {
+    "name": "CodeCredentialKeyReused",
+    "wire": "credential_key_reused"
+  },
+  {
+    "name": "CodeCredentialNotBeforeMismatch",
+    "wire": "credential_not_before_mismatch"
+  },
+  {
+    "name": "CodeCredentialRenewalTooEarly",
+    "wire": "credential_renewal_too_early"
+  },
+  {
+    "name": "CodeCredentialRoleMismatch",
+    "wire": "credential_role_mismatch"
+  },
+  {
+    "name": "CodeCredentialSubjectMismatch",
+    "wire": "credential_subject_mismatch"
+  },
+  {
+    "name": "CodeCredentialSubjectNotActive",
+    "wire": "credential_subject_not_active"
+  },
+  {
+    "name": "CodeCredentialSubjectNotFound",
+    "wire": "credential_subject_not_found"
+  },
+  {
+    "name": "CodeCredentialValidityMismatch",
+    "wire": "credential_validity_mismatch"
+  },
+  {
+    "name": "CodeDependencyCycle",
+    "wire": "dependency_cycle"
+  },
+  {
+    "name": "CodeDependencyGraphTooComplex",
+    "wire": "dependency_graph_too_complex"
+  },
+  {
+    "name": "CodeDependencyNotFound",
+    "wire": "dependency_not_found"
+  },
+  {
+    "name": "CodeDeviceClaimLimitReached",
+    "wire": "device_claim_limit_reached"
+  },
+  {
+    "name": "CodeDeviceLeaseLimitReached",
+    "wire": "device_lease_limit_reached"
+  },
+  {
+    "name": "CodeEndActorMismatch",
+    "wire": "end_actor_mismatch"
+  },
+  {
+    "name": "CodeEntityAlreadyExists",
+    "wire": "entity_already_exists"
+  },
+  {
+    "name": "CodeEntityNotFound",
+    "wire": "entity_not_found"
+  },
+  {
+    "name": "CodeEntityVersionExhausted",
+    "wire": "entity_version_exhausted"
+  },
+  {
+    "name": "CodeEntityVersionMismatch",
+    "wire": "entity_version_mismatch"
+  },
+  {
+    "name": "CodeExpectedEntityVersion",
+    "wire": "invalid_expected_entity_version"
+  },
+  {
+    "name": "CodeInsufficientRole",
+    "wire": "insufficient_role"
+  },
+  {
+    "name": "CodeIntendedDeviceMismatch",
+    "wire": "intended_device_mismatch"
+  },
+  {
+    "name": "CodeInvalidAgentSessionTransition",
+    "wire": "invalid_agent_session_transition"
+  },
+  {
+    "name": "CodeInvalidConflictTransition",
+    "wire": "invalid_conflict_transition"
+  },
+  {
+    "name": "CodeInvalidCredentialAuthorityHandoff",
+    "wire": "invalid_credential_authority_handoff"
+  },
+  {
+    "name": "CodeInvalidCredentialBinding",
+    "wire": "invalid_credential_binding"
+  },
+  {
+    "name": "CodeInvalidCredentialEndorsements",
+    "wire": "invalid_credential_endorsements"
+  },
+  {
+    "name": "CodeInvalidEndReason",
+    "wire": "invalid_end_reason"
+  },
+  {
+    "name": "CodeInvalidEnvelope",
+    "wire": "invalid_envelope"
+  },
+  {
+    "name": "CodeInvalidKindContract",
+    "wire": "invalid_kind_contract"
+  },
+  {
+    "name": "CodeInvalidLeaseTransition",
+    "wire": "invalid_lease_transition"
+  },
+  {
+    "name": "CodeInvalidMembershipTransition",
+    "wire": "invalid_membership_transition"
+  },
+  {
+    "name": "CodeInvalidOriginSignature",
+    "wire": "invalid_origin_signature"
+  },
+  {
+    "name": "CodeInvalidPayload",
+    "wire": "invalid_payload"
+  },
+  {
+    "name": "CodeInvalidPublicationReceipts",
+    "wire": "invalid_publication_receipts"
+  },
+  {
+    "name": "CodeInvalidPublicationTransition",
+    "wire": "invalid_publication_transition"
+  },
+  {
+    "name": "CodeInvalidRecoveryAuthorization",
+    "wire": "invalid_recovery_authorization"
+  },
+  {
+    "name": "CodeInvalidReleaseReason",
+    "wire": "invalid_release_reason"
+  },
+  {
+    "name": "CodeInvalidTaskTransition",
+    "wire": "invalid_task_transition"
+  },
+  {
+    "name": "CodeInvalidVoterActivationProof",
+    "wire": "invalid_voter_activation_proof"
+  },
+  {
+    "name": "CodeInvalidVoterSet",
+    "wire": "invalid_voter_set"
+  },
+  {
+    "name": "CodeLastActiveOwner",
+    "wire": "last_active_owner"
+  },
+  {
+    "name": "CodeLeaseHolderRequired",
+    "wire": "lease_holder_required"
+  },
+  {
+    "name": "CodeLeaseScopeConflict",
+    "wire": "lease_scope_conflict"
+  },
+  {
+    "name": "CodeLeaseTaskNotFound",
+    "wire": "lease_task_not_found"
+  },
+  {
+    "name": "CodeMemberLimitReached",
+    "wire": "member_limit_reached"
+  },
+  {
+    "name": "CodeMembershipReportUnchanged",
+    "wire": "membership_report_unchanged"
+  },
+  {
+    "name": "CodeMembershipSubjectMismatch",
+    "wire": "membership_subject_mismatch"
+  },
+  {
+    "name": "CodeMembershipSubjectNotActive",
+    "wire": "membership_subject_not_active"
+  },
+  {
+    "name": "CodeMembershipSubjectNotFound",
+    "wire": "membership_subject_not_found"
+  },
+  {
+    "name": "CodeMemoryPredecessorAlreadySuperseded",
+    "wire": "memory_predecessor_already_superseded"
+  },
+  {
+    "name": "CodeMemoryPredecessorMismatch",
+    "wire": "memory_predecessor_mismatch"
+  },
+  {
+    "name": "CodeMemoryPredecessorNotFound",
+    "wire": "memory_predecessor_not_found"
+  },
+  {
+    "name": "CodeMemoryTaskNotFound",
+    "wire": "memory_task_not_found"
+  },
+  {
+    "name": "CodeMissingPayloadField",
+    "wire": "missing_payload_field"
+  },
+  {
+    "name": "CodeOriginDeviceNotActive",
+    "wire": "origin_device_not_active"
+  },
+  {
+    "name": "CodeOriginScopeNotFound",
+    "wire": "origin_scope_not_found"
+  },
+  {
+    "name": "CodeOriginSequenceGap",
+    "wire": "origin_sequence_gap"
+  },
+  {
+    "name": "CodeOriginSequenceReused",
+    "wire": "origin_sequence_reused"
+  },
+  {
+    "name": "CodePlanRevisionNotFound",
+    "wire": "plan_revision_not_found"
+  },
+  {
+    "name": "CodePlanTaskNotFound",
+    "wire": "plan_task_not_found"
+  },
+  {
+    "name": "CodePolicyLimitBelowCurrentUse",
+    "wire": "policy_limit_below_current_use"
+  },
+  {
+    "name": "CodePublicationAuthorBindingMismatch",
+    "wire": "publication_author_binding_mismatch"
+  },
+  {
+    "name": "CodePublicationAuthorMismatch",
+    "wire": "publication_author_mismatch"
+  },
+  {
+    "name": "CodePublicationBaseCommitMismatch",
+    "wire": "publication_base_commit_mismatch"
+  },
+  {
+    "name": "CodePublicationConflictNotFound",
+    "wire": "publication_conflict_not_found"
+  },
+  {
+    "name": "CodePublicationConflictNotUnresolved",
+    "wire": "publication_conflict_not_unresolved"
+  },
+  {
+    "name": "CodePublicationControlPath",
+    "wire": "publication_control_path"
+  },
+  {
+    "name": "CodePublicationPathLeaseRequired",
+    "wire": "publication_path_lease_required"
+  },
+  {
+    "name": "CodePublicationReceiptFromFuture",
+    "wire": "publication_receipt_from_future"
+  },
+  {
+    "name": "CodePublicationReceiptQuorumNotMet",
+    "wire": "publication_receipt_quorum_not_met"
+  },
+  {
+    "name": "CodePublicationReceiptStale",
+    "wire": "publication_receipt_stale"
+  },
+  {
+    "name": "CodePublicationReviewNotIndependent",
+    "wire": "publication_review_not_independent"
+  },
+  {
+    "name": "CodePublicationSupersedesLineageMismatch",
+    "wire": "publication_supersedes_lineage_mismatch"
+  },
+  {
+    "name": "CodePublicationSupersedesNotFound",
+    "wire": "publication_supersedes_not_found"
+  },
+  {
+    "name": "CodePublicationSupersedesNotTerminal",
+    "wire": "publication_supersedes_not_terminal"
+  },
+  {
+    "name": "CodePublicationTaskHolderRequired",
+    "wire": "publication_task_holder_required"
+  },
+  {
+    "name": "CodePublicationTaskNotFound",
+    "wire": "publication_task_not_found"
+  },
+  {
+    "name": "CodePublicationWithdrawalNotAuthorized",
+    "wire": "publication_withdrawal_not_authorized"
+  },
+  {
+    "name": "CodePublicationWorkingRootMismatch",
+    "wire": "publication_working_root_mismatch"
+  },
+  {
+    "name": "CodeReassignmentTargetNotActive",
+    "wire": "reassignment_target_not_active"
+  },
+  {
+    "name": "CodeReleaseActorMismatch",
+    "wire": "release_actor_mismatch"
+  },
+  {
+    "name": "CodeReleaseNotAuthorized",
+    "wire": "release_not_authorized"
+  },
+  {
+    "name": "CodeSessionBindingMismatch",
+    "wire": "session_binding_mismatch"
+  },
+  {
+    "name": "CodeSoleVoterRevocation",
+    "wire": "sole_voter_revocation"
+  },
+  {
+    "name": "CodeStaleCheckpoint",
+    "wire": "stale_checkpoint"
+  },
+  {
+    "name": "CodeTaskHasUnresolvedConflict",
+    "wire": "task_has_unresolved_conflict"
+  },
+  {
+    "name": "CodeTaskHolderRequired",
+    "wire": "task_holder_required"
+  },
+  {
+    "name": "CodeTaskMustBeUnowned",
+    "wire": "task_must_be_unowned"
+  },
+  {
+    "name": "CodeTaskNotActionable",
+    "wire": "task_not_actionable"
+  },
+  {
+    "name": "CodeUnknownPayloadField",
+    "wire": "unknown_payload_field"
+  },
+  {
+    "name": "CodeVoterSetVersionExhausted",
+    "wire": "voter_set_version_exhausted"
+  },
+  {
+    "name": "CodeVoterSetVersionMismatch",
+    "wire": "voter_set_version_mismatch"
+  },
+  {
+    "name": "CodeVoterTargetAlreadyActivated",
+    "wire": "voter_target_already_activated"
+  },
+  {
+    "name": "CodeVoterTargetNotActive",
+    "wire": "voter_target_not_active"
+  },
+  {
+    "name": "CodeVoterTargetUnchanged",
+    "wire": "voter_target_unchanged"
+  }
+]

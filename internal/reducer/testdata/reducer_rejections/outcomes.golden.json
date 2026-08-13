@@ -1,0 +1,324 @@
+[
+  {
+    "name": "preflight_without_origin_consumption",
+    "kind": "task.created",
+    "prior_state": {
+      "chain_index": 0,
+      "chain_hash": "Z0XMQIObcapUcFR9uMHp5T-W1O1hn_ahqmfAQ75LLtU",
+      "result_index": 1,
+      "result_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "projection_state_digest": "JdOBLcbdmxjX55zDl7lh4FB66wxvcoNZrW2gnzVt9v8",
+      "projection_accumulator": "I-pMP_qGZieoUslQMhix4USDiTbmKNOxclISQzY2VB8"
+    },
+    "signed_input": {
+      "actions": [],
+      "capture_level": "agent_reported",
+      "created_at": "2026-08-11T12:00:00Z",
+      "entity_id": "01890f47-3e72-7000-8000-000000000010",
+      "event_id": "01890f47-3e72-7000-8000-000000000020",
+      "kind": "task.created",
+      "min_apply_level": 1,
+      "origin": {
+        "actor_type": "agent",
+        "agent_profile_id": null,
+        "agent_session_id": "01890f47-3e72-7000-8000-000000000002",
+        "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "origin_boot_id": null,
+        "origin_sequence": 3
+      },
+      "origin_signature": "ypviIuRDVvPRz1NPEhWQYx-02Ye5z3T4kBe202gu2k4xdJ0nrXTpIlE7be6_wYbtX9JTQ2bl2wLumnsRb1xKDA",
+      "payload": {
+        "priority": 2,
+        "title": "gap"
+      },
+      "rationale_summary": "",
+      "redaction": {
+        "fields_removed": [],
+        "policy": "default"
+      },
+      "schema_version": 1,
+      "session_id": "01890f47-3e72-7000-8000-000000000001",
+      "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "outcome_json": {
+      "code": "origin_sequence_gap",
+      "status": "rejected"
+    },
+    "consumed_origin": false,
+    "result_chain_input": {
+      "previous_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "result_index": 2,
+      "proposal_digest": "pA7NAvCKWHF-kr-jzqYtuRZWyFjw5J4XqB44vJ8NZ40",
+      "chain_index": null,
+      "chain_hash": null
+    },
+    "result_hash": "LFp_-qy_Zzewr29qyZWmIEVvbtBBMT4axWgk5sfYhOQ",
+    "projection_accumulator_input": {
+      "previous_hash": "I-pMP_qGZieoUslQMhix4USDiTbmKNOxclISQzY2VB8",
+      "result_index": 2,
+      "result_hash": "LFp_-qy_Zzewr29qyZWmIEVvbtBBMT4axWgk5sfYhOQ",
+      "projection_mutations": []
+    },
+    "resulting_projection_accumulator": "fMXc4W5ESwS92wmlUmR1SX5dHybWJz-Edd8PDEbPam0"
+  },
+  {
+    "name": "role_check_consumes_origin",
+    "kind": "policy.changed",
+    "prior_state": {
+      "chain_index": 0,
+      "chain_hash": "Z0XMQIObcapUcFR9uMHp5T-W1O1hn_ahqmfAQ75LLtU",
+      "result_index": 1,
+      "result_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "projection_state_digest": "JdOBLcbdmxjX55zDl7lh4FB66wxvcoNZrW2gnzVt9v8",
+      "projection_accumulator": "I-pMP_qGZieoUslQMhix4USDiTbmKNOxclISQzY2VB8"
+    },
+    "signed_input": {
+      "actions": [],
+      "capture_level": "human_reported",
+      "created_at": "2026-08-11T12:00:00Z",
+      "entity_id": "01890f47-3e72-7000-8000-000000000001",
+      "event_id": "01890f47-3e72-7000-8000-000000000020",
+      "expected_entity_version": 1,
+      "kind": "policy.changed",
+      "min_apply_level": 1,
+      "origin": {
+        "actor_type": "human",
+        "agent_profile_id": null,
+        "agent_session_id": null,
+        "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "origin_boot_id": "01890f47-3e72-7000-8000-000000000004",
+        "origin_sequence": 2
+      },
+      "origin_signature": "mNroQCUcQRtyJkMurC_DZgtam4bFwQmN4mcGnEV1pcq7AIZc7pQpSBCXkvJoI4tBBk5mASEbz08esusVNkOzBg",
+      "payload": {
+        "advertisement_interval_seconds": 20,
+        "agent_claim_limit": 8,
+        "agent_lease_limit": 32,
+        "audit_depth_per_device_per_epoch": 256,
+        "checkpoint_events": 501,
+        "checkpoint_interval_seconds": 300,
+        "cluster_min_apply_level": 1,
+        "device_claim_limit": 64,
+        "device_lease_limit": 256,
+        "lease_default_ttl_seconds": 900,
+        "lease_max_ttl_seconds": 3600,
+        "lease_min_ttl_seconds": 30,
+        "max_active_agent_sessions": 32,
+        "max_member_devices": 8
+      },
+      "rationale_summary": "",
+      "redaction": {
+        "fields_removed": [],
+        "policy": "default"
+      },
+      "schema_version": 1,
+      "session_id": "01890f47-3e72-7000-8000-000000000001",
+      "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "outcome_json": {
+      "code": "insufficient_role",
+      "status": "rejected"
+    },
+    "consumed_origin": true,
+    "result_chain_input": {
+      "previous_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "result_index": 2,
+      "proposal_digest": "VP5tGlUdjtGCqoAhp_-rAxqPolbIR9f0yCVOQ0wpQig",
+      "chain_index": null,
+      "chain_hash": null
+    },
+    "result_hash": "JK0BPUJGFNJNGr1zSDxJ-qm07NJSShRmFTB__jfIs1w",
+    "projection_accumulator_input": {
+      "previous_hash": "I-pMP_qGZieoUslQMhix4USDiTbmKNOxclISQzY2VB8",
+      "result_index": 2,
+      "result_hash": "JK0BPUJGFNJNGr1zSDxJ-qm07NJSShRmFTB__jfIs1w",
+      "projection_mutations": [
+        {
+          "after": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 2,
+            "scope_id": "01890f47-3e72-7000-8000-000000000004",
+            "scope_kind": "boot"
+          },
+          "before": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 1,
+            "scope_id": "01890f47-3e72-7000-8000-000000000004",
+            "scope_kind": "boot"
+          },
+          "primary_key": [
+            "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "boot",
+            "01890f47-3e72-7000-8000-000000000004"
+          ],
+          "table": "origin_scopes"
+        }
+      ]
+    },
+    "resulting_projection_accumulator": "OnjZnOCYv5LftvRWJ8RTmNFBH-PX6kG1ABsK_UNll5k"
+  },
+  {
+    "name": "payload_check_consumes_origin",
+    "kind": "task.claimed",
+    "prior_state": {
+      "chain_index": 0,
+      "chain_hash": "Z0XMQIObcapUcFR9uMHp5T-W1O1hn_ahqmfAQ75LLtU",
+      "result_index": 1,
+      "result_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "projection_state_digest": "4iW7q5Q0MCsLfyQKcZI6_jgUOv2niLH0vnff43fWA2o",
+      "projection_accumulator": "jOuAY6BXwzbEWn1SKTb_IpzyRxlfS96etFu4c7I8Uq8"
+    },
+    "signed_input": {
+      "actions": [],
+      "capture_level": "agent_reported",
+      "created_at": "2026-08-11T12:00:00Z",
+      "entity_id": "01890f47-3e72-7000-8000-000000000010",
+      "event_id": "01890f47-3e72-7000-8000-000000000020",
+      "expected_entity_version": 4,
+      "kind": "task.claimed",
+      "min_apply_level": 1,
+      "origin": {
+        "actor_type": "agent",
+        "agent_profile_id": null,
+        "agent_session_id": "01890f47-3e72-7000-8000-000000000002",
+        "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "origin_boot_id": null,
+        "origin_sequence": 2
+      },
+      "origin_signature": "7GkU-2sR9MPbxiDJ5ALtVFNFX5xSXgOGS3FwGNSE0N_LnBfqWWFDSznsK-jLRaD4NQ_0hh-y-c6U5herLkrNAA",
+      "payload": {
+        "unexpected": true
+      },
+      "rationale_summary": "",
+      "redaction": {
+        "fields_removed": [],
+        "policy": "default"
+      },
+      "schema_version": 1,
+      "session_id": "01890f47-3e72-7000-8000-000000000001",
+      "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "outcome_json": {
+      "code": "unknown_payload_field",
+      "status": "rejected"
+    },
+    "consumed_origin": true,
+    "result_chain_input": {
+      "previous_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "result_index": 2,
+      "proposal_digest": "ThqR74nn0KBqPW22QTRswfMDgC8InfelKi3zVA6gbn4",
+      "chain_index": null,
+      "chain_hash": null
+    },
+    "result_hash": "WxiVbFC6_bDZb4LLGewS-vAi8R7PBnhNvOL09OGv11s",
+    "projection_accumulator_input": {
+      "previous_hash": "jOuAY6BXwzbEWn1SKTb_IpzyRxlfS96etFu4c7I8Uq8",
+      "result_index": 2,
+      "result_hash": "WxiVbFC6_bDZb4LLGewS-vAi8R7PBnhNvOL09OGv11s",
+      "projection_mutations": [
+        {
+          "after": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 2,
+            "scope_id": "01890f47-3e72-7000-8000-000000000002",
+            "scope_kind": "agent"
+          },
+          "before": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 1,
+            "scope_id": "01890f47-3e72-7000-8000-000000000002",
+            "scope_kind": "agent"
+          },
+          "primary_key": [
+            "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "agent",
+            "01890f47-3e72-7000-8000-000000000002"
+          ],
+          "table": "origin_scopes"
+        }
+      ]
+    },
+    "resulting_projection_accumulator": "0_6Le7cfdC7rqnZRKYYUmbuYEngTB6_mzesjwt0iAHM"
+  },
+  {
+    "name": "domain_check_consumes_origin",
+    "kind": "task.claimed",
+    "prior_state": {
+      "chain_index": 0,
+      "chain_hash": "Z0XMQIObcapUcFR9uMHp5T-W1O1hn_ahqmfAQ75LLtU",
+      "result_index": 1,
+      "result_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "projection_state_digest": "bXy04gUKR2uwrCDq4QM54pn84fOzxm0SIPOkTHlUo6g",
+      "projection_accumulator": "iIOCH6FpfIPUPu8TSzmWYFLFQFtD91gM-wnDlcOaaNc"
+    },
+    "signed_input": {
+      "actions": [],
+      "capture_level": "agent_reported",
+      "created_at": "2026-08-11T12:00:00Z",
+      "entity_id": "01890f47-3e72-7000-8000-000000000010",
+      "event_id": "01890f47-3e72-7000-8000-000000000020",
+      "expected_entity_version": 4,
+      "kind": "task.claimed",
+      "min_apply_level": 1,
+      "origin": {
+        "actor_type": "agent",
+        "agent_profile_id": null,
+        "agent_session_id": "01890f47-3e72-7000-8000-000000000002",
+        "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "origin_boot_id": null,
+        "origin_sequence": 2
+      },
+      "origin_signature": "ceh9LMtKF5xIcOphfYZyOHa2ir1rJfivBJhZSITJB6Y5pZtOJIA5-zcIn_1XSvL7mck3Bma52uo84FnyXZLHDw",
+      "payload": {},
+      "rationale_summary": "",
+      "redaction": {
+        "fields_removed": [],
+        "policy": "default"
+      },
+      "schema_version": 1,
+      "session_id": "01890f47-3e72-7000-8000-000000000001",
+      "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+    },
+    "outcome_json": {
+      "code": "task_not_actionable",
+      "status": "rejected"
+    },
+    "consumed_origin": true,
+    "result_chain_input": {
+      "previous_hash": "MN8xcuRF_lpx-3Go0qfLce29zRpxEIVLOyVDJ4G_6H8",
+      "result_index": 2,
+      "proposal_digest": "J82A8uzmd-ghvTPVEPT9QmxGkt96vYcyaM5vqZ-LJms",
+      "chain_index": null,
+      "chain_hash": null
+    },
+    "result_hash": "sl0VgxlOFzUM__rkxvDcE3kS2uqmPdQHcNUa7dISwwk",
+    "projection_accumulator_input": {
+      "previous_hash": "iIOCH6FpfIPUPu8TSzmWYFLFQFtD91gM-wnDlcOaaNc",
+      "result_index": 2,
+      "result_hash": "sl0VgxlOFzUM__rkxvDcE3kS2uqmPdQHcNUa7dISwwk",
+      "projection_mutations": [
+        {
+          "after": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 2,
+            "scope_id": "01890f47-3e72-7000-8000-000000000002",
+            "scope_kind": "agent"
+          },
+          "before": {
+            "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "last_sequence": 1,
+            "scope_id": "01890f47-3e72-7000-8000-000000000002",
+            "scope_kind": "agent"
+          },
+          "primary_key": [
+            "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+            "agent",
+            "01890f47-3e72-7000-8000-000000000002"
+          ],
+          "table": "origin_scopes"
+        }
+      ]
+    },
+    "resulting_projection_accumulator": "SuYO_ExVkYS07hQKY8MSvte2M9SxCgyeZ8RbUpGFt9E"
+  }
+]

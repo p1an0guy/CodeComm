@@ -1,0 +1,313 @@
+{
+  "kind": "membership.version_reported",
+  "prior_state": {
+    "chain_index": 0,
+    "chain_hash": "q4ao94ewui27h2NAVJhpB4Y9I8yAzDEh3id99AdGB9Y",
+    "result_index": 1,
+    "result_hash": "ZMWGYnFAJXtj5HywOjVxXMgWCzfaq6dAWD75wmQlbEY",
+    "projection_state_digest": "JdOBLcbdmxjX55zDl7lh4FB66wxvcoNZrW2gnzVt9v8",
+    "projection_accumulator": "ZXbzsh35jnlUt0BaJjJ4KxklKZ0CtuNJJJOrrFjPcss",
+    "rows": [
+      {
+        "table": "origin_scopes",
+        "primary_key": [
+          "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "boot",
+          "01890f47-3e72-7000-8000-000000000004"
+        ],
+        "row": {
+          "device_id": "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "last_sequence": 1,
+          "scope_id": "01890f47-3e72-7000-8000-000000000004",
+          "scope_kind": "boot"
+        }
+      },
+      {
+        "table": "origin_scopes",
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "agent",
+          "01890f47-3e72-7000-8000-000000000002"
+        ],
+        "row": {
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "last_sequence": 1,
+          "scope_id": "01890f47-3e72-7000-8000-000000000002",
+          "scope_kind": "agent"
+        }
+      },
+      {
+        "table": "origin_scopes",
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "boot",
+          "01890f47-3e72-7000-8000-000000000004"
+        ],
+        "row": {
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "last_sequence": 1,
+          "scope_id": "01890f47-3e72-7000-8000-000000000004",
+          "scope_kind": "boot"
+        }
+      },
+      {
+        "table": "audit_counters",
+        "primary_key": [
+          "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+        ],
+        "row": {
+          "accepted_count": 0,
+          "credential_epoch": 0,
+          "device_id": "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+        }
+      },
+      {
+        "table": "audit_counters",
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
+        ],
+        "row": {
+          "accepted_count": 0,
+          "credential_epoch": 0,
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
+        }
+      },
+      {
+        "table": "audit_counters",
+        "primary_key": [
+          "cc1b62e867fa2f33afe62d5d6b1642e1621d543307846b2a57b897e710919b76709"
+        ],
+        "row": {
+          "accepted_count": 0,
+          "credential_epoch": 0,
+          "device_id": "cc1b62e867fa2f33afe62d5d6b1642e1621d543307846b2a57b897e710919b76709"
+        }
+      },
+      {
+        "table": "plan_current",
+        "primary_key": [
+          "01890f47-3e72-7000-8000-000000000001"
+        ],
+        "row": {
+          "entity_version": 1,
+          "plan_revision_id": null,
+          "session_id": "01890f47-3e72-7000-8000-000000000001"
+        }
+      },
+      {
+        "table": "devices",
+        "primary_key": [
+          "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+        ],
+        "row": {
+          "daemon_version": "0.1.0",
+          "device_id": "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "entity_version": 1,
+          "identity_public_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+          "max_apply_level": 1,
+          "role": "owner",
+          "status": "active"
+        }
+      },
+      {
+        "table": "devices",
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
+        ],
+        "row": {
+          "daemon_version": "0.1.0",
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "entity_version": 1,
+          "identity_public_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+          "max_apply_level": 1,
+          "role": "editor",
+          "status": "active"
+        }
+      },
+      {
+        "table": "devices",
+        "primary_key": [
+          "cc1b62e867fa2f33afe62d5d6b1642e1621d543307846b2a57b897e710919b76709"
+        ],
+        "row": {
+          "daemon_version": "0.1.0",
+          "device_id": "cc1b62e867fa2f33afe62d5d6b1642e1621d543307846b2a57b897e710919b76709",
+          "entity_version": 1,
+          "identity_public_key": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+          "max_apply_level": 1,
+          "role": "editor",
+          "status": "active"
+        }
+      },
+      {
+        "table": "voter_set",
+        "primary_key": [
+          "01890f47-3e72-7000-8000-000000000001"
+        ],
+        "row": {
+          "session_id": "01890f47-3e72-7000-8000-000000000001",
+          "voter_device_ids": [
+            "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+          ],
+          "voter_set_version": 1
+        }
+      },
+      {
+        "table": "credential_authority",
+        "primary_key": [
+          "01890f47-3e72-7000-8000-000000000001"
+        ],
+        "row": {
+          "activation_checkpoint_event_id": null,
+          "activation_proofs": [],
+          "activation_source": "genesis",
+          "prior_authority_handoff": null,
+          "prior_authority_signer": null,
+          "session_id": "01890f47-3e72-7000-8000-000000000001",
+          "voter_device_ids": [
+            "cc134750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+          ],
+          "voter_set_version": 1
+        }
+      },
+      {
+        "table": "agent_sessions",
+        "primary_key": [
+          "01890f47-3e72-7000-8000-000000000002"
+        ],
+        "row": {
+          "agent_profile_id": null,
+          "agent_session_id": "01890f47-3e72-7000-8000-000000000002",
+          "client_kind": "codex",
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "end_reason": null,
+          "entity_version": 1,
+          "resume_state": null,
+          "state": "idle",
+          "working_root_id": "01890f47-3e72-7000-8000-000000000003"
+        }
+      },
+      {
+        "table": "canonical_refs",
+        "primary_key": [
+          "refs/codecomm/canonical"
+        ],
+        "row": {
+          "commit_oid": "sha1:0000000000000000000000000000000000000001",
+          "entity_version": 1,
+          "ref_name": "refs/codecomm/canonical"
+        }
+      },
+      {
+        "table": "session_policy",
+        "primary_key": [
+          "01890f47-3e72-7000-8000-000000000001"
+        ],
+        "row": {
+          "entity_version": 1,
+          "session_id": "01890f47-3e72-7000-8000-000000000001",
+          "values": {
+            "advertisement_interval_seconds": 20,
+            "agent_claim_limit": 8,
+            "agent_lease_limit": 32,
+            "audit_depth_per_device_per_epoch": 256,
+            "checkpoint_events": 500,
+            "checkpoint_interval_seconds": 300,
+            "cluster_min_apply_level": 1,
+            "device_claim_limit": 64,
+            "device_lease_limit": 256,
+            "lease_default_ttl_seconds": 900,
+            "lease_max_ttl_seconds": 3600,
+            "lease_min_ttl_seconds": 30,
+            "max_active_agent_sessions": 32,
+            "max_member_devices": 8
+          }
+        }
+      }
+    ]
+  },
+  "signed_input": {
+    "actions": [],
+    "capture_level": "daemon_observed",
+    "created_at": "2026-08-11T12:00:00Z",
+    "entity_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+    "event_id": "01890f47-3e72-7000-8000-000000000020",
+    "expected_entity_version": 1,
+    "kind": "membership.version_reported",
+    "min_apply_level": 1,
+    "origin": {
+      "actor_type": "daemon",
+      "agent_profile_id": null,
+      "agent_session_id": null,
+      "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+      "origin_boot_id": "01890f47-3e72-7000-8000-000000000004",
+      "origin_sequence": 2
+    },
+    "origin_signature": "SlRwAtqbtFjkShRCEkBFgK5spRTt8apxhXSsUPr7Mf1Ws9CEbs70uJEvkGAd8CyxPtyx35SeZYn5t30stu3wDw",
+    "payload": {
+      "daemon_version": "0.2.0",
+      "max_apply_level": 2
+    },
+    "rationale_summary": "",
+    "redaction": {
+      "fields_removed": [],
+      "policy": "default"
+    },
+    "schema_version": 1,
+    "session_id": "01890f47-3e72-7000-8000-000000000001",
+    "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
+  },
+  "outcome": {
+    "status": "accepted",
+    "code": "accepted",
+    "projection_mutations": [
+      {
+        "after": {
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "last_sequence": 2,
+          "scope_id": "01890f47-3e72-7000-8000-000000000004",
+          "scope_kind": "boot"
+        },
+        "before": {
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "last_sequence": 1,
+          "scope_id": "01890f47-3e72-7000-8000-000000000004",
+          "scope_kind": "boot"
+        },
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "boot",
+          "01890f47-3e72-7000-8000-000000000004"
+        ],
+        "table": "origin_scopes"
+      },
+      {
+        "after": {
+          "daemon_version": "0.2.0",
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "entity_version": 2,
+          "identity_public_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+          "max_apply_level": 2,
+          "role": "editor",
+          "status": "active"
+        },
+        "before": {
+          "daemon_version": "0.1.0",
+          "device_id": "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "entity_version": 1,
+          "identity_public_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+          "max_apply_level": 1,
+          "role": "editor",
+          "status": "active"
+        },
+        "primary_key": [
+          "cc16a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827"
+        ],
+        "table": "devices"
+      }
+    ],
+    "record_activity": false
+  },
+  "result_hash": "gM4zaFChY21a_Iz6A1A72DfeAVLyZyoyIiP7GycrdtA",
+  "resulting_projection_accumulator": "SVaNBcLoXWZtp5yWLiIH1iEIIq4Z2QLUqlN6wypoA1c"
+}
