@@ -17,6 +17,12 @@ import (
 
 const windowsPipePrefix = `\\.\pipe\`
 
+// x/sys/windows does not expose FILE_ALL_ACCESS, which is the object-specific
+// mask Windows produces when it maps GENERIC_ALL for a named pipe.
+const windowsFileAllAccess windows.ACCESS_MASK = windows.STANDARD_RIGHTS_REQUIRED |
+	windows.SYNCHRONIZE |
+	0x1ff
+
 var impersonateNamedPipeClient = windows.NewLazySystemDLL(
 	"advapi32.dll",
 ).NewProc("ImpersonateNamedPipeClient")
@@ -271,13 +277,16 @@ func validateOwnerOnlyDescriptor(
 		)
 	}
 	granted := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+	grantsFullAccess := ace.Mask == windows.GENERIC_ALL ||
+		ace.Mask == windowsFileAllAccess
 	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
 		ace.Header.AceFlags != 0 ||
-		ace.Mask != windows.GENERIC_ALL ||
+		!grantsFullAccess ||
 		!granted.Equals(expected) {
 		return fmt.Errorf(
-			"%w: named-pipe DACL is not an exact owner-only grant",
+			"%w: named-pipe DACL is not an exact owner-only grant (mask %#x)",
 			ErrEndpointInsecure,
+			ace.Mask,
 		)
 	}
 	return nil

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsProductionTransportAuthenticatesBothPeers(t *testing.T) {
@@ -130,6 +131,33 @@ func TestWindowsOwnerOnlyDescriptorRejectsEveryWidening(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestWindowsOwnerOnlyDescriptorAcceptsMappedFullAccess(t *testing.T) {
+	t.Parallel()
+
+	ownerSID, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"O:" + ownerSID + "D:P(A;;GA;;;" + ownerSID + ")",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(dacl, 0, &ace); err != nil {
+		t.Fatal(err)
+	}
+	ace.Mask = windowsFileAllAccess
+	if err := validateOwnerOnlyDescriptor(descriptor, ownerSID); err != nil {
+		t.Fatalf("validateOwnerOnlyDescriptor(mapped full access): %v", err)
 	}
 }
 

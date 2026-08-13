@@ -5,15 +5,17 @@ package ipc
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
-	"time"
 )
+
+var testEndpointSequence atomic.Uint64
 
 func testEndpointAddress(string) string {
 	return fmt.Sprintf(
 		`\\.\pipe\codecomm-test-%d-%d`,
 		os.Getpid(),
-		time.Now().UnixNano(),
+		testEndpointSequence.Add(1),
 	)
 }
 
