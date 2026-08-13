@@ -99,4 +99,65 @@ func TestGoWinIOAlwaysRejectsRemoteNamedPipeClients(t *testing.T) {
 	if !declaresRejectionFlag || !passesFlagToCreate || invalidTypeMutation {
 		t.Fatal("reviewed implementation no longer passes FILE_PIPE_REJECT_REMOTE_CLIENTS to pipe creation")
 	}
+
+	acceptedPipePromotesHandle := false
+	for _, declaration := range file.Decls {
+		typeDeclaration, ok := declaration.(*ast.GenDecl)
+		if !ok || typeDeclaration.Tok != token.TYPE {
+			continue
+		}
+		for _, specification := range typeDeclaration.Specs {
+			typeSpecification, ok := specification.(*ast.TypeSpec)
+			if !ok || typeSpecification.Name.Name != "win32Pipe" {
+				continue
+			}
+			structure, ok := typeSpecification.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range structure.Fields.List {
+				if len(field.Names) != 0 {
+					continue
+				}
+				pointer, ok := field.Type.(*ast.StarExpr)
+				if !ok {
+					continue
+				}
+				embedded, ok := pointer.X.(*ast.Ident)
+				if ok && embedded.Name == "win32File" {
+					acceptedPipePromotesHandle = true
+				}
+			}
+		}
+	}
+
+	fileSourcePath := filepath.Join(lines[1], "file.go")
+	fileSource, err := os.ReadFile(fileSourcePath)
+	if err != nil {
+		t.Fatalf("read go-winio file implementation: %v", err)
+	}
+	fileAST, err := parser.ParseFile(token.NewFileSet(), fileSourcePath, fileSource, 0)
+	if err != nil {
+		t.Fatalf("parse go-winio file implementation: %v", err)
+	}
+	exposesHandle := false
+	for _, declaration := range fileAST.Decls {
+		method, ok := declaration.(*ast.FuncDecl)
+		if !ok || method.Recv == nil || method.Name.Name != "Fd" ||
+			len(method.Recv.List) != 1 {
+			continue
+		}
+		pointer, ok := method.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		receiver, ok := pointer.X.(*ast.Ident)
+		if ok && receiver.Name == "win32File" {
+			exposesHandle = true
+			break
+		}
+	}
+	if !exposesHandle || !acceptedPipePromotesHandle {
+		t.Fatal("reviewed implementation no longer exposes Fd through accepted named-pipe connections")
+	}
 }
