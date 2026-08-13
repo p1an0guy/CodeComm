@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 )
@@ -29,13 +30,6 @@ var clockEndorsementFields = []string{
 	"signature",
 }
 
-type credentialBindingWire struct {
-	DeviceID       string `json:"device_id"`
-	Epoch          uint64 `json:"epoch"`
-	EpochPublicKey string `json:"epoch_public_key"`
-	SessionID      string `json:"session_id"`
-}
-
 type credentialTimeEndorsementWire struct {
 	AuthorityVoterSetVersion uint64 `json:"authority_voter_set_version"`
 	Epoch                    uint64 `json:"epoch"`
@@ -51,16 +45,13 @@ func credentialBindingPreimageBytes(
 	epoch uint64,
 	epochPublicKey [ed25519.PublicKeySize]byte,
 ) ([]byte, error) {
-	encoded, err := json.Marshal(credentialBindingWire{
-		DeviceID:       string(deviceID),
-		Epoch:          epoch,
-		EpochPublicKey: codec.EncodeBase64URL(epochPublicKey[:]),
-		SessionID:      string(sessionID),
-	})
-	if err != nil {
-		return nil, err
+	binding := credential.Binding{
+		SessionID: sessionID,
+		DeviceID:  deviceID,
+		Epoch:     epoch,
 	}
-	return codec.CanonicalizeSignedObject(encoded)
+	copy(binding.EpochPublicKey[:], epochPublicKey[:])
+	return binding.CanonicalPreimage()
 }
 
 func credentialTimeEndorsementPreimageBytes(
@@ -84,18 +75,15 @@ func verifyCredentialBinding(
 	authorization credentialauthorization.Authorization,
 	identityPublicKey ed25519.PublicKey,
 ) bool {
-	preimage, err := credentialBindingPreimageBytes(
-		authorization.SessionID,
-		authorization.DeviceID,
-		authorization.Epoch,
-		authorization.EpochPublicKey,
-	)
-	return err == nil && verifyLabeledSignature(
-		identityPublicKey,
-		codec.SignatureCredentialBinding,
-		preimage,
-		authorization.BindingSignature[:],
-	)
+	binding := credential.Binding{
+		SessionID:      authorization.SessionID,
+		DeviceID:       authorization.DeviceID,
+		Epoch:          authorization.Epoch,
+		EpochPublicKey: authorization.EpochPublicKey,
+		KeyDigest:      authorization.KeyDigest,
+		Signature:      authorization.BindingSignature,
+	}
+	return binding.Validate(identityPublicKey) == nil
 }
 
 func decodeCredentialAuthorization(

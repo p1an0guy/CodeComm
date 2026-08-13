@@ -147,6 +147,11 @@ func validDaemonVersion(version string) bool {
 	return true
 }
 
+// ValidDaemonVersion reports whether version is canonical ASCII SemVer.
+func ValidDaemonVersion(version string) bool {
+	return validDaemonVersion(version)
+}
+
 func validIdentifierList(list string, rejectNumericLeadingZero bool) bool {
 	if list == "" {
 		return false

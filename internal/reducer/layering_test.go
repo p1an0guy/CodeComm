@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	reducerInternalPrefix = "github.com/ijonahch/codecomm/internal/"
-	reducerCodecImport    = "github.com/ijonahch/codecomm/internal/codec"
-	reducerDomainImport   = "github.com/ijonahch/codecomm/internal/domain"
-	reducerEventImport    = "github.com/ijonahch/codecomm/internal/event"
+	reducerInternalPrefix   = "github.com/ijonahch/codecomm/internal/"
+	reducerCodecImport      = "github.com/ijonahch/codecomm/internal/codec"
+	reducerCredentialImport = "github.com/ijonahch/codecomm/internal/credential"
+	reducerDomainImport     = "github.com/ijonahch/codecomm/internal/domain"
+	reducerEventImport      = "github.com/ijonahch/codecomm/internal/event"
 )
 
 func TestReducerLayeringAllowsOnlyPureLowerPackages(t *testing.T) {
@@ -51,6 +52,7 @@ func TestReducerLayeringAllowsOnlyPureLowerPackages(t *testing.T) {
 				continue
 			}
 			allowed := importPath == reducerCodecImport ||
+				importPath == reducerCredentialImport ||
 				importPath == reducerDomainImport ||
 				strings.HasPrefix(importPath, reducerDomainImport+"/") ||
 				importPath == reducerEventImport
