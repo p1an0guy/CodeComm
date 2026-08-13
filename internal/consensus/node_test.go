@@ -1,0 +1,1947 @@
+package consensus
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/codec"
+	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
+	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
+	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/plan"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/domain/publication"
+	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/reducer"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
+	"github.com/ijonahch/codecomm/internal/store"
+	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
+)
+
+func TestSingleNodeStatusReportsReadyOneVoterAndDurableWork(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"status task",
+	)
+	if _, err := node.Apply(testContext(t), signed); err != nil {
+		t.Fatalf("Apply(): %v", err)
+	}
+	snapshot, err := node.Status(testContext(t))
+	if err != nil {
+		t.Fatalf("Status(): %v", err)
+	}
+	if snapshot.Runtime.State != coordstatus.ConsensusReady ||
+		snapshot.Runtime.Role != coordstatus.RoleLeader ||
+		snapshot.Runtime.LeaderDeviceID != deviceID ||
+		snapshot.Runtime.StrongWrites != coordstatus.StrongWritesAvailable ||
+		snapshot.Runtime.QuorumRequired != 1 ||
+		len(snapshot.Runtime.LiveVoterDeviceIDs) != 1 ||
+		snapshot.Runtime.LiveVoterDeviceIDs[0] != deviceID ||
+		snapshot.Durable.Member.ID != deviceID ||
+		snapshot.Durable.TaskTotal != 1 ||
+		len(snapshot.Durable.Tasks) != 1 ||
+		snapshot.Durable.Tasks[0].ID != nodeTestTaskID1 {
+		t.Fatalf("Status() = %#v", snapshot)
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("Status().Validate(): %v", err)
+	}
+}
+
+const (
+	nodeTestSessionID   = domain.UUIDv7("018f47de-89ab-7def-8123-0123456789ab")
+	nodeTestWorkspaceID = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
+	nodeTestBootID1     = domain.UUIDv7("018f47de-89ab-7def-8123-1123456789ab")
+	nodeTestBootID2     = domain.UUIDv7("018f47de-89ab-7def-8123-2123456789ab")
+	nodeTestEventID1    = domain.UUIDv7("018f47de-89ab-7def-8123-3123456789ab")
+	nodeTestEventID2    = domain.UUIDv7("018f47de-89ab-7def-8123-4123456789ab")
+	nodeTestEventID3    = domain.UUIDv7("018f47de-89ab-7def-8123-4223456789ab")
+	nodeTestTaskID1     = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ab")
+	nodeTestTaskID2     = domain.UUIDv7("018f47de-89ab-7def-8123-6123456789ab")
+	nodeTestTaskID3     = domain.UUIDv7("018f47de-89ab-7def-8123-6223456789ab")
+	nodeTestTimestamp1  = domain.Timestamp("2026-08-11T12:00:00Z")
+	nodeTestTimestamp2  = domain.Timestamp("2026-08-11T12:01:00Z")
+	nodeTestTimestamp3  = domain.Timestamp("2026-08-11T12:02:00Z")
+)
+
+func TestSingleNodeAppliesSnapshotsAndRestartsWithoutHeadDrift(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	config := nodeTestRaftConfig()
+	clock := nodeTestClock()
+
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        clock,
+		RaftConfig:   config,
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(new): %v", err)
+	}
+	firstClosed := false
+	t.Cleanup(func() {
+		if !firstClosed {
+			_ = node.Close()
+		}
+	})
+	waitForNodeLeader(t, node)
+
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first task",
+	)
+	firstResult, err := node.Apply(testContext(t), first)
+	if err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	if firstResult.Duplicate ||
+		firstResult.Outcome.Status != store.OutcomeAccepted ||
+		firstResult.Outcome.Code != string(reducer.CodeAccepted) ||
+		firstResult.Heads.ChainIndex != 1 ||
+		firstResult.Heads.ResultIndex != 1 {
+		t.Fatalf("Apply(first) = %#v", firstResult)
+	}
+	if err := node.Barrier(testContext(t)); err != nil {
+		t.Fatalf("Barrier(): %v", err)
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+
+	duplicate, err := node.Apply(testContext(t), first)
+	if err != nil {
+		t.Fatalf("Apply(exact duplicate): %v", err)
+	}
+	if !duplicate.Duplicate ||
+		!sameNodeCommitmentHeads(duplicate.Heads, firstResult.Heads) {
+		t.Fatalf(
+			"Apply(exact duplicate) = %#v, first heads = %#v",
+			duplicate,
+			firstResult.Heads,
+		)
+	}
+
+	changed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"changed bytes",
+	)
+	if _, err := node.Apply(testContext(t), changed); !errors.Is(
+		err,
+		store.ErrIdempotencyConflict,
+	) {
+		t.Fatalf(
+			"Apply(changed duplicate) error = %v, want ErrIdempotencyConflict",
+			err,
+		)
+	}
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"second task",
+	)
+	secondResult, err := node.Apply(testContext(t), second)
+	if err != nil {
+		t.Fatalf("Apply(second): %v", err)
+	}
+	if secondResult.Heads.ChainIndex != 2 ||
+		secondResult.Heads.ResultIndex != 2 {
+		t.Fatalf("Apply(second) = %#v", secondResult)
+	}
+	beforeRestart, err := node.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(before restart): %v", err)
+	}
+	if !viewContainsTask(beforeRestart, nodeTestTaskID1) ||
+		!viewContainsTask(beforeRestart, nodeTestTaskID2) {
+		t.Fatal("pre-restart view is missing a task")
+	}
+
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+	firstClosed = true
+
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   config,
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	waitForNodeLeader(t, restarted)
+	assertNodeUsesLocalAddress(t, restarted)
+
+	afterRestart, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(after restart): %v", err)
+	}
+	if afterRestart.Heads != beforeRestart.Heads ||
+		afterRestart.ProjectionStateDigest !=
+			beforeRestart.ProjectionStateDigest {
+		t.Fatalf(
+			"restart drifted commitments:\nbefore: %#v\nafter:  %#v",
+			beforeRestart,
+			afterRestart,
+		)
+	}
+	replayed, err := restarted.Apply(testContext(t), first)
+	if err != nil {
+		t.Fatalf("Apply(restart duplicate): %v", err)
+	}
+	if !replayed.Duplicate || replayed.Heads != beforeRestart.Heads {
+		t.Fatalf("Apply(restart duplicate) = %#v", replayed)
+	}
+
+	third := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID2,
+		nodeTestEventID3,
+		nodeTestTaskID3,
+		nodeTestTimestamp3,
+		1,
+		"third task",
+	)
+	thirdResult, err := restarted.Apply(testContext(t), third)
+	if err != nil {
+		t.Fatalf("Apply(third): %v", err)
+	}
+	if thirdResult.Heads.ChainIndex != 3 ||
+		thirdResult.Heads.ResultIndex != 3 ||
+		thirdResult.Heads.ProjectionAccumulator ==
+			beforeRestart.Heads.ProjectionAccumulator {
+		t.Fatalf("Apply(third) = %#v", thirdResult)
+	}
+	finalView, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(final): %v", err)
+	}
+	if !viewContainsTask(finalView, nodeTestTaskID1) ||
+		!viewContainsTask(finalView, nodeTestTaskID2) ||
+		!viewContainsTask(finalView, nodeTestTaskID3) {
+		t.Fatal("restart/tail replay lost a task projection")
+	}
+}
+
+func TestSingleNodeRestartVerifiesAlreadyAppliedLogPrefix(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(new): %v", err)
+	}
+	waitForNodeLeader(t, node)
+
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first task",
+	)
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"second task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	if _, err := node.Apply(testContext(t), second); err != nil {
+		t.Fatalf("Apply(second): %v", err)
+	}
+	beforeRestart, err := node.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(before restart): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	var restartClockCalls atomic.Int64
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock: func() (domain.Timestamp, int64, error) {
+				restartClockCalls.Add(1)
+				return "", 0, errors.New("covered replay must not read the clock")
+			},
+			RaftConfig: nodeTestRaftConfig(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	waitForNodeLeader(t, restarted)
+	if err := restarted.Barrier(testContext(t)); err != nil {
+		t.Fatalf("Barrier(restart): %v", err)
+	}
+	if err := restarted.FatalError(); err != nil {
+		t.Fatalf("FatalError(restart): %v", err)
+	}
+	if calls := restartClockCalls.Load(); calls != 0 {
+		t.Fatalf("restart clock calls = %d, want 0", calls)
+	}
+	afterRestart, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(after restart): %v", err)
+	}
+	if afterRestart.Heads != beforeRestart.Heads ||
+		afterRestart.ProjectionStateDigest !=
+			beforeRestart.ProjectionStateDigest {
+		t.Fatalf(
+			"covered replay changed durable state:\nbefore: %#v\nafter:  %#v",
+			beforeRestart,
+			afterRestart,
+		)
+	}
+	assertNodeUsesLocalAddress(t, restarted)
+}
+
+func TestConcurrentChangedEventIDNeverCommitsCollision(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(new): %v", err)
+	}
+	waitForNodeLeader(t, node)
+
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first bytes",
+	)
+	changed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"changed bytes",
+	)
+	type applyCall struct {
+		result store.ApplyResult
+		err    error
+	}
+	start := make(chan struct{})
+	calls := make(chan applyCall, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, signed := range []event.SignedEvent{first, changed} {
+		signed := signed
+		go func() {
+			<-start
+			result, err := node.Apply(ctx, signed)
+			calls <- applyCall{result: result, err: err}
+		}()
+	}
+	close(start)
+
+	var accepted, conflicts int
+	for range 2 {
+		call := <-calls
+		switch {
+		case call.err == nil:
+			accepted++
+			if call.result.Duplicate ||
+				call.result.Outcome.Status != store.OutcomeAccepted {
+				t.Fatalf("successful concurrent Apply() = %#v", call.result)
+			}
+		case errors.Is(call.err, store.ErrIdempotencyConflict):
+			conflicts++
+		default:
+			t.Fatalf("concurrent Apply() error = %v", call.err)
+		}
+	}
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf(
+			"concurrent results = %d accepted, %d conflicts",
+			accepted,
+			conflicts,
+		)
+	}
+	if err := node.FatalError(); err != nil {
+		t.Fatalf("FatalError(): %v", err)
+	}
+	beforeRestart, err := node.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(): %v", err)
+	}
+	if beforeRestart.Heads.ResultIndex != 1 ||
+		beforeRestart.LastRaftAppliedLogIndex == nil {
+		t.Fatalf("durable state after race = %#v", beforeRestart)
+	}
+	lastIndex, err := node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("Raft LastIndex(): %v", err)
+	}
+	if lastIndex != *beforeRestart.LastRaftAppliedLogIndex {
+		t.Fatalf(
+			"Raft last index = %d, SQLite applied index = %d",
+			lastIndex,
+			*beforeRestart.LastRaftAppliedLogIndex,
+		)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	waitForNodeLeader(t, restarted)
+	if err := restarted.Barrier(testContext(t)); err != nil {
+		t.Fatalf("Barrier(restart): %v", err)
+	}
+	if err := restarted.FatalError(); err != nil {
+		t.Fatalf("FatalError(restart): %v", err)
+	}
+	afterRestart, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(restart): %v", err)
+	}
+	if afterRestart.Heads != beforeRestart.Heads ||
+		afterRestart.ProjectionStateDigest !=
+			beforeRestart.ProjectionStateDigest {
+		t.Fatalf(
+			"restart after event-ID race drifted state:\nbefore: %#v\nafter:  %#v",
+			beforeRestart,
+			afterRestart,
+		)
+	}
+}
+
+func TestCanceledApplyRetainsEventIDFlightUntilRaftResolves(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	clockEntered := make(chan struct{})
+	releaseClock := make(chan struct{})
+	var (
+		enterOnce   sync.Once
+		releaseOnce sync.Once
+	)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseClock) })
+	})
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock: func() (domain.Timestamp, int64, error) {
+			enterOnce.Do(func() { close(clockEntered) })
+			<-releaseClock
+			return "2026-08-11T13:00:00Z", 1, nil
+		},
+		RaftConfig: nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first bytes",
+	)
+	changed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"changed bytes",
+	)
+	type applyCall struct {
+		result store.ApplyResult
+		err    error
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan applyCall, 1)
+	go func() {
+		result, err := node.Apply(ctx, first)
+		firstDone <- applyCall{result: result, err: err}
+	}()
+	select {
+	case <-clockEntered:
+	case <-testContext(t).Done():
+		t.Fatal("first proposal did not reach the FSM")
+	}
+	beforeChanged, err := node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("LastIndex(before changed retry): %v", err)
+	}
+	cancel()
+	select {
+	case call := <-firstDone:
+		if !errors.Is(call.err, context.Canceled) {
+			t.Fatalf("canceled Apply() error = %v, want context.Canceled", call.err)
+		}
+	case <-testContext(t).Done():
+		t.Fatal("canceled Apply() did not return")
+	}
+
+	if _, err := node.Apply(
+		testContext(t),
+		changed,
+	); !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf(
+			"Apply(changed while first unresolved) error = %v, want ErrIdempotencyConflict",
+			err,
+		)
+	}
+	afterChanged, err := node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("LastIndex(after changed retry): %v", err)
+	}
+	if afterChanged != beforeChanged {
+		t.Fatalf(
+			"changed retry appended Raft log %d after unresolved index %d",
+			afterChanged,
+			beforeChanged,
+		)
+	}
+
+	releaseOnce.Do(func() { close(releaseClock) })
+	if err := node.Barrier(testContext(t)); err != nil {
+		t.Fatalf("Barrier(): %v", err)
+	}
+	duplicate, err := node.Apply(testContext(t), first)
+	if err != nil {
+		t.Fatalf("Apply(exact retry): %v", err)
+	}
+	if !duplicate.Duplicate {
+		t.Fatalf("exact retry = %#v, want durable duplicate", duplicate)
+	}
+	if err := node.FatalError(); err != nil {
+		t.Fatalf("FatalError(): %v", err)
+	}
+}
+
+func TestCloseDrainsCommittedApplyBeforeClosingStores(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	clockEntered := make(chan struct{})
+	releaseClock := make(chan struct{})
+	var (
+		enterOnce   sync.Once
+		releaseOnce sync.Once
+	)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseClock) })
+	})
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock: func() (domain.Timestamp, int64, error) {
+			enterOnce.Do(func() { close(clockEntered) })
+			<-releaseClock
+			return "2026-08-11T13:00:00Z", 1, nil
+		},
+		RaftConfig: nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"close-race task",
+	)
+	applyDone := make(chan error, 1)
+	go func() {
+		_, err := node.Apply(context.Background(), signed)
+		applyDone <- err
+	}()
+	select {
+	case <-clockEntered:
+	case <-testContext(t).Done():
+		t.Fatal("proposal did not reach the FSM")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- node.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close() returned before the active FSM apply drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseClock) })
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	if err := <-applyDone; err != nil && !errors.Is(err, ErrNodeClosed) {
+		t.Fatalf("Apply() during Close error = %v", err)
+	}
+	if _, err := node.View(
+		context.Background(),
+	); !errors.Is(err, ErrNodeClosed) {
+		t.Fatalf("View(after Close) error = %v, want ErrNodeClosed", err)
+	}
+
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	waitForNodeLeader(t, restarted)
+	view, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(restart): %v", err)
+	}
+	if !viewContainsTask(view, nodeTestTaskID1) {
+		t.Fatal("Close lost a command already committed into the FSM")
+	}
+}
+
+func TestSingleNodeRestartsAfterSnapshotCompactsEveryLog(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	config := nodeTestRaftConfig()
+	config.TrailingLogs = 0
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   config,
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(new): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"snapshot-backed task",
+	)
+	if _, err := node.Apply(testContext(t), signed); err != nil {
+		t.Fatalf("Apply(): %v", err)
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+	lastLogIndex, err := node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("Raft LastIndex(): %v", err)
+	}
+	if lastLogIndex != 0 {
+		t.Fatalf("retained last log index = %d, want 0", lastLogIndex)
+	}
+	beforeRestart, err := node.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   config,
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	waitForNodeLeader(t, restarted)
+	afterRestart, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(restart): %v", err)
+	}
+	if afterRestart.Heads != beforeRestart.Heads ||
+		afterRestart.ProjectionStateDigest !=
+			beforeRestart.ProjectionStateDigest {
+		t.Fatalf(
+			"snapshot-backed restart drifted state:\nbefore: %#v\nafter:  %#v",
+			beforeRestart,
+			afterRestart,
+		)
+	}
+}
+
+func TestRestartRejectsInflatedSnapshotMetadata(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"snapshot metadata task",
+	)
+	if _, err := node.Apply(testContext(t), signed); err != nil {
+		t.Fatalf("Apply(): %v", err)
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+	metas, err := node.snapshots.List()
+	if err != nil || len(metas) == 0 {
+		t.Fatalf("List() = (%#v, %v), want a snapshot", metas, err)
+	}
+	snapshotID := metas[0].ID
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	metaPath := filepath.Join(
+		root,
+		"consensus",
+		"snapshots",
+		snapshotID,
+		"meta.json",
+	)
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("ReadFile(meta.json): %v", err)
+	}
+	var diskMeta struct {
+		raft.SnapshotMeta
+		CRC []byte
+	}
+	if err := json.Unmarshal(raw, &diskMeta); err != nil {
+		t.Fatalf("json.Unmarshal(meta.json): %v", err)
+	}
+	diskMeta.Index++
+	raw, err = json.Marshal(diskMeta)
+	if err != nil {
+		t.Fatalf("json.Marshal(meta.json): %v", err)
+	}
+	if err := os.WriteFile(metaPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(meta.json): %v", err)
+	}
+
+	if _, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	); !errors.Is(err, ErrSnapshotAnchorCoverage) {
+		t.Fatalf(
+			"OpenSingleNode(inflated metadata) error = %v, want ErrSnapshotAnchorCoverage",
+			err,
+		)
+	}
+}
+
+func TestRestartVerifiesFullHistoryBeforeTrustingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    statePath,
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first history task",
+	)
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"second history task",
+	)
+	rejected := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID3,
+		nodeTestTaskID3,
+		nodeTestTimestamp3,
+		2,
+		"reused sequence",
+	)
+	for _, signed := range []event.SignedEvent{first, second, rejected} {
+		if _, err := node.Apply(testContext(t), signed); err != nil {
+			t.Fatalf("Apply(%s): %v", signed.Proposal().EventID, err)
+		}
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	tamperSQLite(
+		t,
+		statePath,
+		`UPDATE command_results
+		    SET outcome_json = '{"code":"accepted","status":"accepted","x":1}'
+		  WHERE result_index = 1;`,
+	)
+	if _, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    statePath,
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	); !errors.Is(err, ErrSnapshotAnchorCoverage) {
+		t.Fatalf(
+			"OpenSingleNode(tampered history) error = %v, want ErrSnapshotAnchorCoverage",
+			err,
+		)
+	}
+}
+
+func TestRetainedRaftCommandSubstitutionHaltsReplay(t *testing.T) {
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"first replay task",
+	)
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"second replay task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	if _, err := node.Apply(testContext(t), second); err != nil {
+		t.Fatalf("Apply(second): %v", err)
+	}
+	firstLog := findCommandLog(t, node, first.CanonicalBytes())
+	if err := node.shutdownRaft(); err != nil {
+		t.Fatalf("shutdownRaft(): %v", err)
+	}
+	firstLog.Data = second.CanonicalBytes()
+	if err := node.stable.StoreLog(&firstLog); err != nil {
+		t.Fatalf("StoreLog(substituted): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: filepath.Join(root, "consensus"),
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close() })
+	err = restarted.WaitForLeader(testContext(t))
+	if err == nil {
+		err = restarted.Barrier(testContext(t))
+	}
+	if !errors.Is(err, ErrFSMHalted) &&
+		!errors.Is(restarted.FatalError(), ErrFSMHalted) {
+		t.Fatalf(
+			"substituted replay errors = (%v, %v), want ErrFSMHalted",
+			err,
+			restarted.FatalError(),
+		)
+	}
+}
+
+func TestSnapshotIntegrityFailureHaltsNode(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    statePath,
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"snapshot corruption task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	tamperSQLite(
+		t,
+		statePath,
+		`UPDATE command_results
+		    SET outcome_json = '{"code":"accepted","status":"accepted","x":1}'
+		  WHERE result_index = 1;`,
+	)
+
+	if err := node.Snapshot(testContext(t)); err == nil {
+		t.Fatal("Snapshot() accepted corrupt history")
+	}
+	if err := node.FatalError(); !errors.Is(err, ErrFSMHalted) {
+		t.Fatalf("FatalError() = %v, want ErrFSMHalted", err)
+	}
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"must not apply",
+	)
+	if _, err := node.Apply(
+		testContext(t),
+		second,
+	); !errors.Is(err, ErrFSMHalted) {
+		t.Fatalf("Apply(after snapshot halt) error = %v, want ErrFSMHalted", err)
+	}
+}
+
+func TestOpenRejectsGapAfterLatestSnapshot(t *testing.T) {
+	root := t.TempDir()
+	consensusDir := filepath.Join(root, "consensus")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	config := nodeTestRaftConfig()
+	config.TrailingLogs = 0
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: consensusDir,
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   config,
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"pre-snapshot task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"first post-snapshot task",
+	)
+	third := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID3,
+		nodeTestTaskID3,
+		nodeTestTimestamp3,
+		3,
+		"second post-snapshot task",
+	)
+	if _, err := node.Apply(testContext(t), second); err != nil {
+		t.Fatalf("Apply(second): %v", err)
+	}
+	if _, err := node.Apply(testContext(t), third); err != nil {
+		t.Fatalf("Apply(third): %v", err)
+	}
+	secondLog := findCommandLog(t, node, second.CanonicalBytes())
+	if err := node.shutdownRaft(); err != nil {
+		t.Fatalf("shutdownRaft(): %v", err)
+	}
+	if err := node.stable.DeleteRange(
+		secondLog.Index,
+		secondLog.Index,
+	); err != nil {
+		t.Fatalf("DeleteRange(gap): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	if _, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: consensusDir,
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   config,
+		},
+	); !errors.Is(err, ErrRaftLogCoverage) {
+		t.Fatalf(
+			"OpenSingleNode(gapped logs) error = %v, want ErrRaftLogCoverage",
+			err,
+		)
+	}
+}
+
+func TestOpenRejectsMissingSnapshotForCompactedLogs(t *testing.T) {
+	root := t.TempDir()
+	consensusDir := filepath.Join(root, "consensus")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	config := nodeTestRaftConfig()
+	config.TrailingLogs = 0
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: consensusDir,
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   config,
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"pre-snapshot task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	if err := node.Snapshot(testContext(t)); err != nil {
+		t.Fatalf("Snapshot(): %v", err)
+	}
+	metas, err := node.snapshots.List()
+	if err != nil || len(metas) == 0 {
+		t.Fatalf("List() = (%v, %v), want a snapshot", metas, err)
+	}
+	second := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID2,
+		nodeTestTaskID2,
+		nodeTestTimestamp2,
+		2,
+		"post-snapshot task",
+	)
+	if _, err := node.Apply(testContext(t), second); err != nil {
+		t.Fatalf("Apply(second): %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	if err := os.RemoveAll(
+		filepath.Join(consensusDir, "snapshots", metas[0].ID),
+	); err != nil {
+		t.Fatalf("RemoveAll(snapshot): %v", err)
+	}
+
+	if _, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "state", "state.db"),
+			ConsensusDir: consensusDir,
+			OriginBootID: nodeTestBootID2,
+			Clock:        nodeTestClock(),
+			RaftConfig:   config,
+		},
+	); !errors.Is(err, ErrRaftLogCoverage) {
+		t.Fatalf(
+			"OpenSingleNode(missing snapshot) error = %v, want ErrRaftLogCoverage",
+			err,
+		)
+	}
+}
+
+func TestWaitForLeaderWaitsForRetainedCommandReplay(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	consensusDir := filepath.Join(root, "consensus")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	failingClock := func() (domain.Timestamp, int64, error) {
+		return "", 0, errors.New("injected apply failure")
+	}
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    statePath,
+		ConsensusDir: consensusDir,
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        failingClock,
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(first): %v", err)
+	}
+	waitForNodeLeader(t, node)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"retained replay task",
+	)
+	if _, err := node.Apply(
+		testContext(t),
+		signed,
+	); !errors.Is(err, ErrFSMHalted) {
+		t.Fatalf("Apply(failing clock) error = %v, want ErrFSMHalted", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(first): %v", err)
+	}
+
+	clockEntered := make(chan struct{})
+	releaseClock := make(chan struct{})
+	var clockOnce sync.Once
+	replayClock := func() (domain.Timestamp, int64, error) {
+		clockOnce.Do(func() { close(clockEntered) })
+		<-releaseClock
+		return "2026-08-11T13:00:00Z", 1, nil
+	}
+	restarted, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    statePath,
+			ConsensusDir: consensusDir,
+			OriginBootID: nodeTestBootID2,
+			Clock:        replayClock,
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(restart): %v", err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseClock:
+		default:
+			close(releaseClock)
+		}
+		_ = restarted.Close()
+	})
+	restarted.addressMu.Lock()
+	restarted.addressReconciled = true
+	restarted.addressMu.Unlock()
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- restarted.WaitForLeader(testContext(t))
+	}()
+	select {
+	case <-clockEntered:
+	case err := <-waitDone:
+		t.Fatalf("WaitForLeader() returned before replay: %v", err)
+	case <-testContext(t).Done():
+		t.Fatal("retained command did not begin replay")
+	}
+	select {
+	case err := <-waitDone:
+		t.Fatalf("WaitForLeader() returned during replay: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseClock)
+	if err := <-waitDone; err != nil {
+		t.Fatalf("WaitForLeader() after replay: %v", err)
+	}
+	view, err := restarted.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(): %v", err)
+	}
+	if !viewContainsTask(view, nodeTestTaskID1) {
+		t.Fatal("WaitForLeader returned without applying retained command")
+	}
+}
+
+func TestLookupCorruptionLatchesFatalNodeFailure(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    statePath,
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+	first := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"lookup task",
+	)
+	if _, err := node.Apply(testContext(t), first); err != nil {
+		t.Fatalf("Apply(first): %v", err)
+	}
+	tamperSQLite(
+		t,
+		statePath,
+		`UPDATE command_results
+		    SET outcome_json = '{"code":"accepted","status":"accepted","x":1}'
+		  WHERE result_index = 1;`,
+	)
+	if _, err := node.Apply(
+		testContext(t),
+		first,
+	); !errors.Is(err, store.ErrCommandResultCorrupt) {
+		t.Fatalf(
+			"Apply(corrupt lookup) error = %v, want ErrCommandResultCorrupt",
+			err,
+		)
+	}
+	if !errors.Is(node.FatalError(), store.ErrCommandResultCorrupt) {
+		t.Fatalf(
+			"FatalError() = %v, want ErrCommandResultCorrupt",
+			node.FatalError(),
+		)
+	}
+}
+
+func TestCommittedMalformedCommandHaltsSingleNodeFSM(t *testing.T) {
+	root := t.TempDir()
+	initial, _, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+
+	future := node.raft.Apply([]byte(`{"not":"an event"}`), time.Second)
+	if err := future.Error(); err != nil {
+		t.Fatalf("Raft Apply(malformed) transport error: %v", err)
+	}
+	response, ok := future.Response().(ApplyResponse)
+	if !ok || !errors.Is(response.Err, ErrFSMHalted) {
+		t.Fatalf("malformed response = %#v", future.Response())
+	}
+
+	if !errors.Is(node.FatalError(), ErrFSMHalted) {
+		t.Fatalf("FatalError() = %v, want ErrFSMHalted", node.FatalError())
+	}
+	view, err := node.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(): %v", err)
+	}
+	if view.Heads.ResultIndex != 0 || view.LastRaftAppliedLogIndex != nil {
+		t.Fatalf("malformed command changed SQLite state: %#v", view)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close() after integrity halt: %v", err)
+	}
+	if !errors.Is(node.FatalError(), ErrFSMHalted) {
+		t.Fatalf(
+			"FatalError() after Close = %v, want ErrFSMHalted",
+			node.FatalError(),
+		)
+	}
+}
+
+func TestCommittedVersionSkewHaltsBeforeRaftWatermark(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]json.RawMessage)
+		want   error
+	}{
+		{
+			name: "unknown kind",
+			mutate: func(object map[string]json.RawMessage) {
+				object["kind"] = json.RawMessage(`"task.future"`)
+			},
+			want: reducer.ErrKindNotImplemented,
+		},
+		{
+			name: "unsupported apply level",
+			mutate: func(object map[string]json.RawMessage) {
+				object["kind"] = json.RawMessage(`"task.future"`)
+				object["min_apply_level"] = json.RawMessage(`2`)
+			},
+			want: reducer.ErrApplyLevelUnsupported,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			initial, identityPrivate, deviceID := nodeTestInitialState(t)
+			node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+				ServerID:     deviceID,
+				StatePath:    filepath.Join(root, "state", "state.db"),
+				ConsensusDir: filepath.Join(root, "consensus"),
+				OriginBootID: nodeTestBootID1,
+				InitialState: &initial,
+				Clock:        nodeTestClock(),
+				RaftConfig:   nodeTestRaftConfig(),
+			})
+			if err != nil {
+				t.Fatalf("OpenSingleNode(): %v", err)
+			}
+			t.Cleanup(func() { _ = node.Close() })
+			waitForNodeLeader(t, node)
+
+			base := nodeTestTaskEvent(
+				t,
+				identityPrivate,
+				deviceID,
+				nodeTestBootID1,
+				nodeTestEventID1,
+				nodeTestTaskID1,
+				nodeTestTimestamp1,
+				1,
+				"version skew",
+			)
+			command := nodeTestResignEvent(
+				t,
+				base.CanonicalBytes(),
+				identityPrivate,
+				test.mutate,
+			)
+			future := node.raft.Apply(command, time.Second)
+			if err := future.Error(); err != nil {
+				t.Fatalf("Raft Apply(version skew) transport error: %v", err)
+			}
+			response, ok := future.Response().(ApplyResponse)
+			if !ok ||
+				!errors.Is(response.Err, ErrFSMHalted) ||
+				!errors.Is(response.Err, test.want) {
+				t.Fatalf(
+					"version-skew response = %#v, want ErrFSMHalted wrapping %v",
+					future.Response(),
+					test.want,
+				)
+			}
+			view, err := node.View(context.Background())
+			if err != nil {
+				t.Fatalf("View(): %v", err)
+			}
+			if view.Heads.ResultIndex != 0 ||
+				view.Heads.ChainIndex != 0 ||
+				view.LastRaftAppliedLogIndex != nil {
+				t.Fatalf("version-skew command changed SQLite state: %#v", view)
+			}
+		})
+	}
+}
+
+func nodeTestInitialState(
+	t *testing.T,
+) (store.InitialState, ed25519.PrivateKey, domain.DeviceID) {
+	t.Helper()
+
+	identityPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x31}, ed25519.SeedSize),
+	)
+	identityPublic := append(
+		ed25519.PublicKey(nil),
+		identityPrivate.Public().(ed25519.PublicKey)...,
+	)
+	deviceID, err := device.DeriveID(identityPublic)
+	if err != nil {
+		t.Fatalf("device.DeriveID(): %v", err)
+	}
+	member := device.Device{
+		ID:                deviceID,
+		Role:              device.RoleOwner,
+		IdentityPublicKey: identityPublic,
+		DaemonVersion:     "0.1.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+	voterSet, err := voterset.New(
+		nodeTestSessionID,
+		[]domain.DeviceID{deviceID},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("voterset.New(): %v", err)
+	}
+	recoveryPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x71}, ed25519.SeedSize),
+	)
+	genesis := map[string]any{
+		"recovery_generation": uint64(0),
+		"recovery_public_key": codec.EncodeBase64URL(
+			recoveryPrivate.Public().(ed25519.PublicKey),
+		),
+		"session_id":   string(nodeTestSessionID),
+		"workspace_id": string(nodeTestWorkspaceID),
+	}
+	rawGenesis, err := json.Marshal(genesis)
+	if err != nil {
+		t.Fatalf("json.Marshal(genesis): %v", err)
+	}
+	genesisJSON, err := codec.CanonicalizeSignedObject(rawGenesis)
+	if err != nil {
+		t.Fatalf("CanonicalizeSignedObject(genesis): %v", err)
+	}
+
+	canonicalRef := publication.CanonicalRef{
+		RefName:       publication.CanonicalRefName,
+		CommitOID:     domain.GitOID("sha1:" + strings.Repeat("1", 40)),
+		EntityVersion: 1,
+	}
+	initial := store.InitialState{
+		SessionID:               nodeTestSessionID,
+		WorkspaceID:             nodeTestWorkspaceID,
+		GenesisJSON:             genesisJSON,
+		DigestVersion:           1,
+		ProjectionSchemaVersion: 1,
+		Projections: store.ProjectionWrites{
+			AuditCounters: []auditcounter.Counter{{
+				DeviceID: deviceID,
+			}},
+			PlanCurrent: []plan.Current{{
+				SessionID:     nodeTestSessionID,
+				EntityVersion: 1,
+			}},
+			Devices:  []device.Device{member},
+			VoterSet: []voterset.Set{voterSet},
+			CredentialAuthority: []store.CredentialAuthorityRow{{
+				SessionID:        nodeTestSessionID,
+				VoterDeviceIDs:   []domain.DeviceID{deviceID},
+				VoterSetVersion:  1,
+				ActivationSource: credentialauthority.ActivationGenesis,
+			}},
+			CanonicalRefs: []publication.CanonicalRef{canonicalRef},
+			SessionPolicy: []policy.Policy{{
+				SessionID:     nodeTestSessionID,
+				Values:        policy.DefaultValues(),
+				EntityVersion: 1,
+			}},
+		},
+	}
+	return initial, identityPrivate, deviceID
+}
+
+func nodeTestTaskEvent(
+	t *testing.T,
+	privateKey ed25519.PrivateKey,
+	deviceID domain.DeviceID,
+	bootID domain.UUIDv7,
+	eventID domain.UUIDv7,
+	taskID domain.UUIDv7,
+	createdAt domain.Timestamp,
+	sequence uint64,
+	title string,
+) event.SignedEvent {
+	t.Helper()
+
+	authority, err := event.NewLocalAuthority(deviceID, bootID)
+	if err != nil {
+		t.Fatalf("event.NewLocalAuthority(): %v", err)
+	}
+	binding, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatalf("OperatorBinding(): %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"priority": 2,
+		"title":    title,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(task payload): %v", err)
+	}
+	proposal, err := event.BuildProposal(
+		event.Command{
+			Kind:     event.KindTaskCreated,
+			EntityID: event.StringEntityID(string(taskID)),
+			Actions:  []event.Action{},
+			Payload:  payload,
+			Redaction: event.Redaction{
+				Policy:        event.RedactionDefault,
+				FieldsRemoved: []event.RedactionField{},
+			},
+		},
+		binding,
+		event.BuildContext{
+			EventID:        eventID,
+			SessionID:      nodeTestSessionID,
+			WorkspaceID:    nodeTestWorkspaceID,
+			CreatedAt:      createdAt,
+			OriginSequence: sequence,
+		},
+	)
+	if err != nil {
+		t.Fatalf("event.BuildProposal(): %v", err)
+	}
+	signed, err := event.Sign(proposal, privateKey)
+	if err != nil {
+		t.Fatalf("event.Sign(): %v", err)
+	}
+	return signed
+}
+
+func nodeTestResignEvent(
+	t *testing.T,
+	complete []byte,
+	privateKey ed25519.PrivateKey,
+	mutate func(map[string]json.RawMessage),
+) []byte {
+	t.Helper()
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(complete, &object); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	delete(object, "origin_signature")
+	mutate(object)
+	bodyJSON, err := json.Marshal(object)
+	if err != nil {
+		t.Fatalf("marshal mutated event body: %v", err)
+	}
+	body, err := codec.CanonicalizeSignedObject(bodyJSON)
+	if err != nil {
+		t.Fatalf("canonicalize mutated event body: %v", err)
+	}
+	signature, err := codecommcrypto.SignEd25519(
+		privateKey,
+		codec.SignatureEventOrigin,
+		body,
+	)
+	if err != nil {
+		t.Fatalf("sign mutated event body: %v", err)
+	}
+	signatureJSON, err := json.Marshal(codec.EncodeBase64URL(signature))
+	if err != nil {
+		t.Fatalf("marshal mutated event signature: %v", err)
+	}
+	object["origin_signature"] = signatureJSON
+	completeJSON, err := json.Marshal(object)
+	if err != nil {
+		t.Fatalf("marshal mutated event: %v", err)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(completeJSON)
+	if err != nil {
+		t.Fatalf("canonicalize mutated event: %v", err)
+	}
+	return canonical
+}
+
+func nodeTestClock() ApplyClock {
+	var calls atomic.Int64
+	return func() (domain.Timestamp, int64, error) {
+		call := calls.Add(1)
+		return domain.Timestamp(
+			fmt.Sprintf("2026-08-11T13:00:%02dZ", call),
+		), call * int64(time.Second), nil
+	}
+}
+
+func nodeTestRaftConfig() *raft.Config {
+	config := raft.DefaultConfig()
+	config.HeartbeatTimeout = 500 * time.Millisecond
+	config.ElectionTimeout = 500 * time.Millisecond
+	config.CommitTimeout = 10 * time.Millisecond
+	config.LeaderLeaseTimeout = 250 * time.Millisecond
+	config.SnapshotInterval = time.Hour
+	config.SnapshotThreshold = 1_000
+	config.TrailingLogs = 32
+	config.LogLevel = "ERROR"
+	return config
+}
+
+func waitForNodeLeader(t *testing.T, node *SingleNode) {
+	t.Helper()
+	if err := node.WaitForLeader(testContext(t)); err != nil {
+		t.Fatalf("WaitForLeader(): %v", err)
+	}
+}
+
+func assertNodeUsesLocalAddress(t *testing.T, node *SingleNode) {
+	t.Helper()
+	future := node.raft.GetConfiguration()
+	if err := waitFuture(testContext(t), future); err != nil {
+		t.Fatalf("GetConfiguration(): %v", err)
+	}
+	configuration := future.Configuration()
+	if len(configuration.Servers) != 1 ||
+		configuration.Servers[0].ID != node.serverID ||
+		configuration.Servers[0].Suffrage != raft.Voter ||
+		configuration.Servers[0].Address != node.Address() {
+		t.Fatalf(
+			"configuration = %#v, local address = %q",
+			configuration,
+			node.Address(),
+		)
+	}
+}
+
+func testContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func viewContainsTask(view store.StateView, taskID domain.UUIDv7) bool {
+	for _, row := range view.ProjectionRows {
+		if row.Table == "tasks" &&
+			bytes.Contains(
+				row.Row,
+				[]byte(`"task_id":"`+string(taskID)+`"`),
+			) {
+			return true
+		}
+	}
+	return false
+}
+
+func findCommandLog(
+	t *testing.T,
+	node *SingleNode,
+	canonical []byte,
+) raft.Log {
+	t.Helper()
+	first, err := node.stable.FirstIndex()
+	if err != nil {
+		t.Fatalf("FirstIndex(): %v", err)
+	}
+	last, err := node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("LastIndex(): %v", err)
+	}
+	for index := first; index <= last; index++ {
+		var entry raft.Log
+		if err := node.stable.GetLog(index, &entry); err != nil {
+			t.Fatalf("GetLog(%d): %v", index, err)
+		}
+		if entry.Type == raft.LogCommand &&
+			bytes.Equal(entry.Data, canonical) {
+			return entry
+		}
+	}
+	t.Fatal("command is absent from retained Raft logs")
+	return raft.Log{}
+}
+
+func tamperSQLite(t *testing.T, path, statement string) {
+	t.Helper()
+	conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("sqlite.OpenConn(): %v", err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("sqlite.Close(): %v", err)
+		}
+	}()
+	if err := sqlitex.Execute(conn, statement, nil); err != nil {
+		t.Fatalf("tamper SQLite: %v", err)
+	}
+}
+
+func sameNodeCommitmentHeads(left, right store.ApplyHeads) bool {
+	return left.ChainIndex == right.ChainIndex &&
+		left.ChainHash == right.ChainHash &&
+		left.ResultIndex == right.ResultIndex &&
+		left.ResultHash == right.ResultHash &&
+		left.ProjectionAccumulator == right.ProjectionAccumulator &&
+		left.DigestVersion == right.DigestVersion &&
+		left.ProjectionSchemaVersion == right.ProjectionSchemaVersion
+}
