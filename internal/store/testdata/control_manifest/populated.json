@@ -1,0 +1,5 @@
+{
+  "version": 2,
+  "digest": "UKoJinkQsI6RJyTfAycQGX0ww_InOpoR987l2KkJ6tY",
+  "entries_jcs": "[{\"content_digest\":null,\"operation\":\"delete\",\"path\":\".codecommignore\"},{\"content_digest\":\"Dh66gdWWRNnZvnsJV4hta_DKckDo-BfnlDZGnY1xbks\",\"operation\":\"upsert\",\"path\":\"AGENTS.md\"}]"
+}
