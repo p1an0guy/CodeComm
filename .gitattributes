@@ -1,0 +1,2 @@
+# Keep source and byte-exact protocol/render fixtures stable across platforms.
+* text=auto eol=lf

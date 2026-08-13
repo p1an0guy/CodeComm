@@ -365,13 +365,14 @@ func TestLinuxBackendRejectsNilContext(t *testing.T) {
 			return nil, nil
 		},
 	}}
-	if _, err := backend.Get(nil, "identity/v1"); !errors.Is(err, ErrInvalidContext) {
+	var nilContext context.Context
+	if _, err := backend.Get(nilContext, "identity/v1"); !errors.Is(err, ErrInvalidContext) {
 		t.Fatalf("Get(nil) error = %v, want %v", err, ErrInvalidContext)
 	}
-	if err := backend.Create(nil, "identity/v1", []byte("secret")); !errors.Is(err, ErrInvalidContext) {
+	if err := backend.Create(nilContext, "identity/v1", []byte("secret")); !errors.Is(err, ErrInvalidContext) {
 		t.Fatalf("Create(nil) error = %v, want %v", err, ErrInvalidContext)
 	}
-	if err := backend.Delete(nil, "identity/v1"); !errors.Is(err, ErrInvalidContext) {
+	if err := backend.Delete(nilContext, "identity/v1"); !errors.Is(err, ErrInvalidContext) {
 		t.Fatalf("Delete(nil) error = %v, want %v", err, ErrInvalidContext)
 	}
 }
