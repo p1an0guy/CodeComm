@@ -28,6 +28,9 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
+      - name: Staticcheck
+        if: runner.os == 'Linux'
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
       - name: Verify modules
         run: go mod verify
 
@@ -69,7 +72,7 @@ jobs:
             "$RUNNER_TEMP"/codecomm-store-trace*
 
   fuzz-smoke:
-    name: JCS differential fuzz smoke
+    name: JCS fuzz smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -78,6 +81,7 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - run: go test ./internal/codec -run=^$ -fuzz=FuzzCanonicalizeDifferential -fuzztime=30s
+      - run: go test ./internal/codec -run=^$ -fuzz=FuzzCanonicalizeIntegerProfile -fuzztime=30s
 
   vulnerability-scan:
     name: Go vulnerability scan

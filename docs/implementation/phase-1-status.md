@@ -6,7 +6,7 @@ Scope: the initial Raft/store/JCS/local-IPC gate in `docs/IMPLEMENTATION.md` §2
 broader Phase 1 items are reclassified below as Phase 3-5 subsystem work, since none of them gates
 the architecture.
 
-**Next action: Phase 2, step 1** — `internal/domain` per `docs/IMPLEMENTATION.md` §3.
+**Next action: Phase 3 secure mesh** per `docs/IMPLEMENTATION.md` §4.
 
 ## Initial gate
 
@@ -51,7 +51,7 @@ worth recording because they would have recurred:
 | Apply barrier reaches local FSM | GO | A blocked FSM prevents `Barrier().Error()` from completing; releasing apply makes state visible before the barrier returns |
 | Targeted transfer and 3-voter crash/restart | GO on all three OSes, with a recorded library constraint | A real TCP voter in a separate process becomes leader, is force-killed, the surviving majority elects and commits, and the voter restarts at the same store/address, catches up the offline commit, and accepts another targeted transfer. This is not standalone persisted-FSM replay. **Library constraint found by CI, not by source review:** `hashicorp/raft` v1.7.3 bounds `LeadershipTransferToServer` by `ElectionTimeout` (raft.go:728,749), so a target that cannot be brought current within one election timeout fails the transfer outright rather than waiting. A 300 ms election timeout was insufficient for a freshly started subprocess voter on GitHub's Windows runner while consensus itself was healthy. See the §3 implication below |
 | Staged-nonvoter proof without `matchIndex` | GO for the Raft API; integration open | A compacted leader adds a nonvoter; the target installs a file snapshot, withholds proof while blocked, validates every checkpoint-cut field including `log.Index-1`, then emits the exact proof after apply. The production SQLite transaction and authenticated closed endpoint remain Phase 1 work |
-| Production stable-store fsync/crash behavior | GO pending 65300d1 CI | Static review proves `StoreLogs → bbolt.Tx.Commit`, dirty-page and metadata `fdatasync`/`File.Sync` when both `NoSync` flags are false, and error propagation. A post-ack subprocess kill proves process-crash reopen. Linux `strace` verification asserts same-DB-FD `data write → sync → metadata write → sync → ACK` and merges per-thread trace files, because `-ff` splits a Go process across threads so the writes, syncs, and acknowledgement land in different files. `TestStoreLogsPropagatesSyncFailure` proves a store that cannot grow reports the failure instead of acknowledging it (RLIMIT_FSIZE injection, with a healthy baseline write first so the test cannot pass by never working). `TestFirstStoreCreationSyncsParentDirectory` pins CodeComm's obligation to fsync the parent directory after creating a session's first store file, since fsync on a new file does not make its directory entry durable and a process-kill test cannot see the difference. Genuine power-cut evidence remains out of scope for a spike |
+| Production stable-store fsync/crash behavior | GO on Linux CI | Static review proves `StoreLogs → bbolt.Tx.Commit`, dirty-page and metadata `fdatasync`/`File.Sync` when both `NoSync` flags are false, and error propagation. A post-ack subprocess kill proves process-crash reopen. Linux `strace` verification asserts same-DB-FD `data write → sync → metadata write → sync → ACK` and merges per-thread trace files, because `-ff` splits a Go process across threads so the writes, syncs, and acknowledgement land in different files. `TestStoreLogsPropagatesSyncFailure` proves a store that cannot grow reports the failure instead of acknowledging it (RLIMIT_FSIZE injection, with a healthy baseline write first so the test cannot pass by never working). `TestFirstStoreCreationSyncsParentDirectory` pins CodeComm's obligation to fsync the parent directory after creating a session's first store file, since fsync on a new file does not make its directory entry durable and a process-kill test cannot see the difference. Genuine power-cut evidence remains out of scope for a spike |
 | RFC 8785 primitive | GO on all three OSes; typed protocol integration open | Byte/depth-bounded strict token decode, official corpus plus Appendix B number edges, UTF-16 ordering, ±(2^53-1), Unicode/duplicate/trailing/non-finite negatives, and differential fuzzing against an independent implementation. This generic spike is not the closed typed protocol decoder; schema item/string bounds and decode-once integration remain |
 | Local API reachability/peer identity | GO on Linux, macOS, and Windows | The listener is an owner-only AF_UNIX path, not TCP; the probe enforces `0700`/`0600` and verifies `LOCAL_PEERCRED` plus `LOCAL_PEERPID`. Linux uses `SO_PEERCRED`. Windows uses an owner-only SID DACL, impersonation-token SID check, client PID, and pinned `go-winio` code that unconditionally sets `FILE_PIPE_REJECT_REMOTE_CLIENTS` |
 
@@ -109,9 +109,9 @@ release may use the affected patch.
 
 ## Remaining Phase 1
 
-The initial gate — the five library/store/primitive questions in `docs/IMPLEMENTATION.md` §2 — is
-closed once 65300d1's CI run is green. What remains splits into two kinds of work that were
-previously listed together, and the distinction decides sequencing:
+The initial gate — the five library/store/primitive questions in `docs/IMPLEMENTATION.md` §2 — was
+closed by green run 31428715462. What remains splits into two kinds of work that were previously
+listed together, and the distinction decides sequencing:
 
 **Genuinely gating (a wrong answer invalidates design §3 and any code built on it):**
 
@@ -136,7 +136,7 @@ Building those before Phase 2 would invert §13's order and delay the walking sk
 first thing to exercise reducer determinism end to end. Each carries a phase-1-grade spike only if
 its uncertainty is genuinely architectural.
 
-**Next action: Phase 2, step 1** (`internal/domain`) per `docs/IMPLEMENTATION.md` §3.
+**Next action: Phase 3 secure mesh** per `docs/IMPLEMENTATION.md` §4.
 
 ## Self-review
 
