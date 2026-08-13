@@ -35,12 +35,12 @@ func TestCanonicalizeOfficialRFC8785Corpus(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := Canonicalize(input)
+			got, err := canonicalizeRFC8785(input)
 			if err != nil {
-				t.Fatalf("Canonicalize() error = %v", err)
+				t.Fatalf("canonicalizeRFC8785() error = %v", err)
 			}
 			if !bytes.Equal(got, want) {
-				t.Fatalf("Canonicalize() = %q, want %q", got, want)
+				t.Fatalf("canonicalizeRFC8785() = %q, want %q", got, want)
 			}
 		})
 	}
@@ -84,12 +84,12 @@ func TestCanonicalizeRFC8785Vectors(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := Canonicalize([]byte(test.in))
+			got, err := canonicalizeRFC8785([]byte(test.in))
 			if err != nil {
-				t.Fatalf("Canonicalize() error = %v", err)
+				t.Fatalf("canonicalizeRFC8785() error = %v", err)
 			}
 			if string(got) != test.want {
-				t.Fatalf("Canonicalize() = %q, want %q", got, test.want)
+				t.Fatalf("canonicalizeRFC8785() = %q, want %q", got, test.want)
 			}
 		})
 	}
@@ -159,15 +159,97 @@ func TestCanonicalizeRFC8785AppendixBNumbers(t *testing.T) {
 			if test.bits == 0x8000000000000000 {
 				token = "-0"
 			}
-			got, err := Canonicalize([]byte(`{"n":` + token + `}`))
+			got, err := canonicalizeRFC8785([]byte(`{"n":` + token + `}`))
 			if err != nil {
-				t.Fatalf("Canonicalize() error = %v", err)
+				t.Fatalf("canonicalizeRFC8785() error = %v", err)
 			}
 			want := `{"n":` + test.want + `}`
 			if string(got) != want {
 				t.Fatalf("Canonicalize() = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestCanonicalizeIntegerSafety(t *testing.T) {
+	t.Parallel()
+
+	valid := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "positive safe boundary",
+			in:   `{"n":9007199254740991}`,
+			want: `{"n":9007199254740991}`,
+		},
+		{
+			name: "negative safe boundary",
+			in:   `{"n":-9007199254740991}`,
+			want: `{"n":-9007199254740991}`,
+		},
+	}
+	for _, test := range valid {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Canonicalize([]byte(test.in))
+			if err != nil {
+				t.Fatalf("Canonicalize() error = %v", err)
+			}
+			if string(got) != test.want {
+				t.Fatalf("Canonicalize() = %q, want %q", got, test.want)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name string
+		in   string
+		err  error
+	}{
+		{name: "positive unsafe boundary", in: `{"n":9007199254740992}`, err: ErrIntegerOutOfRange},
+		{name: "positive collision value", in: `{"n":9007199254740993}`, err: ErrIntegerOutOfRange},
+		{name: "negative unsafe boundary", in: `{"n":-9007199254740992}`, err: ErrIntegerOutOfRange},
+		{name: "negative collision value", in: `{"n":-9007199254740993}`, err: ErrIntegerOutOfRange},
+		{name: "larger than int64", in: `{"n":18446744073709551616}`, err: ErrIntegerOutOfRange},
+		{name: "fraction", in: `{"n":1.5}`, err: ErrNonInteger},
+		{name: "decimal collision spelling", in: `{"n":9007199254740993.0}`, err: ErrNonInteger},
+		{name: "exponent collision spelling", in: `{"n":9.007199254740993e15}`, err: ErrNonInteger},
+	}
+	for _, test := range invalid {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := Canonicalize([]byte(test.in)); !errors.Is(err, test.err) {
+				t.Fatalf("Canonicalize() error = %v, want %v", err, test.err)
+			}
+		})
+	}
+}
+
+func TestCanonicalizeRejectsIntegerCollisionPair(t *testing.T) {
+	t.Parallel()
+
+	inputs := []string{
+		`{"a":9007199254740992}`,
+		`{"a":9007199254740993}`,
+	}
+	for _, input := range inputs {
+		if output, err := Canonicalize([]byte(input)); !errors.Is(err, ErrIntegerOutOfRange) {
+			t.Fatalf("Canonicalize(%s) = %q, %v; want %v", input, output, err, ErrIntegerOutOfRange)
+		}
+	}
+	for _, input := range []string{
+		`{"a":9007199254740992.0}`,
+		`{"a":9007199254740993.0}`,
+		`{"a":9.007199254740992e15}`,
+		`{"a":9.007199254740993e15}`,
+	} {
+		if output, err := Canonicalize([]byte(input)); !errors.Is(err, ErrNonInteger) {
+			t.Fatalf("Canonicalize(%s) = %q, %v; want %v", input, output, err, ErrNonInteger)
+		}
 	}
 }
 

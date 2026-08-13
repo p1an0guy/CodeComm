@@ -22,20 +22,36 @@ const (
 )
 
 var (
-	ErrInvalidUTF8       = errors.New("codec: JSON is not valid UTF-8")
-	ErrInvalidSurrogate  = errors.New("codec: invalid UTF-16 surrogate escape")
-	ErrDuplicateKey      = errors.New("codec: duplicate object key")
-	ErrTrailingData      = errors.New("codec: trailing JSON data")
-	ErrNestingTooDeep    = errors.New("codec: JSON nesting exceeds 32")
-	ErrSignedObject      = errors.New("codec: signed value must be an object")
-	ErrNonInteger        = errors.New("codec: signed number is not an integer")
-	ErrIntegerOutOfRange = errors.New("codec: signed integer exceeds the safe range")
+	ErrInvalidUTF8      = errors.New("codec: JSON is not valid UTF-8")
+	ErrInvalidSurrogate = errors.New("codec: invalid UTF-16 surrogate escape")
+	ErrDuplicateKey     = errors.New("codec: duplicate object key")
+	ErrTrailingData     = errors.New("codec: trailing JSON data")
+	ErrNestingTooDeep   = errors.New("codec: JSON nesting exceeds 32")
+	ErrSignedObject     = errors.New("codec: signed value must be an object")
+	ErrNonInteger       = errors.New("codec: JSON number is not an integer")
+	// ErrIntegerOutOfRange reports a JSON integer outside the
+	// interoperable I-JSON range [-(2^53-1), 2^53-1].
+	ErrIntegerOutOfRange = errors.New("codec: integer exceeds the I-JSON safe range")
 	ErrInputTooLarge     = errors.New("codec: JSON exceeds the input limit")
 )
 
-// Canonicalize validates input strictly and returns its RFC 8785 encoding.
+// Canonicalize validates a CodeComm JSON value and returns its RFC 8785
+// encoding. Protocol numbers must be integers in the I-JSON safe range;
+// floating-point tokens and wider integers are rejected before binary64
+// conversion.
 func Canonicalize(input []byte) ([]byte, error) {
-	value, _, err := validateJSON(input, false, maxCanonicalJSONBytes)
+	return canonicalize(input, true, maxCanonicalJSONBytes)
+}
+
+// canonicalizeRFC8785 retains the full RFC number profile only for
+// differential and standards-vector tests. CodeComm protocol callers use the
+// integer-only exported functions above and below.
+func canonicalizeRFC8785(input []byte) ([]byte, error) {
+	return canonicalize(input, false, maxCanonicalJSONBytes)
+}
+
+func canonicalize(input []byte, integerOnly bool, maxBytes int) ([]byte, error) {
+	value, _, err := validateJSON(input, integerOnly, maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +194,10 @@ func validateSignedNumber(token string) error {
 	if strings.ContainsAny(token, ".eE") {
 		return fmt.Errorf("%w: %s", ErrNonInteger, token)
 	}
+	return validateIntegerRange(token)
+}
+
+func validateIntegerRange(token string) error {
 	value, err := strconv.ParseInt(token, 10, 64)
 	if err != nil || value < -maxSafeInteger || value > maxSafeInteger {
 		return fmt.Errorf("%w: %s", ErrIntegerOutOfRange, token)

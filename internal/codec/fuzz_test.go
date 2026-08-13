@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"testing"
 
 	referencejcs "github.com/gowebpki/jcs"
@@ -61,6 +63,33 @@ func FuzzCanonicalizeDifferential(f *testing.F) {
 	})
 }
 
+func FuzzCanonicalizeIntegerProfile(f *testing.F) {
+	for _, seed := range []int64{
+		0,
+		1,
+		-1,
+		maxSafeInteger,
+		-maxSafeInteger,
+		maxSafeInteger + 1,
+		-maxSafeInteger - 1,
+		1<<63 - 1,
+		-1 << 63,
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, value int64) {
+		input := []byte(`{"n":` + strconv.FormatInt(value, 10) + `}`)
+		if value < -maxSafeInteger || value > maxSafeInteger {
+			if _, err := Canonicalize(input); !errors.Is(err, ErrIntegerOutOfRange) {
+				t.Fatalf("Canonicalize(%q) error = %v, want %v", input, err, ErrIntegerOutOfRange)
+			}
+			return
+		}
+		compareCanonicalizers(t, input, false)
+	})
+}
+
 func compareCanonicalizers(t *testing.T, input []byte, signed bool) {
 	t.Helper()
 
@@ -71,7 +100,7 @@ func compareCanonicalizers(t *testing.T, input []byte, signed bool) {
 	if signed {
 		got, err = CanonicalizeSignedObject(input)
 	} else {
-		got, err = Canonicalize(input)
+		got, err = canonicalizeRFC8785(input)
 	}
 	if err != nil {
 		t.Fatalf("canonicalizer rejected valid input: %v", err)
