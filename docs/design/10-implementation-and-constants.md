@@ -94,7 +94,7 @@ defect.
 | Maximum signed-JSON nesting depth | 32 | Committed, immutable in V1; strict decode before signature work |
 | `cluster_min_apply_level` | 1 at V1 creation | Committed |
 | `multicast_ipv4_group` / `multicast_ipv6_group` / `multicast_port` | `239.192.71.31` / `ff12::c0de:c031` / 47831 | Committed, immutable in V1; IPv4 must be in `239.192.0.0/14`, IPv6 transient scope 2-8, port 1024-65535 |
-| `advertisement_interval_seconds` | 20; jitter ±25%, TTL/hop-limit 1, ≤1200 bytes | Committed |
+| `advertisement_interval_seconds` | 20; multicast base cadence `min(value, 48 s)` with independently sampled uniform jitter ±25%; TTL/hop-limit 1; ≤1200 bytes | Committed |
 | `endpoint_hint_ttl_seconds` | `8 * advertisement_interval_seconds` | Derived |
 | `voter_reconcile_deadline` | 30 s; an unfinished voter-set transit past this surfaces the `reconciling` state (§3, §9) | Local |
 | HTTPS port | 47831 default, configurable; per session, so concurrent sessions take the next free port | Local |

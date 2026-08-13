@@ -220,10 +220,13 @@ recovery key are lost, governance is unrecoverable even though existing strong w
 ### 4.4 Discovery
 
 Each session daemon MUST multicast a signed, versioned datagram on every selected
-interface at the §11.2 advertisement interval, and immediately on start, wake, and
-address change (§2.3). A device joined to several sessions emits one advertisement
-stream per session, and receivers filter by `session_id` (§3.3). Group address,
-interval, TTL, and size limit are in §11.2.
+interface, and immediately on start, wake, and address change (§2.3). Its multicast base cadence is
+`min(advertisement_interval_seconds, 48)` seconds with independently sampled uniform ±25% jitter;
+each datagram expires 60 seconds after the whole-second UTC emission time. The configured interval,
+not this cadence clamp, continues to derive endpoint-set TTL. This keeps every allowed 5–300 second
+policy value usable without creating routine gaps in short-lived discovery hints. A device joined to
+several sessions emits one advertisement stream per session, and receivers filter by `session_id`
+(§3.3). Group address, interval, TTL, and size limit are in §11.2.
 
 ```json
 {

@@ -194,12 +194,22 @@ func ParseAndVerify(input []byte, context VerificationContext) (SignedEvent, err
 	if !bytes.Equal(input, canonical) {
 		return SignedEvent{}, ErrNoncanonicalEvent
 	}
-	signedBytes, encodedSignature, err := removeTopLevelMember(
+	signedBytes, encodedSignature, err := codec.RemoveCanonicalObjectMember(
 		canonical,
 		"origin_signature",
 	)
 	if err != nil {
-		return SignedEvent{}, err
+		if errors.Is(err, codec.ErrObjectMemberAbsent) {
+			return SignedEvent{}, fmt.Errorf(
+				"%w: origin_signature",
+				ErrMissingField,
+			)
+		}
+		return SignedEvent{}, fmt.Errorf(
+			"%w: origin_signature: %v",
+			ErrInvalidEnvelope,
+			err,
+		)
 	}
 	var signatureText string
 	if err := json.Unmarshal(encodedSignature, &signatureText); err != nil {
@@ -724,166 +734,6 @@ func decodeStrict(input []byte, destination any) error {
 		return err
 	}
 	return nil
-}
-
-type canonicalMember struct {
-	key         string
-	memberStart int
-	memberEnd   int
-	valueStart  int
-	valueEnd    int
-}
-
-// removeTopLevelMember removes one member from an already-canonical object
-// without decoding and reserializing the remaining values. Unknown members
-// therefore remain in the exact signature preimage.
-func removeTopLevelMember(
-	canonical []byte,
-	target string,
-) ([]byte, json.RawMessage, error) {
-	members, err := scanCanonicalMembers(canonical)
-	if err != nil {
-		return nil, nil, err
-	}
-	result := make([]byte, 0, len(canonical))
-	result = append(result, '{')
-	var value json.RawMessage
-	found := false
-	wrote := false
-	for _, member := range members {
-		if member.key == target {
-			found = true
-			value = bytes.Clone(canonical[member.valueStart:member.valueEnd])
-			continue
-		}
-		if wrote {
-			result = append(result, ',')
-		}
-		result = append(result, canonical[member.memberStart:member.memberEnd]...)
-		wrote = true
-	}
-	result = append(result, '}')
-	if !found {
-		return nil, nil, fmt.Errorf("%w: %s", ErrMissingField, target)
-	}
-	return result, value, nil
-}
-
-func scanCanonicalMembers(canonical []byte) ([]canonicalMember, error) {
-	if len(canonical) < 2 || canonical[0] != '{' || canonical[len(canonical)-1] != '}' {
-		return nil, fmt.Errorf("%w: expected canonical object", ErrInvalidEnvelope)
-	}
-	if len(canonical) == 2 {
-		return nil, nil
-	}
-	var result []canonicalMember
-	for index := 1; index < len(canonical)-1; {
-		memberStart := index
-		keyEnd, err := scanJSONString(canonical, index)
-		if err != nil {
-			return nil, err
-		}
-		var key string
-		if err := json.Unmarshal(canonical[index:keyEnd], &key); err != nil {
-			return nil, fmt.Errorf("%w: object key", ErrInvalidEnvelope)
-		}
-		if keyEnd >= len(canonical) || canonical[keyEnd] != ':' {
-			return nil, fmt.Errorf("%w: object separator", ErrInvalidEnvelope)
-		}
-		valueStart := keyEnd + 1
-		valueEnd, err := scanJSONValue(canonical, valueStart)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, canonicalMember{
-			key:         key,
-			memberStart: memberStart,
-			memberEnd:   valueEnd,
-			valueStart:  valueStart,
-			valueEnd:    valueEnd,
-		})
-		index = valueEnd
-		switch canonical[index] {
-		case ',':
-			index++
-		case '}':
-			if index != len(canonical)-1 {
-				return nil, fmt.Errorf("%w: object end", ErrInvalidEnvelope)
-			}
-			return result, nil
-		default:
-			return nil, fmt.Errorf("%w: object delimiter", ErrInvalidEnvelope)
-		}
-	}
-	return nil, fmt.Errorf("%w: unterminated object", ErrInvalidEnvelope)
-}
-
-func scanJSONString(input []byte, start int) (int, error) {
-	if start >= len(input) || input[start] != '"' {
-		return 0, fmt.Errorf("%w: expected string", ErrInvalidEnvelope)
-	}
-	escaped := false
-	for index := start + 1; index < len(input); index++ {
-		switch {
-		case escaped:
-			escaped = false
-		case input[index] == '\\':
-			escaped = true
-		case input[index] == '"':
-			return index + 1, nil
-		}
-	}
-	return 0, fmt.Errorf("%w: unterminated string", ErrInvalidEnvelope)
-}
-
-func scanJSONValue(input []byte, start int) (int, error) {
-	if start >= len(input) {
-		return 0, fmt.Errorf("%w: missing value", ErrInvalidEnvelope)
-	}
-	if input[start] == '"' {
-		return scanJSONString(input, start)
-	}
-	if input[start] == '{' || input[start] == '[' {
-		depth := 0
-		inString := false
-		escaped := false
-		for index := start; index < len(input); index++ {
-			char := input[index]
-			if inString {
-				switch {
-				case escaped:
-					escaped = false
-				case char == '\\':
-					escaped = true
-				case char == '"':
-					inString = false
-				}
-				continue
-			}
-			switch char {
-			case '"':
-				inString = true
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				if depth == 0 {
-					return index + 1, nil
-				}
-			}
-		}
-		return 0, fmt.Errorf("%w: unterminated container", ErrInvalidEnvelope)
-	}
-	for index := start; index < len(input); index++ {
-		switch input[index] {
-		case ',', '}', ']':
-			if index == start {
-				return 0, fmt.Errorf("%w: empty value", ErrInvalidEnvelope)
-			}
-			return index, nil
-		}
-	}
-	return 0, fmt.Errorf("%w: unterminated scalar", ErrInvalidEnvelope)
 }
 
 func stringPointer(value string) *string {
