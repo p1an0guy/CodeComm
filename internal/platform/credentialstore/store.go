@@ -15,6 +15,8 @@ import (
 // MaxSecretBytes stays below every supported native provider's payload limit.
 const MaxSecretBytes = 1024
 
+const inviteSecretBytes = 16
+
 var (
 	ErrInvalidBackend = errors.New("credentialstore: invalid backend")
 	ErrInvalidContext = errors.New("credentialstore: invalid context")
@@ -65,7 +67,8 @@ func (store *Store) Provider() string {
 	return store.backend.Name()
 }
 
-// Get retrieves a nonempty bounded secret and returns a private copy.
+// Get retrieves a credential of the shape required by its reference kind and
+// returns a private copy.
 func (store *Store) Get(ctx context.Context, reference Reference) ([]byte, error) {
 	selectedBackend, release, err := store.acquire(ctx, reference)
 	if err != nil {
@@ -90,7 +93,7 @@ func (store *Store) Get(ctx context.Context, reference Reference) ([]byte, error
 			fmt.Errorf("%w: got %d bytes", ErrCorrupt, length),
 		)
 	}
-	if _, err := codecrypto.Ed25519PublicKeyFromPrivateKey(value); err != nil {
+	if err := validateCredential(reference.kind, value); err != nil {
 		clear(value)
 		return nil, store.operationError(
 			"read",
@@ -103,8 +106,9 @@ func (store *Store) Get(ctx context.Context, reference Reference) ([]byte, error
 	return result, nil
 }
 
-// Create stores a private copy of one nonempty bounded secret. Native backends
-// must atomically return ErrAlreadyExists instead of replacing any value.
+// Create stores a private copy of one credential after validating the shape
+// required by its reference kind. Native backends must atomically return
+// ErrAlreadyExists instead of replacing any value.
 func (store *Store) Create(ctx context.Context, reference Reference, value []byte) error {
 	selectedBackend, release, err := store.acquire(ctx, reference)
 	if err != nil {
@@ -120,7 +124,7 @@ func (store *Store) Create(ctx context.Context, reference Reference, value []byt
 			MaxSecretBytes,
 		)
 	}
-	if _, err = codecrypto.Ed25519PublicKeyFromPrivateKey(value); err != nil {
+	if err = validateCredential(reference.kind, value); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidSecret, err)
 	}
 	ownedValue := append([]byte(nil), value...)
@@ -132,6 +136,25 @@ func (store *Store) Create(ctx context.Context, reference Reference, value []byt
 		return store.operationError("create", reference, err)
 	}
 	return nil
+}
+
+func validateCredential(kind Kind, value []byte) error {
+	switch kind {
+	case KindIdentity, KindEpoch:
+		_, err := codecrypto.Ed25519PublicKeyFromPrivateKey(value)
+		return err
+	case KindInvite:
+		if len(value) != inviteSecretBytes {
+			return fmt.Errorf(
+				"invite secret has %d bytes, want %d",
+				len(value),
+				inviteSecretBytes,
+			)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported credential kind %q", kind)
+	}
 }
 
 // Delete erases a reference. Repeating an already completed erasure succeeds.

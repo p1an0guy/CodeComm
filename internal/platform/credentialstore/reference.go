@@ -11,18 +11,19 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 )
 
-// Kind identifies the lifecycle and namespace of one private key.
+// Kind identifies the lifecycle, shape, and namespace of one credential.
 type Kind string
 
 const (
 	KindIdentity Kind = "identity"
 	KindEpoch    Kind = "epoch"
+	KindInvite   Kind = "invite"
 )
 
 var ErrInvalidReference = errors.New("credentialstore: invalid secret reference")
 
 // Reference is an opaque, non-secret native-store key. Its fields are private
-// so callers cannot create aliases between identity and per-session epochs.
+// so callers cannot create aliases across credential namespaces.
 type Reference struct {
 	kind Kind
 	key  string
@@ -61,6 +62,23 @@ func EpochReference(
 	}, nil
 }
 
+// InviteReference returns a reference scoped to one session and pairing invite.
+func InviteReference(sessionID, inviteID domain.UUIDv7) (Reference, error) {
+	if !sessionID.Valid() || !inviteID.Valid() {
+		return Reference{}, fmt.Errorf(
+			"%w: invalid session or invite",
+			ErrInvalidReference,
+		)
+	}
+	return Reference{
+		kind: KindInvite,
+		key: strings.Join(
+			[]string{"invite", "v1", string(sessionID), string(inviteID)},
+			"/",
+		),
+	}, nil
+}
+
 // Kind reports the key lifecycle represented by this reference.
 func (reference Reference) Kind() Kind {
 	return reference.kind
@@ -92,6 +110,18 @@ func (reference Reference) Validate() error {
 		canonical, err := EpochReference(sessionID, deviceID, epoch)
 		if err != nil || canonical != reference {
 			return fmt.Errorf("%w: noncanonical epoch reference", ErrInvalidReference)
+		}
+	case KindInvite:
+		parts := strings.Split(reference.key, "/")
+		if len(parts) != 4 || parts[0] != "invite" || parts[1] != "v1" {
+			return fmt.Errorf("%w: malformed invite reference", ErrInvalidReference)
+		}
+		canonical, err := InviteReference(
+			domain.UUIDv7(parts[2]),
+			domain.UUIDv7(parts[3]),
+		)
+		if err != nil || canonical != reference {
+			return fmt.Errorf("%w: noncanonical invite reference", ErrInvalidReference)
 		}
 	default:
 		return fmt.Errorf("%w: unknown kind %q", ErrInvalidReference, reference.kind)

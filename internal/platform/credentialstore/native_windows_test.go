@@ -138,6 +138,7 @@ func TestWindowsCallErrorPreservesContextCancellation(t *testing.T) {
 	if errors.Is(err, ErrAccessDenied) {
 		t.Fatalf("windowsCallError() = %v, native error overrode context", err)
 	}
+	//lint:ignore SA1012 This is deliberate invalid-input coverage for a private boundary.
 	if err := windowsCallError(nil, windows.ERROR_ACCESS_DENIED); !errors.Is(err, ErrInvalidContext) {
 		t.Fatalf("windowsCallError(nil) = %v, want ErrInvalidContext", err)
 	}

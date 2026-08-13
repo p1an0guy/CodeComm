@@ -119,6 +119,77 @@ func TestStoreCreateAndGetDefensivelyCopySecrets(t *testing.T) {
 	}
 }
 
+func TestStoreCreateAndGetOpaqueInviteSecret(t *testing.T) {
+	t.Parallel()
+
+	backend := &fakeBackend{name: "test", values: make(map[string][]byte)}
+	store := mustStore(t, backend)
+	reference, err := InviteReference(testSessionID, testInviteID)
+	if err != nil {
+		t.Fatalf("InviteReference() error = %v", err)
+	}
+	secret := []byte{
+		0xff, 0x00, 0xfe, 0x01, 0xfd, 0x02, 0xfc, 0x03,
+		0xfb, 0x04, 0xfa, 0x05, 0xf9, 0x06, 0xf8, 0x07,
+	}
+	want := append([]byte(nil), secret...)
+
+	if err := store.Create(context.Background(), reference, secret); err != nil {
+		t.Fatalf("Store.Create() error = %v", err)
+	}
+	secret[0] = 0
+	got, err := store.Get(context.Background(), reference)
+	if err != nil {
+		t.Fatalf("Store.Get() error = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Store.Get() = %x, want %x", got, want)
+	}
+	got[0] = 0
+	if !bytes.Equal(backend.values[reference.key], want) {
+		t.Fatal("mutating Store.Get() result changed backend invite value")
+	}
+}
+
+func TestStoreCreateValidatesCredentialByReferenceKindBeforeBackend(t *testing.T) {
+	t.Parallel()
+
+	inviteReference, err := InviteReference(testSessionID, testInviteID)
+	if err != nil {
+		t.Fatalf("InviteReference() error = %v", err)
+	}
+	epochReference, err := EpochReference(testSessionID, testDeviceID, 1)
+	if err != nil {
+		t.Fatalf("EpochReference() error = %v", err)
+	}
+	tests := []struct {
+		name      string
+		reference Reference
+		value     []byte
+	}{
+		{name: "invite short", reference: inviteReference, value: make([]byte, inviteSecretBytes-1)},
+		{name: "invite long", reference: inviteReference, value: make([]byte, inviteSecretBytes+1)},
+		{name: "identity invite-sized", reference: IdentityReference(), value: make([]byte, inviteSecretBytes)},
+		{name: "epoch inconsistent key", reference: epochReference, value: make([]byte, ed25519.PrivateKeySize)},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			backend := &fakeBackend{name: "test", values: make(map[string][]byte)}
+			store := mustStore(t, backend)
+			err := store.Create(context.Background(), test.reference, test.value)
+			if !errors.Is(err, ErrInvalidSecret) {
+				t.Fatalf("Store.Create() error = %v, want %v", err, ErrInvalidSecret)
+			}
+			if backend.createCalls != 0 {
+				t.Fatalf("backend create calls = %d, want 0", backend.createCalls)
+			}
+		})
+	}
+}
+
 func TestStoreRejectsInvalidReferenceAndSecretBeforeBackend(t *testing.T) {
 	t.Parallel()
 
@@ -178,6 +249,45 @@ func TestStoreRejectsCorruptBackendValues(t *testing.T) {
 		if _, err := store.Get(context.Background(), reference); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Store.Get(%d bytes) error = %v, want %v", len(value), err, ErrCorrupt)
 		}
+	}
+}
+
+func TestStoreRejectsCorruptBackendValuesByReferenceKind(t *testing.T) {
+	t.Parallel()
+
+	inviteReference, err := InviteReference(testSessionID, testInviteID)
+	if err != nil {
+		t.Fatalf("InviteReference() error = %v", err)
+	}
+	epochReference, err := EpochReference(testSessionID, testDeviceID, 1)
+	if err != nil {
+		t.Fatalf("EpochReference() error = %v", err)
+	}
+	tests := []struct {
+		name      string
+		reference Reference
+		value     []byte
+	}{
+		{name: "identity wrong size", reference: IdentityReference(), value: make([]byte, inviteSecretBytes)},
+		{name: "identity wrong shape", reference: IdentityReference(), value: make([]byte, ed25519.PrivateKeySize)},
+		{name: "epoch wrong shape", reference: epochReference, value: make([]byte, ed25519.PrivateKeySize)},
+		{name: "invite short", reference: inviteReference, value: make([]byte, inviteSecretBytes-1)},
+		{name: "invite long", reference: inviteReference, value: make([]byte, inviteSecretBytes+1)},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			backend := &fakeBackend{
+				name:   "test",
+				values: map[string][]byte{test.reference.key: test.value},
+			}
+			store := mustStore(t, backend)
+			if _, err := store.Get(context.Background(), test.reference); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Store.Get() error = %v, want %v", err, ErrCorrupt)
+			}
+		})
 	}
 }
 
