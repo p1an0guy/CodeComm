@@ -182,6 +182,11 @@ func (service *Service) finalizeAttempt(
 		if ctx.Err() != nil {
 			return details, ctx.Err()
 		}
+		if errors.Is(err, ErrFinalizationIntegrity) ||
+			errors.Is(err, ErrInvalidDurableFinalizer) {
+			service.setFatal(err)
+			return details, err
+		}
 		if errors.Is(err, ErrFinalizationRejected) {
 			rejected, _, rejectErr := service.state.RejectPairingFinalization(
 				ctx,
