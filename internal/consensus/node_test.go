@@ -88,6 +88,191 @@ func TestSingleNodeStatusReportsReadyOneVoterAndDurableWork(t *testing.T) {
 	}
 }
 
+func TestApplyAtGenerationAppliesExactLineage(t *testing.T) {
+	node, identityPrivate, deviceID := openApplyAtGenerationTestNode(t)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"generation-fenced task",
+	)
+
+	result, err := node.ApplyAtGeneration(
+		testContext(t),
+		nodeTestSessionID,
+		0,
+		signed,
+	)
+	if err != nil {
+		t.Fatalf("ApplyAtGeneration(): %v", err)
+	}
+	if result.Duplicate ||
+		result.Outcome.Status != store.OutcomeAccepted ||
+		result.Heads.ChainIndex != 1 ||
+		result.Heads.ResultIndex != 1 {
+		t.Fatalf("ApplyAtGeneration() = %#v", result)
+	}
+	lookup, found, err := node.state.LookupCommandResult(
+		testContext(t),
+		nodeTestEventID1,
+	)
+	if err != nil {
+		t.Fatalf("LookupCommandResult(): %v", err)
+	}
+	if !found ||
+		lookup.SessionID != nodeTestSessionID ||
+		lookup.RecoveryGeneration != 0 {
+		t.Fatalf("LookupCommandResult() = (%#v, %t)", lookup, found)
+	}
+}
+
+func TestApplyAtGenerationMismatchDoesNotAdvanceState(t *testing.T) {
+	tests := []struct {
+		name       string
+		sessionID  domain.UUIDv7
+		generation uint64
+	}{
+		{
+			name:       "session",
+			sessionID:  nodeTestBootID2,
+			generation: 0,
+		},
+		{
+			name:       "generation",
+			sessionID:  nodeTestSessionID,
+			generation: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node, identityPrivate, deviceID :=
+				openApplyAtGenerationTestNode(t)
+			signed := nodeTestTaskEvent(
+				t,
+				identityPrivate,
+				deviceID,
+				nodeTestBootID1,
+				nodeTestEventID1,
+				nodeTestTaskID1,
+				nodeTestTimestamp1,
+				1,
+				"must not commit",
+			)
+			before, err := node.View(testContext(t))
+			if err != nil {
+				t.Fatalf("View(before): %v", err)
+			}
+
+			if _, err := node.ApplyAtGeneration(
+				testContext(t),
+				test.sessionID,
+				test.generation,
+				signed,
+			); !errors.Is(err, ErrLineageMismatch) {
+				t.Fatalf(
+					"ApplyAtGeneration() error = %v, want ErrLineageMismatch",
+					err,
+				)
+			}
+			assertApplyAtGenerationDidNotAdvance(
+				t,
+				node,
+				before,
+				nodeTestEventID1,
+			)
+		})
+	}
+}
+
+func TestApplyAtGenerationCancellationWhileGateOccupiedDoesNotAdvanceState(
+	t *testing.T,
+) {
+	node, identityPrivate, deviceID := openApplyAtGenerationTestNode(t)
+	signed := nodeTestTaskEvent(
+		t,
+		identityPrivate,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp1,
+		1,
+		"canceled generation-fenced task",
+	)
+	before, err := node.View(testContext(t))
+	if err != nil {
+		t.Fatalf("View(before): %v", err)
+	}
+
+	gateEntered := make(chan struct{})
+	releaseGate := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseGate) })
+	})
+	holderDone := make(chan error, 1)
+	go func() {
+		holderDone <- node.withLineageGate(
+			context.Background(),
+			func() error {
+				close(gateEntered)
+				<-releaseGate
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-gateEntered:
+	case <-testContext(t).Done():
+		t.Fatal("lineage gate holder did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	applyDone := make(chan error, 1)
+	go func() {
+		_, err := node.ApplyAtGeneration(
+			ctx,
+			nodeTestSessionID,
+			0,
+			signed,
+		)
+		applyDone <- err
+	}()
+	select {
+	case err := <-applyDone:
+		t.Fatalf("ApplyAtGeneration() bypassed occupied gate: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf(
+				"ApplyAtGeneration() error = %v, want context.Canceled",
+				err,
+			)
+		}
+	case <-testContext(t).Done():
+		t.Fatal("canceled ApplyAtGeneration() did not return")
+	}
+
+	releaseOnce.Do(func() { close(releaseGate) })
+	if err := <-holderDone; err != nil {
+		t.Fatalf("lineage gate holder: %v", err)
+	}
+	assertApplyAtGenerationDidNotAdvance(
+		t,
+		node,
+		before,
+		nodeTestEventID1,
+	)
+}
+
 const (
 	nodeTestSessionID   = domain.UUIDv7("018f47de-89ab-7def-8123-0123456789ab")
 	nodeTestWorkspaceID = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
@@ -1718,6 +1903,70 @@ func nodeTestInitialState(
 		},
 	}
 	return initial, identityPrivate, deviceID
+}
+
+func openApplyAtGenerationTestNode(
+	t *testing.T,
+) (*SingleNode, ed25519.PrivateKey, domain.DeviceID) {
+	t.Helper()
+	root := t.TempDir()
+	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+	return node, identityPrivate, deviceID
+}
+
+func assertApplyAtGenerationDidNotAdvance(
+	t *testing.T,
+	node *SingleNode,
+	before store.StateView,
+	eventID domain.UUIDv7,
+) {
+	t.Helper()
+	after, err := node.View(testContext(t))
+	if err != nil {
+		t.Fatalf("View(after): %v", err)
+	}
+	if after.Heads != before.Heads ||
+		!sameOptionalUint64(
+			after.LastRaftAppliedLogIndex,
+			before.LastRaftAppliedLogIndex,
+		) {
+		t.Fatalf(
+			"failed ApplyAtGeneration() advanced state:\nbefore: %#v\nafter:  %#v",
+			before,
+			after,
+		)
+	}
+	lookup, found, err := node.state.LookupCommandResult(
+		testContext(t),
+		eventID,
+	)
+	if err != nil {
+		t.Fatalf("LookupCommandResult(): %v", err)
+	}
+	if found {
+		t.Fatalf("LookupCommandResult() = %#v, true; want no result", lookup)
+	}
+}
+
+func sameOptionalUint64(left, right *uint64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func nodeTestTaskEvent(

@@ -39,6 +39,7 @@ var (
 	ErrSnapshotAnchorCoverage = errors.New("consensus: SQLite does not cover Raft snapshot anchor")
 	ErrRaftLogCoverage        = errors.New("consensus: Raft log/snapshot coverage is invalid")
 	ErrNodeClosed             = errors.New("consensus: node is closing or closed")
+	ErrLineageMismatch        = errors.New("consensus: active lineage differs from expected lineage")
 )
 
 // SingleNodeOptions owns the complete Phase 2 local consensus runtime.
@@ -75,10 +76,12 @@ type SingleNode struct {
 	closing      bool
 	closeStarted chan struct{}
 	active       sync.WaitGroup
+	lineageGate  chan struct{}
 
 	fatalOnce sync.Once
 	fatalMu   sync.RWMutex
 	fatalErr  error
+	fatalSet  chan struct{}
 
 	raftShutdownOnce sync.Once
 	raftShutdownErr  error
@@ -325,6 +328,8 @@ func OpenSingleNode(
 		monitorStop:  make(chan struct{}),
 		monitorDone:  make(chan struct{}),
 		closeStarted: make(chan struct{}),
+		lineageGate:  make(chan struct{}, 1),
+		fatalSet:     make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -921,6 +926,7 @@ func (node *SingleNode) recordFatal(err error) {
 		node.fatalMu.Lock()
 		node.fatalErr = err
 		node.fatalMu.Unlock()
+		close(node.fatalSet)
 	})
 }
 
@@ -953,6 +959,56 @@ func (node *SingleNode) beginOperation() error {
 
 func (node *SingleNode) endOperation() {
 	node.active.Done()
+}
+
+// withLineageGate serializes a durable-lineage check and its side effect with
+// any future successor installation using the same callback boundary.
+func (node *SingleNode) withLineageGate(
+	ctx context.Context,
+	operation func() error,
+) error {
+	if node == nil ||
+		ctx == nil ||
+		operation == nil ||
+		node.lineageGate == nil ||
+		node.closeStarted == nil ||
+		node.fatalSet == nil {
+		return ErrInvalidNodeOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := node.beginOperation(); err != nil {
+		return err
+	}
+	defer node.endOperation()
+	if err := node.FatalError(); err != nil {
+		return err
+	}
+
+	select {
+	case node.lineageGate <- struct{}{}:
+		defer func() { <-node.lineageGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-node.closeStarted:
+		return ErrNodeClosed
+	case <-node.fatalSet:
+		return node.FatalError()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-node.closeStarted:
+		return ErrNodeClosed
+	default:
+	}
+	if err := node.FatalError(); err != nil {
+		return err
+	}
+	return operation()
 }
 
 // Address returns the loopback Raft transport address.
@@ -1096,6 +1152,71 @@ func (node *SingleNode) Apply(
 	if err := node.FatalError(); err != nil {
 		return store.ApplyResult{}, err
 	}
+	return node.apply(ctx, signed, false)
+}
+
+// ApplyAtGeneration proposes only while the exact expected lineage remains
+// active. Once enqueued, the proposal retains the lineage gate until its Raft
+// future resolves so successor installation cannot overtake it.
+func (node *SingleNode) ApplyAtGeneration(
+	ctx context.Context,
+	expectedSessionID domain.UUIDv7,
+	expectedRecoveryGeneration uint64,
+	signed event.SignedEvent,
+) (store.ApplyResult, error) {
+	if node == nil ||
+		node.raft == nil ||
+		node.state == nil ||
+		ctx == nil ||
+		!expectedSessionID.Valid() ||
+		!domain.ValidUnsignedInteger(expectedRecoveryGeneration) {
+		return store.ApplyResult{}, ErrInvalidNodeOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return store.ApplyResult{}, err
+	}
+
+	var result store.ApplyResult
+	err := node.withLineageGate(ctx, func() error {
+		if signed.Proposal().SessionID != expectedSessionID {
+			return fmt.Errorf(
+				"%w: signed event belongs to session %q",
+				ErrLineageMismatch,
+				signed.Proposal().SessionID,
+			)
+		}
+		view, err := node.state.View(ctx)
+		if err != nil {
+			return err
+		}
+		if view.SessionID != expectedSessionID ||
+			view.RecoveryGeneration != expectedRecoveryGeneration {
+			return fmt.Errorf(
+				"%w: expected %s/%d, active %s/%d",
+				ErrLineageMismatch,
+				expectedSessionID,
+				expectedRecoveryGeneration,
+				view.SessionID,
+				view.RecoveryGeneration,
+			)
+		}
+		result, err = node.apply(ctx, signed, true)
+		return err
+	})
+	return result, err
+}
+
+func (node *SingleNode) apply(
+	ctx context.Context,
+	signed event.SignedEvent,
+	waitForResolution bool,
+) (store.ApplyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return store.ApplyResult{}, err
+	}
+	if err := node.FatalError(); err != nil {
+		return store.ApplyResult{}, err
+	}
 	proposal := signed.Proposal()
 	canonical := signed.CanonicalBytes()
 	if !proposal.EventID.Valid() || len(canonical) == 0 {
@@ -1113,14 +1234,32 @@ func (node *SingleNode) Apply(
 		return committed, nil
 	}
 	if owner {
-		future := node.raft.Apply(canonical, contextTimeout(ctx))
-		node.active.Add(1)
-		go node.resolveProposal(
-			proposal.EventID,
-			signed,
-			flight,
-			future,
-		)
+		if err := node.preEnqueueError(ctx); err != nil {
+			node.finishProposal(
+				proposal.EventID,
+				flight,
+				store.ApplyResult{},
+				err,
+				false,
+			)
+		} else {
+			future := node.raft.Apply(canonical, contextTimeout(ctx))
+			node.active.Add(1)
+			go node.resolveProposal(
+				proposal.EventID,
+				signed,
+				flight,
+				future,
+			)
+		}
+	}
+	if waitForResolution {
+		<-flight.done
+		result := flight.result
+		if !owner && flight.err == nil {
+			result.Duplicate = true
+		}
+		return result, flight.err
 	}
 	select {
 	case <-flight.done:
@@ -1134,6 +1273,18 @@ func (node *SingleNode) Apply(
 	case <-node.closeStarted:
 		return store.ApplyResult{}, ErrNodeClosed
 	}
+}
+
+func (node *SingleNode) preEnqueueError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-node.closeStarted:
+		return ErrNodeClosed
+	default:
+	}
+	return node.FatalError()
 }
 
 func (node *SingleNode) resolveProposal(
