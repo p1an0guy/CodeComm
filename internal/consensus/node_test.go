@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,19 +19,23 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/credential"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/plan"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/domain/publication"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/reducer"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/transport"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
@@ -90,6 +96,17 @@ func TestSingleNodeStatusReportsReadyOneVoterAndDurableWork(t *testing.T) {
 
 func TestApplyAtGenerationAppliesExactLineage(t *testing.T) {
 	node, identityPrivate, deviceID := openApplyAtGenerationTestNode(t)
+	initialAdmission, err := node.PeerAdmissionSnapshot()
+	if err != nil {
+		t.Fatalf("PeerAdmissionSnapshot(initial): %v", err)
+	}
+	if index, valid := initialAdmission.AppliedChainIndex(); !valid || index != 0 {
+		t.Fatalf(
+			"initial admission chain index = (%d, %t), want (0, true)",
+			index,
+			valid,
+		)
+	}
 	signed := nodeTestTaskEvent(
 		t,
 		identityPrivate,
@@ -128,6 +145,361 @@ func TestApplyAtGenerationAppliesExactLineage(t *testing.T) {
 		lookup.SessionID != nodeTestSessionID ||
 		lookup.RecoveryGeneration != 0 {
 		t.Fatalf("LookupCommandResult() = (%#v, %t)", lookup, found)
+	}
+	appliedAdmission, err := node.PeerAdmissionSnapshot()
+	if err != nil {
+		t.Fatalf("PeerAdmissionSnapshot(applied): %v", err)
+	}
+	if index, valid := appliedAdmission.AppliedChainIndex(); !valid || index != 1 {
+		t.Fatalf(
+			"applied admission chain index = (%d, %t), want (1, true)",
+			index,
+			valid,
+		)
+	}
+	member, found := appliedAdmission.Member(deviceID)
+	if !found || member.ID != deviceID ||
+		!bytes.Equal(member.IdentityPublicKey, identityPrivate.Public().(ed25519.PublicKey)) {
+		t.Fatalf("applied admission member = (%+v, %t)", member, found)
+	}
+}
+
+func TestPeerAdmissionSnapshotFailsClosedOnRevisionMismatch(t *testing.T) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+
+	publication := node.fsm.admission.Load()
+	if publication == nil || publication.snapshot == nil ||
+		publication.revision < 1 {
+		t.Fatalf("initial peer-admission publication = %#v", publication)
+	}
+	select {
+	case <-node.PeerAdmissionChanges():
+	default:
+		t.Fatal("initial peer-admission publication was not signaled")
+	}
+
+	node.fsm.admission.Store(&peerAdmissionPublication{
+		revision: publication.revision + 1,
+		snapshot: publication.snapshot,
+	})
+	if snapshot, err := node.PeerAdmissionSnapshot(); snapshot != nil ||
+		!errors.Is(err, ErrPeerAdmissionUnavailable) {
+		t.Fatalf(
+			"PeerAdmissionSnapshot(mismatch) = (%v, %v), want unavailable",
+			snapshot,
+			err,
+		)
+	}
+
+	node.fsm.admission.Store(publication)
+	if snapshot, err := node.PeerAdmissionSnapshot(); err != nil ||
+		snapshot != publication.snapshot {
+		t.Fatalf(
+			"PeerAdmissionSnapshot(restored) = (%p, %v), want %p",
+			snapshot,
+			err,
+			publication.snapshot,
+		)
+	}
+}
+
+func TestPeerAdmissionChangesCloseOnNodeShutdown(t *testing.T) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+	changes := node.PeerAdmissionChanges()
+	awaitPeerAdmissionChange(t, changes, "initial publication")
+
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	select {
+	case _, open := <-changes:
+		if open {
+			t.Fatal("PeerAdmissionChanges() remained open after Close")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PeerAdmissionChanges() did not close with node")
+	}
+}
+
+func TestPeerAdmissionChangesCloseOnFatalNodeFailure(t *testing.T) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+	changes := node.PeerAdmissionChanges()
+	awaitPeerAdmissionChange(t, changes, "initial publication")
+
+	terminal := errors.New("terminal test failure")
+	node.recordFatal(terminal)
+	select {
+	case _, open := <-changes:
+		if open {
+			t.Fatal("PeerAdmissionChanges() remained open after fatal failure")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PeerAdmissionChanges() did not close after fatal failure")
+	}
+	if err := node.FatalError(); !errors.Is(err, terminal) {
+		t.Fatalf("FatalError() = %v, want %v", err, terminal)
+	}
+}
+
+func TestAdmissionAccessChangedExcludesAuditAccounting(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		changes reducer.Changes
+		want    bool
+	}{
+		"none": {},
+		"audit accounting": {
+			changes: reducer.Changes{
+				AuditCounters: []auditcounter.Counter{{}},
+			},
+		},
+		"membership": {
+			changes: reducer.Changes{
+				Devices: []device.Device{{}},
+			},
+			want: true,
+		},
+		"credential authorization": {
+			changes: reducer.Changes{
+				CredentialAuthorizations: []credentialauthorization.Authorization{{}},
+			},
+			want: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := admissionAccessChanged(test.changes); got != test.want {
+				t.Fatalf("admissionAccessChanged() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPeerAdmissionTracksCredentialRoleAndRevocationApplies(t *testing.T) {
+	fixture := openPeerAdmissionTestNode(t)
+	changes := fixture.node.PeerAdmissionChanges()
+	select {
+	case <-changes:
+	default:
+		t.Fatal("initial peer-admission publication was not signaled")
+	}
+
+	readerStop := make(chan struct{})
+	readerErrors := make(chan error, 32)
+	var readers sync.WaitGroup
+	for range 32 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-readerStop:
+					return
+				default:
+					snapshot, err := fixture.node.PeerAdmissionSnapshot()
+					if err != nil {
+						if errors.Is(err, ErrPeerAdmissionUnavailable) {
+							continue
+						}
+						readerErrors <- err
+						return
+					}
+					sessionID, generation, valid := snapshot.Lineage()
+					member, found := snapshot.Member(fixture.peerDeviceID)
+					if !valid || sessionID != nodeTestSessionID ||
+						generation != 0 || !found ||
+						member.ID != fixture.peerDeviceID {
+						readerErrors <- errors.New(
+							"concurrent reader observed an invalid admission cut",
+						)
+						return
+					}
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(readerStop)
+		readers.Wait()
+		close(readerErrors)
+		for err := range readerErrors {
+			t.Errorf("concurrent peer-admission read: %v", err)
+		}
+	}()
+
+	credentialEvent, authorization, epochPrivateKey :=
+		nodeTestCredentialAuthorizationEvent(t, fixture, 1)
+	result, err := fixture.node.Apply(testContext(t), credentialEvent)
+	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("Apply(credential) = (%#v, %v)", result, err)
+	}
+	awaitPeerAdmissionChange(t, changes, "credential authorization")
+
+	contentTLS, _, err := transport.IssueContentCertificate(
+		authorization,
+		epochPrivateKey,
+	)
+	if err != nil {
+		t.Fatalf("IssueContentCertificate(): %v", err)
+	}
+	contentCertificate, err := transport.ParseContentCertificate(
+		contentTLS.Certificate[0],
+	)
+	if err != nil {
+		t.Fatalf("ParseContentCertificate(): %v", err)
+	}
+	identityTLS, _, err := transport.IssueIdentityCertificate(
+		nodeTestSessionID,
+		0,
+		fixture.peerIdentityPrivate,
+	)
+	if err != nil {
+		t.Fatalf("IssueIdentityCertificate(): %v", err)
+	}
+	identityCertificate, err := transport.ParseIdentityCertificate(
+		identityTLS.Certificate[0],
+	)
+	if err != nil {
+		t.Fatalf("ParseIdentityCertificate(): %v", err)
+	}
+	verifiers, err := peerauth.NewVerifiers(
+		fixture.node.PeerAdmissionSnapshot,
+		func() time.Time {
+			return time.Date(2026, 8, 14, 12, 5, 0, 0, time.UTC)
+		},
+	)
+	if err != nil {
+		t.Fatalf("peerauth.NewVerifiers(): %v", err)
+	}
+	if err := verifiers.VerifyConsensusPeer(identityCertificate); err != nil {
+		t.Fatalf("VerifyConsensusPeer(active) error = %v", err)
+	}
+	if _, err := verifiers.VerifyContentPeer(contentCertificate); err != nil {
+		t.Fatalf("VerifyContentPeer(active) error = %v", err)
+	}
+	if err := verifiers.RequireOwner(fixture.peerDeviceID); err != nil {
+		t.Fatalf("RequireOwner(active owner) error = %v", err)
+	}
+
+	roleEvent := nodeTestMembershipEvent(
+		t,
+		fixture.ownerIdentityPrivate,
+		fixture.ownerDeviceID,
+		event.KindMembershipRoleChanged,
+		fixture.peerDeviceID,
+		1,
+		map[string]any{
+			"device_id": fixture.peerDeviceID,
+			"role":      device.RoleEditor,
+		},
+		nodeTestEventID5,
+		2,
+	)
+	result, err = fixture.node.Apply(testContext(t), roleEvent)
+	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("Apply(role change) = (%#v, %v)", result, err)
+	}
+	awaitPeerAdmissionChange(t, changes, "role change")
+	if _, err := verifiers.VerifyContentPeer(contentCertificate); err != nil {
+		t.Fatalf("credential stopped authenticating after demotion: %v", err)
+	}
+	if role, err := verifiers.CurrentRole(fixture.peerDeviceID); err != nil ||
+		role != device.RoleEditor {
+		t.Fatalf("CurrentRole(demoted) = (%q, %v)", role, err)
+	}
+	if err := verifiers.RequireOwner(fixture.peerDeviceID); !errors.Is(
+		err,
+		peerauth.ErrPeerNotAuthorized,
+	) {
+		t.Fatalf("RequireOwner(demoted) error = %v", err)
+	}
+
+	ingress := startPeerAdmissionTestIngress(
+		t,
+		fixture,
+		verifiers,
+		changes,
+	)
+	consensusConnection := ingress.dial(
+		t,
+		transport.PlaneConsensus,
+		identityTLS,
+	)
+	defer consensusConnection.Close()
+	contentConnection := ingress.dial(
+		t,
+		transport.PlaneContent,
+		contentTLS,
+	)
+	defer contentConnection.Close()
+	enteredPlanes := make(map[transport.Plane]bool, 2)
+	for range 2 {
+		select {
+		case peer := <-ingress.entered:
+			if peer.DeviceID != fixture.peerDeviceID {
+				t.Fatalf(
+					"ingress peer = %+v, want device %s",
+					peer,
+					fixture.peerDeviceID,
+				)
+			}
+			enteredPlanes[peer.Plane] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for peer ingress")
+		}
+	}
+	if !enteredPlanes[transport.PlaneConsensus] ||
+		!enteredPlanes[transport.PlaneContent] {
+		t.Fatalf("entered ingress planes = %v", enteredPlanes)
+	}
+
+	revokeEvent := nodeTestMembershipEvent(
+		t,
+		fixture.ownerIdentityPrivate,
+		fixture.ownerDeviceID,
+		event.KindMembershipDeviceRevoked,
+		fixture.peerDeviceID,
+		2,
+		map[string]any{
+			"device_id":                  fixture.peerDeviceID,
+			"reason":                     "integration test retirement",
+			"voter_set":                  []domain.DeviceID{fixture.ownerDeviceID},
+			"expected_voter_set_version": uint64(1),
+		},
+		nodeTestEventID6,
+		3,
+	)
+	result, err = fixture.node.Apply(testContext(t), revokeEvent)
+	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("Apply(revocation) = (%#v, %v)", result, err)
+	}
+	closedPlanes := make(map[transport.Plane]bool, 2)
+	for range 2 {
+		select {
+		case peer := <-ingress.canceled:
+			closedPlanes[peer.Plane] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for revoked ingress closure")
+		}
+	}
+	if !closedPlanes[transport.PlaneConsensus] ||
+		!closedPlanes[transport.PlaneContent] {
+		t.Fatalf("revocation closed planes = %v", closedPlanes)
+	}
+	assertPeerTLSClosed(t, consensusConnection)
+	assertPeerTLSClosed(t, contentConnection)
+	if err := verifiers.VerifyConsensusPeer(identityCertificate); !errors.Is(
+		err,
+		peerauth.ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyConsensusPeer(revoked) error = %v", err)
+	}
+	if _, err := verifiers.VerifyContentPeer(contentCertificate); !errors.Is(
+		err,
+		peerauth.ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(revoked) error = %v", err)
 	}
 }
 
@@ -386,6 +758,9 @@ const (
 	nodeTestEventID1    = domain.UUIDv7("018f47de-89ab-7def-8123-3123456789ab")
 	nodeTestEventID2    = domain.UUIDv7("018f47de-89ab-7def-8123-4123456789ab")
 	nodeTestEventID3    = domain.UUIDv7("018f47de-89ab-7def-8123-4223456789ab")
+	nodeTestEventID4    = domain.UUIDv7("018f47de-89ab-7def-8123-4323456789ab")
+	nodeTestEventID5    = domain.UUIDv7("018f47de-89ab-7def-8123-4423456789ab")
+	nodeTestEventID6    = domain.UUIDv7("018f47de-89ab-7def-8123-4523456789ab")
 	nodeTestTaskID1     = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ab")
 	nodeTestTaskID2     = domain.UUIDv7("018f47de-89ab-7def-8123-6123456789ab")
 	nodeTestTaskID3     = domain.UUIDv7("018f47de-89ab-7def-8123-6223456789ab")
@@ -2008,6 +2383,509 @@ func nodeTestInitialState(
 		},
 	}
 	return initial, identityPrivate, deviceID
+}
+
+type peerAdmissionTestFixture struct {
+	node                 *SingleNode
+	ownerIdentityPrivate ed25519.PrivateKey
+	ownerDeviceID        domain.DeviceID
+	peerIdentityPrivate  ed25519.PrivateKey
+	peerDeviceID         domain.DeviceID
+}
+
+func openPeerAdmissionTestNode(t *testing.T) peerAdmissionTestFixture {
+	t.Helper()
+	initial, ownerPrivate, ownerID := nodeTestInitialState(t)
+	peerPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x32}, ed25519.SeedSize),
+	)
+	peerPublic := bytes.Clone(peerPrivate.Public().(ed25519.PublicKey))
+	peerID, err := device.DeriveID(peerPublic)
+	if err != nil {
+		t.Fatalf("device.DeriveID(peer): %v", err)
+	}
+	initial.Projections.Devices = append(
+		initial.Projections.Devices,
+		device.Device{
+			ID:                peerID,
+			Role:              device.RoleOwner,
+			IdentityPublicKey: peerPublic,
+			DaemonVersion:     "0.1.0",
+			MaxApplyLevel:     1,
+			Status:            device.StatusActive,
+			EntityVersion:     1,
+		},
+	)
+	initial.Projections.AuditCounters = append(
+		initial.Projections.AuditCounters,
+		auditcounter.Counter{DeviceID: peerID},
+	)
+
+	root := t.TempDir()
+	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     ownerID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(peer admission): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	waitForNodeLeader(t, node)
+	return peerAdmissionTestFixture{
+		node:                 node,
+		ownerIdentityPrivate: ownerPrivate,
+		ownerDeviceID:        ownerID,
+		peerIdentityPrivate:  peerPrivate,
+		peerDeviceID:         peerID,
+	}
+}
+
+type nodeTestCredentialEndorsementWire struct {
+	AuthorityVoterSetVersion uint64 `json:"authority_voter_set_version"`
+	Epoch                    uint64 `json:"epoch"`
+	IssuedAt                 string `json:"issued_at"`
+	KeyDigest                string `json:"key_digest"`
+	SessionID                string `json:"session_id"`
+	SubjectDeviceID          string `json:"subject_device_id"`
+}
+
+func nodeTestCredentialAuthorizationEvent(
+	t *testing.T,
+	fixture peerAdmissionTestFixture,
+	sequence uint64,
+) (
+	event.SignedEvent,
+	credentialauthorization.Authorization,
+	ed25519.PrivateKey,
+) {
+	t.Helper()
+	epochPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x33}, ed25519.SeedSize),
+	)
+	binding, err := credential.SignBinding(
+		nodeTestSessionID,
+		fixture.peerDeviceID,
+		1,
+		epochPrivate.Public().(ed25519.PublicKey),
+		fixture.peerIdentityPrivate,
+	)
+	if err != nil {
+		t.Fatalf("credential.SignBinding(): %v", err)
+	}
+	authorization := credentialauthorization.Authorization{
+		SessionID:                nodeTestSessionID,
+		DeviceID:                 fixture.peerDeviceID,
+		Epoch:                    1,
+		EpochPublicKey:           binding.EpochPublicKey,
+		KeyDigest:                binding.KeyDigest,
+		Role:                     credentialauthorization.RoleOwner,
+		IssuedAt:                 "2026-08-14T12:00:00Z",
+		NotBefore:                "2026-08-14T12:00:00Z",
+		ValiditySeconds:          credentialauthorization.ValiditySeconds,
+		AuthorityVoterSetVersion: 1,
+		BindingSignature:         binding.Signature,
+		AuthorizationChainIndex:  1,
+	}
+	endorsementJSON, err := json.Marshal(nodeTestCredentialEndorsementWire{
+		AuthorityVoterSetVersion: authorization.AuthorityVoterSetVersion,
+		Epoch:                    authorization.Epoch,
+		IssuedAt:                 string(authorization.IssuedAt),
+		KeyDigest: codec.EncodeBase64URL(
+			authorization.KeyDigest[:],
+		),
+		SessionID:       string(authorization.SessionID),
+		SubjectDeviceID: string(authorization.DeviceID),
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(credential endorsement): %v", err)
+	}
+	endorsementPreimage, err := codec.CanonicalizeSignedObject(
+		endorsementJSON,
+	)
+	if err != nil {
+		t.Fatalf("canonicalize credential endorsement: %v", err)
+	}
+	endorsementSignature, err := codecommcrypto.SignEd25519(
+		fixture.ownerIdentityPrivate,
+		codec.SignatureCredentialTimeEndorsement,
+		endorsementPreimage,
+	)
+	if err != nil {
+		t.Fatalf("sign credential endorsement: %v", err)
+	}
+	endorsement := credentialauthorization.ClockEndorsement{
+		DeviceID: fixture.ownerDeviceID,
+	}
+	copy(endorsement.Signature[:], endorsementSignature)
+	authorization.ClockEndorsements = []credentialauthorization.ClockEndorsement{
+		endorsement,
+	}
+	if err := authorization.Validate(); err != nil {
+		t.Fatalf("credential authorization fixture: %v", err)
+	}
+
+	payload := map[string]any{
+		"subject_device_id": authorization.DeviceID,
+		"epoch_public_key": codec.EncodeBase64URL(
+			authorization.EpochPublicKey[:],
+		),
+		"key_digest": codec.EncodeBase64URL(
+			authorization.KeyDigest[:],
+		),
+		"epoch":                       authorization.Epoch,
+		"role":                        authorization.Role,
+		"issued_at":                   authorization.IssuedAt,
+		"not_before":                  authorization.NotBefore,
+		"validity_seconds":            authorization.ValiditySeconds,
+		"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
+		"clock_endorsements": []map[string]any{{
+			"device_id": endorsement.DeviceID,
+			"signature": codec.EncodeBase64URL(
+				endorsement.Signature[:],
+			),
+		}},
+		"binding_signature": codec.EncodeBase64URL(
+			authorization.BindingSignature[:],
+		),
+	}
+	signed := nodeTestSignedCommand(
+		t,
+		fixture.ownerIdentityPrivate,
+		fixture.ownerDeviceID,
+		event.ActorDaemon,
+		event.KindCredentialAuthorized,
+		fixture.peerDeviceID,
+		nil,
+		payload,
+		nodeTestEventID4,
+		sequence,
+	)
+	return signed, authorization, epochPrivate
+}
+
+func nodeTestMembershipEvent(
+	t *testing.T,
+	privateKey ed25519.PrivateKey,
+	originDeviceID domain.DeviceID,
+	kind event.Kind,
+	subjectDeviceID domain.DeviceID,
+	expectedVersion uint64,
+	payload map[string]any,
+	eventID domain.UUIDv7,
+	sequence uint64,
+) event.SignedEvent {
+	t.Helper()
+	return nodeTestSignedCommand(
+		t,
+		privateKey,
+		originDeviceID,
+		event.ActorHuman,
+		kind,
+		subjectDeviceID,
+		&expectedVersion,
+		payload,
+		eventID,
+		sequence,
+	)
+}
+
+func nodeTestSignedCommand(
+	t *testing.T,
+	privateKey ed25519.PrivateKey,
+	originDeviceID domain.DeviceID,
+	actor event.ActorType,
+	kind event.Kind,
+	subjectDeviceID domain.DeviceID,
+	expectedVersion *uint64,
+	payload any,
+	eventID domain.UUIDv7,
+	sequence uint64,
+) event.SignedEvent {
+	t.Helper()
+	authority, err := event.NewLocalAuthority(
+		originDeviceID,
+		nodeTestBootID1,
+	)
+	if err != nil {
+		t.Fatalf("event.NewLocalAuthority(): %v", err)
+	}
+	var binding event.Binding
+	switch actor {
+	case event.ActorHuman:
+		binding, err = authority.OperatorBinding()
+	case event.ActorDaemon:
+		binding, err = authority.DaemonBinding()
+	default:
+		t.Fatalf("unsupported actor %q", actor)
+	}
+	if err != nil {
+		t.Fatalf("event binding: %v", err)
+	}
+	encodedPayload, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("json.Marshal(command payload): %v", err)
+	}
+	proposal, err := event.BuildProposal(
+		event.Command{
+			Kind:                  kind,
+			EntityID:              event.StringEntityID(string(subjectDeviceID)),
+			ExpectedEntityVersion: expectedVersion,
+			Actions:               []event.Action{},
+			Payload:               encodedPayload,
+			Redaction: event.Redaction{
+				Policy:        event.RedactionDefault,
+				FieldsRemoved: []event.RedactionField{},
+			},
+		},
+		binding,
+		event.BuildContext{
+			EventID:        eventID,
+			SessionID:      nodeTestSessionID,
+			WorkspaceID:    nodeTestWorkspaceID,
+			CreatedAt:      nodeTestTimestamp1,
+			OriginSequence: sequence,
+		},
+	)
+	if err != nil {
+		t.Fatalf("event.BuildProposal(%s): %v", kind, err)
+	}
+	signed, err := event.Sign(proposal, privateKey)
+	if err != nil {
+		t.Fatalf("event.Sign(%s): %v", kind, err)
+	}
+	return signed
+}
+
+func awaitPeerAdmissionChange(
+	t *testing.T,
+	changes <-chan struct{},
+	description string,
+) {
+	t.Helper()
+	select {
+	case <-changes:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s admission change", description)
+	}
+}
+
+type peerAdmissionIngress struct {
+	address             string
+	ownerDeviceID       domain.DeviceID
+	ownerIdentityPublic ed25519.PublicKey
+	serverAuthorization credentialauthorization.Authorization
+	entered             chan transport.AuthenticatedPeer
+	canceled            chan transport.AuthenticatedPeer
+}
+
+func startPeerAdmissionTestIngress(
+	t *testing.T,
+	fixture peerAdmissionTestFixture,
+	verifiers *peerauth.Verifiers,
+	changes <-chan struct{},
+) *peerAdmissionIngress {
+	t.Helper()
+	serverIdentity, _, err := transport.IssueIdentityCertificate(
+		nodeTestSessionID,
+		0,
+		fixture.ownerIdentityPrivate,
+	)
+	if err != nil {
+		t.Fatalf("IssueIdentityCertificate(server): %v", err)
+	}
+	serverEpochPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x34}, ed25519.SeedSize),
+	)
+	serverBinding, err := credential.SignBinding(
+		nodeTestSessionID,
+		fixture.ownerDeviceID,
+		1,
+		serverEpochPrivate.Public().(ed25519.PublicKey),
+		fixture.ownerIdentityPrivate,
+	)
+	if err != nil {
+		t.Fatalf("credential.SignBinding(server): %v", err)
+	}
+	serverAuthorization := credentialauthorization.Authorization{
+		SessionID:                nodeTestSessionID,
+		DeviceID:                 fixture.ownerDeviceID,
+		Epoch:                    1,
+		EpochPublicKey:           serverBinding.EpochPublicKey,
+		KeyDigest:                serverBinding.KeyDigest,
+		Role:                     credentialauthorization.RoleOwner,
+		IssuedAt:                 "2026-08-14T12:00:00Z",
+		NotBefore:                "2026-08-14T12:00:00Z",
+		ValiditySeconds:          credentialauthorization.ValiditySeconds,
+		AuthorityVoterSetVersion: 1,
+		ClockEndorsements: []credentialauthorization.ClockEndorsement{{
+			DeviceID: fixture.ownerDeviceID,
+		}},
+		BindingSignature:        serverBinding.Signature,
+		AuthorizationChainIndex: 1,
+	}
+	serverContent, _, err := transport.IssueContentCertificate(
+		serverAuthorization,
+		serverEpochPrivate,
+	)
+	if err != nil {
+		t.Fatalf("IssueContentCertificate(server): %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for peer ingress: %v", err)
+	}
+	entered := make(chan transport.AuthenticatedPeer, 2)
+	canceled := make(chan transport.AuthenticatedPeer, 2)
+	handler := transport.ConnectionHandlerFunc(func(
+		ctx context.Context,
+		_ *tls.Conn,
+	) error {
+		peer, ok := transport.AuthenticatedPeerFromContext(ctx)
+		if !ok {
+			return errors.New("authenticated peer context missing")
+		}
+		entered <- peer
+		<-ctx.Done()
+		canceled <- peer
+		return ctx.Err()
+	})
+	ingress, err := transport.NewIngress(transport.IngressOptions{
+		Listener: listener,
+		TLS: transport.ServerTLSOptions{
+			IdentityCertificate: serverIdentity,
+			ContentCertificate: func() (tls.Certificate, error) {
+				return serverContent, nil
+			},
+			VerifyPairingPeer:   verifiers.VerifyPairingPeer,
+			VerifyConsensusPeer: verifiers.VerifyConsensusPeer,
+			VerifyContentPeer:   verifiers.VerifyContentPeer,
+		},
+		PeerAccessChanges: changes,
+		Consensus:         handler,
+		Content:           handler,
+	})
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("transport.NewIngress(): %v", err)
+	}
+	serveContext, cancelServe := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- ingress.Serve(serveContext)
+	}()
+	t.Cleanup(func() {
+		cancelServe()
+		shutdownContext, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancel()
+		if err := ingress.Shutdown(shutdownContext); err != nil {
+			t.Errorf("Ingress.Shutdown(): %v", err)
+		}
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Errorf("Ingress.Serve(): %v", err)
+			}
+		case <-shutdownContext.Done():
+			t.Errorf("Ingress.Serve() did not stop: %v", shutdownContext.Err())
+		}
+	})
+	return &peerAdmissionIngress{
+		address:       listener.Addr().String(),
+		ownerDeviceID: fixture.ownerDeviceID,
+		ownerIdentityPublic: bytes.Clone(
+			fixture.ownerIdentityPrivate.Public().(ed25519.PublicKey),
+		),
+		serverAuthorization: serverAuthorization,
+		entered:             entered,
+		canceled:            canceled,
+	}
+}
+
+func (ingress *peerAdmissionIngress) dial(
+	t *testing.T,
+	plane transport.Plane,
+	certificate tls.Certificate,
+) *tls.Conn {
+	t.Helper()
+	options := transport.ClientTLSOptions{
+		Plane:       plane,
+		Certificate: certificate,
+	}
+	switch plane {
+	case transport.PlaneConsensus:
+		options.VerifyIdentityPeer = func(
+			certificate transport.IdentityCertificate,
+		) error {
+			return certificate.VerifyIdentity(
+				nodeTestSessionID,
+				0,
+				ingress.ownerDeviceID,
+				ingress.ownerIdentityPublic,
+			)
+		}
+	case transport.PlaneContent:
+		options.VerifyContentPeer = func(
+			certificate transport.ContentCertificate,
+		) (transport.ContentPeerAdmission, error) {
+			now := time.Date(2026, 8, 14, 12, 5, 0, 0, time.UTC)
+			if err := certificate.VerifyAuthorization(
+				ingress.serverAuthorization,
+				now,
+			); err != nil {
+				return transport.ContentPeerAdmission{}, err
+			}
+			closeAfter, err := certificate.CloseAfter(now)
+			return transport.ContentPeerAdmission{
+				CloseAfter: closeAfter,
+			}, err
+		}
+	default:
+		t.Fatalf("unsupported peer-admission test plane %q", plane)
+	}
+	tlsConfig, err := transport.NewClientTLSConfig(options)
+	if err != nil {
+		t.Fatalf("transport.NewClientTLSConfig(%s): %v", plane, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(
+		ctx,
+		"tcp",
+		ingress.address,
+	)
+	if err != nil {
+		t.Fatalf("dial peer ingress: %v", err)
+	}
+	connection := tls.Client(raw, tlsConfig)
+	if err := connection.HandshakeContext(ctx); err != nil {
+		_ = connection.Close()
+		t.Fatalf("TLS handshake (%s): %v", plane, err)
+	}
+	return connection
+}
+
+func assertPeerTLSClosed(t *testing.T, connection net.Conn) {
+	t.Helper()
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set peer read deadline: %v", err)
+	}
+	var buffer [1]byte
+	if _, err := connection.Read(buffer[:]); err == nil {
+		t.Fatal("revoked peer connection remained open")
+	} else {
+		var networkError net.Error
+		if errors.As(err, &networkError) && networkError.Timeout() {
+			t.Fatalf("revoked peer connection did not close: %v", err)
+		}
+	}
 }
 
 func openApplyAtGenerationTestNode(

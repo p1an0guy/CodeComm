@@ -26,6 +26,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/publication"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -34,6 +35,7 @@ var ErrInvalidStateView = errors.New("consensus: invalid state view")
 
 type decodedState struct {
 	Reducer            reducer.State
+	Admission          *peerauth.Snapshot
 	identityPublicKeys map[domain.DeviceID]ed25519.PublicKey
 	voterDeviceIDs     []domain.DeviceID
 }
@@ -99,8 +101,24 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 			err,
 		)
 	}
+	admission, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
+		SessionID:                view.SessionID,
+		RecoveryGeneration:       view.RecoveryGeneration,
+		AppliedChainIndex:        view.Heads.ChainIndex,
+		Devices:                  snapshot.Devices,
+		AuditCounters:            snapshot.AuditCounters,
+		CredentialAuthorizations: snapshot.CredentialAuthorizations,
+	})
+	if err != nil {
+		return decodedState{}, fmt.Errorf(
+			"%w: peer admission snapshot: %w",
+			ErrInvalidStateView,
+			err,
+		)
+	}
 	return decodedState{
 		Reducer:            state,
+		Admission:          admission,
 		identityPublicKeys: copyIdentityPublicKeys(snapshot.Devices),
 		voterDeviceIDs:     snapshot.VoterSet.VoterDeviceIDs(),
 	}, nil

@@ -19,6 +19,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 	"go.etcd.io/bbolt"
@@ -30,17 +31,18 @@ const (
 )
 
 var (
-	ErrInvalidNodeOptions     = errors.New("consensus: invalid node options")
-	ErrInsecureConsensusPath  = errors.New("consensus: insecure storage path")
-	ErrRaftStateMissing       = errors.New("consensus: initialized SQLite has no Raft state")
-	ErrStateInitialization    = errors.New("consensus: state initialization required")
-	ErrSingleVoterTopology    = errors.New("consensus: Phase 2 requires exactly one local voter")
-	ErrUnexpectedFSMResponse  = errors.New("consensus: unexpected Raft FSM response")
-	ErrSnapshotAnchorCoverage = errors.New("consensus: SQLite does not cover Raft snapshot anchor")
-	ErrRaftLogCoverage        = errors.New("consensus: Raft log/snapshot coverage is invalid")
-	ErrNodeClosed             = errors.New("consensus: node is closing or closed")
-	ErrLineageMismatch        = errors.New("consensus: active lineage differs from expected lineage")
-	ErrLineageReentry         = errors.New("consensus: lineage operation cannot reenter its gate")
+	ErrInvalidNodeOptions       = errors.New("consensus: invalid node options")
+	ErrInsecureConsensusPath    = errors.New("consensus: insecure storage path")
+	ErrRaftStateMissing         = errors.New("consensus: initialized SQLite has no Raft state")
+	ErrStateInitialization      = errors.New("consensus: state initialization required")
+	ErrSingleVoterTopology      = errors.New("consensus: Phase 2 requires exactly one local voter")
+	ErrUnexpectedFSMResponse    = errors.New("consensus: unexpected Raft FSM response")
+	ErrSnapshotAnchorCoverage   = errors.New("consensus: SQLite does not cover Raft snapshot anchor")
+	ErrRaftLogCoverage          = errors.New("consensus: Raft log/snapshot coverage is invalid")
+	ErrNodeClosed               = errors.New("consensus: node is closing or closed")
+	ErrLineageMismatch          = errors.New("consensus: active lineage differs from expected lineage")
+	ErrLineageReentry           = errors.New("consensus: lineage operation cannot reenter its gate")
+	ErrPeerAdmissionUnavailable = errors.New("consensus: applied peer admission unavailable")
 )
 
 type lineageOperationContextKey struct{}
@@ -307,6 +309,11 @@ func OpenSingleNode(
 	if err != nil {
 		return nil, err
 	}
+	fsm.publishPeerAdmission(
+		decoded.Admission,
+		view.AdmissionRevision,
+		true,
+	)
 	instance, err := newRaftSafely(
 		config,
 		fsm,
@@ -931,6 +938,9 @@ func (node *SingleNode) recordFatal(err error) {
 		node.fatalMu.Unlock()
 		close(node.fatalSet)
 	})
+	if node.fsm != nil {
+		node.fsm.closePeerAdmissionChanges()
+	}
 }
 
 // FatalError reports a terminal FSM integrity failure.
@@ -1516,9 +1526,10 @@ func (node *SingleNode) lookupCommitted(
 		return store.ApplyResult{}, false, store.ErrIdempotencyConflict
 	}
 	return store.ApplyResult{
-		Heads:     lookup.CurrentHeads,
-		Outcome:   lookup.Outcome,
-		Duplicate: true,
+		Heads:             lookup.CurrentHeads,
+		Outcome:           lookup.Outcome,
+		AdmissionRevision: node.state.AdmissionRevision(),
+		Duplicate:         true,
 	}, true, nil
 }
 
@@ -1587,6 +1598,39 @@ func (node *SingleNode) View(ctx context.Context) (store.StateView, error) {
 	}
 	defer node.endOperation()
 	return node.state.View(ctx)
+}
+
+// PeerAdmissionSnapshot returns the latest immutable state published only
+// after its corresponding SQLite apply transaction committed.
+func (node *SingleNode) PeerAdmissionSnapshot() (*peerauth.Snapshot, error) {
+	if node == nil || node.fsm == nil {
+		return nil, ErrInvalidNodeOptions
+	}
+	if err := node.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer node.endOperation()
+	if err := node.FatalError(); err != nil {
+		return nil, err
+	}
+	snapshot := node.fsm.admission.Load()
+	if snapshot == nil ||
+		snapshot.snapshot == nil ||
+		snapshot.revision == 0 ||
+		snapshot.revision != node.state.AdmissionRevision() {
+		return nil, ErrPeerAdmissionUnavailable
+	}
+	return snapshot.snapshot, nil
+}
+
+// PeerAdmissionChanges coalesces access-relevant applied-state changes for the
+// session's single peer-ingress reconciler. Consumers must always reload the
+// current snapshot after receiving a signal.
+func (node *SingleNode) PeerAdmissionChanges() <-chan struct{} {
+	if node == nil || node.fsm == nil {
+		return nil
+	}
+	return node.fsm.admissionChanged
 }
 
 // Status returns one durable coordination cut plus a nearby nonblocking Raft
@@ -1774,6 +1818,9 @@ func (node *SingleNode) Close() error {
 		node.closing = true
 		close(node.closeStarted)
 		node.lifecycleMu.Unlock()
+		if node.fsm != nil {
+			node.fsm.closePeerAdmissionChanges()
+		}
 		if node.monitorStop != nil {
 			close(node.monitorStop)
 		}

@@ -10,6 +10,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 )
 
 func TestTLSALPNSelectsClosedCertificatePlane(t *testing.T) {
@@ -70,8 +72,14 @@ func TestTLSALPNSelectsClosedCertificatePlane(t *testing.T) {
 				clientIdentityKey.Public().(ed25519.PublicKey),
 			)
 		},
-		VerifyContentPeer: func(certificate ContentCertificate) error {
-			return certificate.VerifyAuthorization(clientAuthorization, notBefore)
+		VerifyContentPeer: func(
+			certificate ContentCertificate,
+		) (ContentPeerAdmission, error) {
+			return verifyTestContentPeer(
+				certificate,
+				clientAuthorization,
+				notBefore,
+			)
 		},
 	})
 	if err != nil {
@@ -105,8 +113,14 @@ func TestTLSALPNSelectsClosedCertificatePlane(t *testing.T) {
 		},
 		{
 			name: "content", plane: PlaneContent, certificate: clientContentCertificate,
-			content: func(certificate ContentCertificate) error {
-				return certificate.VerifyAuthorization(serverAuthorization, notBefore)
+			content: func(
+				certificate ContentCertificate,
+			) (ContentPeerAdmission, error) {
+				return verifyTestContentPeer(
+					certificate,
+					serverAuthorization,
+					notBefore,
+				)
 			},
 		},
 	}
@@ -143,7 +157,7 @@ func TestTLSRejectsAmbiguousAndCrossProfileOffers(t *testing.T) {
 
 	serverConfig, clientIdentity, contentCertificate := tlsTestConfigs(t)
 	identityVerifier := func(IdentityCertificate) error { return nil }
-	contentVerifier := func(ContentCertificate) error { return nil }
+	contentVerifier := admitTestContentPeer
 
 	for _, test := range []struct {
 		name        string
@@ -261,6 +275,45 @@ func TestTLSRejectsVerifierFailureAndVersionDowngrade(t *testing.T) {
 	}
 }
 
+func TestTLSRejectsInvalidContentAdmissionLifetime(t *testing.T) {
+	t.Parallel()
+
+	_, _, contentCertificate := tlsTestConfigs(t)
+	leaf, err := x509.ParseCertificate(contentCertificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := tls.ConnectionState{
+		Version:            tls.VersionTLS13,
+		NegotiatedProtocol: ALPNContent,
+		PeerCertificates:   []*x509.Certificate{leaf},
+	}
+	for name, admission := range map[string]ContentPeerAdmission{
+		"zero": {},
+		"beyond certificate": {
+			CloseAfter: 31 * time.Minute,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			verify := planeConnectionVerifier(
+				PlaneContent,
+				nil,
+				func(ContentCertificate) (ContentPeerAdmission, error) {
+					return admission, nil
+				},
+			)
+			if err := verify(state); !errors.Is(err, ErrTLSAdmission) {
+				t.Fatalf(
+					"content admission %q error = %v, want %v",
+					name,
+					err,
+					ErrTLSAdmission,
+				)
+			}
+		})
+	}
+}
+
 func TestServerTLSConfigRejectsCrossDeviceCertificateSet(t *testing.T) {
 	t.Parallel()
 
@@ -289,7 +342,7 @@ func TestServerTLSConfigRejectsCrossDeviceCertificateSet(t *testing.T) {
 		ContentCertificate:  staticContentCertificate(contentCertificate),
 		VerifyPairingPeer:   func(IdentityCertificate) error { return nil },
 		VerifyConsensusPeer: func(IdentityCertificate) error { return nil },
-		VerifyContentPeer:   func(ContentCertificate) error { return nil },
+		VerifyContentPeer:   admitTestContentPeer,
 	})
 	if err != nil {
 		t.Fatalf("NewServerTLSConfig() error = %v", err)
@@ -335,7 +388,7 @@ func TestIdentityPlanesRemainAvailableWithoutContentCertificate(t *testing.T) {
 			)
 		},
 		VerifyConsensusPeer: func(IdentityCertificate) error { return nil },
-		VerifyContentPeer:   func(ContentCertificate) error { return nil },
+		VerifyContentPeer:   admitTestContentPeer,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +453,7 @@ func tlsTestConfigs(
 		ContentCertificate:  staticContentCertificate(contentCertificate),
 		VerifyPairingPeer:   func(IdentityCertificate) error { return nil },
 		VerifyConsensusPeer: func(IdentityCertificate) error { return nil },
-		VerifyContentPeer:   func(ContentCertificate) error { return nil },
+		VerifyContentPeer:   admitTestContentPeer,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -412,6 +465,29 @@ func staticContentCertificate(
 	certificate tls.Certificate,
 ) ContentCertificateProvider {
 	return func() (tls.Certificate, error) { return certificate, nil }
+}
+
+func admitTestContentPeer(
+	certificate ContentCertificate,
+) (ContentPeerAdmission, error) {
+	return ContentPeerAdmission{
+		CloseAfter: certificate.NotAfter.Sub(certificate.NotBefore),
+	}, nil
+}
+
+func verifyTestContentPeer(
+	certificate ContentCertificate,
+	authorization credentialauthorization.Authorization,
+	now time.Time,
+) (ContentPeerAdmission, error) {
+	if err := certificate.VerifyAuthorization(authorization, now); err != nil {
+		return ContentPeerAdmission{}, err
+	}
+	closeAfter, err := certificate.CloseAfter(now)
+	if err != nil {
+		return ContentPeerAdmission{}, err
+	}
+	return ContentPeerAdmission{CloseAfter: closeAfter}, nil
 }
 
 func tlsPipeHandshake(

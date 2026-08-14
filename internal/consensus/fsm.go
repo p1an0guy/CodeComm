@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -62,10 +64,14 @@ type ApplyResponse struct {
 // FSM adapts committed Raft commands to the deterministic reducer and the
 // atomic SQLite apply transaction.
 type FSM struct {
-	store        *store.Store
-	originBootID domain.UUIDv7
-	clock        ApplyClock
-	logStore     raft.LogStore
+	store            *store.Store
+	originBootID     domain.UUIDv7
+	clock            ApplyClock
+	logStore         raft.LogStore
+	admission        atomic.Pointer[peerAdmissionPublication]
+	admissionChanged chan struct{}
+	admissionMu      sync.Mutex
+	admissionClosed  bool
 
 	haltOnce sync.Once
 	haltMu   sync.RWMutex
@@ -82,11 +88,12 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 		return nil, ErrInvalidFSMOptions
 	}
 	return &FSM{
-		store:        options.Store,
-		originBootID: options.OriginBootID,
-		clock:        options.Clock,
-		logStore:     options.LogStore,
-		halted:       make(chan error, 1),
+		store:            options.Store,
+		originBootID:     options.OriginBootID,
+		clock:            options.Clock,
+		logStore:         options.LogStore,
+		admissionChanged: make(chan struct{}, 1),
+		halted:           make(chan error, 1),
 	}, nil
 }
 
@@ -200,9 +207,10 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		return ApplyResponse{
 			LogIndex: log.Index,
 			Result: store.ApplyResult{
-				Heads:     view.Heads,
-				Outcome:   lookup.Outcome,
-				Duplicate: true,
+				Heads:             view.Heads,
+				Outcome:           lookup.Outcome,
+				AdmissionRevision: view.AdmissionRevision,
+				Duplicate:         true,
 			},
 		}
 	}
@@ -269,6 +277,18 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 			err,
 		))
 	}
+	nextAdmission, err := decoded.Admission.Advance(peerauth.Changes{
+		AdvancesEventChain:       outcome.Changes.AdvancesEventChain,
+		Devices:                  outcome.Changes.Devices,
+		AuditCounters:            outcome.Changes.AuditCounters,
+		CredentialAuthorizations: outcome.Changes.CredentialAuthorizations,
+	})
+	if err != nil {
+		return fsm.halt(log, fmt.Errorf(
+			"validate prospective peer admission: %w",
+			err,
+		))
+	}
 	request, err := BuildApplyRequest(signed, outcome, applyContext)
 	if err != nil {
 		return fsm.halt(log, err)
@@ -277,7 +297,57 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 	if err != nil {
 		return fsm.halt(log, fmt.Errorf("commit command: %w", err))
 	}
+	fsm.publishPeerAdmission(
+		nextAdmission,
+		result.AdmissionRevision,
+		admissionAccessChanged(outcome.Changes),
+	)
 	return ApplyResponse{LogIndex: log.Index, Result: result}
+}
+
+type peerAdmissionPublication struct {
+	revision uint64
+	snapshot *peerauth.Snapshot
+}
+
+func (fsm *FSM) publishPeerAdmission(
+	snapshot *peerauth.Snapshot,
+	revision uint64,
+	notify bool,
+) {
+	fsm.admissionMu.Lock()
+	defer fsm.admissionMu.Unlock()
+	if fsm.admissionClosed {
+		return
+	}
+	fsm.admission.Store(&peerAdmissionPublication{
+		revision: revision,
+		snapshot: snapshot,
+	})
+	if notify {
+		select {
+		case fsm.admissionChanged <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (fsm *FSM) closePeerAdmissionChanges() {
+	if fsm == nil {
+		return
+	}
+	fsm.admissionMu.Lock()
+	defer fsm.admissionMu.Unlock()
+	if fsm.admissionClosed {
+		return
+	}
+	fsm.admissionClosed = true
+	close(fsm.admissionChanged)
+}
+
+func admissionAccessChanged(changes reducer.Changes) bool {
+	return len(changes.Devices) != 0 ||
+		len(changes.CredentialAuthorizations) != 0
 }
 
 func reduceCommitted(
@@ -349,6 +419,7 @@ func (fsm *FSM) halt(log *raft.Log, cause error) ApplyResponse {
 		fsm.haltMu.Lock()
 		fsm.haltErr = err
 		fsm.haltMu.Unlock()
+		fsm.closePeerAdmissionChanges()
 		fsm.halted <- err
 	})
 	return ApplyResponse{LogIndex: index, Err: fsm.HaltError()}

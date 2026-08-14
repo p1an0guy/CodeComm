@@ -41,6 +41,14 @@ func TestApplyFirstSeenAcceptedAndSequenceReuseRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if firstResult.AdmissionRevision != 3 ||
+		store.AdmissionRevision() != firstResult.AdmissionRevision {
+		t.Fatalf(
+			"first admission revision = %d, store = %d, want 3",
+			firstResult.AdmissionRevision,
+			store.AdmissionRevision(),
+		)
+	}
 	assertCounts(t, store, map[string]int64{
 		"events":           1,
 		"event_provenance": 1,
@@ -57,8 +65,17 @@ func TestApplyFirstSeenAcceptedAndSequenceReuseRejected(t *testing.T) {
 		testSignedTaskEvent(t, testEventID2, 1),
 		firstResult.Heads,
 	)
-	if _, err := store.Apply(context.Background(), reused); err != nil {
+	rejectedResult, err := store.Apply(context.Background(), reused)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if rejectedResult.AdmissionRevision != 4 ||
+		store.AdmissionRevision() != rejectedResult.AdmissionRevision {
+		t.Fatalf(
+			"rejected admission revision = %d, store = %d, want 4",
+			rejectedResult.AdmissionRevision,
+			store.AdmissionRevision(),
+		)
 	}
 	assertCounts(t, store, map[string]int64{
 		"events":           1,
@@ -131,6 +148,12 @@ func TestApplyRollsBackAtEveryBoundary(t *testing.T) {
 				"outbox":           1,
 			})
 			assertConsensus(t, store, 0, 0, 0)
+			if revision := store.AdmissionRevision(); revision != 2 {
+				t.Fatalf(
+					"failed apply admission revision = %d, want 2",
+					revision,
+				)
+			}
 		})
 	}
 }

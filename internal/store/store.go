@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -51,8 +52,9 @@ type Store struct {
 	closed   bool
 	closeErr error
 
-	applyMu        sync.Mutex
-	applyFailpoint func(applyStage) error
+	applyMu           sync.Mutex
+	applyFailpoint    func(applyStage) error
+	admissionRevision atomic.Uint64
 
 	controlFileFailpoint func(controlFileDecisionStage) error
 }
@@ -131,6 +133,7 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 		return nil, normalizeSQLiteError(ctx, "open connection pool", err)
 	}
 	store := &Store{path: path, pool: pool}
+	store.admissionRevision.Store(1)
 	if err := store.withConn(ctx, func(*sqlite.Conn) error { return nil }); err != nil {
 		_ = pool.Close()
 		return nil, err
@@ -144,6 +147,22 @@ func (store *Store) Path() string {
 		return ""
 	}
 	return store.path
+}
+
+// AdmissionRevision returns a process-local token that changes after every
+// committed mutation capable of making an applied peer-admission cut stale.
+// The apply lock linearizes the token with the corresponding SQLite commit.
+func (store *Store) AdmissionRevision() uint64 {
+	if store == nil {
+		return 0
+	}
+	store.applyMu.Lock()
+	defer store.applyMu.Unlock()
+	return store.admissionRevision.Load()
+}
+
+func (store *Store) advanceAdmissionRevision() uint64 {
+	return store.admissionRevision.Add(1)
 }
 
 // Close interrupts active operations and closes every pooled connection after

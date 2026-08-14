@@ -176,6 +176,10 @@ func TestDecodedStateDoesNotAliasViewOrReturnedKeys(t *testing.T) {
 	if !exists || !bytes.Equal(third, fixture.identityPublicKey) {
 		t.Fatal("decoded identity key aliases StateView storage")
 	}
+	member, exists := decoded.Admission.Member(fixture.deviceID)
+	if !exists || !bytes.Equal(member.IdentityPublicKey, fixture.identityPublicKey) {
+		t.Fatal("decoded peer admission aliases StateView storage")
+	}
 	outcome, err := reducer.Reduce(
 		decoded.Reducer,
 		decodeTestSignedTask(t, fixture),

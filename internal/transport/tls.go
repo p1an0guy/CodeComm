@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -18,9 +19,25 @@ var (
 // fixed certificate profile and TLS channel have been verified.
 type IdentityPeerVerifier func(IdentityCertificate) error
 
+// ContentPeerAdmission is the monotonic lifetime authorized by the same
+// applied-state and wall-clock cut that admitted a content certificate.
+type ContentPeerAdmission struct {
+	CloseAfter time.Duration
+}
+
+func (admission ContentPeerAdmission) validFor(
+	certificate ContentCertificate,
+) bool {
+	certificateLifetime := certificate.NotAfter.Sub(certificate.NotBefore)
+	return admission.CloseAfter > 0 &&
+		certificateLifetime > 0 &&
+		admission.CloseAfter <= certificateLifetime
+}
+
 // ContentPeerVerifier applies membership/authorization policy after the fixed
-// certificate profile and TLS channel have been verified.
-type ContentPeerVerifier func(ContentCertificate) error
+// certificate profile and TLS channel have been verified. Its returned
+// lifetime must be armed directly as a monotonic close timer.
+type ContentPeerVerifier func(ContentCertificate) (ContentPeerAdmission, error)
 
 // ContentCertificateProvider returns the current local epoch certificate for
 // each content handshake. It may return ErrContentCertificateUnavailable while
@@ -220,8 +237,12 @@ func planeConnectionVerifier(
 			if err != nil {
 				return fmt.Errorf("%w: %v", ErrTLSAdmission, err)
 			}
-			if err := verifyContent(certificate); err != nil {
+			admission, err := verifyContent(certificate)
+			if err != nil {
 				return fmt.Errorf("%w: %v", ErrTLSAdmission, err)
+			}
+			if !admission.validFor(certificate) {
+				return ErrTLSAdmission
 			}
 		default:
 			return ErrTLSAdmission

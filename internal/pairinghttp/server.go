@@ -67,6 +67,8 @@ type Server struct {
 	streamNoProgress time.Duration
 }
 
+type directPeerReauthorizationContextKey struct{}
+
 // New constructs the fixed V1 pairing HTTP/2 server.
 func New(service Service) (*Server, error) {
 	return newServer(service, ActiveHandlersMax)
@@ -100,15 +102,17 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 }
 
 // ServeConn handshakes and serves one admission-limited TLS connection. It
-// accepts only the pairing ALPN and fixed identity-certificate profile.
+// accepts only the pairing ALPN and fixed identity-certificate profile, and
+// reruns verifyPeer before every stream.
 func (server *Server) ServeConn(
 	ctx context.Context,
 	connection *tls.Conn,
 	permit *transport.HandshakePermit,
+	verifyPeer transport.IdentityPeerVerifier,
 ) error {
 	if server == nil || server.service == nil || server.http2 == nil ||
 		server.handlers == nil || ctx == nil || connection == nil ||
-		permit == nil {
+		permit == nil || verifyPeer == nil {
 		return ErrInvalidConnection
 	}
 	if !permit.BeginHandshake() {
@@ -137,6 +141,21 @@ func (server *Server) ServeConn(
 		return fmt.Errorf("%w: handshake", ErrTLSBinding)
 	}
 	permit.Release()
+	peer, exporter, err := pairingConnectionState(connection.ConnectionState())
+	clear(exporter)
+	if err != nil {
+		return err
+	}
+	if err := verifyPeer(peer); err != nil {
+		return fmt.Errorf("%w: peer admission", ErrTLSBinding)
+	}
+	ctx = context.WithValue(
+		ctx,
+		directPeerReauthorizationContextKey{},
+		func() error {
+			return verifyPeer(peer)
+		},
+	)
 	return server.ServeAuthenticatedConn(ctx, connection)
 }
 
@@ -164,6 +183,21 @@ func (server *Server) ServeAuthenticatedConn(
 		return err
 	}
 	defer clear(exporter)
+	metadata, ingressBound := transport.AuthenticatedPeerFromContext(ctx)
+	directReauthorize, directBound := ctx.Value(
+		directPeerReauthorizationContextKey{},
+	).(func() error)
+	if ingressBound {
+		if metadata.Plane != transport.PlanePairing ||
+			metadata.SessionID != peer.Binding.SessionID ||
+			metadata.DeviceID != peer.Binding.DeviceID ||
+			metadata.RecoveryGeneration !=
+				peer.Binding.RecoveryGeneration {
+			return ErrTLSBinding
+		}
+	} else if !directBound || directReauthorize == nil {
+		return ErrInvalidConnection
+	}
 
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		return fmt.Errorf("%w: clear handshake deadline", ErrInvalidConnection)
@@ -181,8 +215,9 @@ func (server *Server) ServeAuthenticatedConn(
 	}()
 
 	handler := &connectionHandler{
-		server: server,
-		peer:   peer,
+		server:            server,
+		peer:              peer,
+		directReauthorize: directReauthorize,
 	}
 	defer func() {
 		stop()
@@ -251,9 +286,10 @@ func pairingConnectionState(
 }
 
 type connectionHandler struct {
-	server   *Server
-	peer     transport.IdentityCertificate
-	exporter [pairing.ExporterSize]byte
+	server            *Server
+	peer              transport.IdentityCertificate
+	exporter          [pairing.ExporterSize]byte
+	directReauthorize func() error
 
 	mu      sync.Mutex
 	active  sync.WaitGroup
@@ -274,6 +310,18 @@ func (handler *connectionHandler) ServeHTTP(
 		return
 	}
 	defer handler.active.Done()
+	if err := handler.reauthorize(request.Context()); err != nil {
+		if errors.Is(err, transport.ErrPeerAuthorizationDenied) {
+			writeProblem(writer, http.StatusForbidden, problemRejected)
+		} else {
+			writeProblem(
+				writer,
+				http.StatusServiceUnavailable,
+				problemUnavailable,
+			)
+		}
+		return
+	}
 	select {
 	case handler.server.handlers <- struct{}{}:
 		defer func() { <-handler.server.handlers }()
@@ -373,6 +421,24 @@ func (handler *connectionHandler) ServeHTTP(
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(response)
+}
+
+func (handler *connectionHandler) reauthorize(ctx context.Context) (err error) {
+	if _, ingressBound := transport.AuthenticatedPeerFromContext(ctx); ingressBound {
+		return transport.ReauthorizeAuthenticatedPeer(ctx)
+	}
+	if handler.directReauthorize == nil {
+		return transport.ErrPeerAuthorizationUnavailable
+	}
+	defer func() {
+		if recover() != nil {
+			err = transport.ErrPeerAuthorizationUnavailable
+		}
+	}()
+	if err := handler.directReauthorize(); err != nil {
+		return transport.ErrPeerAuthorizationDenied
+	}
+	return nil
 }
 
 func (handler *connectionHandler) begin() bool {

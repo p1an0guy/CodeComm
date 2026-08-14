@@ -7,11 +7,56 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"zombiezen.com/go/sqlite"
 )
+
+func TestAdmissionRevisionWaitsForApplyCriticalSection(t *testing.T) {
+	store := openTestStore(
+		t,
+		filepath.Join(t.TempDir(), "session", "state.db"),
+		nil,
+	)
+
+	store.applyMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			store.applyMu.Unlock()
+		}
+	}()
+
+	started := make(chan struct{})
+	revision := make(chan uint64, 1)
+	go func() {
+		close(started)
+		revision <- store.AdmissionRevision()
+	}()
+	<-started
+	select {
+	case got := <-revision:
+		t.Fatalf(
+			"AdmissionRevision() returned %d inside apply critical section",
+			got,
+		)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	store.admissionRevision.Add(1)
+	store.applyMu.Unlock()
+	locked = false
+	select {
+	case got := <-revision:
+		if got != 2 {
+			t.Fatalf("AdmissionRevision() = %d, want 2", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AdmissionRevision() remained blocked after apply unlock")
+	}
+}
 
 func TestViewReturnsAtomicLogicalStateAndIndependentBytes(t *testing.T) {
 	store := openTestStore(
@@ -40,6 +85,14 @@ func TestViewReturnsAtomicLogicalStateAndIndependentBytes(t *testing.T) {
 		got.RecoveryGeneration != 0 ||
 		!bytes.Equal(got.GenesisJSON, initial.GenesisJSON) {
 		t.Fatalf("View() lineage = (%q, %q, %d)", got.SessionID, got.WorkspaceID, got.RecoveryGeneration)
+	}
+	if got.AdmissionRevision != 2 ||
+		store.AdmissionRevision() != got.AdmissionRevision {
+		t.Fatalf(
+			"View() admission revision = %d, store = %d, want 2",
+			got.AdmissionRevision,
+			store.AdmissionRevision(),
+		)
 	}
 	if got.CurrentTerm != nil || got.LastRaftAppliedLogIndex != nil {
 		t.Fatalf(

@@ -1142,6 +1142,7 @@ func TestServeConnCanceledContextReleasesPermitAndConnection(t *testing.T) {
 		ctx,
 		connection,
 		permit,
+		func(transport.IdentityCertificate) error { return nil },
 	); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ServeConn(canceled) error = %v", err)
 	}
@@ -1377,7 +1378,19 @@ func startTestTLS(
 		t.Fatalf("handshake permit: %v", err)
 	}
 	go func() {
-		serverDone <- server.ServeConn(ctx, serverTLS, permit)
+		serverDone <- server.ServeConn(
+			ctx,
+			serverTLS,
+			permit,
+			func(certificate transport.IdentityCertificate) error {
+				return certificate.VerifyIdentity(
+					pairingHTTPTestSessionID,
+					0,
+					clientBinding.DeviceID,
+					clientKey.Public().(ed25519.PublicKey),
+				)
+			},
+		)
 	}()
 	return &testTLSHarness{
 		clientTLS: clientTLS, serverKey: serverKey, clientKey: clientKey,

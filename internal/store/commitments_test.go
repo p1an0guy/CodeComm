@@ -81,6 +81,9 @@ func TestCommitmentsInitialBoundarySeedsAndRejectsRepeat(t *testing.T) {
 	if after != before {
 		t.Fatalf("repeat Initialize() changed consensus state:\nbefore: %+v\nafter:  %+v", before, after)
 	}
+	if revision := store.AdmissionRevision(); revision != 2 {
+		t.Fatalf("rejected repeat changed admission revision to %d", revision)
+	}
 	assertCounts(t, store, map[string]int64{
 		"genesis_records": 1,
 		"consensus_state": 1,
@@ -111,6 +114,9 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 		t.Fatalf("Apply(second): %v", err)
 	}
 	predecessor := secondResult.Heads
+	if revision := store.AdmissionRevision(); revision != 4 {
+		t.Fatalf("predecessor admission revision = %d, want 4", revision)
+	}
 	if predecessor.ChainIndex != 1 || predecessor.ResultIndex != 2 {
 		t.Fatalf(
 			"predecessor positions = (%d, %d), want (1, 2)",
@@ -188,6 +194,9 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 	if got != want {
 		t.Fatalf("successor heads = %+v, want %+v", got, want)
 	}
+	if revision := store.AdmissionRevision(); revision != 5 {
+		t.Fatalf("successor admission revision = %d, want 5", revision)
+	}
 	if got.ChainHash == predecessor.ChainHash ||
 		got.ResultHash == predecessor.ResultHash ||
 		got.ProjectionAccumulator == predecessor.ProjectionAccumulator {
@@ -229,6 +238,9 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 			t.Errorf("Close(reopened): %v", err)
 		}
 	})
+	if revision := reopened.AdmissionRevision(); revision != 1 {
+		t.Fatalf("reopened admission revision = %d, want 1", revision)
+	}
 	if reopenedHeads := headsFromConsensus(commitmentConsensus(t, reopened)); reopenedHeads != want {
 		t.Fatalf("reopened heads = %+v, want %+v", reopenedHeads, want)
 	}
@@ -248,6 +260,14 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 	)
 	if err != nil {
 		t.Fatalf("Apply(predecessor-generation duplicate): %v", err)
+	}
+	if duplicateResult.AdmissionRevision != 1 ||
+		reopened.AdmissionRevision() != 1 {
+		t.Fatalf(
+			"duplicate admission revision = %d, store = %d, want 1",
+			duplicateResult.AdmissionRevision,
+			reopened.AdmissionRevision(),
+		)
 	}
 	if !duplicateResult.Duplicate ||
 		!sameCommitmentHeads(duplicateResult.Heads, want) ||
@@ -327,6 +347,12 @@ func TestCommitmentsDuplicateRejectsFutureGenerationWithoutMutation(
 			"future-generation duplicate changed consensus state:\nbefore: %+v\nafter:  %+v",
 			before,
 			after,
+		)
+	}
+	if revision := store.AdmissionRevision(); revision != 3 {
+		t.Fatalf(
+			"future-generation duplicate changed admission revision to %d",
+			revision,
 		)
 	}
 	assertCounts(t, store, map[string]int64{
@@ -467,6 +493,9 @@ func TestCommitmentsSuccessorGenesisBindingFailsClosed(t *testing.T) {
 			before,
 			after,
 		)
+	}
+	if revision := store.AdmissionRevision(); revision != 2 {
+		t.Fatalf("rejected successors changed admission revision to %d", revision)
 	}
 	assertCounts(t, store, map[string]int64{
 		"genesis_records": 1,
@@ -617,6 +646,12 @@ func TestCommitmentsDuplicateAdvancesWatermarkAndCollisionDoesNotMutate(
 			"reopened consensus after collision = %+v, want %+v",
 			got,
 			afterDuplicate,
+		)
+	}
+	if revision := store.AdmissionRevision(); revision != 3 {
+		t.Fatalf(
+			"duplicate or collision changed admission revision to %d",
+			revision,
 		)
 	}
 }

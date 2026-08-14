@@ -115,6 +115,16 @@ func TestFSMSnapshotAnchorValidationAndRestoreRefusal(t *testing.T) {
 		&raft.Log{Index: 3},
 		ErrInvalidCommand,
 	).Err
+	select {
+	case _, open := <-fsm.admissionChanged:
+		if open {
+			t.Fatal("FSM admission feed remained open after halt")
+		}
+	default:
+		t.Fatal("FSM admission feed did not close synchronously on halt")
+	}
+	fsm.closePeerAdmissionChanges()
+	fsm.publishPeerAdmission(nil, 1, true)
 	if err := fsm.Restore(
 		io.NopCloser(bytes.NewReader(encoded)),
 	); !errors.Is(err, halted) {

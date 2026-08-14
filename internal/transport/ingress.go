@@ -19,8 +19,14 @@ import (
 const (
 	PeerConnectionsMax = 128
 
-	ingressAcceptRetryBase = 5 * time.Millisecond
-	ingressAcceptRetryMax  = time.Second
+	ingressAcceptRetryBase          = 5 * time.Millisecond
+	ingressAcceptRetryMax           = time.Second
+	peerEstablishmentVerifyAttempts = 2
+	peerConsensusConnectionsMax     = 1
+	// TLS ingress cannot classify content-control versus bulk until HTTP
+	// dispatch. Permit three current slots plus one draining predecessor each;
+	// the HTTP layer applies the narrower 1-control/2-bulk limits.
+	peerContentConnectionsMax = 6
 )
 
 var (
@@ -51,6 +57,9 @@ type IngressOptions struct {
 	Listener  net.Listener
 	TLS       ServerTLSOptions
 	Admission *AdmissionLimiter
+	// PeerAccessChanges coalesces applied membership and credential changes.
+	// Each signal revalidates all established peers against current policy.
+	PeerAccessChanges <-chan struct{}
 
 	Pairing   ConnectionHandler
 	Consensus ConnectionHandler
@@ -59,17 +68,24 @@ type IngressOptions struct {
 
 // Ingress owns one TCP listener and dispatches exact authenticated ALPN planes.
 type Ingress struct {
-	listener  net.Listener
-	tlsConfig *tls.Config
-	admission *AdmissionLimiter
-	handlers  map[Plane]ConnectionHandler
-	slots     chan struct{}
+	listener          net.Listener
+	tlsConfig         *tls.Config
+	admission         *AdmissionLimiter
+	handlers          map[Plane]ConnectionHandler
+	slots             chan struct{}
+	peerAccessChanges <-chan struct{}
 
-	stateMu     sync.Mutex
-	started     bool
-	stopping    bool
-	serveCancel context.CancelFunc
-	active      map[net.Conn]context.CancelFunc
+	verifyPairing   IdentityPeerVerifier
+	verifyConsensus IdentityPeerVerifier
+	verifyContent   ContentPeerVerifier
+
+	stateMu                sync.Mutex
+	started                bool
+	stopping               bool
+	serveCancel            context.CancelFunc
+	revalidationGeneration uint64
+	memberAccessAvailable  bool
+	active                 map[net.Conn]*ingressPeer
 
 	stopOnce sync.Once
 	stopErr  error
@@ -84,13 +100,34 @@ type Ingress struct {
 	recoveredPanics atomic.Uint64
 }
 
+type ingressPeer struct {
+	cancel      context.CancelFunc
+	credentials peerCredentials
+	established bool
+	closing     bool
+}
+
+type ingressPeerSnapshot struct {
+	connection  net.Conn
+	peer        *ingressPeer
+	credentials peerCredentials
+}
+
 // IngressStats is bounded operational state suitable for metrics and tests.
 type IngressStats struct {
-	ActiveConnections int
-	HandshakeErrors   uint64
-	DispatchErrors    uint64
-	HandlerErrors     uint64
-	RecoveredPanics   uint64
+	ActiveConnections      int
+	PendingConnections     int
+	EstablishedConnections int
+	HandshakeErrors        uint64
+	DispatchErrors         uint64
+	HandlerErrors          uint64
+	RecoveredPanics        uint64
+}
+
+// RevalidationResult reports one bounded pass over established peers.
+type RevalidationResult struct {
+	Checked int
+	Closed  int
 }
 
 // NewIngress validates and, on success, takes ownership of one shared peer
@@ -122,6 +159,11 @@ func newIngress(
 	if len(handlers) == 0 {
 		return nil, ErrInvalidIngressConfig
 	}
+	memberHandlers := handlers[PlaneConsensus] != nil ||
+		handlers[PlaneContent] != nil
+	if memberHandlers && options.PeerAccessChanges == nil {
+		return nil, ErrInvalidIngressConfig
+	}
 	tlsConfig, err := NewServerTLSConfig(options.TLS)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidIngressConfig, err)
@@ -136,9 +178,14 @@ func newIngress(
 	return &Ingress{
 		listener: options.Listener, tlsConfig: tlsConfig,
 		admission: admission, handlers: handlers,
-		slots:  make(chan struct{}, maxConnections),
-		active: make(map[net.Conn]context.CancelFunc),
-		done:   make(chan struct{}),
+		slots:                 make(chan struct{}, maxConnections),
+		peerAccessChanges:     options.PeerAccessChanges,
+		verifyPairing:         options.TLS.VerifyPairingPeer,
+		verifyConsensus:       options.TLS.VerifyConsensusPeer,
+		verifyContent:         options.TLS.VerifyContentPeer,
+		memberAccessAvailable: !memberHandlers || options.PeerAccessChanges != nil,
+		active:                make(map[net.Conn]*ingressPeer),
+		done:                  make(chan struct{}),
 	}, nil
 }
 
@@ -161,6 +208,14 @@ func (ingress *Ingress) Serve(ctx context.Context) error {
 	serveContext, cancel := context.WithCancel(ctx)
 	ingress.serveCancel = cancel
 	ingress.stateMu.Unlock()
+
+	if ingress.peerAccessChanges != nil {
+		ingress.work.Add(1)
+		go func() {
+			defer ingress.work.Done()
+			ingress.watchPeerAccessChanges(serveContext)
+		}()
+	}
 
 	contextDone := make(chan struct{})
 	go func() {
@@ -252,6 +307,21 @@ acceptLoop:
 	return serveErr
 }
 
+func (ingress *Ingress) watchPeerAccessChanges(ctx context.Context) {
+	for {
+		select {
+		case _, open := <-ingress.peerAccessChanges:
+			if !open {
+				ingress.disableMemberAccess()
+				return
+			}
+			ingress.RevalidatePeers()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Shutdown closes the listener and active connections, then waits for every
 // connection handler that honors cancellation.
 func (ingress *Ingress) Shutdown(ctx context.Context) error {
@@ -326,6 +396,35 @@ func (ingress *Ingress) serveConnection(
 		ingress.dispatchErrors.Add(1)
 		return
 	}
+	credentials, err := parsePeerCredentials(
+		plane,
+		state.PeerCertificates[0].Raw,
+	)
+	if err != nil {
+		ingress.dispatchErrors.Add(1)
+		return
+	}
+	metadata, trackedPeer, closeAt, ok := ingress.establishPeer(
+		connection,
+		credentials,
+	)
+	if !ok {
+		ingress.dispatchErrors.Add(1)
+		return
+	}
+	var expiryTimer *time.Timer
+	if plane == PlaneContent {
+		closeAfter := time.Until(closeAt)
+		if closeAfter <= 0 {
+			ingress.closeTrackedPeer(connection, trackedPeer)
+			ingress.dispatchErrors.Add(1)
+			return
+		}
+		expiryTimer = time.AfterFunc(closeAfter, func() {
+			ingress.closeTrackedPeer(connection, trackedPeer)
+		})
+		defer expiryTimer.Stop()
+	}
 	handler := ingress.handlers[plane]
 	if nilConnectionHandler(handler) {
 		return
@@ -334,7 +433,17 @@ func (ingress *Ingress) serveConnection(
 		ingress.dispatchErrors.Add(1)
 		return
 	}
-	if err := handler.ServeAuthenticatedConn(ctx, tlsConnection); err != nil {
+	handlerContext := context.WithValue(
+		ctx,
+		authenticatedPeerContextKey{},
+		&authenticatedPeerContext{
+			metadata: metadata,
+			reauthorize: func() error {
+				return ingress.reauthorizePeer(connection, trackedPeer)
+			},
+		},
+	)
+	if err := handler.ServeAuthenticatedConn(handlerContext, tlsConnection); err != nil {
 		contextErr := ctx.Err()
 		if contextErr == nil || !errors.Is(err, contextErr) {
 			ingress.handlerErrors.Add(1)
@@ -349,14 +458,59 @@ func (ingress *Ingress) Stats() IngressStats {
 	}
 	ingress.stateMu.Lock()
 	activeConnections := len(ingress.active)
+	establishedConnections := 0
+	for _, peer := range ingress.active {
+		if peer.established {
+			establishedConnections++
+		}
+	}
 	ingress.stateMu.Unlock()
 	return IngressStats{
-		ActiveConnections: activeConnections,
-		HandshakeErrors:   ingress.handshakeErrors.Load(),
-		DispatchErrors:    ingress.dispatchErrors.Load(),
-		HandlerErrors:     ingress.handlerErrors.Load(),
-		RecoveredPanics:   ingress.recoveredPanics.Load(),
+		ActiveConnections:      activeConnections,
+		PendingConnections:     activeConnections - establishedConnections,
+		EstablishedConnections: establishedConnections,
+		HandshakeErrors:        ingress.handshakeErrors.Load(),
+		DispatchErrors:         ingress.dispatchErrors.Load(),
+		HandlerErrors:          ingress.handlerErrors.Load(),
+		RecoveredPanics:        ingress.recoveredPanics.Load(),
 	}
+}
+
+// RevalidatePeers reruns current admission policy for every established peer.
+// Each call examines at most PeerConnectionsMax peers.
+func (ingress *Ingress) RevalidatePeers() RevalidationResult {
+	if ingress == nil {
+		return RevalidationResult{}
+	}
+	ingress.stateMu.Lock()
+	ingress.revalidationGeneration++
+	if ingress.stopping {
+		ingress.stateMu.Unlock()
+		return RevalidationResult{}
+	}
+	peers := make([]ingressPeerSnapshot, 0, len(ingress.active))
+	for connection, peer := range ingress.active {
+		if !peer.established || peer.closing {
+			continue
+		}
+		peers = append(peers, ingressPeerSnapshot{
+			connection:  connection,
+			peer:        peer,
+			credentials: peer.credentials,
+		})
+	}
+	ingress.stateMu.Unlock()
+
+	result := RevalidationResult{Checked: len(peers)}
+	for _, peer := range peers {
+		if _, authorized := ingress.verifyPeer(peer.credentials); authorized {
+			continue
+		}
+		if ingress.closeTrackedPeer(peer.connection, peer.peer) {
+			result.Closed++
+		}
+	}
+	return result
 }
 
 func (ingress *Ingress) recoverConnectionPanic() {
@@ -373,8 +527,9 @@ func (ingress *Ingress) initiateShutdown() {
 			ingress.serveCancel()
 		}
 		active := make(map[net.Conn]context.CancelFunc, len(ingress.active))
-		for connection, cancel := range ingress.active {
-			active[connection] = cancel
+		for connection, peer := range ingress.active {
+			peer.closing = true
+			active[connection] = peer.cancel
 		}
 		ingress.stateMu.Unlock()
 
@@ -399,18 +554,234 @@ func (ingress *Ingress) registerConnection(
 	if ingress.stopping {
 		return false
 	}
-	ingress.active[connection] = cancel
+	ingress.active[connection] = &ingressPeer{cancel: cancel}
 	return true
 }
 
 func (ingress *Ingress) unregisterConnection(connection net.Conn) {
 	ingress.stateMu.Lock()
-	cancel := ingress.active[connection]
+	peer := ingress.active[connection]
 	delete(ingress.active, connection)
 	ingress.stateMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if peer != nil {
+		peer.cancel()
 	}
+}
+
+func (ingress *Ingress) establishPeer(
+	connection net.Conn,
+	credentials peerCredentials,
+) (AuthenticatedPeer, *ingressPeer, time.Time, bool) {
+	for range peerEstablishmentVerifyAttempts {
+		ingress.stateMu.Lock()
+		peer := ingress.active[connection]
+		if ingress.stopping ||
+			!ingress.memberAccessPermitted(credentials.metadata.Plane) ||
+			!ingress.peerConnectionSlotAvailable(connection, credentials.metadata) ||
+			peer == nil ||
+			peer.closing ||
+			peer.established {
+			ingress.stateMu.Unlock()
+			return AuthenticatedPeer{}, nil, time.Time{}, false
+		}
+		generation := ingress.revalidationGeneration
+		ingress.stateMu.Unlock()
+
+		closeAt, authorized := ingress.verifyPeer(credentials)
+		if !authorized {
+			return AuthenticatedPeer{}, nil, time.Time{}, false
+		}
+
+		ingress.stateMu.Lock()
+		peer = ingress.active[connection]
+		switch {
+		case ingress.stopping ||
+			!ingress.memberAccessPermitted(credentials.metadata.Plane) ||
+			!ingress.peerConnectionSlotAvailable(connection, credentials.metadata) ||
+			peer == nil ||
+			peer.closing ||
+			peer.established:
+			ingress.stateMu.Unlock()
+			return AuthenticatedPeer{}, nil, time.Time{}, false
+		case generation == ingress.revalidationGeneration:
+			peer.credentials = credentials
+			peer.established = true
+			ingress.stateMu.Unlock()
+			return credentials.metadata, peer, closeAt, true
+		default:
+			ingress.stateMu.Unlock()
+		}
+	}
+	return AuthenticatedPeer{}, nil, time.Time{}, false
+}
+
+func (ingress *Ingress) verifyPeer(
+	credentials peerCredentials,
+) (closeAt time.Time, authorized bool) {
+	defer func() {
+		if recover() != nil {
+			ingress.recoveredPanics.Add(1)
+			closeAt = time.Time{}
+			authorized = false
+		}
+	}()
+	switch credentials.metadata.Plane {
+	case PlanePairing:
+		return time.Time{}, ingress.verifyPairing != nil &&
+			ingress.verifyPairing(credentials.identity) == nil
+	case PlaneConsensus:
+		return time.Time{}, ingress.verifyConsensus != nil &&
+			ingress.verifyConsensus(credentials.identity) == nil
+	case PlaneContent:
+		if ingress.verifyContent == nil {
+			return time.Time{}, false
+		}
+		started := time.Now()
+		admission, err := ingress.verifyContent(credentials.content)
+		if err != nil || !admission.validFor(credentials.content) {
+			return time.Time{}, false
+		}
+		closeAt := started.Add(admission.CloseAfter)
+		if !closeAt.After(time.Now()) {
+			return time.Time{}, false
+		}
+		return closeAt, true
+	default:
+		return time.Time{}, false
+	}
+}
+
+func (ingress *Ingress) reauthorizePeer(
+	connection net.Conn,
+	expected *ingressPeer,
+) error {
+	for range peerEstablishmentVerifyAttempts {
+		ingress.stateMu.Lock()
+		peer := ingress.active[connection]
+		if ingress.stopping ||
+			peer == nil ||
+			peer != expected ||
+			peer.closing ||
+			!peer.established ||
+			!ingress.memberAccessPermitted(
+				peer.credentials.metadata.Plane,
+			) {
+			ingress.stateMu.Unlock()
+			return ErrPeerAuthorizationUnavailable
+		}
+		generation := ingress.revalidationGeneration
+		credentials := peer.credentials
+		ingress.stateMu.Unlock()
+
+		if _, authorized := ingress.verifyPeer(credentials); !authorized {
+			ingress.closeTrackedPeer(connection, expected)
+			return ErrPeerAuthorizationDenied
+		}
+
+		ingress.stateMu.Lock()
+		peer = ingress.active[connection]
+		switch {
+		case ingress.stopping ||
+			peer == nil ||
+			peer != expected ||
+			peer.closing ||
+			!peer.established ||
+			!ingress.memberAccessPermitted(
+				peer.credentials.metadata.Plane,
+			):
+			ingress.stateMu.Unlock()
+			return ErrPeerAuthorizationUnavailable
+		case generation == ingress.revalidationGeneration:
+			ingress.stateMu.Unlock()
+			return nil
+		default:
+			ingress.stateMu.Unlock()
+		}
+	}
+	ingress.closeTrackedPeer(connection, expected)
+	return ErrPeerAuthorizationUnavailable
+}
+
+func (ingress *Ingress) memberAccessPermitted(plane Plane) bool {
+	return plane == PlanePairing || ingress.memberAccessAvailable
+}
+
+// peerConnectionSlotAvailable runs only while stateMu is held.
+func (ingress *Ingress) peerConnectionSlotAvailable(
+	candidate net.Conn,
+	metadata AuthenticatedPeer,
+) bool {
+	limit := 0
+	switch metadata.Plane {
+	case PlanePairing:
+		return true
+	case PlaneConsensus:
+		limit = peerConsensusConnectionsMax
+	case PlaneContent:
+		limit = peerContentConnectionsMax
+	default:
+		return false
+	}
+	count := 0
+	for connection, peer := range ingress.active {
+		if connection == candidate ||
+			!peer.established ||
+			peer.closing ||
+			peer.credentials.metadata.Plane != metadata.Plane ||
+			peer.credentials.metadata.DeviceID != metadata.DeviceID {
+			continue
+		}
+		count++
+		if count >= limit {
+			return false
+		}
+	}
+	return true
+}
+
+func (ingress *Ingress) disableMemberAccess() {
+	ingress.stateMu.Lock()
+	if !ingress.memberAccessAvailable {
+		ingress.stateMu.Unlock()
+		return
+	}
+	ingress.memberAccessAvailable = false
+	ingress.revalidationGeneration++
+	peers := make([]ingressPeerSnapshot, 0, len(ingress.active))
+	for connection, peer := range ingress.active {
+		if peer.closing || !peer.established ||
+			peer.credentials.metadata.Plane == PlanePairing {
+			continue
+		}
+		peers = append(peers, ingressPeerSnapshot{
+			connection: connection,
+			peer:       peer,
+		})
+	}
+	ingress.stateMu.Unlock()
+
+	for _, peer := range peers {
+		ingress.closeTrackedPeer(peer.connection, peer.peer)
+	}
+}
+
+func (ingress *Ingress) closeTrackedPeer(
+	connection net.Conn,
+	expected *ingressPeer,
+) bool {
+	ingress.stateMu.Lock()
+	peer := ingress.active[connection]
+	if peer == nil || peer.closing || expected != nil && peer != expected {
+		ingress.stateMu.Unlock()
+		return false
+	}
+	peer.closing = true
+	cancel := peer.cancel
+	ingress.stateMu.Unlock()
+
+	cancel()
+	_ = connection.Close()
+	return true
 }
 
 func (ingress *Ingress) tryConnectionSlot() bool {

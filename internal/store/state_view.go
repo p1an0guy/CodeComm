@@ -20,6 +20,9 @@ type StateView struct {
 	WorkspaceID        domain.UUIDv4
 	RecoveryGeneration uint64
 	GenesisJSON        []byte
+	// AdmissionRevision is process-local and names the store cut covered by
+	// this view. It is not replicated or digest-covered state.
+	AdmissionRevision uint64
 
 	CurrentTerm             *uint64
 	LastRaftAppliedLogIndex *uint64
@@ -103,6 +106,7 @@ func (store *Store) View(ctx context.Context) (StateView, error) {
 			WorkspaceID:        workspaceID,
 			RecoveryGeneration: state.recoveryGeneration,
 			GenesisJSON:        bytes.Clone(genesisJSON),
+			AdmissionRevision:  store.admissionRevision.Load(),
 			Heads:              headsFromConsensus(state),
 			ProjectionStateDigest: Digest(
 				digest,

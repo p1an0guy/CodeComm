@@ -68,9 +68,10 @@ func (stage applyStage) String() string {
 // commands return their original Outcome while Heads names the current store
 // head after advancing only the local Raft watermark.
 type ApplyResult struct {
-	Heads     ApplyHeads
-	Outcome   CommandOutcome
-	Duplicate bool
+	Heads             ApplyHeads
+	Outcome           CommandOutcome
+	AdmissionRevision uint64
+	Duplicate         bool
 }
 
 // Apply commits one Raft command and its complete deterministic write set.
@@ -329,6 +330,11 @@ func (store *Store) Apply(
 	})
 	if err != nil {
 		return ApplyResult{}, err
+	}
+	if result.Duplicate {
+		result.AdmissionRevision = store.admissionRevision.Load()
+	} else {
+		result.AdmissionRevision = store.advanceAdmissionRevision()
 	}
 	return result, nil
 }

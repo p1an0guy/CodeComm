@@ -459,7 +459,11 @@ func (store *Store) Initialize(
 		}
 		return writeBoundaryConsensusState(conn, initial, heads)
 	})
-	return heads, err
+	if err != nil {
+		return ApplyHeads{}, err
+	}
+	store.advanceAdmissionRevision()
+	return heads, nil
 }
 
 // InstallSuccessor atomically replaces covered projections with a verified
@@ -654,7 +658,11 @@ func (store *Store) InstallSuccessor(
 		}
 		return writeSuccessorConsensusState(conn, successor, heads)
 	})
-	return heads, err
+	if err != nil {
+		return ApplyHeads{}, err
+	}
+	store.advanceAdmissionRevision()
+	return heads, nil
 }
 
 func sameCommitmentHeads(left, right ApplyHeads) bool {

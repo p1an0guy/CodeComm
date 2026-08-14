@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,7 @@ func TestPairingHTTPComposesWithSharedPeerIngress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var revoked atomic.Bool
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +60,9 @@ func TestPairingHTTPComposesWithSharedPeerIngress(t *testing.T) {
 			VerifyPairingPeer: func(
 				certificate transport.IdentityCertificate,
 			) error {
+				if revoked.Load() {
+					return errors.New("peer revoked")
+				}
 				return certificate.VerifyIdentity(
 					pairingHTTPTestSessionID,
 					0,
@@ -72,8 +77,9 @@ func TestPairingHTTPComposesWithSharedPeerIngress(t *testing.T) {
 			},
 			VerifyContentPeer: func(
 				transport.ContentCertificate,
-			) error {
-				return errors.New("content unavailable")
+			) (transport.ContentPeerAdmission, error) {
+				return transport.ContentPeerAdmission{},
+					errors.New("content unavailable")
 			},
 		},
 		Pairing: pairingServer,
@@ -208,6 +214,10 @@ func TestPairingHTTPComposesWithSharedPeerIngress(t *testing.T) {
 		confirmationResult.CanonicalBytes(),
 	) {
 		t.Fatalf("Confirm() = (%+v, %v)", confirmed, err)
+	}
+	revoked.Store(true)
+	if _, err := client.Confirm(dialContext, confirmation); err == nil {
+		t.Fatal("Confirm() succeeded after current peer policy revoked access")
 	}
 
 	calls := service.snapshot()
