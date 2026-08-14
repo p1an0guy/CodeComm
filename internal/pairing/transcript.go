@@ -89,3 +89,9 @@ func renderSAS(transcriptHash [sha256.Size]byte) string {
 		binary.BigEndian.Uint16(digest[8:10])%10_000,
 	)
 }
+
+// RenderSAS returns the normative five-group authentication string for a
+// persisted pairing transcript hash.
+func RenderSAS(transcriptHash [sha256.Size]byte) string {
+	return renderSAS(transcriptHash)
+}
