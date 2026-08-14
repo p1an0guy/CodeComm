@@ -49,6 +49,36 @@ func buildTranscriptHash(
 	return result, nil
 }
 
+// VerifyTranscriptBinding proves that persisted pairing state was created on
+// the current TLS connection with the same role-ordered identities and request
+// core.
+func VerifyTranscriptBinding(
+	exporter []byte,
+	inviterIdentityPublicKey []byte,
+	joinerIdentityPublicKey []byte,
+	inviteDigest [sha256.Size]byte,
+	core CanonicalRequestCore,
+	expected [sha256.Size]byte,
+) error {
+	if len(core.canonical) == 0 {
+		return ErrInvalidTranscript
+	}
+	actual, err := buildTranscriptHash(
+		exporter,
+		inviterIdentityPublicKey,
+		joinerIdentityPublicKey,
+		inviteDigest,
+		core.canonical,
+	)
+	if err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare(actual[:], expected[:]) != 1 {
+		return ErrInvalidTranscript
+	}
+	return nil
+}
+
 type byteWriter interface {
 	Write([]byte) (int, error)
 }

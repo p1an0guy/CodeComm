@@ -106,6 +106,36 @@ func TestPairingProofIsConnectionBound(t *testing.T) {
 	if _, err := request.Verify(invite, otherExporter); !errors.Is(err, ErrInviteProof) {
 		t.Fatalf("Verify(second connection) error = %v, want %v", err, ErrInviteProof)
 	}
+	verified, err := request.Verify(invite, exporter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inviteValue := invite.Invite()
+	coreValue := core.Value()
+	if err := VerifyTranscriptBinding(
+		exporter,
+		inviteValue.InviterIdentityPublicKey[:],
+		coreValue.JoinerIdentityPublicKey[:],
+		invite.Digest(),
+		core,
+		verified.TranscriptHash(),
+	); err != nil {
+		t.Fatalf("VerifyTranscriptBinding() error = %v", err)
+	}
+	if err := VerifyTranscriptBinding(
+		otherExporter,
+		inviteValue.InviterIdentityPublicKey[:],
+		coreValue.JoinerIdentityPublicKey[:],
+		invite.Digest(),
+		core,
+		verified.TranscriptHash(),
+	); !errors.Is(err, ErrInvalidTranscript) {
+		t.Fatalf(
+			"VerifyTranscriptBinding(second connection) error = %v, want %v",
+			err,
+			ErrInvalidTranscript,
+		)
+	}
 	if _, err := BuildRequest(invite, core, exporter[:ExporterSize-1]); !errors.Is(err, ErrInvalidTranscript) {
 		t.Fatalf("BuildRequest(short exporter) error = %v, want %v", err, ErrInvalidTranscript)
 	}

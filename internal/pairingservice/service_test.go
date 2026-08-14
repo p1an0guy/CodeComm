@@ -101,8 +101,20 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.clock.set("2026-08-13T12:02:01Z")
+	if _, err := fixture.service.ConfirmRemote(
+		context.Background(),
+		confirmation.CanonicalBytes(),
+		bytes.Repeat([]byte{0x99}, pairing.ExporterSize),
+		fixture.peer,
+	); !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf(
+			"cross-connection confirmation error = %v, want %v",
+			err,
+			ErrRequestRejected,
+		)
+	}
 	remote, err := fixture.service.ConfirmRemote(
-		context.Background(), confirmation.CanonicalBytes(), fixture.peer,
+		context.Background(), confirmation.CanonicalBytes(), fixture.exporter, fixture.peer,
 	)
 	if err != nil || remote.Status != pairing.StatusAwaitingInviter {
 		t.Fatalf("ConfirmRemote() = (%+v, %v)", remote, err)
@@ -131,7 +143,7 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 	}
 	fixture.clock.set("2026-08-13T12:02:03Z")
 	poll, err := fixture.service.ConfirmRemote(
-		context.Background(), confirmation.CanonicalBytes(), fixture.peer,
+		context.Background(), confirmation.CanonicalBytes(), fixture.exporter, fixture.peer,
 	)
 	if err != nil || poll.Status != pairing.StatusConfirmed {
 		t.Fatalf("ConfirmRemote(poll) = (%+v, %v)", poll, err)
@@ -260,7 +272,7 @@ func TestPairingServiceRejectsMismatchedPeerAndDecision(t *testing.T) {
 	}
 	fixture.clock.set("2026-08-13T12:07:02Z")
 	if _, err := fixture.service.ConfirmRemote(
-		context.Background(), confirmation.CanonicalBytes(), fixture.peer,
+		context.Background(), confirmation.CanonicalBytes(), fixture.exporter, fixture.peer,
 	); !errors.Is(err, ErrRequestRejected) {
 		t.Fatalf("wrong decision digest error = %v, want %v", err, ErrRequestRejected)
 	}
@@ -295,6 +307,7 @@ func TestPairingServiceReportsFinalizingUntilDurableCompletion(t *testing.T) {
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -310,6 +323,7 @@ func TestPairingServiceReportsFinalizingUntilDurableCompletion(t *testing.T) {
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		changedDecision.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); !errors.Is(err, ErrRequestRejected) {
 		t.Fatalf("changed remote decision error = %v, want %v", err, ErrRequestRejected)
@@ -328,6 +342,7 @@ func TestPairingServiceReportsFinalizingUntilDurableCompletion(t *testing.T) {
 	poll, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	)
 	if err != nil || poll.Status != pairing.StatusFinalizing {
@@ -348,6 +363,7 @@ func TestPairingServiceReportsFinalizingUntilDurableCompletion(t *testing.T) {
 	poll, err = fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	)
 	if err != nil || poll.Status != pairing.StatusConfirmed || finalizer.callCount() != 2 {
@@ -389,6 +405,7 @@ func TestPairingServiceDurableFinalizationRejectionIsTerminal(t *testing.T) {
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -406,6 +423,7 @@ func TestPairingServiceDurableFinalizationRejectionIsTerminal(t *testing.T) {
 	poll, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	)
 	if err != nil || poll.Status != pairing.StatusRevoked {
@@ -471,6 +489,7 @@ func TestPairingServiceFinalizationRejectionDoesNotStarveLaterAttempt(
 		if _, err := fixture.service.ConfirmRemote(
 			context.Background(),
 			confirmation.CanonicalBytes(),
+			fixture.exporter,
 			fixture.peer,
 		); err != nil {
 			t.Fatalf("ConfirmRemote(%d) error = %v", index+1, err)
@@ -606,6 +625,7 @@ func TestPairingServiceRestartResumesFinalization(t *testing.T) {
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -725,6 +745,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	if _, err := first.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -866,6 +887,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	if _, err := first.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -947,6 +969,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	poll, err := restarted.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	)
 	if err != nil || poll.Status != pairing.StatusRevoked {
@@ -1027,6 +1050,7 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 			if _, err := fixture.service.ConfirmRemote(
 				context.Background(),
 				confirmation.CanonicalBytes(),
+				fixture.exporter,
 				fixture.peer,
 			); err != nil {
 				t.Fatal(err)

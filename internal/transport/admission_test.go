@@ -142,6 +142,31 @@ func TestAdmissionLimiterPendingCeilingsAndRelease(t *testing.T) {
 	}
 }
 
+func TestHandshakePermitHasOneHandshakeOwner(t *testing.T) {
+	t.Parallel()
+	clock := &admissionTestClock{now: time.Unix(2500, 0)}
+	limiter := newTestAdmissionLimiter(t, clock, nil)
+	permit, err := limiter.TryAcquire(netip.MustParseAddr("192.0.2.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyOfPermit := *permit
+	if !permit.BeginHandshake() {
+		t.Fatal("first BeginHandshake() was rejected")
+	}
+	if copyOfPermit.BeginHandshake() {
+		t.Fatal("copied permit acquired a second handshake")
+	}
+	permit.Release()
+	copyOfPermit.Release()
+	if permit.BeginHandshake() {
+		t.Fatal("released permit was reused")
+	}
+	if pending := limiter.Stats().PendingHandshakes; pending != 0 {
+		t.Fatalf("pending handshakes = %d, want 0", pending)
+	}
+}
+
 func TestAdmissionLimiterTrackedSourceEviction(t *testing.T) {
 	t.Parallel()
 	clock := &admissionTestClock{now: time.Unix(3000, 0)}

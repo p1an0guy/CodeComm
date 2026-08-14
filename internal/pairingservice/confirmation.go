@@ -16,11 +16,15 @@ import (
 func (service *Service) ConfirmRemote(
 	ctx context.Context,
 	canonicalConfirmation []byte,
+	exporter []byte,
 	peer transport.IdentityCertificate,
 ) (pairing.ConfirmationResult, error) {
 	observedAt, err := service.callTime(ctx)
 	if err != nil {
 		return pairing.ConfirmationResult{}, err
+	}
+	if len(exporter) != pairing.ExporterSize {
+		return pairing.ConfirmationResult{}, ErrRequestRejected
 	}
 	confirmation, err := pairing.ParseConfirmation(canonicalConfirmation)
 	if err != nil {
@@ -33,6 +37,23 @@ func (service *Service) ConfirmRemote(
 	if err := peer.VerifyIdentity(
 		details.Invite.SessionID, details.Invite.RecoveryGeneration,
 		details.Core.JoinerDeviceID, details.Core.JoinerIdentityPublicKey[:],
+	); err != nil {
+		return pairing.ConfirmationResult{}, ErrRequestRejected
+	}
+	core, err := pairing.ParseRequestCore(
+		details.Attempt.RequestCore,
+		details.Invite.SessionID,
+	)
+	if err != nil {
+		return pairing.ConfirmationResult{}, ErrUnavailable
+	}
+	if err := pairing.VerifyTranscriptBinding(
+		exporter,
+		service.identityPublicKey[:],
+		details.Core.JoinerIdentityPublicKey[:],
+		[sha256.Size]byte(details.Invite.InviteDigest),
+		core,
+		[sha256.Size]byte(details.Attempt.TranscriptHash),
 	); err != nil {
 		return pairing.ConfirmationResult{}, ErrRequestRejected
 	}

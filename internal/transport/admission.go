@@ -20,6 +20,12 @@ const (
 	admissionAttemptWindow      = time.Minute
 )
 
+const (
+	handshakePermitIssued uint32 = iota
+	handshakePermitClaimed
+	handshakePermitReleased
+)
+
 var (
 	ErrInvalidAdmissionConfig = errors.New("transport: invalid admission configuration")
 	ErrInvalidAdmissionSource = errors.New("transport: invalid admission source")
@@ -79,9 +85,9 @@ type HandshakePermit struct {
 }
 
 type handshakePermitState struct {
-	limiter  *AdmissionLimiter
-	source   netip.Addr
-	released atomic.Bool
+	limiter   *AdmissionLimiter
+	source    netip.Addr
+	lifecycle atomic.Uint32
 }
 
 // AdmissionStats is bounded operational state suitable for metrics and tests.
@@ -277,13 +283,35 @@ func (limiter *AdmissionLimiter) evictOldestIdle() bool {
 	return true
 }
 
+// BeginHandshake transfers this permit to exactly one TLS handshake owner.
+// The owner must call Release on every exit path.
+func (permit *HandshakePermit) BeginHandshake() bool {
+	return permit != nil &&
+		permit.state != nil &&
+		permit.state.lifecycle.CompareAndSwap(
+			handshakePermitIssued,
+			handshakePermitClaimed,
+		)
+}
+
 // Release returns the permit's source and global pending capacity.
 func (permit *HandshakePermit) Release() {
-	if permit == nil || permit.state == nil ||
-		!permit.state.released.CompareAndSwap(false, true) {
+	if permit == nil || permit.state == nil {
 		return
 	}
 	state := permit.state
+	for {
+		lifecycle := state.lifecycle.Load()
+		if lifecycle == handshakePermitReleased {
+			return
+		}
+		if state.lifecycle.CompareAndSwap(
+			lifecycle,
+			handshakePermitReleased,
+		) {
+			break
+		}
+	}
 	limiter := state.limiter
 	limiter.mu.Lock()
 	source := limiter.sources[state.source]

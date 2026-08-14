@@ -587,6 +587,7 @@ func TestPairingServiceFinalizationIntegrityFailureIsFatal(t *testing.T) {
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatal(err)
@@ -662,6 +663,7 @@ func pendingFinalization(
 	if _, err := fixture.service.ConfirmRemote(
 		context.Background(),
 		confirmation.CanonicalBytes(),
+		fixture.exporter,
 		fixture.peer,
 	); err != nil {
 		t.Fatalf("ConfirmRemote() error = %v", err)
