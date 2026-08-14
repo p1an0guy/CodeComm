@@ -59,9 +59,12 @@ type Service interface {
 
 // Server serves authenticated pairing connections.
 type Server struct {
-	service  Service
-	http2    *http2.Server
-	handlers chan struct{}
+	service          Service
+	http2            *http2.Server
+	handlers         chan struct{}
+	headerTimeout    time.Duration
+	requestTimeout   time.Duration
+	streamNoProgress time.Duration
 }
 
 // New constructs the fixed V1 pairing HTTP/2 server.
@@ -89,7 +92,10 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 				pairing.MaxPairingMessageBytes,
 			MaxUploadBufferPerStream: pairing.MaxPairingMessageBytes,
 		},
-		handlers: make(chan struct{}, activeHandlers),
+		handlers:         make(chan struct{}, activeHandlers),
+		headerTimeout:    RequestHeaderTimeout,
+		requestTimeout:   RequestTimeout,
+		streamNoProgress: StreamNoProgress,
 	}, nil
 }
 
@@ -130,9 +136,30 @@ func (server *Server) ServeConn(
 		}
 		return fmt.Errorf("%w: handshake", ErrTLSBinding)
 	}
-	state := connection.ConnectionState()
-	peer, exporter, err := pairingConnectionState(state)
 	permit.Release()
+	return server.ServeAuthenticatedConn(ctx, connection)
+}
+
+// ServeAuthenticatedConn serves one connection already handshaken by the
+// shared peer ingress. The caller retains connection ownership.
+func (server *Server) ServeAuthenticatedConn(
+	ctx context.Context,
+	connection *tls.Conn,
+) error {
+	if server == nil || server.service == nil || server.http2 == nil ||
+		server.handlers == nil ||
+		server.headerTimeout <= 0 ||
+		server.requestTimeout <= 0 ||
+		server.streamNoProgress <= 0 ||
+		ctx == nil || connection == nil {
+		return ErrInvalidConnection
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	peer, exporter, err := pairingConnectionState(
+		connection.ConnectionState(),
+	)
 	if err != nil {
 		return err
 	}
@@ -141,14 +168,7 @@ func (server *Server) ServeConn(
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		return fmt.Errorf("%w: clear handshake deadline", ErrInvalidConnection)
 	}
-	if err := connection.SetReadDeadline(
-		time.Now().Add(RequestHeaderTimeout),
-	); err != nil {
-		return fmt.Errorf("%w: arm header deadline", ErrInvalidConnection)
-	}
-
 	connectionContext, stop := context.WithCancel(ctx)
-	defer stop()
 	watcherDone := make(chan struct{})
 	serveDone := make(chan struct{})
 	go func() {
@@ -164,20 +184,32 @@ func (server *Server) ServeConn(
 		server: server,
 		peer:   peer,
 	}
+	defer func() {
+		stop()
+		handler.close()
+		close(serveDone)
+		<-watcherDone
+	}()
 	copy(handler.exporter[:], exporter)
-	server.http2.ServeConn(connection, &http2.ServeConnOpts{
+	deadlineConnection, err := newHTTP2DeadlineConn(
+		connection,
+		server.headerTimeout,
+		ConnectionIdle,
+		server.streamNoProgress,
+	)
+	if err != nil {
+		return err
+	}
+	server.http2.ServeConn(deadlineConnection, &http2.ServeConnOpts{
 		Context: connectionContext,
 		BaseConfig: &http.Server{
-			ReadTimeout:       RequestTimeout,
+			ReadTimeout:       server.requestTimeout,
 			ReadHeaderTimeout: RequestHeaderTimeout,
 			IdleTimeout:       ConnectionIdle,
 			MaxHeaderBytes:    HeaderMaxBytes,
 		},
 		Handler: handler,
 	})
-	handler.close()
-	close(serveDone)
-	<-watcherDone
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -237,6 +269,7 @@ func (handler *connectionHandler) ServeHTTP(
 		writeProblem(writer, http.StatusInternalServerError, problemInternal)
 		return
 	}
+	requestDeadline := time.Now().Add(handler.server.requestTimeout)
 	if !handler.begin() {
 		return
 	}
@@ -278,7 +311,12 @@ func (handler *connectionHandler) ServeHTTP(
 		)
 		return
 	}
-	body, err := readPairingBody(writer, request)
+	body, err := readPairingBody(
+		writer,
+		request,
+		requestDeadline,
+		handler.server.streamNoProgress,
+	)
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
 			writeProblem(
@@ -292,9 +330,9 @@ func (handler *connectionHandler) ServeHTTP(
 		return
 	}
 
-	callContext, cancel := context.WithTimeout(
+	callContext, cancel := context.WithDeadline(
 		request.Context(),
-		RequestTimeout,
+		requestDeadline,
 	)
 	defer cancel()
 	exporter := handler.exporter
@@ -393,9 +431,13 @@ var errBodyTooLarge = errors.New("pairing HTTP: body too large")
 func readPairingBody(
 	writer http.ResponseWriter,
 	request *http.Request,
+	requestDeadline time.Time,
+	streamNoProgress time.Duration,
 ) ([]byte, error) {
 	if request.Body == nil || request.ContentLength == 0 ||
-		request.ContentLength > pairing.MaxPairingMessageBytes {
+		request.ContentLength > pairing.MaxPairingMessageBytes ||
+		requestDeadline.IsZero() ||
+		streamNoProgress <= 0 {
 		if request.ContentLength > pairing.MaxPairingMessageBytes {
 			return nil, errBodyTooLarge
 		}
@@ -404,9 +446,11 @@ func readPairingBody(
 	defer request.Body.Close()
 	controller := http.NewResponseController(writer)
 	refreshDeadline := func() error {
-		return controller.SetReadDeadline(
-			time.Now().Add(StreamNoProgress),
-		)
+		return controller.SetReadDeadline(pairingReadDeadline(
+			time.Now(),
+			requestDeadline,
+			streamNoProgress,
+		))
 	}
 	if err := refreshDeadline(); err != nil {
 		return nil, err
@@ -434,6 +478,18 @@ func readPairingBody(
 		return nil, pairing.ErrInvalidPairingMessage
 	}
 	return body, nil
+}
+
+func pairingReadDeadline(
+	now time.Time,
+	requestDeadline time.Time,
+	streamNoProgress time.Duration,
+) time.Time {
+	progressDeadline := now.Add(streamNoProgress)
+	if requestDeadline.Before(progressDeadline) {
+		return requestDeadline
+	}
+	return progressDeadline
 }
 
 type progressReader struct {
@@ -555,3 +611,4 @@ func writeProblem(
 
 var _ http.Handler = (*connectionHandler)(nil)
 var _ Service = (*pairingservice.Service)(nil)
+var _ transport.ConnectionHandler = (*Server)(nil)

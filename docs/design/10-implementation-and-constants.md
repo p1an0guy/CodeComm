@@ -134,7 +134,7 @@ defect.
 | TLS/pairing handshake timeout / pending cap / source rate | 10 s / 32 per daemon / 10 attempts per source IP per minute, burst 20 | Local, before expensive certificate/pairing state |
 | `handshake_tracked_sources_max` / `handshake_source_idle_seconds` / `handshake_state_max_bytes` | 1,024 / 600 / 8 MiB | Local; expire then evict oldest idle source, otherwise silently drop excess attempts (§4.6) |
 | Peer HTTP limits | 32 KiB headers; 1 MiB JSON body unless an endpoint-specific bound applies; 256 list items/page; 128 active handlers/daemon | Local hard ceilings |
-| Peer HTTP/2 limits | 32 control streams/connection; per peer/direction, 1 consensus and 1 content-control + 2 content-bulk connections | Local hard ceilings; bulk carries one artifact stream; rollover permits one draining predecessor per content slot with no new streams |
+| Peer HTTP/2 limits | 32 control streams/connection; 128 inbound connections/daemon; per peer/direction, 1 consensus and 1 content-control + 2 content-bulk connections | Local hard ceilings; bulk carries one artifact stream; rollover permits one draining predecessor per content slot with no new streams |
 | Connection/stream liveness | 10 s request-header timeout; 120 s idle connection; 30 s stream no-progress timeout; SSE keepalive 15 s | Local; long transfers resume by digest/offset |
 | Local IPC limits | 128 connections and 64 active handlers/daemon; 32 KiB headers; 10 s header and 120 s body/idle timeout | Local hard ceilings; one non-pipelined request/connection at a time |
 | Pending local work | 256 unresolved commands/origin scope, 4,096/session; 64 queued Git transfers/session | Local hard ceilings; refusal occurs before request mapping/signing |

@@ -816,6 +816,187 @@ func TestServerHandlerCapacityRejectsWithoutQueueing(t *testing.T) {
 	}
 }
 
+func TestServerAbsoluteBodyDeadlineReleasesHandlerCapacity(t *testing.T) {
+	service := newRecordingService(t)
+	server, err := newServer(service, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.requestTimeout = 500 * time.Millisecond
+	server.streamNoProgress = 100 * time.Millisecond
+	connection := openTestConnection(t, server)
+	defer connection.close(t)
+
+	reader, writer := io.Pipe()
+	firstContext, cancelFirst := context.WithTimeout(
+		context.Background(),
+		6*time.Second,
+	)
+	defer cancelFirst()
+	first, err := http.NewRequestWithContext(
+		firstContext,
+		http.MethodPost,
+		"https://codecomm.test"+RequestPath,
+		reader,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.ContentLength = 1 << 10
+	first.Header.Set("Content-Type", "application/json")
+	firstDone := make(chan roundTripResult, 1)
+	firstStartedAt := time.Now()
+	go func() {
+		response, err := connection.client.RoundTrip(first)
+		firstDone <- roundTripResult{response: response, err: err}
+	}()
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if _, err := writer.Write([]byte(" ")); err != nil {
+				return
+			}
+			<-ticker.C
+		}
+	}()
+	writerStopped := false
+	stopWriter := func() {
+		if writerStopped {
+			return
+		}
+		writerStopped = true
+		_ = writer.Close()
+		<-writeDone
+	}
+	defer stopWriter()
+
+	handlerDeadline := time.NewTimer(3 * time.Second)
+	defer handlerDeadline.Stop()
+	for len(server.handlers) != 1 {
+		select {
+		case <-handlerDeadline.C:
+			t.Fatal("slow body did not acquire the handler slot")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	capacity := roundTrip(
+		t,
+		connection.client,
+		http.MethodPost,
+		RequestPath,
+		[]byte(`{"second":true}`),
+		"application/json",
+	)
+	if capacity.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("capacity response = %s", capacity.Status)
+	}
+	assertProblem(t, capacity, "handler_capacity")
+
+	select {
+	case result := <-firstDone:
+		if result.err != nil {
+			t.Fatalf("slow-body RoundTrip(): %v", result.err)
+		}
+		if result.response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("slow-body response = %s", result.response.Status)
+		}
+		if elapsed := time.Since(firstStartedAt); elapsed <
+			server.requestTimeout/2 {
+			t.Fatalf(
+				"slow-body response arrived after %s; progress timeout fired before absolute deadline",
+				elapsed,
+			)
+		}
+		assertProblem(t, result.response, "invalid_pairing_message")
+	case <-time.After(5 * time.Second):
+		t.Fatal("absolute request deadline did not release handler capacity")
+	}
+	stopWriter()
+
+	after := roundTrip(
+		t,
+		connection.client,
+		http.MethodPost,
+		RequestPath,
+		[]byte(`{"after":true}`),
+		"application/json",
+	)
+	if after.StatusCode != http.StatusOK {
+		t.Fatalf("post-timeout response = %s", after.Status)
+	}
+	_ = readResponse(t, after)
+}
+
+func TestServerTimesEveryHTTP2HeaderBlock(t *testing.T) {
+	service := newRecordingService(t)
+	server, err := New(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.headerTimeout = 150 * time.Millisecond
+	connection := openTestConnection(t, server)
+	stopped := false
+	defer func() {
+		_ = connection.client.Close()
+		_ = connection.harness.clientTLS.Close()
+		connection.harness.cancel()
+		if !stopped {
+			select {
+			case <-connection.harness.serverDone:
+			case <-testDeadline(t):
+				t.Fatal("pairing server did not stop")
+			}
+		}
+		clear(connection.exporter)
+	}()
+
+	response := roundTrip(
+		t,
+		connection.client,
+		http.MethodPost,
+		RequestPath,
+		[]byte(`{"first":true}`),
+		"application/json",
+	)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("first response = %s", response.Status)
+	}
+	_ = readResponse(t, response)
+
+	partialHeaders := testHTTP2Frame(
+		64,
+		http2FrameTypeHeaders,
+		http2FlagEndHeaders,
+		[]byte{0},
+	)
+	partialHeaders[8] = 3
+	startedAt := time.Now()
+	if _, err := connection.harness.clientTLS.Write(partialHeaders); err != nil {
+		t.Fatalf("write partial second header: %v", err)
+	}
+	select {
+	case err := <-connection.harness.serverDone:
+		stopped = true
+		if err != nil {
+			t.Fatalf("ServeConn() error = %v", err)
+		}
+		elapsed := time.Since(startedAt)
+		if elapsed < server.headerTimeout/2 || elapsed > 3*time.Second {
+			t.Fatalf(
+				"partial second header closed after %s, want near %s",
+				elapsed,
+				server.headerTimeout,
+			)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second HTTP/2 header block outlived its deadline")
+	}
+}
+
 func TestPairingConnectionStateRejectsWrongPlaneAndResumption(t *testing.T) {
 	t.Parallel()
 
@@ -885,6 +1066,9 @@ func TestServerUsesFixedHTTP2Limits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cap(server.handlers) != ActiveHandlersMax ||
+		server.headerTimeout != RequestHeaderTimeout ||
+		server.requestTimeout != RequestTimeout ||
+		server.streamNoProgress != StreamNoProgress ||
 		server.http2.MaxConcurrentStreams != ControlStreamsMax ||
 		server.http2.IdleTimeout != ConnectionIdle ||
 		server.http2.WriteByteTimeout != StreamNoProgress ||
@@ -897,6 +1081,44 @@ func TestServerUsesFixedHTTP2Limits(t *testing.T) {
 		ErrInvalidOptions,
 	) {
 		t.Fatalf("oversized handler limit error = %v", err)
+	}
+}
+
+func TestPairingReadDeadlineCannotExtendAbsoluteRequestBudget(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	requestDeadline := now.Add(RequestTimeout)
+	if got, want := pairingReadDeadline(
+		now,
+		requestDeadline,
+		StreamNoProgress,
+	), now.Add(StreamNoProgress); !got.Equal(want) {
+		t.Fatalf("initial read deadline = %s, want %s", got, want)
+	}
+
+	nearAbsoluteDeadline := requestDeadline.Add(-time.Second)
+	if got := pairingReadDeadline(
+		nearAbsoluteDeadline,
+		requestDeadline,
+		StreamNoProgress,
+	); !got.Equal(requestDeadline) {
+		t.Fatalf(
+			"near-budget read deadline = %s, want %s",
+			got,
+			requestDeadline,
+		)
+	}
+	if got := pairingReadDeadline(
+		requestDeadline.Add(time.Second),
+		requestDeadline,
+		StreamNoProgress,
+	); !got.Equal(requestDeadline) {
+		t.Fatalf(
+			"expired-budget read deadline = %s, want %s",
+			got,
+			requestDeadline,
+		)
 	}
 }
 
