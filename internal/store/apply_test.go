@@ -823,10 +823,14 @@ func insertOutbox(t *testing.T, store *Store, signed event.SignedEvent) {
 		return execute(
 			conn,
 			`INSERT INTO outbox(
-			    event_id, session_id, origin_device_id, origin_scope_kind,
-			    origin_scope_id, origin_sequence, kind, signed_proposal_json,
+			    event_id, session_id, recovery_generation,
+			    origin_device_id, origin_scope_kind, origin_scope_id,
+			    origin_sequence, kind, signed_proposal_json,
 			    proposal_digest, state, queued_at
-			) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10);`,
+			) VALUES (
+			    ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+			    'queued', ?10
+			);`,
 			string(proposal.EventID),
 			string(proposal.SessionID),
 			string(proposal.Origin.DeviceID()),

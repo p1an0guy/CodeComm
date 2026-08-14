@@ -43,6 +43,7 @@ type State interface {
 	ConsumePairingInvite(context.Context, pairing.VerifiedRequest, domain.Timestamp) (store.PairingAttemptRecord, bool, error)
 	RecordPairingProofFailure(context.Context, store.PairingProofFailureInput) (store.PairingAttemptRecord, bool, error)
 	RecordPairingConfirmation(context.Context, store.PairingConfirmationInput) (store.PairingAttemptRecord, bool, error)
+	RecordLocalPairingConfirmation(context.Context, store.PairingConfirmationInput, *store.PairingFinalizationAuthorization) (store.PairingAttemptRecord, bool, error)
 	RecoverPairingState(context.Context, domain.Timestamp) (store.PairingMaintenanceResult, error)
 	MaintainPairingState(context.Context, domain.Timestamp) (store.PairingMaintenanceResult, error)
 	NextPairingFinalization(context.Context) (store.PairingAttemptRecord, bool, error)
@@ -69,6 +70,17 @@ type Finalizer interface {
 	FinalizePairing(context.Context, AttemptDetails) error
 }
 
+// FinalizationAuthorizer constructs the exact human-origin request evidence
+// while the verified local approval is still on the call stack. New and
+// readmission modes also include their admission reservation.
+type FinalizationAuthorizer interface {
+	PreparePairing(
+		context.Context,
+		AttemptDetails,
+		domain.Timestamp,
+	) (*store.PairingFinalizationAuthorization, error)
+}
+
 // SettledNonvoterGuard excludes a subject from live Raft configuration while
 // an existing-device invite is transactionally consumed.
 type SettledNonvoterGuard interface {
@@ -86,6 +98,7 @@ type SecretStore interface {
 type Options struct {
 	State               State
 	Secrets             SecretStore
+	Authorizer          FinalizationAuthorizer
 	Finalizer           Finalizer
 	Nonvoters           SettledNonvoterGuard
 	IdentityPublicKey   []byte
@@ -97,6 +110,7 @@ type Options struct {
 type Service struct {
 	state               State
 	secrets             SecretStore
+	authorizer          FinalizationAuthorizer
 	finalizer           Finalizer
 	nonvoters           SettledNonvoterGuard
 	identityPublicKey   [ed25519.PublicKeySize]byte
@@ -137,7 +151,8 @@ type AttemptDetails struct {
 
 // New validates a pairing service without reading native secret material.
 func New(options Options) (*Service, error) {
-	if options.State == nil || options.Secrets == nil || options.Finalizer == nil ||
+	if options.State == nil || options.Secrets == nil ||
+		options.Authorizer == nil || options.Finalizer == nil ||
 		options.Nonvoters == nil ||
 		len(options.IdentityPublicKey) != ed25519.PublicKeySize ||
 		options.MaintenanceInterval < 0 {
@@ -159,7 +174,8 @@ func New(options Options) (*Service, error) {
 	}
 	serviceContext, cancel := context.WithCancel(context.Background())
 	service := &Service{
-		state: options.State, secrets: options.Secrets, finalizer: options.Finalizer,
+		state: options.State, secrets: options.Secrets,
+		authorizer: options.Authorizer, finalizer: options.Finalizer,
 		nonvoters: options.Nonvoters, deviceID: deviceID, clock: clock,
 		maintenanceInterval: interval, ctx: serviceContext, cancel: cancel,
 	}

@@ -5,18 +5,20 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"net/netip"
 	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/chain"
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"zombiezen.com/go/sqlite"
 )
@@ -340,7 +342,371 @@ func TestPairingInviteConcurrentValidProofHasOneWinner(t *testing.T) {
 	}
 }
 
-func TestPairingFinalizationMigrationResumesSASCompleteAttempt(t *testing.T) {
+func TestLocalPairingApprovalAtomicallyReservesAdmission(t *testing.T) {
+	fixture := newPairingLifecycleFixture(t, false, "", false)
+	invite := fixture.invite(
+		t,
+		pairingTestUUID(430),
+		pairing.ModeNew,
+		1,
+		0,
+	)
+	reserveAndActivatePairingInvite(t, fixture.state, invite)
+	verified := fixture.verifiedRequest(t, invite, pairingTestUUID(431))
+	attempt, _, err := fixture.state.ConsumePairingInvite(
+		context.Background(),
+		verified,
+		"2026-08-13T12:01:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:00Z",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	decidedAt := domain.Timestamp("2026-08-13T12:02:01Z")
+	authorization := pairingAdmissionAuthorization(
+		t,
+		fixture.ownerKey,
+		fixture.ownerID,
+		attempt.AttemptID,
+		verified.Core().Value().JoinerDeviceID,
+		decidedAt,
+	)
+	updated, duplicate, err := fixture.state.RecordLocalPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationLocal,
+			Confirmed: true,
+			DecidedAt: decidedAt,
+		},
+		authorization,
+	)
+	if err != nil || duplicate ||
+		updated.State != PairingAttemptFinalizing {
+		t.Fatalf(
+			"RecordLocalPairingConfirmation() = (%+v, %t, %v)",
+			updated,
+			duplicate,
+			err,
+		)
+	}
+	command, found, err := fixture.state.LookupRequest(
+		context.Background(),
+		attempt.AttemptID,
+		attempt.AttemptID,
+	)
+	if err != nil || !found ||
+		command.State != LocalRequestSigned ||
+		command.RecoveryGeneration != 0 ||
+		command.RequestKind != event.KindMembershipDeviceAdmitted {
+		t.Fatalf("reserved admission = (%+v, %t, %v)", command, found, err)
+	}
+	if err := fixture.state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			var (
+				status           string
+				clientID         string
+				requestID        string
+				originBootID     string
+				admissionEventID string
+				requestDigest    Digest
+				proposalDigest   Digest
+				rowErr           error
+			)
+			if err := queryOneArgs(
+				conn,
+				`SELECT authority_status, operator_client_instance_id,
+				        operator_request_id, operator_request_digest,
+				        operator_origin_boot_id, admission_event_id,
+				        admission_proposal_digest
+				   FROM pairing_attempt_finalizations
+				  WHERE attempt_id = ?1;`,
+				[]any{string(attempt.AttemptID)},
+				func(stmt *sqlite.Stmt) {
+					status = stmt.ColumnText(0)
+					clientID = stmt.ColumnText(1)
+					requestID = stmt.ColumnText(2)
+					rowErr = copyDigestColumn(&requestDigest, stmt, 3)
+					originBootID = stmt.ColumnText(4)
+					admissionEventID = stmt.ColumnText(5)
+					if rowErr == nil {
+						rowErr = copyDigestColumn(&proposalDigest, stmt, 6)
+					}
+				},
+			); err != nil {
+				return err
+			}
+			if rowErr != nil ||
+				status != "bound" ||
+				clientID != string(attempt.AttemptID) ||
+				requestID != string(attempt.AttemptID) ||
+				requestDigest != command.RequestDigest ||
+				originBootID != string(command.OriginScopeID) ||
+				admissionEventID != string(command.EventID) ||
+				proposalDigest != command.ProposalDigest {
+				t.Fatalf(
+					"finalization authority = (%q, %q, %q, %x, %q, %q, %x, %v)",
+					status,
+					clientID,
+					requestID,
+					requestDigest,
+					originBootID,
+					admissionEventID,
+					proposalDigest,
+					rowErr,
+				)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	changedRequest, err := json.Marshal(map[string]any{
+		"attempt_id": attempt.AttemptID,
+		"changed":    true,
+		"confirmed":  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedCanonical, err := codec.CanonicalizeSignedObject(changedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedAuthorization := *authorization
+	changedAuthorization.Request = authorization.Request
+	changedAuthorization.Request.CanonicalRequest = changedCanonical
+	changedAdmission := *authorization.Admission
+	changedAdmission.Input = authorization.Admission.Input
+	changedAdmission.Input.CanonicalRequest = bytes.Clone(changedCanonical)
+	changedAuthorization.Admission = &changedAdmission
+	if _, _, err := fixture.state.RecordLocalPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationLocal,
+			Confirmed: true,
+			DecidedAt: decidedAt,
+		},
+		&changedAuthorization,
+	); !errors.Is(err, ErrPairingStateIntegrity) {
+		t.Fatalf(
+			"changed authorization retry error = %v, want %v",
+			err,
+			ErrPairingStateIntegrity,
+		)
+	}
+	signed, err := event.ParseAndVerify(
+		command.SignedProposal,
+		event.VerificationContext{
+			SessionID:         domain.UUIDv7(testSessionID),
+			WorkspaceID:       testWorkspaceID,
+			IdentityPublicKey: fixture.ownerKey.Public().(ed25519.PublicKey),
+		},
+	)
+	if err != nil {
+		t.Fatalf("ParseAndVerify(reserved admission): %v", err)
+	}
+	proposal := signed.Proposal()
+	if proposal.Origin.ActorType() != event.ActorHuman ||
+		proposal.CreatedAt != decidedAt ||
+		proposal.EntityID != event.StringEntityID(
+			string(verified.Core().Value().JoinerDeviceID),
+		) {
+		t.Fatalf("reserved admission proposal = %+v", proposal)
+	}
+}
+
+func TestLocalPairingApprovalRollsBackWhenAdmissionReservationFails(t *testing.T) {
+	fixture := newPairingLifecycleFixture(t, false, "", false)
+	invite := fixture.invite(
+		t,
+		pairingTestUUID(432),
+		pairing.ModeNew,
+		1,
+		0,
+	)
+	reserveAndActivatePairingInvite(t, fixture.state, invite)
+	verified := fixture.verifiedRequest(t, invite, pairingTestUUID(433))
+	attempt, _, err := fixture.state.ConsumePairingInvite(
+		context.Background(),
+		verified,
+		"2026-08-13T12:01:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:00Z",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	authorization := pairingAdmissionAuthorization(
+		t,
+		fixture.ownerKey,
+		fixture.ownerID,
+		attempt.AttemptID,
+		verified.Core().Value().JoinerDeviceID,
+		"2026-08-13T12:02:01Z",
+	)
+	authorization.Admission.Build = func(
+		domain.UUIDv7,
+		uint64,
+	) (event.SignedEvent, error) {
+		return event.SignedEvent{}, errors.New("injected admission builder failure")
+	}
+	if _, _, err := fixture.state.RecordLocalPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationLocal,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:01Z",
+		},
+		authorization,
+	); err == nil {
+		t.Fatal("RecordLocalPairingConfirmation() succeeded")
+	}
+	stored, found, err := fixture.state.PairingAttempt(
+		context.Background(),
+		attempt.AttemptID,
+	)
+	if err != nil || !found ||
+		stored.State != PairingAttemptAwaitingSAS ||
+		stored.LocalConfirmed {
+		t.Fatalf("attempt after rollback = (%+v, %t, %v)", stored, found, err)
+	}
+	if command, found, err := fixture.state.LookupRequest(
+		context.Background(),
+		attempt.AttemptID,
+		attempt.AttemptID,
+	); err != nil || found {
+		t.Fatalf("command after rollback = (%+v, %t, %v)", command, found, err)
+	}
+}
+
+func TestLocalRebootstrapApprovalReservesNoAdmission(t *testing.T) {
+	fixture := newPairingLifecycleFixture(
+		t,
+		true,
+		device.StatusActive,
+		false,
+	)
+	invite := fixture.invite(
+		t,
+		pairingTestUUID(434),
+		pairing.ModeRebootstrap,
+		1,
+		0,
+	)
+	reserveAndActivatePairingInvite(t, fixture.state, invite)
+	verified := fixture.verifiedRequest(t, invite, pairingTestUUID(435))
+	attempt, _, err := fixture.state.ConsumePairingInvite(
+		context.Background(),
+		verified,
+		"2026-08-13T12:01:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:00Z",
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	authorization := pairingAdmissionAuthorization(
+		t,
+		fixture.ownerKey,
+		fixture.ownerID,
+		attempt.AttemptID,
+		verified.Core().Value().JoinerDeviceID,
+		"2026-08-13T12:02:01Z",
+	)
+	authorization.Admission = nil
+	updated, duplicate, err := fixture.state.RecordLocalPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationLocal,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:01Z",
+		},
+		authorization,
+	)
+	if err != nil || duplicate ||
+		updated.State != PairingAttemptFinalizing {
+		t.Fatalf(
+			"RecordLocalPairingConfirmation() = (%+v, %t, %v)",
+			updated,
+			duplicate,
+			err,
+		)
+	}
+	if command, found, err := fixture.state.LookupRequest(
+		context.Background(),
+		attempt.AttemptID,
+		attempt.AttemptID,
+	); err != nil || found {
+		t.Fatalf(
+			"rebootstrap admission command = (%+v, %t, %v)",
+			command,
+			found,
+			err,
+		)
+	}
+	if err := fixture.state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			assertTextQuery(
+				t,
+				conn,
+				`SELECT authority_status
+				   FROM pairing_attempt_finalizations
+				  WHERE attempt_id = '`+string(attempt.AttemptID)+`';`,
+				"bound",
+			)
+			assertIntQuery(
+				t,
+				conn,
+				`SELECT admission_event_id IS NULL
+				         AND admission_proposal_digest IS NULL
+				   FROM pairing_attempt_finalizations
+				  WHERE attempt_id = '`+string(attempt.AttemptID)+`';`,
+				1,
+			)
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPairingAuthorityMigrationRevokesUnboundFinalization(t *testing.T) {
 	state, inviterKey, inviterID := newPairingStateFixture(t)
 	path := state.store.path
 	invite := reserveAndActivatePairingInvite(
@@ -357,29 +723,34 @@ func TestPairingFinalizationMigrationResumesSASCompleteAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index, party := range []PairingConfirmationParty{
-		PairingConfirmationRemote,
-		PairingConfirmationLocal,
-	} {
-		if _, _, err := state.RecordPairingConfirmation(
-			context.Background(),
-			PairingConfirmationInput{
-				AttemptID: attempt.AttemptID,
-				Party:     party,
-				Confirmed: true,
-				DecidedAt: domain.Timestamp(
-					fmt.Sprintf("2026-08-13T12:02:0%dZ", index),
-				),
-			},
-		); err != nil {
-			t.Fatal(err)
-		}
+	if _, _, err := state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:00Z",
+		},
+	); err != nil {
+		t.Fatal(err)
 	}
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := execute(
+			conn,
+			`UPDATE pairing_attempts
+			    SET state = 'confirmed',
+			        local_confirmed = 1,
+			        local_confirmed_at = '2026-08-13T12:02:01Z',
+			        terminal_at = '2026-08-13T12:02:01Z'
+			  WHERE attempt_id = ?1;`,
+			string(attempt.AttemptID),
+		); err != nil {
+			return err
+		}
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
 			return err
 		}
-		return execute(conn, "DELETE FROM schema_migrations WHERE version = 3;")
+		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -395,8 +766,197 @@ func TestPairingFinalizationMigrationResumesSASCompleteAttempt(t *testing.T) {
 		context.Background(),
 		attempt.AttemptID,
 	)
-	if err != nil || !found || migrated.State != PairingAttemptFinalizing {
+	if err != nil || !found || migrated.State != PairingAttemptRevoked {
 		t.Fatalf("migrated attempt = (%+v, %t, %v)", migrated, found, err)
+	}
+}
+
+func TestPairingAuthorityMigrationPreservesLegacyCompletion(t *testing.T) {
+	state, inviterKey, inviterID := newPairingStateFixture(t)
+	path := state.store.path
+	invite := reserveAndActivatePairingInvite(
+		t,
+		state,
+		pairingTestInvite(t, pairingTestUUID(607), inviterKey, inviterID),
+	)
+	attempt, _, err := state.ConsumePairingInvite(
+		context.Background(),
+		pairingVerifiedRequest(t, invite, pairingTestUUID(608), 91),
+		"2026-08-13T12:01:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmPairingAttempt(
+		t,
+		state,
+		inviterKey,
+		inviterID,
+		attempt,
+		"2026-08-13T12:02:00Z",
+		"2026-08-13T12:02:01Z",
+	)
+	completedAt := domain.Timestamp("2026-08-13T12:02:02Z")
+	if _, _, err := state.CompletePairingFinalization(
+		context.Background(),
+		attempt.AttemptID,
+		completedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
+			return err
+		}
+		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.store.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		return applyMigration(conn, embeddedMigrations[2], systemClock())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		return execute(
+			conn,
+			`UPDATE pairing_attempt_finalizations
+			    SET state = 'completed', completed_at = ?2
+			  WHERE attempt_id = ?1;`,
+			string(attempt.AttemptID),
+			string(completedAt),
+		)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open(v3 completed pairing state) error = %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	migrated, found, err := reopened.LocalState().PairingAttempt(
+		context.Background(),
+		attempt.AttemptID,
+	)
+	if err != nil || !found ||
+		migrated.State != PairingAttemptCompleted ||
+		migrated.FinalizedAt != completedAt {
+		t.Fatalf("migrated completion = (%+v, %t, %v)", migrated, found, err)
+	}
+	if err := reopened.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		assertTextQuery(
+			t,
+			conn,
+			`SELECT authority_status
+			   FROM pairing_attempt_finalizations
+			  WHERE attempt_id = '`+string(attempt.AttemptID)+`';`,
+			"legacy_completed",
+		)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pairingAdmissionAuthorization(
+	t *testing.T,
+	ownerKey ed25519.PrivateKey,
+	ownerID domain.DeviceID,
+	attemptID domain.UUIDv7,
+	subjectID domain.DeviceID,
+	createdAt domain.Timestamp,
+) *PairingFinalizationAuthorization {
+	t.Helper()
+	authority, err := event.NewLocalAuthority(
+		ownerID,
+		pairingTestUUID(436),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSON, err := json.Marshal(map[string]any{
+		"attempt_id": attemptID,
+		"confirmed":  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRequest, err := codec.CanonicalizeSignedObject(requestJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := &LocalCommandReservation{
+		Input: LocalCommandInput{
+			ClientInstanceID: attemptID,
+			RequestID:        attemptID,
+			SessionID:        domain.UUIDv7(testSessionID),
+			WorkspaceID:      testWorkspaceID,
+			BindingClass:     LocalBindingOperator,
+			OriginDeviceID:   ownerID,
+			OriginScopeKind:  OriginScopeKindBoot,
+			OriginScopeID:    pairingTestUUID(436),
+			RequestKind:      event.KindMembershipDeviceAdmitted,
+			CanonicalRequest: canonicalRequest,
+			CreatedAt:        createdAt,
+		},
+		GenerateEventID: func() (domain.UUIDv7, error) {
+			return attemptID, nil
+		},
+		Build: func(
+			eventID domain.UUIDv7,
+			sequence uint64,
+		) (event.SignedEvent, error) {
+			payload, err := codec.CanonicalizeSignedObject([]byte(`{}`))
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			proposal, err := event.BuildProposal(
+				event.Command{
+					Kind:     event.KindMembershipDeviceAdmitted,
+					EntityID: event.StringEntityID(string(subjectID)),
+					Actions:  []event.Action{},
+					Payload:  payload,
+					Redaction: event.Redaction{
+						Policy:        event.RedactionDefault,
+						FieldsRemoved: []event.RedactionField{},
+					},
+				},
+				binding,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      domain.UUIDv7(testSessionID),
+					WorkspaceID:    testWorkspaceID,
+					CreatedAt:      createdAt,
+					OriginSequence: sequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, ownerKey)
+		},
+	}
+	return &PairingFinalizationAuthorization{
+		Request: PairingOperatorRequest{
+			ClientInstanceID: reservation.Input.ClientInstanceID,
+			RequestID:        reservation.Input.RequestID,
+			SessionID:        reservation.Input.SessionID,
+			WorkspaceID:      reservation.Input.WorkspaceID,
+			OriginDeviceID:   reservation.Input.OriginDeviceID,
+			OriginBootID:     reservation.Input.OriginScopeID,
+			CanonicalRequest: bytes.Clone(reservation.Input.CanonicalRequest),
+			CreatedAt:        reservation.Input.CreatedAt,
+		},
+		Admission: reservation,
 	}
 }
 
@@ -425,26 +985,31 @@ func TestPairingFinalizationMigrationRevokesPredecessorAttempts(t *testing.T) {
 	}
 	awaiting := createAttempt(pairingTestUUID(602), pairingTestUUID(603))
 	confirmed := createAttempt(pairingTestUUID(604), pairingTestUUID(605))
-	for index, party := range []PairingConfirmationParty{
-		PairingConfirmationRemote,
-		PairingConfirmationLocal,
-	} {
-		if _, _, err := state.RecordPairingConfirmation(
-			context.Background(),
-			PairingConfirmationInput{
-				AttemptID: confirmed.AttemptID,
-				Party:     party,
-				Confirmed: true,
-				DecidedAt: domain.Timestamp(
-					fmt.Sprintf("2026-08-13T12:02:0%dZ", index),
-				),
-			},
-		); err != nil {
-			t.Fatal(err)
-		}
+	if _, _, err := state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: confirmed.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: "2026-08-13T12:02:00Z",
+		},
+	); err != nil {
+		t.Fatal(err)
 	}
 	predecessorSessionID := pairingTestUUID(606)
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := execute(
+			conn,
+			`UPDATE pairing_attempts
+			    SET state = 'confirmed',
+			        local_confirmed = 1,
+			        local_confirmed_at = '2026-08-13T12:02:01Z',
+			        terminal_at = '2026-08-13T12:02:01Z'
+			  WHERE attempt_id = ?1;`,
+			string(confirmed.AttemptID),
+		); err != nil {
+			return err
+		}
 		if err := execute(
 			conn,
 			`UPDATE pairing_invites
@@ -459,7 +1024,7 @@ func TestPairingFinalizationMigrationRevokesPredecessorAttempts(t *testing.T) {
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
 			return err
 		}
-		return execute(conn, "DELETE FROM schema_migrations WHERE version = 3;")
+		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")
 	}); err != nil {
 		t.Fatal(err)
 	}

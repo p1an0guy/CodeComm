@@ -169,6 +169,77 @@ type PairingConfirmationInput struct {
 	DecidedAt domain.Timestamp
 }
 
+// PairingOperatorRequest is the durable identity of the operator-bound local
+// command that made the inviter's final SAS decision. CanonicalRequest is
+// hashed but never retained.
+type PairingOperatorRequest struct {
+	ClientInstanceID domain.UUIDv7
+	RequestID        domain.UUIDv7
+	SessionID        domain.UUIDv7
+	WorkspaceID      domain.UUIDv4
+	OriginDeviceID   domain.DeviceID
+	OriginBootID     domain.UUIDv7
+	CanonicalRequest []byte
+	CreatedAt        domain.Timestamp
+}
+
+func (request PairingOperatorRequest) validate() (Digest, error) {
+	if !request.ClientInstanceID.Valid() ||
+		!request.RequestID.Valid() ||
+		!request.SessionID.Valid() ||
+		!request.WorkspaceID.Valid() ||
+		!request.OriginDeviceID.Valid() ||
+		!request.OriginBootID.Valid() ||
+		!request.CreatedAt.Valid() {
+		return Digest{}, ErrInvalidPairingState
+	}
+	digest, err := validateCanonicalLocalRequest(request.CanonicalRequest)
+	if err != nil {
+		return Digest{}, ErrInvalidPairingState
+	}
+	return digest, nil
+}
+
+// PairingFinalizationAuthorization binds finalization to the exact local
+// operator request. Admission is required for new/readmission and absent for
+// rebootstrap.
+type PairingFinalizationAuthorization struct {
+	Request   PairingOperatorRequest
+	Admission *LocalCommandReservation
+}
+
+func (authorization *PairingFinalizationAuthorization) validate() (Digest, error) {
+	if authorization == nil {
+		return Digest{}, ErrInvalidPairingState
+	}
+	requestDigest, err := authorization.Request.validate()
+	if err != nil {
+		return Digest{}, err
+	}
+	if authorization.Admission == nil {
+		return requestDigest, nil
+	}
+	admissionDigest, err := authorization.Admission.validate()
+	if err != nil {
+		return Digest{}, ErrInvalidPairingState
+	}
+	input := authorization.Admission.Input
+	request := authorization.Request
+	if input.ClientInstanceID != request.ClientInstanceID ||
+		input.RequestID != request.RequestID ||
+		input.SessionID != request.SessionID ||
+		input.WorkspaceID != request.WorkspaceID ||
+		input.BindingClass != LocalBindingOperator ||
+		input.OriginDeviceID != request.OriginDeviceID ||
+		input.OriginScopeKind != OriginScopeKindBoot ||
+		input.OriginScopeID != request.OriginBootID ||
+		input.CreatedAt != request.CreatedAt ||
+		admissionDigest != requestDigest {
+		return Digest{}, ErrInvalidPairingState
+	}
+	return requestDigest, nil
+}
+
 // PairingSecretDeletion is one idempotent native-store cleanup item.
 type PairingSecretDeletion struct {
 	InviteID      domain.UUIDv7

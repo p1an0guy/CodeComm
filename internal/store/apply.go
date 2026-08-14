@@ -136,6 +136,7 @@ func (store *Store) Apply(
 			}
 			if err := compactLocalProposal(
 				conn,
+				stored.recoveryGeneration,
 				request.Proposal.Proposal().EventID,
 				stored.proposalJSON,
 				stored.proposalDigest,
@@ -303,6 +304,7 @@ func (store *Store) Apply(
 		}
 		if err := compactLocalProposal(
 			conn,
+			request.RecoveryGeneration,
 			request.Proposal.Proposal().EventID,
 			request.Proposal.CanonicalBytes(),
 			proposalDigest(request.Proposal),

@@ -104,12 +104,27 @@ func (service *Service) ConfirmLocal(
 	if confirmed && !details.Attempt.RemoteConfirmed {
 		return AttemptDetails{}, ErrAwaitingJoinerConfirmation
 	}
-	updated, _, err := service.state.RecordPairingConfirmation(
+	var authorization *store.PairingFinalizationAuthorization
+	if confirmed {
+		authorization, err = service.authorizer.PreparePairing(
+			ctx,
+			details,
+			decidedAt,
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return AttemptDetails{}, ctx.Err()
+			}
+			return AttemptDetails{}, ErrUnavailable
+		}
+	}
+	updated, _, err := service.state.RecordLocalPairingConfirmation(
 		ctx,
 		store.PairingConfirmationInput{
 			AttemptID: attemptID, Party: store.PairingConfirmationLocal,
 			Confirmed: confirmed, DecidedAt: decidedAt,
 		},
+		authorization,
 	)
 	if err != nil {
 		return AttemptDetails{}, service.stateError(ctx, err)

@@ -17,6 +17,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -31,6 +32,7 @@ const (
 
 type serviceFixture struct {
 	service           *Service
+	authorizer        *AdmissionAuthorizer
 	database          *store.Store
 	databasePath      string
 	state             store.LocalState
@@ -111,6 +113,21 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 	)
 	if err != nil || confirmed.Attempt.State != store.PairingAttemptCompleted {
 		t.Fatalf("ConfirmLocal() = (%+v, %v)", confirmed, err)
+	}
+	admission, found, err := fixture.state.LookupRequest(
+		context.Background(),
+		result.Attempt.AttemptID,
+		result.Attempt.AttemptID,
+	)
+	if err != nil || !found ||
+		admission.RequestKind != event.KindMembershipDeviceAdmitted ||
+		admission.BindingClass != store.LocalBindingOperator {
+		t.Fatalf(
+			"durable admission reservation = (%+v, %t, %v)",
+			admission,
+			found,
+			err,
+		)
 	}
 	fixture.clock.set("2026-08-13T12:02:03Z")
 	poll, err := fixture.service.ConfirmRemote(
@@ -526,6 +543,7 @@ func TestPairingServiceRequiresRecoveryAndStopsCleanly(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	service, err := New(Options{
 		State: fixture.state, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
@@ -621,6 +639,7 @@ func TestPairingServiceRestartResumesFinalization(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
@@ -669,6 +688,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	first, err := New(Options{
 		State: failingState, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
@@ -750,6 +770,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	reopenedState := reopened.LocalState()
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
@@ -808,6 +829,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	defer clear(inviteValue.Secret[:])
 	first, err := New(Options{
 		State: failingState, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
@@ -889,6 +911,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	reopenedState := reopened.LocalState()
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
@@ -967,6 +990,7 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 			defer clear(inviteValue.Secret[:])
 			service, err := New(Options{
 				State: superseding, Secrets: fixture.secrets,
+				Authorizer:        fixture.authorizer,
 				IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 				Clock:             fixture.clock.read, Finalizer: finalizer,
 				Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
@@ -1088,6 +1112,7 @@ func TestPairingServiceMaintenanceRetriesSecretDeletion(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	restarted, err := New(Options{
 		State: fixture.state, Secrets: fixture.secrets,
+		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
@@ -1289,9 +1314,29 @@ func newServiceFixtureWithMode(
 		t.Fatal(err)
 	}
 	clock := &testClock{now: "2026-08-13T12:00:00Z"}
+	localAuthority, err := event.NewLocalAuthority(
+		inviterID,
+		serviceTestUUID(500),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorOrigin, err := localAuthority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer, err := NewAdmissionAuthorizer(AdmissionAuthorizerOptions{
+		DeviceID:           inviterID,
+		OriginBootID:       serviceTestUUID(500),
+		IdentityPrivateKey: inviterKey,
+		OperatorOrigin:     operatorOrigin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	service, err := New(Options{
 		State: localState, Secrets: secrets, IdentityPublicKey: inviterPublicKey,
-		Clock: clock.read, Finalizer: finalizer,
+		Clock: clock.read, Authorizer: authorizer, Finalizer: finalizer,
 		Nonvoters: nonvoters, MaintenanceInterval: time.Hour,
 	})
 	if err != nil {
@@ -1312,7 +1357,8 @@ func newServiceFixtureWithMode(
 		t.Fatal(err)
 	}
 	return serviceFixture{
-		service: service, database: database, databasePath: databasePath,
+		service: service, authorizer: authorizer,
+		database: database, databasePath: databasePath,
 		state: localState, secrets: secrets, clock: clock, invite: invite,
 		joinerIdentityKey: joinerIdentityKey, joinerEpochKey: joinerEpochKey, peer: peer,
 		exporter: bytes.Repeat([]byte{0x55}, pairing.ExporterSize),

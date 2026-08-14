@@ -121,36 +121,62 @@ func TestPairingConsumeAndTwoSidedConfirmation(t *testing.T) {
 		t.Fatalf("duplicate consume = (%+v, %t, %v)", got, duplicate, err)
 	}
 
-	localDecision := PairingConfirmationInput{
-		AttemptID: attempt.AttemptID, Party: PairingConfirmationLocal,
+	remoteDecision := PairingConfirmationInput{
+		AttemptID: attempt.AttemptID, Party: PairingConfirmationRemote,
 		Confirmed: true, DecidedAt: "2026-08-13T12:03:00Z",
 	}
-	local, duplicate, err := state.RecordPairingConfirmation(context.Background(), localDecision)
-	if err != nil || duplicate || !local.LocalConfirmed || local.RemoteConfirmed ||
-		local.State != PairingAttemptAwaitingSAS {
-		t.Fatalf("local confirmation = (%+v, %t, %v)", local, duplicate, err)
+	remote, duplicate, err := state.RecordPairingConfirmation(
+		context.Background(),
+		remoteDecision,
+	)
+	if err != nil || duplicate || remote.LocalConfirmed || !remote.RemoteConfirmed ||
+		remote.State != PairingAttemptAwaitingSAS {
+		t.Fatalf("remote confirmation = (%+v, %t, %v)", remote, duplicate, err)
 	}
-	if _, duplicate, err := state.RecordPairingConfirmation(context.Background(), localDecision); err != nil || !duplicate {
+	if _, duplicate, err := state.RecordPairingConfirmation(
+		context.Background(),
+		remoteDecision,
+	); err != nil || !duplicate {
+		t.Fatalf("duplicate remote confirmation = (%t, %v)", duplicate, err)
+	}
+
+	localDecision := PairingConfirmationInput{
+		AttemptID: attempt.AttemptID, Party: PairingConfirmationLocal,
+		Confirmed: true, DecidedAt: "2026-08-13T12:04:00Z",
+	}
+	authorization := pairingAdmissionAuthorization(
+		t,
+		inviterKey,
+		inviterID,
+		attempt.AttemptID,
+		attempt.JoinerDeviceID,
+		localDecision.DecidedAt,
+	)
+	confirmed, duplicate, err := state.RecordLocalPairingConfirmation(
+		context.Background(),
+		localDecision,
+		authorization,
+	)
+	if err != nil || duplicate || confirmed.State != PairingAttemptFinalizing ||
+		!confirmed.LocalConfirmed || !confirmed.RemoteConfirmed ||
+		confirmed.TerminalAt != localDecision.DecidedAt {
+		t.Fatalf("local confirmation = (%+v, %t, %v)", confirmed, duplicate, err)
+	}
+	if _, duplicate, err := state.RecordLocalPairingConfirmation(
+		context.Background(),
+		localDecision,
+		authorization,
+	); err != nil || !duplicate {
 		t.Fatalf("duplicate local confirmation = (%t, %v)", duplicate, err)
 	}
 	changed := localDecision
-	changed.DecidedAt = "2026-08-13T12:03:01Z"
-	if _, _, err := state.RecordPairingConfirmation(context.Background(), changed); !errors.Is(err, ErrPairingConflict) {
+	changed.DecidedAt = "2026-08-13T12:04:01Z"
+	if _, _, err := state.RecordLocalPairingConfirmation(
+		context.Background(),
+		changed,
+		authorization,
+	); !errors.Is(err, ErrPairingConflict) {
 		t.Fatalf("changed local confirmation error = %v, want %v", err, ErrPairingConflict)
-	}
-
-	remoteDecision := PairingConfirmationInput{
-		AttemptID: attempt.AttemptID, Party: PairingConfirmationRemote,
-		Confirmed: true, DecidedAt: "2026-08-13T12:04:00Z",
-	}
-	confirmed, duplicate, err := state.RecordPairingConfirmation(context.Background(), remoteDecision)
-	if err != nil || duplicate || confirmed.State != PairingAttemptFinalizing ||
-		!confirmed.LocalConfirmed || !confirmed.RemoteConfirmed ||
-		confirmed.TerminalAt != remoteDecision.DecidedAt {
-		t.Fatalf("remote confirmation = (%+v, %t, %v)", confirmed, duplicate, err)
-	}
-	if _, duplicate, err := state.RecordPairingConfirmation(context.Background(), remoteDecision); err != nil || !duplicate {
-		t.Fatalf("duplicate terminal confirmation = (%t, %v)", duplicate, err)
 	}
 	pending, found, err := state.NextPairingFinalization(context.Background())
 	if err != nil || !found || pending.AttemptID != attempt.AttemptID ||
@@ -385,7 +411,7 @@ func TestPairingSASAttemptExpiresAndCanBeRevoked(t *testing.T) {
 		t.Fatalf("ConsumePairingInvite() error = %v", err)
 	}
 	late := PairingConfirmationInput{
-		AttemptID: attempt.AttemptID, Party: PairingConfirmationLocal,
+		AttemptID: attempt.AttemptID, Party: PairingConfirmationRemote,
 		Confirmed: true, DecidedAt: "2026-08-13T12:15:00Z",
 	}
 	if _, _, err := state.RecordPairingConfirmation(
@@ -632,24 +658,15 @@ func TestPairingGenerationClearRevokesOnlyUnfinishedAttempts(t *testing.T) {
 	}
 	confirm := func(attempt PairingAttemptRecord) {
 		t.Helper()
-		for index, party := range []PairingConfirmationParty{
-			PairingConfirmationRemote,
-			PairingConfirmationLocal,
-		} {
-			if _, _, err := state.RecordPairingConfirmation(
-				context.Background(),
-				PairingConfirmationInput{
-					AttemptID: attempt.AttemptID,
-					Party:     party,
-					Confirmed: true,
-					DecidedAt: domain.Timestamp(
-						fmt.Sprintf("2026-08-13T12:02:0%dZ", index),
-					),
-				},
-			); err != nil {
-				t.Fatal(err)
-			}
-		}
+		confirmPairingAttempt(
+			t,
+			state,
+			inviterKey,
+			inviterID,
+			attempt,
+			"2026-08-13T12:02:00Z",
+			"2026-08-13T12:02:01Z",
+		)
 	}
 
 	awaiting := createAttempt(70, 71)
@@ -719,24 +736,15 @@ func TestPairingAttemptRejectsFinalizationModeCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index, party := range []PairingConfirmationParty{
-		PairingConfirmationRemote,
-		PairingConfirmationLocal,
-	} {
-		if _, _, err := state.RecordPairingConfirmation(
-			context.Background(),
-			PairingConfirmationInput{
-				AttemptID: attempt.AttemptID,
-				Party:     party,
-				Confirmed: true,
-				DecidedAt: domain.Timestamp(
-					fmt.Sprintf("2026-08-13T12:02:0%dZ", index),
-				),
-			},
-		); err != nil {
-			t.Fatal(err)
-		}
-	}
+	confirmPairingAttempt(
+		t,
+		state,
+		inviterKey,
+		inviterID,
+		attempt,
+		"2026-08-13T12:02:00Z",
+		"2026-08-13T12:02:01Z",
+	)
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
 		return execute(
 			conn,
@@ -745,18 +753,8 @@ func TestPairingAttemptRejectsFinalizationModeCorruption(t *testing.T) {
 			  WHERE attempt_id = ?1;`,
 			string(attempt.AttemptID),
 		)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := state.PairingAttempt(
-		context.Background(),
-		attempt.AttemptID,
-	); !errors.Is(err, ErrPairingStateIntegrity) {
-		t.Fatalf(
-			"PairingAttempt() error = %v, want %v",
-			err,
-			ErrPairingStateIntegrity,
-		)
+	}); err == nil {
+		t.Fatal("schema allowed admission-bearing finalization to become rebootstrap")
 	}
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
 		return execute(
@@ -812,25 +810,21 @@ func TestRejectedPairingFinalizationDoesNotStarveQueue(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for index, party := range []PairingConfirmationParty{
-			PairingConfirmationRemote,
-			PairingConfirmationLocal,
-		} {
-			if _, _, err := state.RecordPairingConfirmation(
-				context.Background(),
-				PairingConfirmationInput{
-					AttemptID: attempt.AttemptID,
-					Party:     party,
-					Confirmed: true,
-					DecidedAt: domain.Timestamp(fmt.Sprintf(
-						"2026-08-13T12:02:%02dZ",
-						second+index,
-					)),
-				},
-			); err != nil {
-				t.Fatal(err)
-			}
-		}
+		confirmPairingAttempt(
+			t,
+			state,
+			inviterKey,
+			inviterID,
+			attempt,
+			domain.Timestamp(fmt.Sprintf(
+				"2026-08-13T12:02:%02dZ",
+				second,
+			)),
+			domain.Timestamp(fmt.Sprintf(
+				"2026-08-13T12:02:%02dZ",
+				second+1,
+			)),
+		)
 		return attempt
 	}
 
@@ -868,6 +862,51 @@ func TestRejectedPairingFinalizationDoesNotStarveQueue(t *testing.T) {
 	if err != nil || !found || pending.AttemptID != second.AttemptID {
 		t.Fatalf("second pending = (%+v, %t, %v)", pending, found, err)
 	}
+}
+
+func confirmPairingAttempt(
+	t *testing.T,
+	state LocalState,
+	inviterKey ed25519.PrivateKey,
+	inviterID domain.DeviceID,
+	attempt PairingAttemptRecord,
+	remoteAt domain.Timestamp,
+	localAt domain.Timestamp,
+) PairingAttemptRecord {
+	t.Helper()
+	if _, _, err := state.RecordPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationRemote,
+			Confirmed: true,
+			DecidedAt: remoteAt,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	authorization := pairingAdmissionAuthorization(
+		t,
+		inviterKey,
+		inviterID,
+		attempt.AttemptID,
+		attempt.JoinerDeviceID,
+		localAt,
+	)
+	confirmed, _, err := state.RecordLocalPairingConfirmation(
+		context.Background(),
+		PairingConfirmationInput{
+			AttemptID: attempt.AttemptID,
+			Party:     PairingConfirmationLocal,
+			Confirmed: true,
+			DecidedAt: localAt,
+		},
+		authorization,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return confirmed
 }
 
 func newPairingStateFixture(

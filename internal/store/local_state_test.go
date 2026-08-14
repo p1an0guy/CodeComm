@@ -130,6 +130,68 @@ func TestLocalStateReserveCommandIsDurableAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestLocalStateRejectsStaleGenerationOutbox(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(
+				conn,
+				`UPDATE outbox
+				    SET recovery_generation = 1
+				  WHERE event_id = ?1;`,
+				string(testEventID),
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := state.OutboxScopes(
+		context.Background(),
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf("OutboxScopes() error = %v, want %v", err, ErrLocalStateIntegrity)
+	}
+	if _, _, err := state.LookupRequest(
+		context.Background(),
+		testClientInstanceID,
+		testRequestID,
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf("LookupRequest() error = %v, want %v", err, ErrLocalStateIntegrity)
+	}
+	if _, _, err := state.ClaimNextOutbox(
+		context.Background(),
+		OutboxScope{
+			OriginDeviceID:  deviceID,
+			OriginScopeKind: OriginScopeKindBoot,
+			OriginScopeID:   testBootID,
+		},
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf("ClaimNextOutbox() error = %v, want %v", err, ErrLocalStateIntegrity)
+	}
+}
+
 func TestLocalStateBackpressurePrecedesIDAndSequenceAllocation(t *testing.T) {
 	state, privateKey, deviceID := newLocalStateFixture(t)
 	err := state.store.withConn(context.Background(), func(conn *sqlite.Conn) (err error) {

@@ -132,7 +132,12 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		wantNames := []string{"initial", "phase3_foundations", "pairing_finalization"}
+		wantNames := []string{
+			"initial",
+			"phase3_foundations",
+			"pairing_finalization",
+			"pairing_authority_fencing",
+		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
 		}
@@ -215,7 +220,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
 	broken := migrationFromText(
-		4,
+		5,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
@@ -233,7 +238,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 4;", 0)
+		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 5;", 0)
 		return nil
 	})
 	if err != nil {
