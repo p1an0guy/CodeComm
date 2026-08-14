@@ -210,6 +210,14 @@ claim either. Instead, a voter change is a **committed intent plus a driven reco
    objects. An unavailable target or missing canonical object leaves reconciliation visibly stalled
    and preserves both the old live configuration and old credential authority.
 
+   This gate has no development or production bypass. Phase 3 defines the coverage-provider
+   interface, receipt bytes/signatures, exact-tuple validation/invalidation, and invokes the gate
+   before every configuration call. Receipt issuance itself requires the provider to verify durable
+   possession of the exact commit. Phase 3 integration uses pre-seeded fixture repositories whose
+   objects are actually verified; Phase 4 supplies the production local-Git provider and Phase 5
+   supplies peer fetch/repair/collection. Until the provider and target-majority receipts are
+   available, reconciliation remains `object-coverage-degraded` and issues no configuration call.
+
 The consequence to state plainly: between intent commit and reconciliation completion the committed
 application target, activated credential authority, and live Raft configuration may all differ.
 `voter_reconcile_deadline` is an alert threshold, not a protocol time bound: an unavailable target,
@@ -258,7 +266,8 @@ or every eligible owner identity and the recovery key are lost, the session is u
 1. Fully recomputes both chains, the projection accumulator, deterministic outcomes, and full
    projection-state digest from genesis (§§5.2.1, 5.6), and verifies every authority handoff plus the
    latest checkpoint at its cut. A Raft survivor additionally proves its
-   `last_raft_applied_log_index` against matching stable-store/snapshot state. A settled nonvoter
+   `last_raft_applied_log_index` against matching stable-store/snapshot state, including any
+   verified installed-snapshot baseline and every required post-baseline command binding. A settled nonvoter
    instead proves contiguous authority-signed batch/checkpoint attestations from genesis or a trusted
    checkpoint through its result head; it cannot claim Raft provenance. A pre-checkpoint session is
    recoverable only with complete Raft evidence or signed batch coverage from genesis. Recovery

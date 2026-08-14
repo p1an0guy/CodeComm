@@ -152,8 +152,10 @@ These follow §13 directly and need no elaboration here beyond build order withi
 
 - **Phase 3 (secure mesh):** `discovery` → `pairing` → `credential` → `transport` (consensus plane
   first, since it never expires and everything else recovers through it) → 3-voter cluster →
-  voter-set reconciliation → revocation. Must exit proving a minority commits nothing, self-promotes
-  nothing, and authorizes no credential — the fail-closed half, not just the happy path.
+  signed canonical-coverage contract/gate with verified fixture repositories → voter-set
+  reconciliation → revocation. The gate has no permissive implementation; Phase 4 supplies its
+  production local-Git provider and Phase 5 adds peer repair. Must exit proving a minority commits
+  nothing, self-promotes nothing, and authorizes no credential.
 - **Phase 4 (bootstrap):** `gitplumbing` bundle path, no-checkout clone, isolated Git config
   (including `core.hooksPath`, `init.templateDir`, `GIT_CONFIG_*`, `core.fsmonitor`,
   `protectNTFS`/`protectHFS`), preflight.
@@ -175,5 +177,6 @@ These follow §13 directly and need no elaboration here beyond build order withi
   defeat the staging quorum. Detection is post-hoc refetch; build that refetch, don't skip it.
 - **Opt-in draft inclusion can leak a secret irreversibly.** Revocation ends authorization, not
   possession.
-- **OQ2 (scale) is still open** and closes at phase 3's first real benchmarks. §11.2 values may move;
-  no mechanism should.
+- **OQ2 (scale) is still open.** Phase 3 records control-plane baselines; it closes only in Phase 5
+  when the Git/object mesh can exercise the authoritative 100k-file/2 GiB/eight-device workload.
+  §11.2 values may move; no mechanism should.

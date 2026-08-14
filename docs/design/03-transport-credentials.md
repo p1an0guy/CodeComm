@@ -29,6 +29,9 @@ invite proof of §4.5; it reaches only `POST /v1/pairing/{request,confirm}`. A c
 exactly one CodeComm ALPN. The server chooses the matching certificate before application dispatch
 and rejects multiple, absent, or cross-profile offers. Distinct ALPNs are required: with one ALPN a
 server cannot know during the TLS handshake whether to present its identity or epoch certificate.
+The listener obtains the current local content certificate from a concurrency-safe provider on every
+content handshake. A missing, expired, or invalid content key rejects that handshake only; pairing
+and consensus remain available so renewal never depends on a current content credential.
 
 Before certificate parsing or pairing allocation, one source-IP-keyed limiter enforces §11.2's
 attempt, pending-handshake, tracked-source, idle-expiry, and aggregate-byte ceilings across all three
@@ -79,14 +82,14 @@ the wide interval only prevents an accidental generic-stack expiry. Phase 1 veri
 chosen Go TLS/X.509 path parses this interval on every supported OS. The TLS 1.3 handshake proves
 fresh possession of the identity private key, so no additional nonce exchange is required.
 
-The custom extensions are fixed DER, not implementation-selected JSON or ASN.1. Their globally
-unique OIDs are UUID-derived:
+The custom extensions are fixed DER, not implementation-selected JSON or ASN.1. Their protocol-fixed
+OIDs encode the corresponding UUID as eight unsigned 16-bit arcs below `2.25.0`:
 
 ```text
-id-codecomm-identity = 2.25.137450442163372855725609670219938592112
-                       (UUID 6767fe03-a5ff-42df-81ef-24257c26f570)
-id-codecomm-content  = 2.25.257152678922134553830201523637681587822
-                       (UUID c175cdf1-313f-4f06-a098-a6b839b3066e)
+id-codecomm-identity = 2.25.0.26471.65027.42495.17119.33263.9253.31782.62832
+                       (words of UUID 6767fe03-a5ff-42df-81ef-24257c26f570)
+id-codecomm-content  = 2.25.0.49525.52721.12607.20230.41112.42680.14771.1646
+                       (words of UUID c175cdf1-313f-4f06-a098-a6b839b3066e)
 
 IdentityBinding ::= SEQUENCE {
   formatVersion       INTEGER,       -- exactly 1
@@ -103,6 +106,12 @@ ContentBinding ::= SEQUENCE {
   authorizationChainIndex   INTEGER        -- unsigned uint64, at least 1
 }
 ```
+
+The leading zero distinguishes this compatibility encoding from the X.667 single-decimal-arc UUID
+form. Go's `crypto/x509` rejects an OID arc above signed 31-bit range before a custom verifier runs,
+so the X.667 forms are not interoperable with the selected runtime. The eight-word mapping is
+injective, fixed by the protocol, and tested as exact DER; extension authority still comes only from
+the closed profile and pinned verifier, never from public OID registration.
 
 The identity OID carries `IdentityBinding`; the content OID carries `ContentBinding`; each extension
 is critical and exactly one is present. DER minimal-length rules apply, negative/overflow integers
@@ -162,9 +171,10 @@ The rotation procedure:
    authority_voter_set_version, issued_at)` on
    `POST /v1/credentials/endorse`. An endorser signs under
    `codecomm/v1/credential-time-endorsement` only when `issued_at` is within
-   `credential_clock_skew_seconds` of its local clock. This is a clock attestation, not an authorization decision: a
-   version-halted voter may endorse without applying newer events. Endorsement requests and replies
-   carry no repository or coordination content.
+   `credential_clock_skew_seconds` of its local clock. This is a clock attestation, not an
+   authorization decision. A version-halted daemon serves no consensus route and therefore does not
+   endorse until upgraded. Endorsement requests and replies carry no repository or coordination
+   content.
 4. The leader proposes `credential.authorized` only with distinct valid endorsements from active
    devices that form a majority of the **full exact activated authority set**. Revocation never
    shrinks this denominator; §3 rejects a revocation that would leave too few active authority
@@ -244,17 +254,12 @@ already-applied state, its content links stay closed, and strong proposals queue
 on every connectivity change. An all-devices-asleep cluster recovers by ordinary election on the
 consensus plane — there is no distinct cold-start mode, and this is not §3.1 quorum recovery.
 
-**Version-halted voters.** A halted voter (§5.5) cannot campaign, but it still grants votes and
-still accepts `AppendEntries` — it receives entries and never serves them, per the leader-only
-rule — so one up-to-date voter can lead with halted voters counting toward its quorum. That
-follows from quorum deriving from the committed configuration rather than from each replica's
-applied membership. If no reachable voter can apply the log far enough to lead, the session is
-not self-recoverable: it surfaces the §5.5 version blocker naming the release required. The
-remedy is upgrading a voter, not §3.1 recovery, since committed state is intact and nothing has
-diverged; §3.1 MUST NOT be offered for this case, because it would discard entries that are
-merely unapplied rather than lost. Because endorsement is a clock-only operation available while
-halted, members of the activated credential authority may endorse without applying newer events;
-authorization still travels the non-expiring plane and no proposal freeze is required.
+**Version-halted voters.** The selected Raft API cannot safely suppress campaigning while retaining
+vote and replication service. A halted daemon therefore stops Raft and all consensus routes and is
+unavailable, while the persisted configuration remains the sole quorum definition. A compatible
+majority can still elect, commit, and authorize credentials; otherwise those operations pause until
+enough voters upgrade. The remedy is upgrading a voter, not §3.1 recovery, because committed state
+is intact and merely unapplied.
 
 Pairing (§4.5) and the consensus plane are the only network surfaces reachable without a current
 content credential. Their ALPN dispatchers are closed independently. Plain HTTP is limited to

@@ -261,7 +261,9 @@ persistence, history, or snapshot-integrity failure latches one fatal FSM error 
 Canonical snapshot anchor v2 binds session/generation, term/applied index, both chain heads,
 projection accumulator and state digest, schema versions, and a bounded contiguous non-command Raft
 tail. Phase 2 refuses restore because the anchor contains no transferable SQLite state; Phase 3 must
-add verified logical restore before accepting `InstallSnapshot`. Adversarial tests cover
+add verified logical restore plus adapter-bound `raft_snapshot_installs` baseline evidence before
+accepting `InstallSnapshot`; an installed prefix never fabricates source command provenance.
+Adversarial tests cover
 restart/replay, all-log compaction, concurrent collision, canceled callers, close races, old or
 tampered anchors, historical projection rewind, corrupt ledgers, missing coverage, and fatal halts.
 

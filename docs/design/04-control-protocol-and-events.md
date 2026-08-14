@@ -555,6 +555,10 @@ checkpoint attestation. Every settled nonvoter MUST retain contiguous attestatio
 genesis or its latest retained trusted checkpoint through its local result head. Pre-checkpoint
 batch attestations may be pruned only after a later authority-valid checkpoint covers their range
 and local recomputation through that cut matches its heads, accumulator, and full state digest.
+This standalone import never advances a Raft watermark. When the same artifact is carried by
+`InstallSnapshot`, the snapshot-store adapter additionally binds its non-payload Raft metadata and
+the replacement transaction records §6.2's local install baseline; only that verified path may
+establish a Raft command watermark without per-command apply bindings for the compacted prefix.
 
 Snapshot history is potentially session-sized and MUST NOT be allocated as one request or in-memory
 object. The expanded artifact is a fixed record stream: each record is
@@ -785,12 +789,14 @@ leader can reject a not-yet-enabled kind without applying it. Raising the floor 
 feature-enable operation, not merely a startup warning.
 
 A replica below the committed floor, or facing an unknown kind/required input at or below a floor it
-claimed to support, MUST stop before the entry, leave `last_raft_applied_log_index` unchanged, and never
-substitute a local rejection for an outcome a newer replica accepted. It keeps serving prior reads
-and accepting `AppendEntries`, votes for eligible candidates, but never campaigns; a halted leader
-steps down. The selected Raft library MUST expose this follower-without-campaigning behavior or phase
-1 replaces it; repeatedly winning and stepping down is not an acceptable approximation. Upgrade
-resumes from the same index automatically.
+claimed to support, MUST stop before the entry, leave `last_raft_applied_log_index` unchanged, and
+never substitute a local rejection for an outcome a newer replica accepted. It latches the required
+level, serves prior local reads, and shuts down its Raft instance; it neither campaigns, votes,
+accepts replication, nor serves consensus HTTP routes while halted. A halted leader may attempt one
+bounded transfer first, but safety and progress MUST NOT depend on success. The committed
+configuration still defines quorum, so a compatible majority may continue and any smaller set fails
+closed until enough voters upgrade. Upgrade restarts from persisted Raft state and resumes before
+the blocked entry. Version halt alone never permits §3.1 recovery.
 
 Genesis carries `cluster_min_apply_level`. A daemon below it refuses to join/start that session.
 An owner may raise it through `policy.changed` only after every active `devices` row reports a
@@ -800,8 +806,9 @@ Presence is irrelevant, and the reducer reads only committed device rows. A bina
 committed floor cannot start merely to report a downgrade.
 
 The supported product-release skew is N/N-1, subject to apply levels. A member with an expired
-content credential renews on the consensus plane before reporting; clock-only endorsements remain
-available from halted voters (§4.6). The event emitter stamps the one authoritative level frozen for
+content credential renews on the consensus plane before reporting; halted daemons expose no
+consensus route and provide no clock endorsement (§4.6). The event emitter stamps the one
+authoritative level frozen for
 its pair, so emitters cannot disagree. Compatibility tests must prove every event an N-1 member may
 receive either applies identically or halts cleanly.
 

@@ -38,8 +38,8 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
 - ADR-016: Unique agent sessions and isolated worktrees.
 - ADR-017: Per-session SQLite, one database per joined workspace, with logical replication.
 - ADR-018: Logical command-result batches/snapshots, never SQLite diffs.
-- ADR-024: Frozen reducers per `(kind, schema_version)`; halt rather than diverge on an
-  unappliable committed entry; N-1 supported skew.
+- ADR-024: **Refined by ADR-107.** Frozen reducers per `(kind, schema_version)`; halt rather than
+  diverge on an unappliable committed entry; N-1 supported skew.
 - ADR-025: **Revised by ADR-080.** Formerly one normative projection digest over declared tables at
   committed checkpoints.
 - ADR-019: Permanent regression harness and release gates.
@@ -130,7 +130,7 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
 - ADR-058: Successor content credentials retain the renewal-lead lower bound but no prior-expiry
   upper bound; exact activated-authority-majority clock endorsements prevent one fast leader from
   minting a future credential while allowing next-day late renewal.
-- ADR-059: Every Raft configuration call requires target-majority signed coverage of the exact
+- ADR-059: **Refined by ADR-109.** Every Raft configuration call requires target-majority signed coverage of the exact
   current canonical object; canonical advance invalidates receipts and missing coverage stalls
   reconciliation without removing an old copy.
 - ADR-060: The daemon alone constructs publication artifacts from an opaque committed
@@ -215,8 +215,9 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
 - ADR-084: The maintained Raft framed transport is carried unmodified over RFC 8441 extended CONNECT
   with an exact protocol/path and first-SETTINGS requirement; CodeComm adapts a byte stream and does
   not implement Raft framing.
-- ADR-085: Pairing uses one exact TLS exporter label/context and length-framed role-ordered
-  transcript; identity/content certificates use fixed critical UUID-derived OIDs and closed DER
+- ADR-085: **Refined by ADR-110.** Pairing uses one exact TLS exporter label/context and
+  length-framed role-ordered transcript; identity/content certificates use fixed critical
+  UUID-derived OIDs and closed DER
   schemas. Golden fixtures therefore define one interoperable proof and certificate profile rather
   than leaving security framing to each implementation. Refines ADR-045 and ADR-057.
 - ADR-086: Sparse drafts use a closed self-describing JCS manifest, fixed non-identifying synthetic
@@ -277,7 +278,7 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
   canonical UTC RFC 3339 form, and Git OIDs are lowercase algorithm-tagged values. Both successor-
   genesis signatures cover the same signature-free body; immutable primitive-suite and protocol-
   policy versions are explicit genesis inputs. Refines ADR-003 and ADR-097.
-- ADR-101: Replica currency and recovery evidence are mode-specific. Raft participants retain real
+- ADR-101: **Refined by ADR-108.** Replica currency and recovery evidence are mode-specific. Raft participants retain real
   `last_raft_applied_log_index` provenance; settled nonvoters retain contiguous authority-signed batch/snapshot
   attestations and never synthesize it. Backups preserve the corresponding evidence, and quorum
   recovery ranks verified survivors by `result_index`, not a Raft index unavailable to nonvoters.
@@ -298,14 +299,28 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
   excluded pins unless conflict-protected, retires predecessor draft streams while retaining
   selected historical snapshots, and returns survivors only through conditional same-key
   readmission. Refines ADR-067, ADR-074, ADR-083, and ADR-094.
+- ADR-107: `hashicorp/raft` exposes no follower-without-campaigning mode. A version-halted daemon
+  stops its Raft instance and consensus routes; the persisted configuration still defines quorum,
+  so compatible majorities progress and smaller sets fail closed until upgrade. Refines ADR-024.
+- ADR-108: A verified Raft snapshot install records one adapter-metadata-bound local baseline for
+  its compacted prefix and exact local command bindings thereafter; it never copies or synthesizes
+  source provenance. Standalone logical imports never establish a Raft watermark. Refines ADR-101.
 - ADR-106: Reducer/schema closure explicitly enforces actionable claims, task-update ownership,
   blocked-state reasons, path-lease cardinality, publication author/origin equality, and type-
   specific activity targets. Rejection audit deduplication is per reporter's local request mapping;
   independent reporter observations remain distinct attributed records. Refines ADR-082 and
   ADR-088.
+- ADR-109: The canonical-coverage gate has no bypass. Phase 3 freezes and enforces the signed
+  provider contract with verified fixture repositories, Phase 4 supplies local Git verification,
+  and Phase 5 supplies peer acquisition/repair. Missing coverage issues no Raft configuration call.
+  Refines ADR-059.
+- ADR-110: Go's X.509 parser rejects X.667's single 128-bit UUID arc before custom verification.
+  Certificate extensions therefore use protocol-fixed OIDs under `2.25.0` followed by the UUID's
+  eight unsigned 16-bit words. This injective compatibility encoding is frozen in DER fixtures;
+  authority comes from the closed pinned profile, not public OID registration. Refines ADR-085.
 
 Numbers are allocation order and never reused. Materialized ADR bodies are immutable; this backlog
-may annotate supersession but does not rewrite them. Next free number: ADR-107.
+may annotate supersession but does not rewrite them. Next free number: ADR-111.
 
 ## 18. References
 

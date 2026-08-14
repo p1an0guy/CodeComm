@@ -15,9 +15,11 @@ jobs**: the three-OS test matrix, the race detector, the Linux `strace` stable-s
 proof, the JCS differential fuzz smoke, and the vulnerability scan. Every row below is
 cross-platform except where it names a platform.
 
-`hashicorp/raft` v1.7.3 and `raft-boltdb/v2` v2.3.1 are **accepted for V1**. All five gating
-questions in `docs/IMPLEMENTATION.md` §2 are answered on the real API, so no library replacement is
-required and design §3 stands as written.
+`hashicorp/raft` v1.7.3 and `raft-boltdb/v2` v2.3.1 are **accepted for V1**. All five listed gating
+questions in `docs/IMPLEMENTATION.md` §2 are answered on the real API. Phase 3 review later found
+that the library has no public follower mode that disables campaigning while retaining votes and
+`AppendEntries`; design §§4.6/5.5 now use the supported fail-closed behavior of stopping that Raft
+instance on a version halt.
 
 It took five CI runs to get here, and the pattern is worth recording: every failure but one was the
 harness encoding an assumption about its execution environment that only a real three-OS matrix

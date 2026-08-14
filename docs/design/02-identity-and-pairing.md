@@ -384,7 +384,8 @@ Discovery MUST NOT pair, alter membership, import Git objects, update refs, or w
                        || len64(exporter) || exporter
                        || len64(inviter_key) || inviter_key
                        || len64(joiner_key) || joiner_key
-                       || len64(invite_digest) || invite_digest)
+                       || len64(invite_digest) || invite_digest
+                       || len64(canonical_request_core) || canonical_request_core)
    proof = HMAC-SHA-256(secret,
              "codecomm/v1/invite-proof" || 0x00 || transcript_hash)
    ```
@@ -396,8 +397,9 @@ Discovery MUST NOT pair, alter membership, import Git objects, update refs, or w
    a **valid** proof — a failed proof does not consume the invite but increments a durable failure
    counter. Proof failures are rate-limited and enter the bounded local unauthenticated aggregate,
    never `audit.recorded`; three failures void the invite. A crash
-   after consumption and before the response leaves the invite consumed, so the joiner retries
-   with a fresh invite rather than replaying a consumed one.
+   after consumption and before the response leaves the invite consumed. An exact request may
+   recover a lost response only on the still-open exporter-bound TLS channel; a new connection or
+   daemon restart requires a fresh invite.
 7. The operator of each device compares and confirms a short authentication string derived
    from `sas = SHA-256("codecomm/v1/sas-transcript" || 0x00 || transcript_hash)`. The rendering is
    normative because two implementations that differ produce mismatched strings and every pairing
@@ -408,6 +410,10 @@ Discovery MUST NOT pair, alter membership, import Git objects, update refs, or w
    inviter's confirmation is an operator-bound local command that displays and binds the exact
    joiner identity, role, version, and initial epoch-key binding; it is the human authorization from
    which the daemon constructs step 8's event origin (§5.2), not a later unattended daemon action.
+   Two approvals durably move the attempt to `finalizing`, not `confirmed`; remote polling reports
+   that distinction. Restart retries the exact idempotent finalizer. Durable success records local
+   completion and returns `confirmed`; a durable authoritative rejection revokes the attempt,
+   returns `revoked`, and requires a fresh invite. Transient errors remain `finalizing`.
 8. In `new` mode that local confirmation creates `membership.device_admitted` for an absent identity.
    In `readmission` mode it creates the same event against the named `requires_readmission` row and
    invite-bound expected version; the reducer requires the same enrolled key, then updates role and
@@ -419,6 +425,22 @@ Discovery MUST NOT pair, alter membership, import Git objects, update refs, or w
    membership proof and roster; only then does the joiner open content-plane peer connections. If
    this final step is interrupted, it is safely retryable with the admitted identity and does not
    require a fresh invite.
+
+Immediately before consuming a valid proof, the inviter transactionally rechecks that the issuer is
+still an active owner and that the mode-specific subject preconditions still hold. `new` requires an
+absent identity. `rebootstrap` requires the exact active enrolled identity and role, the next content
+epoch, and exclusion from both the committed voter target and live Raft configuration. `readmission`
+requires the exact `requires_readmission` identity/version and the same voter exclusions. The live
+configuration check holds the reconciliation exclusion through invite consumption; a check followed
+by an unlocked race is insufficient.
+
+On startup the daemon abandons crash-stranded `preparing` invites, expires stale invite/SAS rows,
+resumes every `finalizing` attempt, and drains durable native-secret deletion work. The same expiry
+and deletion maintenance continues while running with bounded exponential retry. Failed-proof rows
+exist only while their invite remains outstanding and are deleted atomically on consumption or any
+terminal transition. A proof with a reused `attempt_id` but changed bound input still consumes the
+failure budget. Successor-generation installation revokes every unfinished predecessor attempt and
+never retries its finalizer in the successor lineage.
 
 An active settled nonvoter that retained its installation identity but deleted local session state
 uses closed **rebootstrap** mode. The inviter verifies the named active row and presented key,

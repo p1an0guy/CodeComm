@@ -377,7 +377,8 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 | `event_provenance` | Unsigned local `(term, log_index, applied_at, chain_index, chain_hash)` only for accepted events applied by this store's Raft FSM; result-batch/snapshot imports never synthesize it |
 | `chain_checkpoints` | Committed checkpoints with authority signature, both covered chain heads, and projection accumulator (§5.2.1) |
 | `command_results` | One immutable first-seen record per `event_id`: exact proposal/digest, canonical accepted-or-rejected outcome, exact canonical projection-mutation list, accepted chain tuple or nulls, dense result index, predecessor hash, and result hash. Retained for lineage lifetime, historical replay, and every FSM/logical snapshot (§5.2.1) |
-| `raft_command_applications` | **Local Raft evidence**: one immutable `(recovery_generation, log_index, term, event_id, proposal_digest)` binding for every applied command position, including exact duplicates. It joins `command_results` by event ID/digest; its application generation may differ from that result's immutable first-seen generation after recovery. Written with the FSM transaction and checked in both directions; imports never synthesize it |
+| `raft_command_applications` | **Local Raft evidence**: one immutable `(recovery_generation, log_index, term, event_id, proposal_digest)` binding for every command this FSM applies after its latest installed-snapshot baseline, including exact duplicates. It joins `command_results` by event ID/digest; its application generation may differ from that result's immutable first-seen generation after recovery. Written with the FSM transaction; imports never synthesize it |
+| `raft_snapshot_installs` | **Local Raft evidence**: the latest successfully installed Raft snapshot baseline, binding authenticated source, exact Raft metadata/configuration, payload digest, imported command/result/event cuts, both heads, accumulator, and full state digest. A standalone logical-snapshot import never creates it |
 | `replication_attestations` | **Local evidence**: verified signed batch envelope/signature and covered ranges, plus trusted snapshot-root/checkpoint attestations. Exact `results[]` reconstruct from immutable `command_results`; contiguous coverage supports settled-nonvoter backup/recovery (§5.3) |
 | `origin_scopes`, `audit_counters` | Digest-covered protocol projections for strict origin ordering and bounded rejection audit (§§5.2, 5.4, 6.1) |
 | `devices` | Membership, role, enrolled identity keys including revoked and superseded ones (§4.2) |
@@ -403,6 +404,10 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 | `replication_cursors`, `outbox` | Catch-up cursors hold both chain heads, result watermark, and authority version per peer; outbox holds proposals awaiting forward, drained in insertion order by the owning daemon and deleted once committed or rejected |
 | `local_requests` | **Local only**: durable `(client_instance_id, request_id) → (request_digest, event_id, publication_preparation?, exact_signed_proposal?, result?)` mapping. A preparation fixes publication ID, immutable metadata/digest, artifact, and active/abandoned state before receipts; abandonment is a generation-lifetime ID tombstone. Ordinary requests write the signed proposal immediately. Retained for the active generation (§5.1) |
 | `owner_recovery_challenges` | **Local only**: durable challenge tuple/deadline/state. One unexpired row per device; expiry is a generation-lifetime tombstone, and timely finalize atomically creates the matching `local_requests` row (§5.1) |
+| `pairing_invites` | **Local only**: bounded one-use invite metadata and lifecycle; never the secret or complete invite code |
+| `pairing_attempts` | **Local only**: bounded failed-proof observations plus the sole consumed invite's exporter-bound request and two-sided SAS decisions |
+| `pairing_attempt_finalizations` | **Local only**: `finalizing`/`completed` marker that makes mode-specific admission or rebootstrap retryable without treating SAS agreement as completion |
+| `pairing_secret_deletions` | **Local only**: durable idempotent native-credential deletion queue with stable failure codes and retry history |
 | `origin_counters` | **Local only**: next sequence per agent-session or daemon-boot scope; advanced atomically with creation of the exact signed proposal |
 | `audit_events` | Local projection of accepted action events, first-seen committed rejections, and explicit bounded pre-result rejection audits (§§5.4, 10.1); never independent authority |
 
@@ -410,6 +415,18 @@ Queryable identity/kind/version/status/time fields are typed and indexed; versio
 payloads use the §4.1 canonical encoding. Network input never becomes SQL; trusted SQL uses
 prepared statements. V1 DDL and migration 0001 are a phase-2 deliverable, frozen thereafter
 as golden fixtures (§12.2).
+
+`raft_snapshot_installs` is added by the first Phase 3 migration and has one current row per active
+generation. It stores `(session_id, workspace_id, recovery_generation, source_server_id,
+snapshot_id, snapshot_index, snapshot_term, configuration_index, configuration_digest,
+payload_digest, baseline_command_log_index?, baseline_command_term?, chain_index, chain_hash,
+result_index, result_hash, projection_accumulator, projection_state_digest, digest_version,
+projection_schema_version, installed_at)`. Digests are exact 32-byte values; nullable command
+position/term are both null or both positive. The snapshot-store adapter, not the payload, supplies
+the Raft `(snapshot_id, index, term, configuration, configuration_index)` and exposes `FSM.Restore`
+only after those values match the bounded payload envelope. `configuration_digest` hashes the
+canonical ordered server-ID/address/suffrage tuple. `installed_at` is local audit time and grants no
+authority.
 
 `local_requests` retains replay identity, not duplicate bulk. After a signed request reaches a
 committed result, the row keeps only its keys/digests/event ID and resolves the immutable outcome
@@ -422,10 +439,15 @@ coordination-state warning in §11.2, and is cleared only by §3.1's new generat
 SQLite MUST enable WAL, `synchronous=FULL`, foreign keys, a 5 s busy timeout (§11.2), and
 supported defensive settings. `synchronous=NORMAL` is insufficient: WAL's default loses committed
 transactions on power loss, which could make a Raft participant's
-`last_raft_applied_log_index` regress below its log or, on a truncated log, exceed it. A store with Raft state MUST assert
-`last_raft_applied_log_index <= last Raft log index` at startup and fail closed on violation. A
-settled nonvoter without Raft state leaves that index null/historical and validates contiguous signed
-result attestations instead.
+`last_raft_applied_log_index` regress below its log or, on a truncated log, exceed it. A store with
+Raft state MUST assert `last_raft_applied_log_index <= last Raft log or installed-snapshot command
+cut` at startup and fail closed on violation. Without an install baseline, every current-generation
+command result must have an exact first-seen local command binding and every binding must match a
+result. With one, results through its `result_index` are covered by the verified baseline; every
+later result needs a first-seen binding, every retained binding must be after the baseline command
+cut and match a result, and the latest binding or baseline must equal the SQLite command watermark.
+A settled nonvoter leaves that watermark null/historical and validates contiguous signed result
+attestations instead.
 
 The §5.3 Raft-FSM apply transaction writes atomically: accepted event or rejection,
 accepted-event provenance when applicable, `last_raft_applied_log_index`, chain heads and projection
@@ -440,9 +462,15 @@ persisted wall time is display-only and never shortens it.
 A settled-nonvoter import scratch-replays the same deterministic transitions, then atomically writes
 the batch's results/events/projections/heads, local views/timers, cursor, and
 `replication_attestations` row. It neither advances `last_raft_applied_log_index` nor writes event
-provenance. Snapshot import
-does the equivalent replacement transaction with its trusted checkpoint attestation before any
-state becomes visible.
+provenance. Standalone logical-snapshot import does the equivalent replacement transaction with its
+trusted checkpoint attestation before any state becomes visible.
+
+A Raft `InstallSnapshot` instead verifies the same logical artifact plus the adapter-supplied Raft
+metadata, then atomically replaces SQLite state, removes source-local `event_provenance` and
+`raft_command_applications`, writes the matching `raft_snapshot_installs` baseline, and establishes
+`last_raft_applied_log_index` only at the envelope's nullable command cut. It never copies or
+synthesizes the source's per-command provenance. Failure before the replacement commit leaves the
+old state and baseline intact; failure after it is ordinary idempotent Raft restart.
 
 No covered projection may carry an inbound foreign key to a locally-pruned table, and reducer
 validation reads only covered state. Foreign-key enforcement runs inside the
@@ -457,8 +485,8 @@ transactional checksummed migrations are daemon-controlled; irreversible migrati
 verified backup.
 
 Use the Raft library's production stable store, not a custom log. A Raft participant's backup uses
-SQLite online backup plus a matching verified Raft snapshot and
-`last_raft_applied_log_index`. A settled nonvoter's backup instead carries a verified logical
+SQLite online backup plus matching stable-store snapshot metadata, any installed-snapshot baseline,
+and `last_raft_applied_log_index`. A settled nonvoter's backup instead carries a verified logical
 checkpoint/snapshot plus contiguous signed batch attestations through its result head; it MUST NOT
 claim a Raft position it never applied. Never ordinary-copy active DB/WAL files. Startup after unclean exit performs recovery/integrity
 and current-head/link checks; a full historical chain scan is reserved for snapshot, export,

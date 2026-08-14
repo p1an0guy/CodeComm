@@ -258,6 +258,13 @@ recollects receipts. `object-coverage-degraded` names missing targets/objects. U
 `sessions leave` likewise refuses without explicit data-loss override when this device holds the
 sole known canonical copy (§10.1).
 
+The receipt signer calls a closed coverage-provider interface that returns success only after
+durably verifying the exact object in local storage; no caller may inject a boolean or use a
+permissive provider. Phase 3 freezes and gates on this contract using real pre-seeded fixture
+repositories. Phase 4 installs the production local-Git verifier; Phase 5 adds remote acquisition
+and repair. Missing provider support is ordinary `object-coverage-degraded`, never authorization to
+skip the gate.
+
 Retention applies the per-source ceiling and explicit pins on both source and receivers. Workspace
 checkout, stash, reset, clean, branch switch, or deletion cannot touch those out-of-tree refs; only
 the quota policy above may prune unpinned history. A clean branch switch creates no dirty snapshot

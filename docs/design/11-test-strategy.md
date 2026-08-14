@@ -58,7 +58,8 @@ Required unit/component subjects:
   same body with both signature fields absent; every genesis carries exact immutable
   `primitive_suite_version = 1` and `protocol_policy_version = 1`; exact
   pairing exporter label/empty context, role ordering, length framing, invite digest, proof, and SAS
-  vectors; both fixed certificate-extension OIDs and DER schemas reject wrong lengths, nonminimal/
+  vectors; both fixed portable certificate-extension OIDs and DER schemas reject wrong lengths,
+  nonminimal/
   negative/overflow integers, trailing bytes, wrong profile, or more than one CodeComm extension;
 - task/plan states; signatures/auth/idempotency; canonical encoding/compression; a duplicate
   `event_id` verifies and returns its durable chained outcome after restart, snapshot, recovery
@@ -163,8 +164,10 @@ Required unit/component subjects:
   positive and ASCII case variant is protected, including `.gitignore` at every depth;
   extension/placement near-misses for the other root-scoped formats are not, local config
   cannot alter classification, and another policy version is rejected in V1;
-- halted voter (§5.5): does not campaign, surrenders leadership if held, still votes for others,
-  and does not stall the leader's commit index;
+- halted voter (§5.5): leaves the blocked entry and apply watermark untouched, latches the required
+  level, attempts at most one bounded leadership transfer, then stops Raft and every consensus
+  route; a compatible configured majority progresses, a smaller set cannot, and upgrade resumes
+  before the same entry;
 - chain construction (§5.2.1): golden vectors for both seeds, links, and generation boundaries;
   accepted events alone densely advance `chain_index`, every first-seen accepted or rejected ID
   densely advances `result_index`, and duplicates/collisions advance neither; result preimages
@@ -238,10 +241,22 @@ Required unit/component subjects:
   nor extends them; every replica reaches the same verdict, while installation-wide process caps
   remain local;
 - credential epochs/revocation; membership/voter/old-term validation;
-- pairing (§4.5): an invite proof replayed on a second connection fails channel binding; a
-  crash between consumption and response leaves the invite consumed; three proof failures
+- pairing (§4.5): an exact post-consumption request retry on the same TLS channel returns the same
+  acknowledgment, while replay on a second connection fails channel binding and a process crash
+  between consumption and response leaves the invite consumed; three proof failures
   void it; the outstanding-invite cap and TTL are enforced; SAS mismatch voids the invite
-  with no retry; both sides derive the same proof/SAS from the exact exporter transcript; wrong
+  with no retry; two approvals report `finalizing` until mode-specific durable completion, and a
+  crash in that interval resumes the exact idempotent finalizer without reporting `confirmed`;
+  a durable finalizer rejection reports `revoked`, cannot starve later attempts, and requires a new
+  invite; changed requests reusing one attempt ID still consume the three-failure budget;
+  startup abandons `preparing` rows, continuously expires stale attempts, bounds/scrubs failed-proof
+  rows, and retries native-secret deletion with backoff;
+  issuer ownership and every mode-specific subject/version/epoch/voter precondition are rechecked
+  atomically at consumption, while live-configuration exclusion is held against reconciliation;
+  concurrent valid proofs have exactly one winner;
+  successor installation revokes unfinished predecessor attempts and selects no predecessor
+  finalizer after the lineage changes;
+  both sides derive the same proof/SAS from the exact exporter transcript; wrong
   exporter label/context or inviter/joiner ordering fails; encoded invite/hints/messages hit their
   exact bounds; `new`, `rebootstrap`, and `readmission` enforce their distinct subject/version/status
   fields, with only `new` generating an installation identity, both existing-device modes requiring
@@ -296,11 +311,10 @@ Required unit/component subjects:
   promoted and prove one fresh checkpoint before activation; the prior active authority signer,
   target/current versions, complete proof set, and handoff signature are reducer-validated; a crash,
   target change, revoked signer, missing proof, or unpromoted target fails without changing authority;
-- version-halt interaction (§5.5, §4.6): a halted voter still grants votes and keeps accepting
-  `AppendEntries` — never serving them — so one up-to-date voter leads with halted voters counting
-  toward quorum, and credential authorization is unaffected because it travels the non-expiring
-  plane; only "no reachable voter can apply far enough to lead" surfaces the version blocker, and
-  §3.1 is not offered for it;
+- version-halt interaction (§5.5, §4.6): stopped voters grant no votes, replication, or clock
+  endorsements; a compatible configured majority still elects and authorizes, while a smaller set
+  fails closed and surfaces the required release. Upgrade resumes from persisted Raft state and
+  §3.1 is never offered solely for version halt;
 - origin construction (§5.2, §7.1): client-supplied `origin` is a schema rejection; MCP cannot assert
   `human`, while TUI/CLI cannot assert `agent` or borrow an `agent_session_id`; daemon restarts mint a
   fresh `origin_boot_id`; every §6.4 override records its originating IPC channel;
@@ -410,11 +424,17 @@ Required unit/component subjects:
 - staging coverage after a target change (§§3, 8.1): before **every** Raft configuration call, a
   majority of the current target must hold the exact current canonical version/commit; missing or
   old-version receipts surface `object-coverage-degraded` and prevent old-voter removal; a concurrent
-  canonical advance invalidates the check; a lying receipt holder is an audited integrity blocker;
+  canonical advance invalidates the check; absent/permissive providers fail closed, Phase 3 fixture
+  providers verify real pre-seeded objects, and a lying receipt holder is an audited integrity blocker;
 - catch-up completeness (§5.3): a server that withholds the tail is detected by comparing its signed
   `server_applied_result_index` against closed peer watermarks, and a regressing value or a
   same-position different head is an audited blocker; a receiver does not treat catch-up as complete
   while any peer advertises a higher result watermark;
+- snapshot provenance (§§5.3, 6.2): `InstallSnapshot` cross-checks adapter-supplied index, term,
+  configuration/index, source, and payload digest before atomic visibility; it records one baseline,
+  imports no foreign command/event provenance, requires exact bindings for every later command, and
+  survives restore/reopen. A metadata/payload mismatch, copied binding, missing post-baseline
+  binding, or standalone import claiming a Raft watermark fails closed;
 - settled-nonvoter evidence (§§3, 5.3, 6.2): batch/snapshot imports retain contiguous authorized
   attestations and never create `event_provenance` or advance `last_raft_applied_log_index`; currency
   is relative to the greatest observed authority-signed result watermark. Its backup/restore carries
@@ -445,6 +465,10 @@ Required unit/component subjects:
   cap reductions below current replicated use and a nonmonotonic or unsupported
   `cluster_min_apply_level` reject atomically; `session_policy` participates in both projection
   commitments;
+- discovery cadence (§4.4): every allowed configured interval preserves the configured endpoint-set
+  TTL while multicast cadence clamps at 48 seconds; jitter remains within ±25%, advertisement
+  expiry remains within 60 seconds, and mandatory native Linux/macOS/Windows jobs prove same-port
+  multicast exchange rather than converting capability failures into skips;
 - durability write set (§6.2): a failpoint at each §5.3 step-7 boundary leaves event/rejection,
   provenance, consensus state, projections, lifetime `command_results`, audit, checkpoint, lease
   timer metadata, and outbox removal all committed or all absent; separate failpoints prove the local
@@ -656,7 +680,8 @@ Core scenarios:
 18. Remove a permanently lost voter, add a caught-up replacement, and retain trust; exercise
     `{A}→{B}`, unreachable-extra 3→1, leader transfer, crash after every step, target change
     mid-transit, and indefinite stall; before every configuration call require fresh target-majority
-    canonical-coverage receipts and invalidate them on canonical advance. Prove a stalled target
+    canonical-coverage receipts from actually verified fixture repositories and invalidate them on
+    canonical advance; prove a missing provider issues no configuration call. Prove a stalled target
     leaves the prior authority able to renew; activation occurs only after every target proof plus an
     active prior-authority handoff. Force-leave one voter while the other two retain quorum and prove
     no implicit membership/configuration change, then replace it explicitly; force-leave the sole
@@ -708,7 +733,9 @@ Core scenarios:
    exporter proof, and two-sided SAS rebootstrap the same `device_id` without a second admission,
    while a revoked device or different key fails; all stale sessions owned by that device end and
    release their claims/leases before a new local agent can start.
-27. Catch up a settled nonvoter solely through signed result batches/snapshots, back it up, restore
+27. Catch up a staging Raft nonvoter through a compacted `InstallSnapshot`, verify its local
+    snapshot baseline and post-baseline command bindings across restart, then promote it. Separately
+    catch up a settled nonvoter solely through signed result batches/snapshots, back it up, restore
     it, and recover quorum from it after voter loss. Verify contiguous attestation coverage,
     authority handoffs, equal heads/state, greatest-`result_index` survivor selection, and canonical
     object availability; at no point may it create Raft provenance or advance
