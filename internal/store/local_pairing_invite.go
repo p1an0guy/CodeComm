@@ -57,6 +57,13 @@ func (state LocalState) ReservePairingInvite(
 		); err != nil {
 			return err
 		}
+		if _, err := maintainPairingRows(
+			conn,
+			domain.Timestamp(record.CreatedAt),
+			false,
+		); err != nil {
+			return err
+		}
 		existing, found, err := readPairingInvite(conn, record.InviteID)
 		if err != nil {
 			return err
@@ -224,6 +231,9 @@ func (state LocalState) TerminatePairingInvite(
 				return ErrInvalidPairingState
 			}
 		}
+		if err := deleteRejectedPairingAttempts(conn, record.InviteID); err != nil {
+			return err
+		}
 		if err := execute(
 			conn,
 			`UPDATE pairing_invites SET state = ?2, terminal_at = ?3
@@ -296,6 +306,32 @@ func (state LocalState) PairingInvites(
 		result[index] = clonePairingInvite(records[index])
 	}
 	return result, nil
+}
+
+// PairingInvite reads one current-generation invite without exposing its secret.
+func (state LocalState) PairingInvite(
+	ctx context.Context,
+	inviteID domain.UUIDv7,
+) (PairingInviteRecord, bool, error) {
+	if !inviteID.Valid() {
+		return PairingInviteRecord{}, false, ErrInvalidPairingState
+	}
+	var (
+		record PairingInviteRecord
+		found  bool
+	)
+	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		var err error
+		record, found, err = readPairingInvite(conn, inviteID)
+		if err != nil || !found {
+			return err
+		}
+		return requirePairingRecordLineage(conn, record)
+	})
+	if err != nil {
+		return PairingInviteRecord{}, false, err
+	}
+	return clonePairingInvite(record), found, nil
 }
 
 func readPairingInvite(

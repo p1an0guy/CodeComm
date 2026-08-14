@@ -64,6 +64,9 @@ func (state LocalState) ConsumePairingInvite(
 			!pairingCoreMatchesInvite(coreValue, invite) {
 			return ErrPairingConflict
 		}
+		if err := requirePairingEligibility(conn, invite, coreValue); err != nil {
+			return err
+		}
 		if invite.State == PairingInviteExpired {
 			return ErrPairingInviteExpired
 		}
@@ -89,6 +92,9 @@ func (state LocalState) ConsumePairingInvite(
 			State: PairingAttemptAwaitingSAS, CreatedAt: observedAt,
 		}
 		if err := insertPairingAttempt(conn, record); err != nil {
+			return err
+		}
+		if err := deleteRejectedPairingAttempts(conn, invite.InviteID); err != nil {
 			return err
 		}
 		if err := execute(
@@ -128,9 +134,10 @@ func (state LocalState) RecordPairingProofFailure(
 		return PairingAttemptRecord{}, false, ErrInvalidPairingState
 	}
 	var (
-		result       PairingAttemptRecord
-		duplicate    bool
-		operationErr error
+		result             PairingAttemptRecord
+		duplicate          bool
+		attemptIDCollision bool
+		operationErr       error
 	)
 	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
 		existing, found, err := readPairingAttempt(conn, coreValue.AttemptID)
@@ -138,16 +145,20 @@ func (state LocalState) RecordPairingProofFailure(
 			return err
 		}
 		if found {
-			if existing.State != PairingAttemptProofRejected ||
-				!samePairingAttemptInput(
-					existing, input.InviteID, input.RequestDigest, coreBytes,
-					input.TranscriptHash, coreValue.JoinerDeviceID,
+			if existing.State == PairingAttemptProofRejected &&
+				samePairingAttemptInput(
+					existing,
+					input.InviteID,
+					input.RequestDigest,
+					coreBytes,
+					input.TranscriptHash,
+					coreValue.JoinerDeviceID,
 				) {
-				return ErrPairingConflict
+				result = existing
+				duplicate = true
+				return nil
 			}
-			result = existing
-			duplicate = true
-			return nil
+			attemptIDCollision = true
 		}
 
 		invite, found, err := readPairingInvite(conn, input.InviteID)
@@ -185,15 +196,18 @@ func (state LocalState) RecordPairingProofFailure(
 			return ErrPairingStateIntegrity
 		}
 
-		record := PairingAttemptRecord{
-			AttemptID: coreValue.AttemptID, InviteID: input.InviteID,
-			RequestDigest: input.RequestDigest, RequestCore: bytes.Clone(coreBytes),
-			TranscriptHash: input.TranscriptHash, JoinerDeviceID: coreValue.JoinerDeviceID,
-			State: PairingAttemptProofRejected, CreatedAt: input.ObservedAt,
-			TerminalAt: input.ObservedAt,
-		}
-		if err := insertPairingAttempt(conn, record); err != nil {
-			return err
+		if !attemptIDCollision {
+			record := PairingAttemptRecord{
+				AttemptID: coreValue.AttemptID, InviteID: input.InviteID,
+				RequestDigest: input.RequestDigest, RequestCore: bytes.Clone(coreBytes),
+				TranscriptHash: input.TranscriptHash, JoinerDeviceID: coreValue.JoinerDeviceID,
+				State: PairingAttemptProofRejected, CreatedAt: input.ObservedAt,
+				TerminalAt: input.ObservedAt,
+			}
+			if err := insertPairingAttempt(conn, record); err != nil {
+				return err
+			}
+			result = record
 		}
 		nextFailures := invite.ProofFailures + 1
 		if nextFailures == MaxPairingProofFailures {
@@ -217,7 +231,14 @@ func (state LocalState) RecordPairingProofFailure(
 		if err := requireOneChangedRow(conn); err != nil {
 			return err
 		}
-		result = record
+		if nextFailures == MaxPairingProofFailures {
+			if err := deleteRejectedPairingAttempts(conn, invite.InviteID); err != nil {
+				return err
+			}
+		}
+		if attemptIDCollision {
+			operationErr = ErrPairingConflict
+		}
 		return nil
 	})
 	if err != nil {
@@ -230,7 +251,7 @@ func (state LocalState) RecordPairingProofFailure(
 }
 
 // RecordPairingConfirmation records one side of the SAS comparison. A decline
-// is terminal; two confirmations transition the attempt to confirmed.
+// is terminal; two confirmations authorize durable finalization.
 func (state LocalState) RecordPairingConfirmation(
 	ctx context.Context,
 	input PairingConfirmationInput,
@@ -312,10 +333,10 @@ func (state LocalState) RecordPairingConfirmation(
 		} else {
 			nextLocal := record.LocalConfirmed || input.Party == PairingConfirmationLocal
 			nextRemote := record.RemoteConfirmed || input.Party == PairingConfirmationRemote
-			nextState := PairingAttemptAwaitingSAS
+			nextState := string(PairingAttemptAwaitingSAS)
 			var terminalAt any
 			if nextLocal && nextRemote {
-				nextState = PairingAttemptConfirmed
+				nextState = "confirmed"
 				terminalAt = string(input.DecidedAt)
 			}
 			localAt, remoteAt := nullableTimestampValue(record.LocalConfirmedAt), nullableTimestampValue(record.RemoteConfirmedAt)
@@ -334,6 +355,17 @@ func (state LocalState) RecordPairingConfirmation(
 				localAt, remoteAt, terminalAt,
 			); err != nil {
 				return err
+			}
+			if nextLocal && nextRemote {
+				if err := execute(
+					conn,
+					`INSERT INTO pairing_attempt_finalizations(
+					    attempt_id, mode, state, started_at, completed_at
+					) VALUES (?1, ?2, 'finalizing', ?3, NULL);`,
+					string(record.AttemptID), string(invite.Mode), string(input.DecidedAt),
+				); err != nil {
+					return err
+				}
 			}
 		}
 		if err := requireOneChangedRow(conn); err != nil {
@@ -490,16 +522,26 @@ func readPairingAttempt(
 	attemptID domain.UUIDv7,
 ) (PairingAttemptRecord, bool, error) {
 	var (
-		record PairingAttemptRecord
-		found  bool
-		rowErr error
+		record                PairingAttemptRecord
+		finalizationMode      pairing.Mode
+		finalizationStartedAt domain.Timestamp
+		found                 bool
+		rowErr                error
 	)
 	err := queryArgs(
 		conn,
-		`SELECT attempt_id, invite_id, request_digest, request_core_json, transcript_hash,
-		        joiner_device_id, state, local_confirmed, remote_confirmed,
-		        local_confirmed_at, remote_confirmed_at, declined_by, created_at, terminal_at
-		   FROM pairing_attempts WHERE attempt_id = ?1;`,
+		`SELECT attempts.attempt_id, attempts.invite_id, attempts.request_digest,
+		        attempts.request_core_json, attempts.transcript_hash,
+		        attempts.joiner_device_id, attempts.state,
+		        attempts.local_confirmed, attempts.remote_confirmed,
+		        attempts.local_confirmed_at, attempts.remote_confirmed_at,
+		        attempts.declined_by, attempts.created_at, attempts.terminal_at,
+		        finalizations.mode, finalizations.state, finalizations.started_at,
+		        finalizations.completed_at
+		   FROM pairing_attempts AS attempts
+		   LEFT JOIN pairing_attempt_finalizations AS finalizations
+		     ON finalizations.attempt_id = attempts.attempt_id
+		  WHERE attempts.attempt_id = ?1;`,
 		[]any{string(attemptID)},
 		func(stmt *sqlite.Stmt) {
 			if found {
@@ -507,12 +549,45 @@ func readPairingAttempt(
 				return
 			}
 			found = true
+			persistedState := stmt.ColumnText(6)
 			record = PairingAttemptRecord{
 				AttemptID: domain.UUIDv7(stmt.ColumnText(0)), InviteID: domain.UUIDv7(stmt.ColumnText(1)),
 				RequestCore: []byte(stmt.ColumnText(3)), JoinerDeviceID: domain.DeviceID(stmt.ColumnText(5)),
-				State:          PairingAttemptState(stmt.ColumnText(6)),
 				LocalConfirmed: stmt.ColumnInt64(7) == 1, RemoteConfirmed: stmt.ColumnInt64(8) == 1,
 				CreatedAt: domain.Timestamp(stmt.ColumnText(12)),
+			}
+			switch persistedState {
+			case "confirmed":
+				if stmt.ColumnType(14) == sqlite.TypeNull ||
+					stmt.ColumnType(15) == sqlite.TypeNull ||
+					stmt.ColumnType(16) == sqlite.TypeNull {
+					rowErr = ErrPairingStateIntegrity
+					return
+				}
+				finalizationMode = pairing.Mode(stmt.ColumnText(14))
+				finalizationStartedAt = domain.Timestamp(stmt.ColumnText(16))
+				if !finalizationMode.Valid() {
+					rowErr = ErrPairingStateIntegrity
+					return
+				}
+				switch stmt.ColumnText(15) {
+				case "finalizing":
+					record.State = PairingAttemptFinalizing
+				case "completed":
+					record.State = PairingAttemptCompleted
+				default:
+					rowErr = ErrPairingStateIntegrity
+					return
+				}
+			default:
+				if stmt.ColumnType(14) != sqlite.TypeNull ||
+					stmt.ColumnType(15) != sqlite.TypeNull ||
+					stmt.ColumnType(16) != sqlite.TypeNull ||
+					stmt.ColumnType(17) != sqlite.TypeNull {
+					rowErr = ErrPairingStateIntegrity
+					return
+				}
+				record.State = PairingAttemptState(persistedState)
 			}
 			if copyDigestColumn(&record.RequestDigest, stmt, 2) != nil ||
 				copyDigestColumn(&record.TranscriptHash, stmt, 4) != nil {
@@ -531,6 +606,9 @@ func readPairingAttempt(
 			if stmt.ColumnType(13) != sqlite.TypeNull {
 				record.TerminalAt = domain.Timestamp(stmt.ColumnText(13))
 			}
+			if stmt.ColumnType(17) != sqlite.TypeNull {
+				record.FinalizedAt = domain.Timestamp(stmt.ColumnText(17))
+			}
 		},
 	)
 	if err != nil {
@@ -544,6 +622,12 @@ func readPairingAttempt(
 		return PairingAttemptRecord{}, false, err
 	}
 	if !inviteFound {
+		return PairingAttemptRecord{}, false, ErrPairingStateIntegrity
+	}
+	if (record.State == PairingAttemptFinalizing ||
+		record.State == PairingAttemptCompleted) &&
+		(finalizationMode != invite.Mode ||
+			finalizationStartedAt != record.TerminalAt) {
 		return PairingAttemptRecord{}, false, ErrPairingStateIntegrity
 	}
 	if err := record.validate(invite.SessionID); err != nil {
@@ -586,6 +670,9 @@ func expirePairingInvite(
 	invite PairingInviteRecord,
 	expiredAt domain.Timestamp,
 ) error {
+	if err := deleteRejectedPairingAttempts(conn, invite.InviteID); err != nil {
+		return err
+	}
 	if err := execute(
 		conn,
 		`UPDATE pairing_invites SET state = 'expired', terminal_at = ?2
@@ -595,6 +682,18 @@ func expirePairingInvite(
 		return err
 	}
 	return requireOneChangedRow(conn)
+}
+
+func deleteRejectedPairingAttempts(
+	conn *sqlite.Conn,
+	inviteID domain.UUIDv7,
+) error {
+	return execute(
+		conn,
+		`DELETE FROM pairing_attempts
+		  WHERE invite_id = ?1 AND state = 'proof_rejected';`,
+		string(inviteID),
+	)
 }
 
 func exactPairingConfirmation(

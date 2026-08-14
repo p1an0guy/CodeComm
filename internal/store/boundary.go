@@ -688,22 +688,57 @@ func replaceCoveredProjections(
 
 func clearGenerationLocalState(conn *sqlite.Conn) error {
 	// Pairing rows are retained as idempotency evidence, but predecessor
-	// secrets must become deletion work before the active lineage changes.
-	if err := execute(
-		conn,
-		`INSERT OR IGNORE INTO pairing_secret_deletions(
-		    invite_id, session_id, reason, queued_at, failure_count
-		)
-		SELECT invite_id, session_id, 'generation_changed', expires_at, 0
-		  FROM pairing_invites
-		 WHERE state IN ('preparing', 'outstanding');`,
-	); err != nil {
+	// secrets and unfinished attempts cannot remain live across the boundary.
+	if err := queueGenerationPairingCleanup(conn); err != nil {
 		return fmt.Errorf("store: queue predecessor pairing cleanup: %w", err)
 	}
 	if err := execute(
 		conn,
+		`DELETE FROM pairing_attempts
+		  WHERE state = 'proof_rejected'
+		    AND invite_id IN (
+		        SELECT invite_id FROM pairing_invites
+		         WHERE state IN ('preparing', 'outstanding')
+		    );`,
+	); err != nil {
+		return fmt.Errorf("store: scrub predecessor pairing failures: %w", err)
+	}
+	if err := execute(
+		conn,
+		`UPDATE pairing_attempts
+		    SET state = 'revoked',
+		        terminal_at = coalesce(
+		            terminal_at,
+		            local_confirmed_at,
+		            remote_confirmed_at,
+		            created_at
+		        )
+		  WHERE state = 'awaiting_sas'
+		     OR (state = 'confirmed' AND EXISTS (
+		            SELECT 1
+		              FROM pairing_attempt_finalizations AS finalizations
+		             WHERE finalizations.attempt_id = pairing_attempts.attempt_id
+		               AND finalizations.state = 'finalizing'
+		        ));`,
+	); err != nil {
+		return fmt.Errorf("store: revoke predecessor pairing attempts: %w", err)
+	}
+	if err := execute(
+		conn,
+		`DELETE FROM pairing_attempt_finalizations WHERE state = 'finalizing';`,
+	); err != nil {
+		return fmt.Errorf("store: clear predecessor pairing finalizations: %w", err)
+	}
+	if err := execute(
+		conn,
 		`UPDATE pairing_invites
-		    SET state = 'abandoned', terminal_at = expires_at
+		    SET state = 'abandoned',
+		        terminal_at = (
+		            SELECT queued_at
+		              FROM pairing_secret_deletions
+		             WHERE pairing_secret_deletions.invite_id =
+		                   pairing_invites.invite_id
+		        )
 		  WHERE state IN ('preparing', 'outstanding');`,
 	); err != nil {
 		return fmt.Errorf("store: abandon predecessor pairing invites: %w", err)
@@ -727,6 +762,112 @@ func clearGenerationLocalState(conn *sqlite.Conn) error {
 				table,
 				err,
 			)
+		}
+	}
+	return nil
+}
+
+type generationPairingCleanup struct {
+	inviteID  domain.UUIDv7
+	sessionID domain.UUIDv7
+	queuedAt  domain.Timestamp
+}
+
+func queueGenerationPairingCleanup(conn *sqlite.Conn) error {
+	var (
+		candidates []generationPairingCleanup
+		indexes    = make(map[domain.UUIDv7]int)
+		rowErr     error
+	)
+	if err := queryArgs(
+		conn,
+		`SELECT invites.invite_id, invites.session_id, invites.created_at,
+		        attempts.terminal_at
+		   FROM pairing_invites AS invites
+		   LEFT JOIN pairing_attempts AS attempts
+		     ON attempts.invite_id = invites.invite_id
+		    AND attempts.state = 'proof_rejected'
+		  WHERE invites.state IN ('preparing', 'outstanding')
+		  ORDER BY invites.invite_id, attempts.attempt_id;`,
+		nil,
+		func(stmt *sqlite.Stmt) {
+			if rowErr != nil {
+				return
+			}
+			inviteID := domain.UUIDv7(stmt.ColumnText(0))
+			sessionID := domain.UUIDv7(stmt.ColumnText(1))
+			createdAt := domain.Timestamp(stmt.ColumnText(2))
+			if !inviteID.Valid() || !sessionID.Valid() || !createdAt.Valid() {
+				rowErr = ErrPairingStateIntegrity
+				return
+			}
+			index, found := indexes[inviteID]
+			if !found {
+				index = len(candidates)
+				indexes[inviteID] = index
+				candidates = append(candidates, generationPairingCleanup{
+					inviteID:  inviteID,
+					sessionID: sessionID,
+					queuedAt:  createdAt,
+				})
+			} else if candidates[index].sessionID != sessionID {
+				rowErr = ErrPairingStateIntegrity
+				return
+			}
+			if stmt.ColumnType(3) == sqlite.TypeNull {
+				return
+			}
+			observedAt := domain.Timestamp(stmt.ColumnText(3))
+			if !observedAt.Valid() {
+				rowErr = ErrPairingStateIntegrity
+				return
+			}
+			beforeCreated, err := timestampBefore(observedAt, createdAt)
+			if err != nil || beforeCreated {
+				rowErr = ErrPairingStateIntegrity
+				return
+			}
+			latestBeforeObserved, err := timestampBefore(
+				candidates[index].queuedAt,
+				observedAt,
+			)
+			if err != nil {
+				rowErr = ErrPairingStateIntegrity
+				return
+			}
+			if latestBeforeObserved {
+				candidates[index].queuedAt = observedAt
+			}
+		},
+	); err != nil {
+		return err
+	}
+	if rowErr != nil {
+		return rowErr
+	}
+	for _, candidate := range candidates {
+		if err := execute(
+			conn,
+			`INSERT INTO pairing_secret_deletions(
+			    invite_id, session_id, reason, queued_at, failure_count
+			) VALUES (?1, ?2, 'generation_changed', ?3, 0)
+			ON CONFLICT(invite_id) DO NOTHING;`,
+			string(candidate.inviteID),
+			string(candidate.sessionID),
+			string(candidate.queuedAt),
+		); err != nil {
+			return err
+		}
+		record, found, err := readPairingSecretDeletion(conn, candidate.inviteID)
+		if err != nil {
+			return err
+		}
+		if !found ||
+			record.SessionID != candidate.sessionID ||
+			record.Reason != "generation_changed" ||
+			record.QueuedAt != candidate.queuedAt ||
+			record.FailureCount != 0 {
+			return ErrPairingStateIntegrity
 		}
 	}
 	return nil

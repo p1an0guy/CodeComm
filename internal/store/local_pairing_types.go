@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"errors"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
@@ -24,6 +25,8 @@ var (
 	ErrPairingInviteExpired     = errors.New("store: pairing invite expired")
 	ErrPairingConflict          = errors.New("store: pairing idempotency conflict")
 	ErrPairingAttemptNotFound   = errors.New("store: pairing attempt not found")
+	ErrPairingEligibility       = errors.New("store: pairing subject is not eligible")
+	ErrPairingNotFinalizing     = errors.New("store: pairing attempt is not finalizing")
 	ErrPairingStateIntegrity    = errors.New("store: pairing state integrity failure")
 	ErrPairingDeletionNotFound  = errors.New("store: pairing secret deletion not found")
 	ErrPairingDeletionExhausted = errors.New("store: pairing secret deletion failure counter exhausted")
@@ -88,7 +91,8 @@ type PairingAttemptState string
 const (
 	PairingAttemptProofRejected PairingAttemptState = "proof_rejected"
 	PairingAttemptAwaitingSAS   PairingAttemptState = "awaiting_sas"
-	PairingAttemptConfirmed     PairingAttemptState = "confirmed"
+	PairingAttemptFinalizing    PairingAttemptState = "finalizing"
+	PairingAttemptCompleted     PairingAttemptState = "completed"
 	PairingAttemptDeclined      PairingAttemptState = "declined"
 	PairingAttemptExpired       PairingAttemptState = "expired"
 	PairingAttemptRevoked       PairingAttemptState = "revoked"
@@ -98,7 +102,8 @@ func (state PairingAttemptState) valid() bool {
 	switch state {
 	case PairingAttemptProofRejected,
 		PairingAttemptAwaitingSAS,
-		PairingAttemptConfirmed,
+		PairingAttemptFinalizing,
+		PairingAttemptCompleted,
 		PairingAttemptDeclined,
 		PairingAttemptExpired,
 		PairingAttemptRevoked:
@@ -136,6 +141,14 @@ type PairingAttemptRecord struct {
 	DeclinedBy        PairingConfirmationParty
 	CreatedAt         domain.Timestamp
 	TerminalAt        domain.Timestamp
+	FinalizedAt       domain.Timestamp
+}
+
+// PairingMaintenanceResult reports deterministic local lifecycle work.
+type PairingMaintenanceResult struct {
+	AbandonedPreparing uint64
+	ExpiredInvites     uint64
+	ExpiredAttempts    uint64
 }
 
 // PairingProofFailureInput is a structurally valid request whose HMAC failed.
@@ -211,6 +224,13 @@ func (record PairingInviteRecord) validate() error {
 	if record.TerminalAt != "" && !record.TerminalAt.Valid() {
 		return ErrPairingStateIntegrity
 	}
+	if record.TerminalAt != "" {
+		terminalAt, _ := record.TerminalAt.Time()
+		if terminalAt.Before(createdAt) ||
+			record.State == PairingInviteExpired && terminalAt.Before(expiresAt) {
+			return ErrPairingStateIntegrity
+		}
+	}
 	return nil
 }
 
@@ -224,15 +244,45 @@ func (record PairingAttemptRecord) validate(sessionID domain.UUIDv7) error {
 		core.Value().JoinerDeviceID != record.JoinerDeviceID {
 		return ErrPairingStateIntegrity
 	}
-	terminal := record.State != PairingAttemptAwaitingSAS
-	if terminal != (record.TerminalAt != "") || record.TerminalAt != "" && !record.TerminalAt.Valid() {
+	hasDecisionTime := record.State != PairingAttemptAwaitingSAS
+	if hasDecisionTime != (record.TerminalAt != "") ||
+		record.TerminalAt != "" && !record.TerminalAt.Valid() ||
+		record.FinalizedAt != "" && !record.FinalizedAt.Valid() {
 		return ErrPairingStateIntegrity
 	}
 	if record.LocalConfirmed != (record.LocalConfirmedAt != "") ||
 		record.RemoteConfirmed != (record.RemoteConfirmedAt != "") ||
 		record.LocalConfirmedAt != "" && !record.LocalConfirmedAt.Valid() ||
-		record.RemoteConfirmedAt != "" && !record.RemoteConfirmedAt.Valid() {
+		record.RemoteConfirmedAt != "" && !record.RemoteConfirmedAt.Valid() ||
+		record.State != PairingAttemptCompleted && record.FinalizedAt != "" {
 		return ErrPairingStateIntegrity
+	}
+	createdTime, _ := record.CreatedAt.Time()
+	var terminalTime time.Time
+	if record.TerminalAt != "" {
+		terminalTime, _ = record.TerminalAt.Time()
+		if terminalTime.Before(createdTime) {
+			return ErrPairingStateIntegrity
+		}
+		if record.FinalizedAt != "" {
+			finalizedTime, _ := record.FinalizedAt.Time()
+			if finalizedTime.Before(terminalTime) {
+				return ErrPairingStateIntegrity
+			}
+		}
+	}
+	for _, decision := range []domain.Timestamp{
+		record.LocalConfirmedAt,
+		record.RemoteConfirmedAt,
+	} {
+		if decision == "" {
+			continue
+		}
+		decisionTime, _ := decision.Time()
+		if decisionTime.Before(createdTime) ||
+			!terminalTime.IsZero() && decisionTime.After(terminalTime) {
+			return ErrPairingStateIntegrity
+		}
 	}
 	switch record.State {
 	case PairingAttemptProofRejected:
@@ -243,8 +293,14 @@ func (record PairingAttemptRecord) validate(sessionID domain.UUIDv7) error {
 		if record.LocalConfirmed && record.RemoteConfirmed || record.DeclinedBy != "" {
 			return ErrPairingStateIntegrity
 		}
-	case PairingAttemptConfirmed:
-		if !record.LocalConfirmed || !record.RemoteConfirmed || record.DeclinedBy != "" {
+	case PairingAttemptFinalizing:
+		if !record.LocalConfirmed || !record.RemoteConfirmed || record.DeclinedBy != "" ||
+			record.FinalizedAt != "" {
+			return ErrPairingStateIntegrity
+		}
+	case PairingAttemptCompleted:
+		if !record.LocalConfirmed || !record.RemoteConfirmed || record.DeclinedBy != "" ||
+			record.FinalizedAt == "" {
 			return ErrPairingStateIntegrity
 		}
 	case PairingAttemptDeclined:
@@ -252,7 +308,7 @@ func (record PairingAttemptRecord) validate(sessionID domain.UUIDv7) error {
 			return ErrPairingStateIntegrity
 		}
 	case PairingAttemptExpired, PairingAttemptRevoked:
-		if record.DeclinedBy != "" {
+		if record.DeclinedBy != "" || record.FinalizedAt != "" {
 			return ErrPairingStateIntegrity
 		}
 	}
