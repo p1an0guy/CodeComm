@@ -196,7 +196,6 @@ func planeConnectionVerifier(
 	return func(state tls.ConnectionState) error {
 		if state.Version != tls.VersionTLS13 || state.DidResume ||
 			state.NegotiatedProtocol != protocol ||
-			!state.NegotiatedProtocolIsMutual ||
 			len(state.PeerCertificates) != 1 {
 			return ErrTLSAdmission
 		}

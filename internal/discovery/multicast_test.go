@@ -913,11 +913,6 @@ func (network *fakeMulticastNetwork) openCountFor(
 	return len(network.sockets[family])
 }
 
-type fakeJoin struct {
-	interfaceIndex int
-	group          netip.Addr
-}
-
 type fakeWrite struct {
 	interfaceIndex int
 	destination    netip.AddrPort

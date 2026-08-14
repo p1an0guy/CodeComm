@@ -228,13 +228,6 @@ func TestTLSRejectsVerifierFailureAndVersionDowngrade(t *testing.T) {
 
 	serverConfig, clientCertificate, _ := tlsTestConfigs(t)
 	denied := errors.New("member revoked")
-	clientConfig, err := NewClientTLSConfig(ClientTLSOptions{
-		Plane: PlaneConsensus, Certificate: clientCertificate,
-		VerifyIdentityPeer: func(IdentityCertificate) error { return denied },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	leaf, err := x509.ParseCertificate(clientCertificate.Certificate[0])
 	if err != nil {
 		t.Fatal(err)
@@ -245,16 +238,15 @@ func TestTLSRejectsVerifierFailureAndVersionDowngrade(t *testing.T) {
 		nil,
 	)
 	verifyErr := verify(tls.ConnectionState{
-		Version:                    tls.VersionTLS13,
-		NegotiatedProtocol:         ALPNConsensus,
-		NegotiatedProtocolIsMutual: true,
-		PeerCertificates:           []*x509.Certificate{leaf},
+		Version:            tls.VersionTLS13,
+		NegotiatedProtocol: ALPNConsensus,
+		PeerCertificates:   []*x509.Certificate{leaf},
 	})
 	if !errors.Is(verifyErr, ErrTLSAdmission) {
 		t.Fatalf("verifier rejection = %v, want %v", verifyErr, ErrTLSAdmission)
 	}
 
-	clientConfig, err = NewClientTLSConfig(ClientTLSOptions{
+	clientConfig, err := NewClientTLSConfig(ClientTLSOptions{
 		Plane: PlaneConsensus, Certificate: clientCertificate,
 		VerifyIdentityPeer: func(IdentityCertificate) error { return nil },
 	})
