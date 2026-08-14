@@ -1,6 +1,7 @@
 package peerauth
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"testing"
 	"time"
@@ -111,6 +112,156 @@ func TestPairingAndConsensusVerifiersApplyDistinctAdmissionRules(t *testing.T) {
 		ErrPeerNotAdmitted,
 	) {
 		t.Fatalf("VerifyPairingPeer(revoked member) error = %v", err)
+	}
+}
+
+func TestVerifyExpectedConsensusPeerPinsRaftDeviceAddress(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 0)
+	otherIdentityKey := snapshotPrivateKey(12)
+	otherDeviceID, err := device.DeriveID(
+		otherIdentityKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("device.DeriveID(other) error = %v", err)
+	}
+	fixture.input.Devices[otherDeviceID] = device.Device{
+		ID:                otherDeviceID,
+		Role:              device.RoleEditor,
+		IdentityPublicKey: otherIdentityKey.Public().(ed25519.PublicKey),
+		DaemonVersion:     "0.1.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+	fixture.input.AuditCounters[otherDeviceID] = auditcounter.Counter{
+		DeviceID: otherDeviceID,
+	}
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	verifiers, err := NewVerifiers(
+		func() (*Snapshot, error) { return snapshot, nil },
+		snapshotTestNow,
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiers() error = %v", err)
+	}
+	certificate := parsedIdentityCertificate(
+		t,
+		snapshotTestSessionID,
+		fixture.input.RecoveryGeneration,
+		fixture.identityKey,
+	)
+	if err := verifiers.VerifyExpectedConsensusPeer(
+		fixture.deviceID,
+		certificate,
+	); err != nil {
+		t.Fatalf("VerifyExpectedConsensusPeer() error = %v", err)
+	}
+
+	otherCertificate := parsedIdentityCertificate(
+		t,
+		snapshotTestSessionID,
+		fixture.input.RecoveryGeneration,
+		otherIdentityKey,
+	)
+	if err := verifiers.VerifyConsensusPeer(otherCertificate); err != nil {
+		t.Fatalf("VerifyConsensusPeer(other active member) error = %v", err)
+	}
+	if err := verifiers.VerifyExpectedConsensusPeer(
+		fixture.deviceID,
+		otherCertificate,
+	); !errors.Is(err, ErrPeerNotAdmitted) {
+		t.Fatalf(
+			"VerifyExpectedConsensusPeer(other active member) error = %v",
+			err,
+		)
+	}
+}
+
+func TestVerifyExpectedConsensusPeerFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 0)
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	verifiers, err := NewVerifiers(
+		func() (*Snapshot, error) { return snapshot, nil },
+		snapshotTestNow,
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiers() error = %v", err)
+	}
+	valid := parsedIdentityCertificate(
+		t,
+		snapshotTestSessionID,
+		fixture.input.RecoveryGeneration,
+		fixture.identityKey,
+	)
+	malformed := valid
+	malformed.Leaf = nil
+
+	tests := []struct {
+		name             string
+		expectedDeviceID domain.DeviceID
+		certificate      transport.IdentityCertificate
+	}{
+		{
+			name:             "empty expected device ID",
+			expectedDeviceID: "",
+			certificate:      valid,
+		},
+		{
+			name:             "noncanonical expected device ID",
+			expectedDeviceID: domain.DeviceID("cc1ABC"),
+			certificate:      valid,
+		},
+		{
+			name:             "malformed certificate",
+			expectedDeviceID: fixture.deviceID,
+			certificate:      malformed,
+		},
+		{
+			name:             "wrong session",
+			expectedDeviceID: fixture.deviceID,
+			certificate: parsedIdentityCertificate(
+				t,
+				"01890f47-3e72-7000-8000-000000000199",
+				fixture.input.RecoveryGeneration,
+				fixture.identityKey,
+			),
+		},
+		{
+			name:             "wrong recovery generation",
+			expectedDeviceID: fixture.deviceID,
+			certificate: parsedIdentityCertificate(
+				t,
+				snapshotTestSessionID,
+				fixture.input.RecoveryGeneration+1,
+				fixture.identityKey,
+			),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := verifiers.VerifyExpectedConsensusPeer(
+				test.expectedDeviceID,
+				test.certificate,
+			); !errors.Is(err, ErrPeerNotAdmitted) {
+				t.Fatalf(
+					"VerifyExpectedConsensusPeer() error = %v, want %v",
+					err,
+					ErrPeerNotAdmitted,
+				)
+			}
+		})
 	}
 }
 

@@ -99,6 +99,19 @@ func (verifiers *Verifiers) VerifyConsensusPeer(
 	return nil
 }
 
+// VerifyExpectedConsensusPeer additionally pins an outbound consensus
+// connection to the device ID carried as its Raft server address.
+func (verifiers *Verifiers) VerifyExpectedConsensusPeer(
+	expectedDeviceID domain.DeviceID,
+	certificate transport.IdentityCertificate,
+) error {
+	if !expectedDeviceID.Valid() ||
+		certificate.Binding.DeviceID != expectedDeviceID {
+		return ErrPeerNotAdmitted
+	}
+	return verifiers.VerifyConsensusPeer(certificate)
+}
+
 // VerifyContentPeer requires active applied membership, the current or overlap
 // predecessor epoch, and an exact authorization already covered by this cut.
 func (verifiers *Verifiers) VerifyContentPeer(
