@@ -208,7 +208,8 @@ func (verifiers *Verifiers) current() (*Snapshot, error) {
 }
 
 var (
-	_ transport.IdentityPeerVerifier = (&Verifiers{}).VerifyPairingPeer
-	_ transport.IdentityPeerVerifier = (&Verifiers{}).VerifyConsensusPeer
-	_ transport.ContentPeerVerifier  = (&Verifiers{}).VerifyContentPeer
+	_ transport.IdentityPeerVerifier          = (&Verifiers{}).VerifyPairingPeer
+	_ transport.IdentityPeerVerifier          = (&Verifiers{}).VerifyConsensusPeer
+	_ transport.ExpectedConsensusPeerVerifier = (&Verifiers{}).VerifyExpectedConsensusPeer
+	_ transport.ContentPeerVerifier           = (&Verifiers{}).VerifyContentPeer
 )
