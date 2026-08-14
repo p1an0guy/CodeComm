@@ -3,13 +3,17 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/store"
 )
 
-const outboxRetryDelay = 100 * time.Millisecond
+const (
+	outboxRetryDelay          = 100 * time.Millisecond
+	pairingOutboxPollInterval = time.Second
+)
 
 type originWorker struct {
 	service *Service
@@ -97,11 +101,36 @@ func (worker *originWorker) drain() bool {
 			},
 		)
 		if err != nil {
+			worker.service.recordFatal(fmt.Errorf(
+				"%w: verify durable outbox command: %v",
+				ErrCommandForwarding,
+				err,
+			))
 			worker.service.signalResult()
 			return false
 		}
+		if !outboxRecordMatchesSigned(record, signed) {
+			worker.service.recordFatal(fmt.Errorf(
+				"%w: durable outbox binding mismatch",
+				ErrCommandForwarding,
+			))
+			worker.service.signalResult()
+			return false
+		}
+		// Pairing owns the only V1 admission path and performs additional
+		// operator-authority checks before submitting this exact command.
+		if signed.Proposal().Kind == event.KindMembershipDeviceAdmitted {
+			if !worker.pause(pairingOutboxPollInterval) {
+				return false
+			}
+			continue
+		}
 		specification, known := event.LookupKind(signed.Proposal().Kind)
 		if !known {
+			worker.service.recordFatal(fmt.Errorf(
+				"%w: durable outbox kind is unknown",
+				ErrCommandForwarding,
+			))
 			worker.service.signalResult()
 			return false
 		}
@@ -113,7 +142,12 @@ func (worker *originWorker) drain() bool {
 			}
 			continue
 		}
-		_, err = worker.service.consensus.Apply(worker.service.ctx, signed)
+		_, err = worker.service.consensus.ApplyAtGeneration(
+			worker.service.ctx,
+			record.SessionID,
+			record.RecoveryGeneration,
+			signed,
+		)
 		if err != nil {
 			if !worker.retry() {
 				return false
@@ -121,6 +155,31 @@ func (worker *originWorker) drain() bool {
 			continue
 		}
 		worker.service.signalResult()
+	}
+}
+
+func outboxRecordMatchesSigned(
+	record store.OutboxRecord,
+	signed event.SignedEvent,
+) bool {
+	proposal := signed.Proposal()
+	if proposal.EventID != record.EventID ||
+		proposal.SessionID != record.SessionID ||
+		proposal.Origin.DeviceID() != record.OriginDeviceID ||
+		proposal.Origin.Sequence() != record.OriginSequence ||
+		proposal.Kind != record.Kind ||
+		proposal.CreatedAt != record.QueuedAt {
+		return false
+	}
+	switch record.OriginScopeKind {
+	case store.OriginScopeKindAgent:
+		return proposal.Origin.AgentSessionID() == record.OriginScopeID &&
+			proposal.Origin.OriginBootID() == ""
+	case store.OriginScopeKindBoot:
+		return proposal.Origin.OriginBootID() == record.OriginScopeID &&
+			proposal.Origin.AgentSessionID() == ""
+	default:
+		return false
 	}
 }
 
@@ -151,7 +210,11 @@ func (worker *originWorker) remove() {
 }
 
 func (worker *originWorker) retry() bool {
-	timer := time.NewTimer(outboxRetryDelay)
+	return worker.pause(outboxRetryDelay)
+}
+
+func (worker *originWorker) pause(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:

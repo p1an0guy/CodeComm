@@ -42,6 +42,8 @@ const (
 	agentTestSessionA    = domain.UUIDv7("018f47de-89ab-7def-8123-2123456789ab")
 	agentTestRootA       = domain.UUIDv7("018f47de-89ab-7def-8123-3123456789ab")
 	agentTestTaskID      = domain.UUIDv7("018f47de-89ab-7def-8123-4123456789ab")
+	agentTestAdmissionID = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ac")
+	agentTestTrailingID  = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ad")
 	agentTestTimestamp   = domain.Timestamp("2026-08-12T12:00:00Z")
 )
 
@@ -61,8 +63,10 @@ type cancellationBlockingConsensus struct {
 	once     sync.Once
 }
 
-func (runtime *cancellationBlockingConsensus) Apply(
+func (runtime *cancellationBlockingConsensus) ApplyAtGeneration(
 	ctx context.Context,
+	_ domain.UUIDv7,
+	_ uint64,
 	_ event.SignedEvent,
 ) (store.ApplyResult, error) {
 	runtime.once.Do(func() {
@@ -84,8 +88,10 @@ func (runtime *cancellationBlockingConsensus) LocalTime() (
 	return runtime.delegate.LocalTime()
 }
 
-func (runtime *fsmConsensus) Apply(
+func (runtime *fsmConsensus) ApplyAtGeneration(
 	ctx context.Context,
+	sessionID domain.UUIDv7,
+	recoveryGeneration uint64,
 	signed event.SignedEvent,
 ) (store.ApplyResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -95,6 +101,14 @@ func (runtime *fsmConsensus) Apply(
 	defer runtime.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return store.ApplyResult{}, err
+	}
+	view, err := runtime.store.View(ctx)
+	if err != nil {
+		return store.ApplyResult{}, err
+	}
+	if view.SessionID != sessionID ||
+		view.RecoveryGeneration != recoveryGeneration {
+		return store.ApplyResult{}, consensus.ErrLineageMismatch
 	}
 	runtime.index++
 	response, ok := runtime.fsm.Apply(&raft.Log{
@@ -132,6 +146,12 @@ func (runtime *fsmConsensus) applyError() error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	return runtime.err
+}
+
+func (runtime *fsmConsensus) appliedCount() uint64 {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.index
 }
 
 type testIDGenerator struct {
@@ -527,6 +547,203 @@ func TestTwoLocalAgentsRaceForOneTaskAndObserveOneWinner(t *testing.T) {
 	}
 	assertAgentObservesTask(t, first.client, claimed)
 	assertAgentObservesTask(t, second.client, claimed)
+}
+
+func TestRecoveryLeavesPairingAdmissionForFinalizer(t *testing.T) {
+	harness := newAgentTestHarness(t, nil)
+	authority, err := event.NewLocalAuthority(
+		harness.deviceID,
+		agentTestBootID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, _, err := harness.local.ReserveCommand(
+		context.Background(),
+		store.LocalCommandInput{
+			ClientInstanceID: agentTestAdmissionID,
+			RequestID:        agentTestAdmissionID,
+			SessionID:        agentTestSessionID,
+			WorkspaceID:      agentTestWorkspaceID,
+			BindingClass:     store.LocalBindingOperator,
+			OriginDeviceID:   harness.deviceID,
+			OriginScopeKind:  store.OriginScopeKindBoot,
+			OriginScopeID:    agentTestBootID,
+			RequestKind:      event.KindMembershipDeviceAdmitted,
+			CanonicalRequest: []byte(
+				`{"operation":"peer.pairing.confirm"}`,
+			),
+			CreatedAt: agentTestTimestamp,
+		},
+		func() (domain.UUIDv7, error) {
+			return agentTestAdmissionID, nil
+		},
+		func(
+			eventID domain.UUIDv7,
+			originSequence uint64,
+		) (event.SignedEvent, error) {
+			proposal, err := event.BuildProposal(
+				event.Command{
+					Kind:     event.KindMembershipDeviceAdmitted,
+					EntityID: event.StringEntityID(string(harness.deviceID)),
+					Actions:  []event.Action{},
+					Payload:  []byte(`{}`),
+					Redaction: event.Redaction{
+						Policy:        event.RedactionDefault,
+						FieldsRemoved: []event.RedactionField{},
+					},
+				},
+				operator,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      agentTestSessionID,
+					WorkspaceID:    agentTestWorkspaceID,
+					CreatedAt:      agentTestTimestamp,
+					OriginSequence: originSequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, harness.private)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trailing, _, err := harness.local.ReserveCommand(
+		context.Background(),
+		store.LocalCommandInput{
+			ClientInstanceID: agentTestTrailingID,
+			RequestID:        agentTestTrailingID,
+			SessionID:        agentTestSessionID,
+			WorkspaceID:      agentTestWorkspaceID,
+			BindingClass:     store.LocalBindingOperator,
+			OriginDeviceID:   harness.deviceID,
+			OriginScopeKind:  store.OriginScopeKindBoot,
+			OriginScopeID:    agentTestBootID,
+			RequestKind:      event.KindTaskCreated,
+			CanonicalRequest: []byte(`{"operation":"task.create"}`),
+			CreatedAt:        agentTestTimestamp,
+		},
+		func() (domain.UUIDv7, error) {
+			return agentTestTrailingID, nil
+		},
+		func(
+			eventID domain.UUIDv7,
+			originSequence uint64,
+		) (event.SignedEvent, error) {
+			proposal, err := event.BuildProposal(
+				event.Command{
+					Kind:     event.KindTaskCreated,
+					EntityID: event.StringEntityID(string(agentTestTaskID)),
+					Actions:  []event.Action{},
+					Payload:  []byte(`{}`),
+					Redaction: event.Redaction{
+						Policy:        event.RedactionDefault,
+						FieldsRemoved: []event.RedactionField{},
+					},
+				},
+				operator,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      agentTestSessionID,
+					WorkspaceID:    agentTestWorkspaceID,
+					CreatedAt:      agentTestTimestamp,
+					OriginSequence: originSequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, harness.private)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.service.Recover(testAgentContext(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, found, err := harness.local.LookupRequest(
+			context.Background(),
+			command.ClientInstanceID,
+			command.RequestID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && current.State == store.LocalRequestPending {
+			if current.Outcome != nil ||
+				harness.consensus.appliedCount() != 0 {
+				t.Fatalf(
+					"pairing command was applied by generic worker: %#v",
+					current,
+				)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"pairing command was not claimed for finalizer: (%#v, %t)",
+				current,
+				found,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := harness.service.FatalError(); err != nil {
+		t.Fatalf("generic worker fatal error = %v", err)
+	}
+	if _, _, err := harness.local.AbandonCommandCollision(
+		context.Background(),
+		store.LocalCommandCollisionInput{
+			ClientInstanceID:   command.ClientInstanceID,
+			RequestID:          command.RequestID,
+			SessionID:          command.SessionID,
+			RecoveryGeneration: command.RecoveryGeneration,
+			EventID:            command.EventID,
+			ProposalDigest:     command.ProposalDigest,
+		},
+	); err != nil {
+		t.Fatalf("remove finalized admission: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		current, found, err := harness.local.LookupRequest(
+			context.Background(),
+			trailing.ClientInstanceID,
+			trailing.RequestID,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && current.State == store.LocalRequestResolved {
+			if current.Outcome == nil ||
+				harness.consensus.appliedCount() != 1 {
+				t.Fatalf(
+					"trailing command did not resolve normally: %#v",
+					current,
+				)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"trailing command remained stranded: (%#v, %t)",
+				current,
+				found,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestLaunchBindCancellationInterruptsWaitWithoutStoppingService(t *testing.T) {

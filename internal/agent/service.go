@@ -37,7 +37,12 @@ var (
 // Consensus is the narrow committed-command boundary needed by the agent
 // service.
 type Consensus interface {
-	Apply(context.Context, event.SignedEvent) (store.ApplyResult, error)
+	ApplyAtGeneration(
+		context.Context,
+		domain.UUIDv7,
+		uint64,
+		event.SignedEvent,
+	) (store.ApplyResult, error)
 	IsLeader() bool
 	LocalTime() (domain.Timestamp, int64, error)
 }
