@@ -431,12 +431,148 @@ func TestApplyAbandonsFirstSeenLocalEventIDCollision(t *testing.T) {
 	}
 	if !found ||
 		record.State != LocalRequestAbandoned ||
-		record.TerminalCode != localEventIDCollisionCode ||
+		record.TerminalCode != LocalEventIDCollisionCode ||
 		len(record.SignedProposal) != 0 ||
 		record.Outcome != nil {
 		t.Fatalf("collision tombstone = %#v, found = %v", record, found)
 	}
 	assertCounts(t, state.store, map[string]int64{"outbox": 0})
+}
+
+func TestAbandonCommandCollisionIsDurableAndIdempotent(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	local, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collision := LocalCommandCollisionInput{
+		ClientInstanceID:   local.ClientInstanceID,
+		RequestID:          local.RequestID,
+		SessionID:          local.SessionID,
+		RecoveryGeneration: local.RecoveryGeneration,
+		EventID:            local.EventID,
+		ProposalDigest:     local.ProposalDigest,
+	}
+	changed := collision
+	changed.ProposalDigest[0] ^= 1
+	if _, _, err := state.AbandonCommandCollision(
+		context.Background(),
+		changed,
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"AbandonCommandCollision(changed) error = %v, want %v",
+			err,
+			ErrLocalStateIntegrity,
+		)
+	}
+	assertCounts(t, state.store, map[string]int64{"outbox": 1})
+
+	abandoned, duplicate, err := state.AbandonCommandCollision(
+		context.Background(),
+		collision,
+	)
+	if err != nil || duplicate ||
+		abandoned.State != LocalRequestAbandoned ||
+		abandoned.TerminalCode != LocalEventIDCollisionCode ||
+		len(abandoned.SignedProposal) != 0 ||
+		abandoned.Outcome != nil {
+		t.Fatalf(
+			"AbandonCommandCollision() = (%#v, %t, %v)",
+			abandoned,
+			duplicate,
+			err,
+		)
+	}
+	assertCounts(t, state.store, map[string]int64{"outbox": 0})
+
+	retried, duplicate, err := state.AbandonCommandCollision(
+		context.Background(),
+		collision,
+	)
+	if err != nil || !duplicate ||
+		retried.State != LocalRequestAbandoned ||
+		retried.TerminalCode != LocalEventIDCollisionCode {
+		t.Fatalf(
+			"AbandonCommandCollision(retry) = (%#v, %t, %v)",
+			retried,
+			duplicate,
+			err,
+		)
+	}
+}
+
+func TestAbandonCommandCollisionPreservesResolvedRaceWinner(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	local, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := parseLocalSignedEvent(t, local.SignedProposal, privateKey)
+	if _, err := state.store.Apply(
+		context.Background(),
+		nextAcceptedApplyRequest(signed, 1, 1, testAppliedAt),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, duplicate, err := state.AbandonCommandCollision(
+		context.Background(),
+		LocalCommandCollisionInput{
+			ClientInstanceID:   local.ClientInstanceID,
+			RequestID:          local.RequestID,
+			SessionID:          local.SessionID,
+			RecoveryGeneration: local.RecoveryGeneration,
+			EventID:            local.EventID,
+			ProposalDigest:     local.ProposalDigest,
+		},
+	)
+	if err != nil || !duplicate ||
+		resolved.State != LocalRequestResolved ||
+		resolved.Outcome == nil ||
+		resolved.Outcome.Status != OutcomeAccepted {
+		t.Fatalf(
+			"AbandonCommandCollision(resolved) = (%#v, %t, %v)",
+			resolved,
+			duplicate,
+			err,
+		)
+	}
 }
 
 func TestDuplicateApplyCollisionDoesNotMutateLocalState(t *testing.T) {

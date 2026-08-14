@@ -159,6 +159,17 @@ type LocalCommandRecord struct {
 	CreatedAt          domain.Timestamp
 }
 
+// LocalCommandCollisionInput identifies an exact unresolved local command
+// whose event ID is already durably bound to different signed bytes.
+type LocalCommandCollisionInput struct {
+	ClientInstanceID   domain.UUIDv7
+	RequestID          domain.UUIDv7
+	SessionID          domain.UUIDv7
+	RecoveryGeneration uint64
+	EventID            domain.UUIDv7
+	ProposalDigest     Digest
+}
+
 // OutboxScope identifies one independently ordered proposal queue.
 type OutboxScope struct {
 	OriginDeviceID  domain.DeviceID
@@ -1132,7 +1143,9 @@ func (state LocalState) OutboxScopes(
 	return scopes, nil
 }
 
-const localEventIDCollisionCode = "local_event_id_collision"
+// LocalEventIDCollisionCode terminally identifies a generated event ID that
+// was already committed with different signed bytes.
+const LocalEventIDCollisionCode = "local_event_id_collision"
 
 // compactLocalProposal removes an outbox entry only after proving whether its
 // local request is the exact proposal that obtained the committed result. A
@@ -1270,7 +1283,7 @@ func compactLocalProposal(
 		nextCode := terminalCode
 		if !exact {
 			nextState = LocalRequestAbandoned
-			nextCode = localEventIDCollisionCode
+			nextCode = LocalEventIDCollisionCode
 		}
 		if err := execute(
 			conn,
@@ -1303,7 +1316,7 @@ func compactLocalProposal(
 		}
 		return nil
 	case LocalRequestAbandoned:
-		if storedCode != localEventIDCollisionCode || outboxFound {
+		if storedCode != LocalEventIDCollisionCode || outboxFound {
 			return ErrLocalStateIntegrity
 		}
 		return nil
