@@ -40,7 +40,10 @@ var (
 	ErrRaftLogCoverage        = errors.New("consensus: Raft log/snapshot coverage is invalid")
 	ErrNodeClosed             = errors.New("consensus: node is closing or closed")
 	ErrLineageMismatch        = errors.New("consensus: active lineage differs from expected lineage")
+	ErrLineageReentry         = errors.New("consensus: lineage operation cannot reenter its gate")
 )
+
+type lineageOperationContextKey struct{}
 
 // SingleNodeOptions owns the complete Phase 2 local consensus runtime.
 // InitialState is required only while creating a new state database or
@@ -1175,9 +1178,15 @@ func (node *SingleNode) ApplyAtGeneration(
 	if err := ctx.Err(); err != nil {
 		return store.ApplyResult{}, err
 	}
+	if lineageOperationActive(ctx) {
+		return store.ApplyResult{}, ErrLineageReentry
+	}
 
-	var result store.ApplyResult
-	err := node.withLineageGate(ctx, func() error {
+	var (
+		result store.ApplyResult
+		err    error
+	)
+	err = node.withLineageGate(ctx, func() error {
 		if signed.Proposal().SessionID != expectedSessionID {
 			return fmt.Errorf(
 				"%w: signed event belongs to session %q",
@@ -1185,25 +1194,118 @@ func (node *SingleNode) ApplyAtGeneration(
 				signed.Proposal().SessionID,
 			)
 		}
-		view, err := node.state.View(ctx)
-		if err != nil {
+		if err := node.requireLineage(
+			ctx,
+			expectedSessionID,
+			expectedRecoveryGeneration,
+		); err != nil {
 			return err
-		}
-		if view.SessionID != expectedSessionID ||
-			view.RecoveryGeneration != expectedRecoveryGeneration {
-			return fmt.Errorf(
-				"%w: expected %s/%d, active %s/%d",
-				ErrLineageMismatch,
-				expectedSessionID,
-				expectedRecoveryGeneration,
-				view.SessionID,
-				view.RecoveryGeneration,
-			)
 		}
 		result, err = node.apply(ctx, signed, true)
 		return err
 	})
 	return result, err
+}
+
+// RunAtGeneration runs one idempotent durable side effect while the exact
+// expected lineage remains installed. The callback must use the supplied
+// context, return when it is canceled, and must not reenter this node.
+func (node *SingleNode) RunAtGeneration(
+	ctx context.Context,
+	expectedSessionID domain.UUIDv7,
+	expectedRecoveryGeneration uint64,
+	operation func(context.Context) error,
+) error {
+	if node == nil ||
+		node.state == nil ||
+		ctx == nil ||
+		operation == nil ||
+		!expectedSessionID.Valid() ||
+		!domain.ValidUnsignedInteger(expectedRecoveryGeneration) {
+		return ErrInvalidNodeOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lineageOperationActive(ctx) {
+		return ErrLineageReentry
+	}
+	return node.withLineageGate(ctx, func() error {
+		if err := node.requireLineage(
+			ctx,
+			expectedSessionID,
+			expectedRecoveryGeneration,
+		); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		operationContext, cancel, wait := node.lineageOperationContext(ctx)
+		defer func() {
+			cancel()
+			wait()
+		}()
+		return operation(operationContext)
+	})
+}
+
+func (node *SingleNode) lineageOperationContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc, func()) {
+	operationContext, cancel := context.WithCancel(ctx)
+	operationContext = context.WithValue(
+		operationContext,
+		lineageOperationContextKey{},
+		struct{}{},
+	)
+	finished := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-node.closeStarted:
+			cancel()
+		case <-node.fatalSet:
+			cancel()
+		case <-finished:
+		}
+	}()
+	var once sync.Once
+	wait := func() {
+		once.Do(func() {
+			close(finished)
+			<-watcherDone
+		})
+	}
+	return operationContext, cancel, wait
+}
+
+func lineageOperationActive(ctx context.Context) bool {
+	return ctx.Value(lineageOperationContextKey{}) != nil
+}
+
+func (node *SingleNode) requireLineage(
+	ctx context.Context,
+	expectedSessionID domain.UUIDv7,
+	expectedRecoveryGeneration uint64,
+) error {
+	view, err := node.state.View(ctx)
+	if err != nil {
+		return err
+	}
+	if view.SessionID != expectedSessionID ||
+		view.RecoveryGeneration != expectedRecoveryGeneration {
+		return fmt.Errorf(
+			"%w: expected %s/%d, active %s/%d",
+			ErrLineageMismatch,
+			expectedSessionID,
+			expectedRecoveryGeneration,
+			view.SessionID,
+			view.RecoveryGeneration,
+		)
+	}
+	return nil
 }
 
 func (node *SingleNode) apply(

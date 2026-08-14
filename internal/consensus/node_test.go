@@ -273,6 +273,111 @@ func TestApplyAtGenerationCancellationWhileGateOccupiedDoesNotAdvanceState(
 	)
 }
 
+func TestRunAtGenerationRequiresExactLineage(t *testing.T) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+	calls := 0
+	if err := node.RunAtGeneration(
+		testContext(t),
+		nodeTestSessionID,
+		0,
+		func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			calls++
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("RunAtGeneration() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("RunAtGeneration() calls = %d, want 1", calls)
+	}
+
+	if err := node.RunAtGeneration(
+		testContext(t),
+		nodeTestSessionID,
+		1,
+		func(context.Context) error {
+			calls++
+			return nil
+		},
+	); !errors.Is(err, ErrLineageMismatch) {
+		t.Fatalf(
+			"RunAtGeneration(stale) error = %v, want ErrLineageMismatch",
+			err,
+		)
+	}
+	if calls != 1 {
+		t.Fatalf("stale RunAtGeneration() invoked callback")
+	}
+
+	err := node.RunAtGeneration(
+		testContext(t),
+		nodeTestSessionID,
+		0,
+		func(ctx context.Context) error {
+			return node.RunAtGeneration(
+				ctx,
+				nodeTestSessionID,
+				0,
+				func(context.Context) error { return nil },
+			)
+		},
+	)
+	if !errors.Is(err, ErrLineageReentry) {
+		t.Fatalf(
+			"RunAtGeneration(reentry) error = %v, want ErrLineageReentry",
+			err,
+		)
+	}
+}
+
+func TestRunAtGenerationCancellationAllowsClose(t *testing.T) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+	entered := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- node.RunAtGeneration(
+			context.Background(),
+			nodeTestSessionID,
+			0,
+			func(ctx context.Context) error {
+				close(entered)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		)
+	}()
+	select {
+	case <-entered:
+	case <-testContext(t).Done():
+		t.Fatal("RunAtGeneration() callback did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- node.Close() }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf(
+				"RunAtGeneration() error = %v, want context.Canceled",
+				err,
+			)
+		}
+	case <-testContext(t).Done():
+		t.Fatal("RunAtGeneration() ignored node close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-testContext(t).Done():
+		t.Fatal("Close() did not finish after callback cancellation")
+	}
+}
+
 const (
 	nodeTestSessionID   = domain.UUIDv7("018f47de-89ab-7def-8123-0123456789ab")
 	nodeTestWorkspaceID = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
