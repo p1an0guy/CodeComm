@@ -69,8 +69,9 @@ func TestAppliedCheckpointMissAndInputValidation(t *testing.T) {
 	); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("AppliedCheckpoint(invalid ID) error = %v", err)
 	}
+	var nilContext context.Context
 	if _, _, err := state.AppliedCheckpoint(
-		nil,
+		nilContext,
 		testCheckpointEventID,
 	); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("AppliedCheckpoint(nil context) error = %v", err)
