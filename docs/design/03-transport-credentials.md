@@ -136,7 +136,12 @@ from a revoked device that a stale peer still admits:
   *holds* any committed revocation, but the gate above reads *applied* membership, and a leader
   begins replicating on election before draining its backlog. A leader MUST therefore apply
   through its committed membership index before replicating to any peer, which is the same
-  catch-up it already owes before forwarding `credential.authorized`.
+  catch-up it already owes before forwarding `credential.authorized`. After restart, Raft's
+  volatile commit index may be zero while a quorum already holds an unapplied committed tail. The
+  maintained transport MAY then send an `AppendEntries` batch containing only `LogNoop` entries to
+  an applied-active peer in the durable committed configuration. Commands, configuration entries,
+  mixed batches, and snapshots remain blocked, so an up-to-date majority can recover commitment
+  without disclosing coordination content and a lagging peer cannot use the exception.
 - **Quorum is whatever the committed Raft configuration says, and nothing else.** A daemon
   MUST NOT alter vote-granting logic, quorum size, or majority counting based on applied
   application membership. Doing so would let two replicas halted at different indices (§5.5)

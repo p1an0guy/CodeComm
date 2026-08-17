@@ -432,6 +432,37 @@ func testConsensusReplicationAuthorization(t *testing.T) {
 	}
 	assertNoConsensusRPC(t, received)
 
+	var commitProbeCalls atomic.Uint64
+	clientTransport.authorizeCommitProbe = func(
+		deviceID domain.DeviceID,
+	) error {
+		commitProbeCalls.Add(1)
+		if deviceID != harness.serverID {
+			wrongTarget.Store(true)
+		}
+		return nil
+	}
+	noop := &raft.AppendEntriesRequest{
+		Term: 1,
+		Entries: []*raft.Log{{
+			Index: 1,
+			Term:  1,
+			Type:  raft.LogNoop,
+		}},
+	}
+	if err := clientTransport.AppendEntries(
+		targetID,
+		targetAddress,
+		noop,
+		&raft.AppendEntriesResponse{},
+	); err != nil {
+		t.Fatalf("commit-probe AppendEntries(): %v", err)
+	}
+	assertConsensusRPCReceived(t, received, "append:1")
+	if got := commitProbeCalls.Load(); got != 1 {
+		t.Fatalf("commit-probe authorization calls = %d, want 1", got)
+	}
+
 	authorizationMode.Store(1)
 	if err := clientTransport.AppendEntries(
 		targetID,
@@ -624,6 +655,7 @@ func newConsensusTestNetworkTransport(
 			Timeout:              time.Second,
 			Logger:               hclog.NewNullLogger(),
 			AuthorizeReplication: authorizer,
+			AuthorizeCommitProbe: ConsensusCommitProbeAuthorizer(authorizer),
 		},
 	)
 	if err != nil {

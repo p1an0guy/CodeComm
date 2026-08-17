@@ -33,6 +33,10 @@ var (
 // and may replicate to the target in the live Raft configuration.
 type ConsensusReplicationAuthorizer func(domain.DeviceID) error
 
+// ConsensusCommitProbeAuthorizer authorizes the no-op-only AppendEntries class
+// used to recover Raft's volatile commit index after restart.
+type ConsensusCommitProbeAuthorizer func(domain.DeviceID) error
+
 // ConsensusNetworkTransportOptions configures guarded HashiCorp Raft framing.
 type ConsensusNetworkTransportOptions struct {
 	Stream               *ConsensusStreamLayer
@@ -40,6 +44,7 @@ type ConsensusNetworkTransportOptions struct {
 	Timeout              time.Duration
 	Logger               hclog.Logger
 	AuthorizeReplication ConsensusReplicationAuthorizer
+	AuthorizeCommitProbe ConsensusCommitProbeAuthorizer
 }
 
 // ConsensusNetworkTransport keeps election traffic available while preventing
@@ -48,6 +53,7 @@ type ConsensusNetworkTransport struct {
 	delegate             *raft.NetworkTransport
 	localDeviceID        domain.DeviceID
 	authorizeReplication ConsensusReplicationAuthorizer
+	authorizeCommitProbe ConsensusCommitProbeAuthorizer
 }
 
 // NewConsensusNetworkTransport binds maintained Raft framing to RFC 8441 and
@@ -60,7 +66,8 @@ func NewConsensusNetworkTransport(
 	}
 	if options.Stream == nil ||
 		options.Timeout <= 0 ||
-		options.AuthorizeReplication == nil {
+		options.AuthorizeReplication == nil ||
+		options.AuthorizeCommitProbe == nil {
 		return nil, ErrInvalidConsensusRaftTransport
 	}
 	if err := options.Stream.openError(); err != nil {
@@ -84,6 +91,7 @@ func NewConsensusNetworkTransport(
 		delegate:             delegate,
 		localDeviceID:        localDeviceID,
 		authorizeReplication: options.AuthorizeReplication,
+		authorizeCommitProbe: options.AuthorizeCommitProbe,
 	}, nil
 }
 
@@ -140,7 +148,10 @@ func (transport *ConsensusNetworkTransport) AppendEntries(
 		return ErrInvalidConsensusRaftTransport
 	}
 	if len(request.Entries) > 0 {
-		if err := transport.authorize(deviceID); err != nil {
+		if err := transport.authorizeAppendEntries(
+			deviceID,
+			request.Entries,
+		); err != nil {
 			return err
 		}
 	}
@@ -216,7 +227,12 @@ func (transport *ConsensusNetworkTransport) EncodePeer(
 	id raft.ServerID,
 	target raft.ServerAddress,
 ) []byte {
-	if _, err := transport.target(id, target); err != nil {
+	if transport == nil || transport.delegate == nil {
+		return nil
+	}
+	deviceID := domain.DeviceID(id)
+	if !deviceID.Valid() ||
+		target != raft.ServerAddress(deviceID) {
 		return nil
 	}
 	return transport.delegate.EncodePeer(id, target)
@@ -304,6 +320,47 @@ func (transport *ConsensusNetworkTransport) authorize(
 	return nil
 }
 
+func (transport *ConsensusNetworkTransport) authorizeCommitRecovery(
+	deviceID domain.DeviceID,
+) (err error) {
+	if transport == nil ||
+		transport.authorizeCommitProbe == nil ||
+		!deviceID.Valid() {
+		return ErrConsensusReplicationDenied
+	}
+	defer func() {
+		if recover() != nil {
+			err = ErrConsensusReplicationDenied
+		}
+	}()
+	if err := transport.authorizeCommitProbe(deviceID); err != nil {
+		return fmt.Errorf("%w: %w", ErrConsensusReplicationDenied, err)
+	}
+	return nil
+}
+
+func (transport *ConsensusNetworkTransport) authorizeAppendEntries(
+	deviceID domain.DeviceID,
+	entries []*raft.Log,
+) error {
+	if commitProbeEntries(entries) {
+		return transport.authorizeCommitRecovery(deviceID)
+	}
+	return transport.authorize(deviceID)
+}
+
+func commitProbeEntries(entries []*raft.Log) bool {
+	if len(entries) == 0 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry == nil || entry.Type != raft.LogNoop {
+			return false
+		}
+	}
+	return true
+}
+
 type consensusAppendPipeline struct {
 	delegate  raft.AppendPipeline
 	transport *ConsensusNetworkTransport
@@ -348,7 +405,10 @@ func (pipeline *consensusAppendPipeline) AppendEntries(
 		return nil, ErrInvalidConsensusRaftTransport
 	}
 	if len(request.Entries) > 0 {
-		if err := pipeline.transport.authorize(pipeline.target); err != nil {
+		if err := pipeline.transport.authorizeAppendEntries(
+			pipeline.target,
+			request.Entries,
+		); err != nil {
 			_ = pipeline.delegate.Close()
 			return nil, err
 		}

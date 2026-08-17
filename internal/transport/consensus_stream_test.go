@@ -392,6 +392,9 @@ func testConsensusRaftFraming(t *testing.T) {
 			AuthorizeReplication: func(domain.DeviceID) error {
 				return nil
 			},
+			AuthorizeCommitProbe: func(domain.DeviceID) error {
+				return nil
+			},
 		},
 	)
 	if err != nil {
@@ -404,6 +407,9 @@ func testConsensusRaftFraming(t *testing.T) {
 			Timeout:       time.Second,
 			Logger:        hclog.NewNullLogger(),
 			AuthorizeReplication: func(domain.DeviceID) error {
+				return nil
+			},
+			AuthorizeCommitProbe: func(domain.DeviceID) error {
 				return nil
 			},
 		},
@@ -446,6 +452,20 @@ func testConsensusRaftFraming(t *testing.T) {
 	if got := clientTransport.LocalAddr(); got !=
 		raft.ServerAddress(harness.clientID) {
 		t.Fatalf("client LocalAddr() = %q", got)
+	}
+	encodedLocal := clientTransport.EncodePeer(
+		raft.ServerID(harness.clientID),
+		raft.ServerAddress(harness.clientID),
+	)
+	if got := clientTransport.DecodePeer(encodedLocal); got !=
+		raft.ServerAddress(harness.clientID) {
+		t.Fatalf("local EncodePeer/DecodePeer = %q", got)
+	}
+	if encoded := clientTransport.EncodePeer(
+		raft.ServerID(harness.clientID),
+		raft.ServerAddress(harness.serverID),
+	); encoded != nil {
+		t.Fatalf("mismatched EncodePeer() = %q, want nil", encoded)
 	}
 	harness.assertNoActiveSocketDeadlines(t)
 }
@@ -491,6 +511,9 @@ func testConsensusLocalIdentityBinding(t *testing.T) {
 			Timeout:       time.Second,
 			Logger:        hclog.NewNullLogger(),
 			AuthorizeReplication: func(domain.DeviceID) error {
+				return nil
+			},
+			AuthorizeCommitProbe: func(domain.DeviceID) error {
 				return nil
 			},
 		},
