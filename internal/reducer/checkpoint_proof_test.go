@@ -9,6 +9,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 )
 
 func TestCheckpointProofGoldenVector(t *testing.T) {
@@ -286,9 +287,11 @@ func signedCheckpointProofPayload(
 ) (json.RawMessage, json.RawMessage) {
 	t.Helper()
 
-	encoded, err := json.Marshal(activationCheckpoint(t, fixture))
+	encoded, err := event.EncodeCheckpoint(
+		activationCheckpoint(t, fixture),
+	)
 	if err != nil {
-		t.Fatalf("json.Marshal() checkpoint error = %v", err)
+		t.Fatalf("event.EncodeCheckpoint() error = %v", err)
 	}
 	var object map[string]any
 	if err := json.Unmarshal(encoded, &object); err != nil {

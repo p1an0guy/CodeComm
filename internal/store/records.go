@@ -453,24 +453,6 @@ type CheckpointRecord struct {
 	AuthoritySignature       Signature
 }
 
-type checkpointRecordWire struct {
-	SessionID                string  `json:"session_id"`
-	WorkspaceID              string  `json:"workspace_id"`
-	RecoveryGeneration       uint64  `json:"recovery_generation"`
-	AuthorityVoterSetVersion uint64  `json:"authority_voter_set_version"`
-	SignerDeviceID           string  `json:"signer_device_id"`
-	Term                     uint64  `json:"term"`
-	CoveredAppliedLogIndex   uint64  `json:"covered_applied_log_index"`
-	CoveredChainIndex        uint64  `json:"covered_chain_index"`
-	CoveredChainHash         string  `json:"covered_chain_hash"`
-	CoveredResultIndex       uint64  `json:"covered_result_index"`
-	CoveredResultHash        string  `json:"covered_result_hash"`
-	ProjectionAccumulator    string  `json:"projection_accumulator"`
-	DigestVersion            uint64  `json:"digest_version"`
-	ProjectionSchemaVersion  uint64  `json:"projection_schema_version"`
-	AuthoritySignature       *string `json:"authority_signature,omitempty"`
-}
-
 func (record CheckpointRecord) Validate() error {
 	if !record.CheckpointEventID.Valid() || !record.SessionID.Valid() ||
 		!record.WorkspaceID.Valid() || !record.SignerDeviceID.Valid() {
@@ -503,43 +485,51 @@ func (record CheckpointRecord) Validate() error {
 	if err != nil || !bytes.Equal(canonical, record.CheckpointJSON) {
 		return errors.New("checkpoint JSON is not a canonical object")
 	}
-	expected, err := record.canonicalJSON(false)
+	expected, err := event.EncodeCheckpoint(record.checkpoint())
 	if err != nil || !bytes.Equal(expected, record.CheckpointJSON) {
 		return errors.New("checkpoint JSON does not match typed fields")
 	}
 	return nil
 }
 
-func (record CheckpointRecord) canonicalJSON(
-	includeSignature bool,
-) ([]byte, error) {
-	wire := checkpointRecordWire{
-		SessionID:                string(record.SessionID),
-		WorkspaceID:              string(record.WorkspaceID),
+func (record CheckpointRecord) checkpoint() domain.Checkpoint {
+	return domain.Checkpoint{
+		SessionID:                record.SessionID,
+		WorkspaceID:              record.WorkspaceID,
 		RecoveryGeneration:       record.RecoveryGeneration,
 		AuthorityVoterSetVersion: record.AuthorityVoterSetVersion,
-		SignerDeviceID:           string(record.SignerDeviceID),
+		SignerDeviceID:           record.SignerDeviceID,
 		Term:                     record.Term,
 		CoveredAppliedLogIndex:   record.CoveredAppliedLogIndex,
 		CoveredChainIndex:        record.CoveredChainIndex,
-		CoveredChainHash: codec.EncodeBase64URL(
-			record.CoveredChainHash[:],
-		),
-		CoveredResultIndex: record.CoveredResultIndex,
-		CoveredResultHash: codec.EncodeBase64URL(
-			record.CoveredResultHash[:],
-		),
-		ProjectionAccumulator: codec.EncodeBase64URL(
-			record.ProjectionAccumulator[:],
-		),
-		DigestVersion:           record.DigestVersion,
-		ProjectionSchemaVersion: record.ProjectionSchemaVersion,
+		CoveredChainHash:         record.CoveredChainHash,
+		CoveredResultIndex:       record.CoveredResultIndex,
+		CoveredResultHash:        record.CoveredResultHash,
+		ProjectionAccumulator:    record.ProjectionAccumulator,
+		DigestVersion:            record.DigestVersion,
+		ProjectionSchemaVersion:  record.ProjectionSchemaVersion,
 	}
-	if includeSignature {
-		signature := codec.EncodeBase64URL(record.AuthoritySignature[:])
-		wire.AuthoritySignature = &signature
+}
+
+func (record CheckpointRecord) canonicalJSON(
+	includeSignature bool,
+) ([]byte, error) {
+	unsigned, err := event.EncodeCheckpoint(record.checkpoint())
+	if err != nil || !includeSignature {
+		return unsigned, err
 	}
-	encoded, err := json.Marshal(wire)
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(unsigned, &object); err != nil {
+		return nil, err
+	}
+	signature, err := json.Marshal(codec.EncodeBase64URL(
+		record.AuthoritySignature[:],
+	))
+	if err != nil {
+		return nil, err
+	}
+	object["authority_signature"] = signature
+	encoded, err := json.Marshal(object)
 	if err != nil {
 		return nil, err
 	}

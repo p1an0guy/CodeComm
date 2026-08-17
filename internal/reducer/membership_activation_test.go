@@ -276,7 +276,10 @@ func activationPayloadObjectAtIndexes(
 
 	checkpoint := activationCheckpoint(t, fixture)
 	checkpoint.CoveredAppliedLogIndex = checkpointAppliedIndex
-	checkpointBytes := mustCanonicalJSON(t, checkpoint)
+	checkpointBytes, err := event.EncodeCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatalf("event.EncodeCheckpoint(): %v", err)
+	}
 	checkpointSignature := signLabeled(
 		t,
 		fixture.privateKeys[fixture.ownerDevice],
@@ -349,29 +352,28 @@ func activationPayloadObjectAtIndexes(
 func activationCheckpoint(
 	t *testing.T,
 	fixture reducerFixture,
-) checkpointWire {
+) domain.Checkpoint {
 	t.Helper()
 
-	digest := bytes.Repeat([]byte{0x31}, 32)
-	return checkpointWire{
-		SessionID:                string(testSessionID),
-		WorkspaceID:              string(testWorkspaceID),
+	var chainHash, resultHash, accumulator [32]byte
+	copy(chainHash[:], bytes.Repeat([]byte{0x31}, 32))
+	copy(resultHash[:], bytes.Repeat([]byte{0x32}, 32))
+	copy(accumulator[:], bytes.Repeat([]byte{0x33}, 32))
+	return domain.Checkpoint{
+		SessionID:                testSessionID,
+		WorkspaceID:              testWorkspaceID,
 		RecoveryGeneration:       fixture.state.recoveryGeneration,
 		AuthorityVoterSetVersion: 1,
-		SignerDeviceID:           string(fixture.ownerDevice),
+		SignerDeviceID:           fixture.ownerDevice,
 		Term:                     3,
 		CoveredAppliedLogIndex:   activationLiveConfigurationIndex,
 		CoveredChainIndex:        5,
-		CoveredChainHash:         codec.EncodeBase64URL(digest),
+		CoveredChainHash:         chainHash,
 		CoveredResultIndex:       6,
-		CoveredResultHash: codec.EncodeBase64URL(
-			bytes.Repeat([]byte{0x32}, 32),
-		),
-		ProjectionAccumulator: codec.EncodeBase64URL(
-			bytes.Repeat([]byte{0x33}, 32),
-		),
-		DigestVersion:           1,
-		ProjectionSchemaVersion: 1,
+		CoveredResultHash:        resultHash,
+		ProjectionAccumulator:    accumulator,
+		DigestVersion:            1,
+		ProjectionSchemaVersion:  1,
 	}
 }
 

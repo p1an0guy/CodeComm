@@ -3,13 +3,13 @@ package reducer
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/json"
 
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 )
 
 var checkpointFields = []string{
@@ -42,23 +42,6 @@ var voterActivationProofFields = []string{
 	"checkpoint",
 	"checkpoint_signature",
 	"voter_signature",
-}
-
-type checkpointWire struct {
-	SessionID                string `json:"session_id"`
-	WorkspaceID              string `json:"workspace_id"`
-	RecoveryGeneration       uint64 `json:"recovery_generation"`
-	AuthorityVoterSetVersion uint64 `json:"authority_voter_set_version"`
-	SignerDeviceID           string `json:"signer_device_id"`
-	Term                     uint64 `json:"term"`
-	CoveredAppliedLogIndex   uint64 `json:"covered_applied_log_index"`
-	CoveredChainIndex        uint64 `json:"covered_chain_index"`
-	CoveredChainHash         string `json:"covered_chain_hash"`
-	CoveredResultIndex       uint64 `json:"covered_result_index"`
-	CoveredResultHash        string `json:"covered_result_hash"`
-	ProjectionAccumulator    string `json:"projection_accumulator"`
-	DigestVersion            uint64 `json:"digest_version"`
-	ProjectionSchemaVersion  uint64 `json:"projection_schema_version"`
 }
 
 type voterActivationProofUnsignedWire struct {
@@ -422,117 +405,11 @@ func decodeVoterActivationProof(
 func decodeCheckpoint(
 	raw json.RawMessage,
 ) (domain.Checkpoint, []byte, bool) {
-	object, code := decodePayload(raw, checkpointFields, nil)
-	if code != "" {
-		return domain.Checkpoint{}, nil, false
-	}
-	sessionText, sessionOK := decodeValue[string](object, "session_id")
-	workspaceText, workspaceOK := decodeValue[string](object, "workspace_id")
-	generation, generationOK := decodeValue[uint64](
-		object,
-		"recovery_generation",
-	)
-	authorityVersion, authorityOK := decodeValue[uint64](
-		object,
-		"authority_voter_set_version",
-	)
-	signerText, signerOK := decodeValue[string](object, "signer_device_id")
-	term, termOK := decodeValue[uint64](object, "term")
-	appliedIndex, appliedOK := decodeValue[uint64](
-		object,
-		"covered_applied_log_index",
-	)
-	chainIndex, chainIndexOK := decodeValue[uint64](
-		object,
-		"covered_chain_index",
-	)
-	chainHashText, chainHashOK := decodeValue[string](
-		object,
-		"covered_chain_hash",
-	)
-	resultIndex, resultIndexOK := decodeValue[uint64](
-		object,
-		"covered_result_index",
-	)
-	resultHashText, resultHashOK := decodeValue[string](
-		object,
-		"covered_result_hash",
-	)
-	accumulatorText, accumulatorOK := decodeValue[string](
-		object,
-		"projection_accumulator",
-	)
-	digestVersion, digestOK := decodeValue[uint64](
-		object,
-		"digest_version",
-	)
-	projectionVersion, projectionOK := decodeValue[uint64](
-		object,
-		"projection_schema_version",
-	)
-	chainHash, chainDecodeErr := codec.DecodeBase64URLExact(
-		chainHashText,
-		sha256.Size,
-	)
-	resultHash, resultDecodeErr := codec.DecodeBase64URLExact(
-		resultHashText,
-		sha256.Size,
-	)
-	accumulator, accumulatorDecodeErr := codec.DecodeBase64URLExact(
-		accumulatorText,
-		sha256.Size,
-	)
-	if !sessionOK || !workspaceOK || !generationOK ||
-		!authorityOK || !signerOK || !termOK || !appliedOK ||
-		!chainIndexOK || !chainHashOK || chainDecodeErr != nil ||
-		!resultIndexOK || !resultHashOK || resultDecodeErr != nil ||
-		!accumulatorOK || accumulatorDecodeErr != nil ||
-		!digestOK || !projectionOK {
-		return domain.Checkpoint{}, nil, false
-	}
-	checkpoint := domain.Checkpoint{
-		SessionID:                domain.UUIDv7(sessionText),
-		WorkspaceID:              domain.UUIDv4(workspaceText),
-		RecoveryGeneration:       generation,
-		AuthorityVoterSetVersion: authorityVersion,
-		SignerDeviceID:           domain.DeviceID(signerText),
-		Term:                     term,
-		CoveredAppliedLogIndex:   appliedIndex,
-		CoveredChainIndex:        chainIndex,
-		CoveredResultIndex:       resultIndex,
-		DigestVersion:            digestVersion,
-		ProjectionSchemaVersion:  projectionVersion,
-	}
-	copy(checkpoint.CoveredChainHash[:], chainHash)
-	copy(checkpoint.CoveredResultHash[:], resultHash)
-	copy(checkpoint.ProjectionAccumulator[:], accumulator)
-	if checkpoint.Validate() != nil {
-		return domain.Checkpoint{}, nil, false
-	}
-	reencoded, err := json.Marshal(checkpointWire{
-		SessionID:                sessionText,
-		WorkspaceID:              workspaceText,
-		RecoveryGeneration:       generation,
-		AuthorityVoterSetVersion: authorityVersion,
-		SignerDeviceID:           signerText,
-		Term:                     term,
-		CoveredAppliedLogIndex:   appliedIndex,
-		CoveredChainIndex:        chainIndex,
-		CoveredChainHash:         chainHashText,
-		CoveredResultIndex:       resultIndex,
-		CoveredResultHash:        resultHashText,
-		ProjectionAccumulator:    accumulatorText,
-		DigestVersion:            digestVersion,
-		ProjectionSchemaVersion:  projectionVersion,
-	})
+	checkpoint, err := event.DecodeCheckpoint(raw)
 	if err != nil {
 		return domain.Checkpoint{}, nil, false
 	}
-	canonical, err := codec.CanonicalizeSignedObject(reencoded)
-	if err != nil || !bytes.Equal(canonical, raw) {
-		return domain.Checkpoint{}, nil, false
-	}
-	return checkpoint, canonical, true
+	return checkpoint, bytes.Clone(raw), true
 }
 
 func validActivationProofContext(
