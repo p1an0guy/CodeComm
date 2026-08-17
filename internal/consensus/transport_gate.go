@@ -3,6 +3,7 @@ package consensus
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 
@@ -135,6 +136,12 @@ func (gate *nodeTransportGate) PeerAdmissionSnapshot() (
 		return nil, err
 	}
 	return node.PeerAdmissionSnapshot()
+}
+
+// ConsensusControlHandler returns the late-bound fail-closed handler used by
+// the transport factory while the node is still under construction.
+func (gate *nodeTransportGate) ConsensusControlHandler() http.Handler {
+	return gate
 }
 
 func (gate *nodeTransportGate) AuthorizePeer(

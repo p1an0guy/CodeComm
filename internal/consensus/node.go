@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -81,6 +82,7 @@ type ConsensusTransportGate interface {
 	AuthorizeReplication(domain.DeviceID) error
 	AuthorizeCommitProbe(domain.DeviceID) error
 	AuthorizationChanges() <-chan struct{}
+	ConsensusControlHandler() http.Handler
 }
 
 // RaftTransportFactory constructs the owned transport around a late-bound
