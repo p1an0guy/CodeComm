@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -241,6 +242,11 @@ func runSecureThreeVoterConsensusMesh(t *testing.T) {
 	if proofTarget == nil {
 		t.Fatal("secure mesh has no proof target")
 	}
+	harness.proveAuthorityCheckpointSigning(
+		t,
+		leader,
+		proofTarget,
+	)
 	expectation := checkpointProofTestExpectation(t)
 	expectation.targetDeviceID = proofTarget.identity.deviceID
 	if _, err := requestStagingApplyProof(
@@ -550,8 +556,27 @@ func (harness *secureMeshHarness) startNode(
 		OriginBootID:            bootID,
 		InitialState:            initial,
 		BootstrapVoterDeviceIDs: harness.bootstrap,
-		Clock:                   nodeTestClock(),
-		RaftConfig:              secureMeshRaftConfig(),
+		CheckpointSigner: CheckpointSignerAdapter{
+			SignerDeviceID: candidate.identity.deviceID,
+			Sign: func(
+				ctx context.Context,
+				checkpoint domain.Checkpoint,
+			) (store.Signature, error) {
+				if err := ctx.Err(); err != nil {
+					return store.Signature{}, err
+				}
+				signature, err := event.SignCheckpoint(
+					checkpoint,
+					candidate.identity.private,
+				)
+				if err != nil {
+					return store.Signature{}, err
+				}
+				return store.Signature(signature), nil
+			},
+		},
+		Clock:      nodeTestClock(),
+		RaftConfig: secureMeshRaftConfig(),
 		TransportFactory: func(
 			gate ConsensusTransportGate,
 		) (RaftTransport, error) {
@@ -851,6 +876,139 @@ func (harness *secureMeshHarness) proveStagingCheckpoint(
 		t.Fatalf("mismatched staging-proof request error = %v", err)
 	}
 	harness.changeMeshSuffrage(t, leader, target, raft.Voter)
+}
+
+func (harness *secureMeshHarness) proveAuthorityCheckpointSigning(
+	t *testing.T,
+	leader *secureMeshNode,
+	signer *secureMeshNode,
+) {
+	t.Helper()
+	if leader == nil || signer == nil || leader == signer {
+		t.Fatal("invalid checkpoint-signing participants")
+	}
+	ctx := meshTestContext(t)
+	guard, err := leader.node.acquireRaftEnqueue(ctx)
+	if err != nil {
+		t.Fatalf("acquire checkpoint enqueue cut: %v", err)
+	}
+	defer guard.release()
+	if err := waitFuture(
+		ctx,
+		leader.node.raft.Barrier(contextTimeout(ctx)),
+	); err != nil {
+		t.Fatalf("checkpoint barrier: %v", err)
+	}
+	view, err := leader.node.View(ctx)
+	if err != nil {
+		t.Fatalf("checkpoint View(): %v", err)
+	}
+	term, err := raftTerm(leader.node.raft.Stats())
+	if err != nil {
+		t.Fatalf("checkpoint term: %v", err)
+	}
+	checkpoint := domain.Checkpoint{
+		SessionID:                view.SessionID,
+		WorkspaceID:              view.WorkspaceID,
+		RecoveryGeneration:       view.RecoveryGeneration,
+		AuthorityVoterSetVersion: 1,
+		SignerDeviceID:           signer.identity.deviceID,
+		Term:                     term,
+		CoveredAppliedLogIndex:   leader.node.raft.AppliedIndex(),
+		CoveredChainIndex:        view.Heads.ChainIndex,
+		CoveredChainHash:         view.Heads.ChainHash,
+		CoveredResultIndex:       view.Heads.ResultIndex,
+		CoveredResultHash:        view.Heads.ResultHash,
+		ProjectionAccumulator:    view.Heads.ProjectionAccumulator,
+		DigestVersion:            view.Heads.DigestVersion,
+		ProjectionSchemaVersion:  view.Heads.ProjectionSchemaVersion,
+	}
+	expectation, err := newCheckpointSigningExpectation(
+		checkpoint,
+		signer.identity.public,
+	)
+	if err != nil {
+		t.Fatalf("checkpoint signing expectation: %v", err)
+	}
+	var proof checkpointSignatureProof
+	awaitMeshCondition(
+		t,
+		10*time.Second,
+		"authority checkpoint signature",
+		func() bool {
+			var requestErr error
+			proof, requestErr = requestCheckpointSignature(
+				context.Background(),
+				leader.stream,
+				expectation,
+			)
+			if requestErr == nil {
+				return true
+			}
+			if !errors.Is(
+				requestErr,
+				ErrCheckpointProofUnavailable,
+			) {
+				t.Fatalf(
+					"requestCheckpointSignature(): %v",
+					requestErr,
+				)
+			}
+			return false
+		},
+	)
+	if codecommcrypto.VerifyEd25519(
+		signer.identity.public,
+		codec.SignatureCheckpoint,
+		expectation.checkpointJSON,
+		proof.signature[:],
+	) != nil {
+		t.Fatal("authority checkpoint signature did not verify")
+	}
+
+	mismatch := expectation
+	mismatch.checkpoint.ProjectionAccumulator[0] ^= 0xff
+	mismatch, err = newCheckpointSigningExpectation(
+		mismatch.checkpoint,
+		signer.identity.public,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requestCheckpointSignature(
+		ctx,
+		leader.stream,
+		mismatch,
+	); !errors.Is(err, ErrCheckpointProofRejected) {
+		t.Fatalf("mismatched checkpoint-sign request error = %v", err)
+	}
+
+	wrongTarget := expectation
+	wrongTarget.checkpoint.SignerDeviceID =
+		leader.identity.deviceID
+	wrongTarget, err = newCheckpointSigningExpectation(
+		wrongTarget.checkpoint,
+		leader.identity.public,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := encodeCheckpointSignRequest(wrongTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := leader.stream.RequestConsensusProof(
+		ctx,
+		signer.identity.deviceID,
+		body,
+	)
+	if err != nil {
+		t.Fatalf("wrong-target checkpoint-sign request: %v", err)
+	}
+	if response.StatusCode != http.StatusForbidden ||
+		response.MediaType != "application/problem+json" {
+		t.Fatalf("wrong-target response = %#v", response)
+	}
 }
 
 func (harness *secureMeshHarness) changeMeshSuffrage(

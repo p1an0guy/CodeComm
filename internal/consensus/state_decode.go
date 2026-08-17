@@ -35,12 +35,13 @@ import (
 var ErrInvalidStateView = errors.New("consensus: invalid state view")
 
 type decodedState struct {
-	Reducer            reducer.State
-	Admission          *peerauth.Snapshot
-	VoterSet           voterset.Set
-	CanonicalRef       publication.CanonicalRef
-	workspaceID        domain.UUIDv4
-	identityPublicKeys map[domain.DeviceID]ed25519.PublicKey
+	Reducer             reducer.State
+	Admission           *peerauth.Snapshot
+	VoterSet            voterset.Set
+	CredentialAuthority credentialauthority.Authority
+	CanonicalRef        publication.CanonicalRef
+	workspaceID         domain.UUIDv4
+	identityPublicKeys  map[domain.DeviceID]ed25519.PublicKey
 }
 
 // IdentityPublicKey returns an independent key copy for an enrolled device.
@@ -145,12 +146,13 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 		)
 	}
 	decoded := decodedState{
-		Reducer:            state,
-		Admission:          admission,
-		VoterSet:           snapshot.VoterSet,
-		CanonicalRef:       snapshot.CanonicalRef,
-		workspaceID:        view.WorkspaceID,
-		identityPublicKeys: copyIdentityPublicKeys(snapshot.Devices),
+		Reducer:             state,
+		Admission:           admission,
+		VoterSet:            snapshot.VoterSet,
+		CredentialAuthority: snapshot.CredentialAuthority.Clone(),
+		CanonicalRef:        snapshot.CanonicalRef,
+		workspaceID:         view.WorkspaceID,
+		identityPublicKeys:  copyIdentityPublicKeys(snapshot.Devices),
 	}
 	if _, err := decoded.CanonicalCoverageSnapshot(); err != nil {
 		return decodedState{}, err

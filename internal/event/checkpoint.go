@@ -2,11 +2,13 @@ package event
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/ijonahch/codecomm/internal/codec"
+	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 )
 
@@ -167,4 +169,49 @@ func DecodeCheckpoint(encoded []byte) (domain.Checkpoint, error) {
 		)
 	}
 	return checkpoint, nil
+}
+
+// SignCheckpoint signs only the canonical checkpoint tuple and requires the
+// private key to belong to the tuple's named signer.
+func SignCheckpoint(
+	checkpoint domain.Checkpoint,
+	privateKey []byte,
+) ([ed25519.SignatureSize]byte, error) {
+	var result [ed25519.SignatureSize]byte
+	encoded, err := EncodeCheckpoint(checkpoint)
+	if err != nil {
+		return result, err
+	}
+	publicKey, err := codecommcrypto.Ed25519PublicKeyFromPrivateKey(
+		privateKey,
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"%w: invalid signer key",
+			ErrInvalidCheckpoint,
+		)
+	}
+	deviceID, err := codec.DeriveDeviceID(publicKey)
+	if err != nil ||
+		domain.DeviceID(deviceID) != checkpoint.SignerDeviceID {
+		return result, fmt.Errorf(
+			"%w: signer key does not match signer_device_id",
+			ErrInvalidCheckpoint,
+		)
+	}
+	signature, err := codecommcrypto.SignEd25519(
+		privateKey,
+		codec.SignatureCheckpoint,
+		encoded,
+	)
+	if err != nil {
+		return result, fmt.Errorf(
+			"%w: sign tuple: %v",
+			ErrInvalidCheckpoint,
+			err,
+		)
+	}
+	copy(result[:], signature)
+	clear(signature)
+	return result, nil
 }

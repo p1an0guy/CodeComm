@@ -93,6 +93,32 @@ type consensusProofRequester interface {
 	) (transport.ConsensusControlResponse, error)
 }
 
+func decodeConsensusProofMode(encoded []byte) (string, error) {
+	if len(encoded) == 0 ||
+		len(encoded) > transport.ConsensusControlBodyMaxBytes {
+		return "", ErrInvalidCheckpointProof
+	}
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return "", ErrInvalidCheckpointProof
+	}
+	var header struct {
+		SchemaVersion uint64 `json:"schema_version"`
+		Mode          string `json:"mode"`
+	}
+	if err := json.Unmarshal(encoded, &header); err != nil ||
+		header.SchemaVersion != consensusProofSchemaVersion {
+		return "", ErrInvalidCheckpointProof
+	}
+	switch header.Mode {
+	case consensusProofModeStagingApply,
+		consensusProofModeCheckpointSign:
+		return header.Mode, nil
+	default:
+		return "", ErrInvalidCheckpointProof
+	}
+}
+
 func requestStagingApplyProof(
 	ctx context.Context,
 	requester consensusProofRequester,

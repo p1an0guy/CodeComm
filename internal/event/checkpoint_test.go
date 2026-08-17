@@ -2,6 +2,7 @@ package event
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -93,6 +94,44 @@ func TestCheckpointCodecRejectsShapeAndEncodingChanges(t *testing.T) {
 	}
 }
 
+func TestSignCheckpointBindsNamedDeviceAndLabel(t *testing.T) {
+	t.Parallel()
+
+	privateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x72}, ed25519.SeedSize),
+	)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	deviceID, err := codec.DeriveDeviceID(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := checkpointCodecFixture()
+	checkpoint.SignerDeviceID = domain.DeviceID(deviceID)
+	signature, err := SignCheckpoint(checkpoint, privateKey)
+	if err != nil {
+		t.Fatalf("SignCheckpoint(): %v", err)
+	}
+	encoded, err := EncodeCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := codec.BuildSignedInput(
+		codec.SignatureCheckpoint,
+		encoded,
+	)
+	if err != nil ||
+		!ed25519.Verify(publicKey, input, signature[:]) {
+		t.Fatalf("checkpoint signature did not verify: %v", err)
+	}
+	checkpoint.SignerDeviceID = checkpointProofDeviceIDForEventTest()
+	if _, err := SignCheckpoint(
+		checkpoint,
+		privateKey,
+	); !errors.Is(err, ErrInvalidCheckpoint) {
+		t.Fatalf("mismatched signer error = %v", err)
+	}
+}
+
 func checkpointCodecFixture() domain.Checkpoint {
 	return domain.Checkpoint{
 		SessionID: domain.UUIDv7(
@@ -116,4 +155,8 @@ func checkpointCodecFixture() domain.Checkpoint {
 		DigestVersion:           1,
 		ProjectionSchemaVersion: 1,
 	}
+}
+
+func checkpointProofDeviceIDForEventTest() domain.DeviceID {
+	return domain.DeviceID("cc1" + strings.Repeat("9", 64))
 }

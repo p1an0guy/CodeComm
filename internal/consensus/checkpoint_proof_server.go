@@ -42,6 +42,12 @@ var (
 	errConsensusProofBodyTimeout = errors.New(
 		"consensus: checkpoint proof body made no progress",
 	)
+	errConsensusCheckpointSignerUnavailable = errors.New(
+		"consensus: checkpoint identity signer is unavailable",
+	)
+	errConsensusCheckpointSignerInvalid = errors.New(
+		"consensus: checkpoint identity signer returned an invalid signature",
+	)
 )
 
 type stagingProofAuthority struct {
@@ -179,6 +185,25 @@ func (node *SingleNode) serveConsensusControl(
 				proofProblemInvalid,
 			)
 		}
+		return
+	}
+	mode, err := decodeConsensusProofMode(body)
+	if err != nil {
+		writeConsensusProofProblem(
+			writer,
+			http.StatusBadRequest,
+			proofProblemInvalid,
+		)
+		return
+	}
+	if mode == consensusProofModeCheckpointSign {
+		node.serveCheckpointSign(
+			writer,
+			callContext,
+			peer,
+			requestAuthority,
+			body,
+		)
 		return
 	}
 	proofRequest, err := decodeStagingApplyRequest(body)

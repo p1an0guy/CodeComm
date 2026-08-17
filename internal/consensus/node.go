@@ -62,6 +62,9 @@ type SingleNodeOptions struct {
 	ConsensusDir string
 	OriginBootID domain.UUIDv7
 	InitialState *store.InitialState
+	// CheckpointSigner is optional until checkpoint scheduling is enabled.
+	// When supplied, it remains owned by the caller.
+	CheckpointSigner CheckpointSigner
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -104,6 +107,7 @@ type NodeOptions struct {
 	TransportFactory        RaftTransportFactory
 	BootstrapVoterDeviceIDs []domain.DeviceID
 	CanonicalCoverage       canonicalcoverage.ReceiptCollector
+	CheckpointSigner        CheckpointSigner
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -113,17 +117,18 @@ type NodeOptions struct {
 // SingleNode is the durable Raft/SQLite runtime. Its historical name remains
 // for API compatibility; OpenNode may construct a multi-voter mesh runtime.
 type SingleNode struct {
-	raft          *raft.Raft
-	fsm           *FSM
-	state         *store.Store
-	stable        *raftboltdb.BoltStore
-	snapshots     *raft.FileSnapshotStore
-	transport     RaftTransport
-	serverID      raft.ServerID
-	clock         ApplyClock
-	single        bool
-	transportGate *nodeTransportGate
-	coverageGate  *canonicalcoverage.Gate
+	raft             *raft.Raft
+	fsm              *FSM
+	state            *store.Store
+	stable           *raftboltdb.BoltStore
+	snapshots        *raft.FileSnapshotStore
+	transport        RaftTransport
+	serverID         raft.ServerID
+	clock            ApplyClock
+	single           bool
+	transportGate    *nodeTransportGate
+	coverageGate     *canonicalcoverage.Gate
+	checkpointSigner CheckpointSigner
 
 	peerAdmissionChangesClaimed atomic.Bool
 
@@ -174,6 +179,7 @@ type nodeOpenOptions struct {
 	TransportFactory       RaftTransportFactory
 	BootstrapConfiguration raft.Configuration
 	CanonicalCoverage      canonicalcoverage.ReceiptCollector
+	CheckpointSigner       CheckpointSigner
 	Single                 bool
 
 	Clock      ApplyClock
@@ -191,15 +197,16 @@ func OpenSingleNode(
 		return nil, err
 	}
 	return openNode(ctx, nodeOpenOptions{
-		ServerID:     options.ServerID,
-		StatePath:    options.StatePath,
-		ConsensusDir: options.ConsensusDir,
-		OriginBootID: options.OriginBootID,
-		InitialState: options.InitialState,
-		Single:       true,
-		Clock:        options.Clock,
-		RaftConfig:   options.RaftConfig,
-		LogOutput:    options.LogOutput,
+		ServerID:         options.ServerID,
+		StatePath:        options.StatePath,
+		ConsensusDir:     options.ConsensusDir,
+		OriginBootID:     options.OriginBootID,
+		InitialState:     options.InitialState,
+		CheckpointSigner: options.CheckpointSigner,
+		Single:           true,
+		Clock:            options.Clock,
+		RaftConfig:       options.RaftConfig,
+		LogOutput:        options.LogOutput,
 	})
 }
 
@@ -227,6 +234,7 @@ func OpenNode(
 		TransportFactory:       options.TransportFactory,
 		BootstrapConfiguration: bootstrap,
 		CanonicalCoverage:      options.CanonicalCoverage,
+		CheckpointSigner:       options.CheckpointSigner,
 		Clock:                  options.Clock,
 		RaftConfig:             options.RaftConfig,
 		LogOutput:              options.LogOutput,
@@ -565,12 +573,15 @@ func openNode(
 		single:        options.Single,
 		transportGate: transportGate,
 		coverageGate:  coverageGate,
-		monitorStop:   make(chan struct{}),
-		monitorDone:   make(chan struct{}),
-		closeStarted:  make(chan struct{}),
-		lineageGate:   make(chan struct{}, 1),
-		raftEnqueue:   make(chan struct{}, 1),
-		fatalSet:      make(chan struct{}),
+		checkpointSigner: normalizedCheckpointSigner(
+			options.CheckpointSigner,
+		),
+		monitorStop:  make(chan struct{}),
+		monitorDone:  make(chan struct{}),
+		closeStarted: make(chan struct{}),
+		lineageGate:  make(chan struct{}, 1),
+		raftEnqueue:  make(chan struct{}, 1),
+		fatalSet:     make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -644,12 +655,18 @@ func validateSingleNodeOptions(
 	ctx context.Context,
 	options SingleNodeOptions,
 ) error {
-	return validateNodeIdentityAndPaths(
+	if err := validateNodeIdentityAndPaths(
 		ctx,
 		options.ServerID,
 		options.OriginBootID,
 		options.StatePath,
 		options.ConsensusDir,
+	); err != nil {
+		return err
+	}
+	return validateCheckpointSigner(
+		options.ServerID,
+		options.CheckpointSigner,
 	)
 }
 
@@ -672,7 +689,10 @@ func validateNodeOptions(
 			ErrInvalidNodeOptions,
 		)
 	}
-	return nil
+	return validateCheckpointSigner(
+		options.ServerID,
+		options.CheckpointSigner,
+	)
 }
 
 func validateNodeIdentityAndPaths(
@@ -739,6 +759,44 @@ func nilRaftTransport(transport RaftTransport) bool {
 	default:
 		return false
 	}
+}
+
+func normalizedCheckpointSigner(
+	signer CheckpointSigner,
+) CheckpointSigner {
+	if signer == nil {
+		return nil
+	}
+	value := reflect.ValueOf(signer)
+	switch value.Kind() {
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice:
+		if value.IsNil() {
+			return nil
+		}
+	}
+	return signer
+}
+
+func validateCheckpointSigner(
+	deviceID domain.DeviceID,
+	signer CheckpointSigner,
+) error {
+	signer = normalizedCheckpointSigner(signer)
+	if signer == nil {
+		return nil
+	}
+	if signer.DeviceID() != deviceID {
+		return fmt.Errorf(
+			"%w: checkpoint signer belongs to another device",
+			ErrInvalidNodeOptions,
+		)
+	}
+	return nil
 }
 
 func meshBootstrapConfiguration(
