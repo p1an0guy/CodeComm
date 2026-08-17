@@ -100,6 +100,18 @@ func TestDecodeStateViewReconstructsAllProjectionTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeStateView(): %v", err)
 	}
+	coverage, err := decoded.CanonicalCoverageSnapshot()
+	if err != nil {
+		t.Fatalf("CanonicalCoverageSnapshot(): %v", err)
+	}
+	requirement, valid := coverage.Requirement()
+	if !valid ||
+		requirement.SessionID != fixture.view.SessionID ||
+		requirement.WorkspaceID != fixture.view.WorkspaceID ||
+		requirement.VoterSet != decoded.VoterSet ||
+		requirement.CanonicalRef != decoded.CanonicalRef {
+		t.Fatalf("canonical coverage requirement = %#v, valid %t", requirement, valid)
+	}
 	recoveryKey, err := recoveryPublicKeyFromGenesis(fixture.view)
 	if err != nil {
 		t.Fatalf("recoveryPublicKeyFromGenesis(): %v", err)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -36,8 +37,10 @@ var ErrInvalidStateView = errors.New("consensus: invalid state view")
 type decodedState struct {
 	Reducer            reducer.State
 	Admission          *peerauth.Snapshot
+	VoterSet           voterset.Set
+	CanonicalRef       publication.CanonicalRef
+	workspaceID        domain.UUIDv4
 	identityPublicKeys map[domain.DeviceID]ed25519.PublicKey
-	voterDeviceIDs     []domain.DeviceID
 }
 
 // IdentityPublicKey returns an independent key copy for an enrolled device.
@@ -54,7 +57,32 @@ func (state decodedState) IdentityPublicKey(
 
 // VoterDeviceIDs returns an independent sorted copy of the committed target.
 func (state decodedState) VoterDeviceIDs() []domain.DeviceID {
-	return append([]domain.DeviceID(nil), state.voterDeviceIDs...)
+	return state.VoterSet.VoterDeviceIDs()
+}
+
+// CanonicalCoverageSnapshot returns an immutable proof requirement assembled
+// entirely from the transactionally consistent store view decoded into state.
+func (state decodedState) CanonicalCoverageSnapshot() (
+	canonicalcoverage.Snapshot,
+	error,
+) {
+	snapshot, err := canonicalcoverage.NewSnapshot(
+		canonicalcoverage.Requirement{
+			SessionID:    state.VoterSet.SessionID,
+			WorkspaceID:  state.workspaceID,
+			VoterSet:     state.VoterSet,
+			CanonicalRef: state.CanonicalRef,
+		},
+		state.identityPublicKeys,
+	)
+	if err != nil {
+		return canonicalcoverage.Snapshot{}, fmt.Errorf(
+			"%w: canonical coverage: %w",
+			ErrInvalidStateView,
+			err,
+		)
+	}
+	return snapshot, nil
 }
 
 // decodeStateView reconstructs reducer state from one transactionally
@@ -116,12 +144,18 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 			err,
 		)
 	}
-	return decodedState{
+	decoded := decodedState{
 		Reducer:            state,
 		Admission:          admission,
+		VoterSet:           snapshot.VoterSet,
+		CanonicalRef:       snapshot.CanonicalRef,
+		workspaceID:        view.WorkspaceID,
 		identityPublicKeys: copyIdentityPublicKeys(snapshot.Devices),
-		voterDeviceIDs:     snapshot.VoterSet.VoterDeviceIDs(),
-	}, nil
+	}
+	if _, err := decoded.CanonicalCoverageSnapshot(); err != nil {
+		return decodedState{}, err
+	}
+	return decoded, nil
 }
 
 func validateStateViewMetadata(view store.StateView) error {

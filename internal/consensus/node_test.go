@@ -794,6 +794,9 @@ func TestSingleNodeAppliesSnapshotsAndRestartsWithoutHeadDrift(t *testing.T) {
 		}
 	})
 	waitForNodeLeader(t, node)
+	if got, want := node.Address(), raft.ServerAddress(deviceID); got != want {
+		t.Fatalf("new single-node address = %q, want stable %q", got, want)
+	}
 
 	first := nodeTestTaskEvent(
 		t,
@@ -906,6 +909,9 @@ func TestSingleNodeAppliesSnapshotsAndRestartsWithoutHeadDrift(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = restarted.Close() })
 	waitForNodeLeader(t, restarted)
+	if got, want := restarted.Address(), raft.ServerAddress(deviceID); got != want {
+		t.Fatalf("restarted single-node address = %q, want stable %q", got, want)
+	}
 	assertNodeUsesLocalAddress(t, restarted)
 
 	afterRestart, err := restarted.View(context.Background())
@@ -2071,9 +2077,6 @@ func TestWaitForLeaderWaitsForRetainedCommandReplay(t *testing.T) {
 		}
 		_ = restarted.Close()
 	})
-	restarted.addressMu.Lock()
-	restarted.addressReconciled = true
-	restarted.addressMu.Unlock()
 
 	waitDone := make(chan error, 1)
 	go func() {

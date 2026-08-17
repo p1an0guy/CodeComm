@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
@@ -101,6 +101,7 @@ type NodeOptions struct {
 
 	TransportFactory        RaftTransportFactory
 	BootstrapVoterDeviceIDs []domain.DeviceID
+	CanonicalCoverage       canonicalcoverage.ReceiptCollector
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -120,6 +121,7 @@ type SingleNode struct {
 	clock         ApplyClock
 	single        bool
 	transportGate *nodeTransportGate
+	coverageGate  *canonicalcoverage.Gate
 
 	peerAdmissionChangesClaimed atomic.Bool
 
@@ -131,6 +133,9 @@ type SingleNode struct {
 	closeStarted chan struct{}
 	active       sync.WaitGroup
 	lineageGate  chan struct{}
+	raftEnqueue  chan struct{}
+
+	readLeadershipEpoch func() (raftLeadershipEpoch, error)
 
 	fatalOnce sync.Once
 	fatalMu   sync.RWMutex
@@ -143,9 +148,6 @@ type SingleNode struct {
 	proposalMu           sync.Mutex
 	proposalFlights      map[domain.UUIDv7]*proposalFlight
 	proposalReservations map[domain.UUIDv7][]byte
-
-	addressMu         sync.Mutex
-	addressReconciled bool
 
 	fsmScanMu                      sync.Mutex
 	fsmScannedCommit               uint64
@@ -169,6 +171,7 @@ type nodeOpenOptions struct {
 	Transport              RaftTransport
 	TransportFactory       RaftTransportFactory
 	BootstrapConfiguration raft.Configuration
+	CanonicalCoverage      canonicalcoverage.ReceiptCollector
 	Single                 bool
 
 	Clock      ApplyClock
@@ -221,6 +224,7 @@ func OpenNode(
 		InitialState:           options.InitialState,
 		TransportFactory:       options.TransportFactory,
 		BootstrapConfiguration: bootstrap,
+		CanonicalCoverage:      options.CanonicalCoverage,
 		Clock:                  options.Clock,
 		RaftConfig:             options.RaftConfig,
 		LogOutput:              options.LogOutput,
@@ -305,16 +309,9 @@ func openNode(
 		return nil, fmt.Errorf("consensus: open snapshot store: %w", err)
 	}
 	if options.Single {
-		transport, err = raft.NewTCPTransport(
-			"127.0.0.1:0",
-			nil,
-			3,
-			10*time.Second,
-			logOutput,
+		_, transport = raft.NewInmemTransport(
+			raft.ServerAddress(options.ServerID),
 		)
-		if err != nil {
-			return nil, fmt.Errorf("consensus: open loopback transport: %w", err)
-		}
 	} else {
 		transportGate = newNodeTransportGate(
 			options.BootstrapConfiguration,
@@ -540,6 +537,21 @@ func openNode(
 		view.AdmissionRevision,
 		true,
 	)
+	var coverageGate *canonicalcoverage.Gate
+	if options.CanonicalCoverage != nil {
+		coverageGate, err = canonicalcoverage.NewGate(
+			options.CanonicalCoverage,
+		)
+		if err != nil {
+			if !errors.Is(err, canonicalcoverage.ErrCollectorUnavailable) {
+				return nil, fmt.Errorf(
+					"consensus: construct canonical coverage gate: %w",
+					err,
+				)
+			}
+			coverageGate = nil
+		}
+	}
 	node := &SingleNode{
 		fsm:           fsm,
 		state:         state,
@@ -550,10 +562,12 @@ func openNode(
 		clock:         clock,
 		single:        options.Single,
 		transportGate: transportGate,
+		coverageGate:  coverageGate,
 		monitorStop:   make(chan struct{}),
 		monitorDone:   make(chan struct{}),
 		closeStarted:  make(chan struct{}),
 		lineageGate:   make(chan struct{}, 1),
+		raftEnqueue:   make(chan struct{}, 1),
 		fatalSet:      make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
@@ -574,6 +588,7 @@ func openNode(
 		return nil, fmt.Errorf("consensus: start Raft: %w", err)
 	}
 	node.raft = instance
+	node.readLeadershipEpoch = node.currentLeadershipEpoch
 	if transportGate != nil {
 		transportGate.bind(node)
 	}
@@ -1460,16 +1475,9 @@ func validateSingleRaftConfiguration(
 	}
 	server := configuration.Servers[0]
 	if server.ID != raft.ServerID(serverID) ||
-		server.Suffrage != raft.Voter {
+		server.Suffrage != raft.Voter ||
+		server.Address != raft.ServerAddress(serverID) {
 		return ErrSingleVoterTopology
-	}
-	host, _, err := net.SplitHostPort(string(server.Address))
-	if err != nil {
-		return ErrInvalidRaftTopology
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return ErrInvalidRaftTopology
 	}
 	return nil
 }
@@ -1733,9 +1741,6 @@ func (node *SingleNode) WaitForLeader(ctx context.Context) error {
 			}
 			if node.raft.State() == raft.Leader &&
 				id == node.serverID {
-				if err := node.reconcileLocalAddress(ctx); err != nil {
-					return err
-				}
 				err := waitFuture(
 					ctx,
 					node.raft.Barrier(contextTimeout(ctx)),
@@ -1811,42 +1816,6 @@ func (node *SingleNode) appliedThroughCommit(
 		return false, nil
 	}
 	return node.raft.CommitIndex() == commitIndex, nil
-}
-
-func (node *SingleNode) reconcileLocalAddress(ctx context.Context) error {
-	if !node.single {
-		return nil
-	}
-	node.addressMu.Lock()
-	defer node.addressMu.Unlock()
-	if node.addressReconciled {
-		return nil
-	}
-	configurationFuture := node.raft.GetConfiguration()
-	if err := waitFuture(ctx, configurationFuture); err != nil {
-		return err
-	}
-	configuration := configurationFuture.Configuration()
-	if len(configuration.Servers) != 1 ||
-		configuration.Servers[0].ID != node.serverID ||
-		configuration.Servers[0].Suffrage != raft.Voter {
-		return ErrSingleVoterTopology
-	}
-	if configuration.Servers[0].Address != node.transport.LocalAddr() {
-		if err := waitFuture(
-			ctx,
-			node.raft.AddVoter(
-				node.serverID,
-				node.transport.LocalAddr(),
-				configurationFuture.Index(),
-				contextTimeout(ctx),
-			),
-		); err != nil {
-			return err
-		}
-	}
-	node.addressReconciled = true
-	return nil
 }
 
 func (node *SingleNode) shutdownRaft() error {
@@ -1975,12 +1944,19 @@ func (node *SingleNode) RunAtGeneration(
 func (node *SingleNode) lineageOperationContext(
 	ctx context.Context,
 ) (context.Context, context.CancelFunc, func()) {
-	operationContext, cancel := context.WithCancel(ctx)
+	operationContext, cancel, wait := node.operationContext(ctx)
 	operationContext = context.WithValue(
 		operationContext,
 		lineageOperationContextKey{},
 		struct{}{},
 	)
+	return operationContext, cancel, wait
+}
+
+func (node *SingleNode) operationContext(
+	ctx context.Context,
+) (context.Context, context.CancelFunc, func()) {
+	operationContext, cancel := context.WithCancel(ctx)
 	finished := make(chan struct{})
 	watcherDone := make(chan struct{})
 	go func() {
@@ -2058,16 +2034,16 @@ func (node *SingleNode) apply(
 		return committed, nil
 	}
 	if owner {
-		if err := node.preEnqueueError(ctx); err != nil {
+		future, enqueueErr := node.enqueueRaftApply(ctx, canonical)
+		if enqueueErr != nil {
 			node.finishProposal(
 				proposal.EventID,
 				flight,
 				store.ApplyResult{},
-				err,
+				enqueueErr,
 				false,
 			)
 		} else {
-			future := node.raft.Apply(canonical, contextTimeout(ctx))
 			node.active.Add(1)
 			go node.resolveProposal(
 				proposal.EventID,

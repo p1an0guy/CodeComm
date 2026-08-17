@@ -229,7 +229,7 @@ func TestFSMSnapshotRefusesTruncatedNonCommandTail(t *testing.T) {
 	}
 }
 
-func TestSnapshotMetadataRequiresExactSingleLoopbackVoter(t *testing.T) {
+func TestSnapshotMetadataRequiresExactStableSingleVoter(t *testing.T) {
 	t.Parallel()
 
 	_, _, deviceID := nodeTestInitialState(t)
@@ -241,7 +241,7 @@ func TestSnapshotMetadataRequiresExactSingleLoopbackVoter(t *testing.T) {
 		Configuration: raft.Configuration{Servers: []raft.Server{{
 			Suffrage: raft.Voter,
 			ID:       raft.ServerID(deviceID),
-			Address:  "127.0.0.1:12345",
+			Address:  raft.ServerAddress(deviceID),
 		}}},
 		ConfigurationIndex: 1,
 		Size:               128,
@@ -310,7 +310,7 @@ func TestSnapshotMetadataRequiresExactSingleLoopbackVoter(t *testing.T) {
 			},
 		},
 		{
-			name: "nonloopback address",
+			name: "wrong stable address",
 			mutate: func(meta *raft.SnapshotMeta) {
 				meta.Configuration.Servers[0].Address = "192.0.2.1:12345"
 			},
