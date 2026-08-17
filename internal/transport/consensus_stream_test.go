@@ -262,6 +262,26 @@ func testConsensusStartupEnabled(t *testing.T) {
 	)
 	t.Run("replication authorization", testConsensusReplicationAuthorization)
 	t.Run("request header timeout", testConsensusRequestHeaderTimeout)
+	t.Run(
+		"proof control reuse",
+		testConsensusProofRequestReusesAuthenticatedConnection,
+	)
+	t.Run(
+		"proof control input bounds",
+		testConsensusProofRequestRejectsInvalidInputBeforeDial,
+	)
+	t.Run(
+		"proof control response bounds",
+		testConsensusProofRequestBoundsAndClassifiesResponses,
+	)
+	t.Run(
+		"proof control cancellation",
+		testConsensusProofRequestHonorsCancellation,
+	)
+	t.Run(
+		"proof control denial closes active streams",
+		testConsensusProofDenialClosesActiveStreamsWithoutDeadlock,
+	)
 }
 
 func testConsensusDuplexAndReuse(t *testing.T) {
@@ -725,7 +745,20 @@ type consensusHarness struct {
 }
 
 func newConsensusHarness(t *testing.T) *consensusHarness {
+	return newConsensusHarnessWithControlHandler(
+		t,
+		http.NotFoundHandler(),
+	)
+}
+
+func newConsensusHarnessWithControlHandler(
+	t *testing.T,
+	controlHandler http.Handler,
+) *consensusHarness {
 	t.Helper()
+	if controlHandler == nil {
+		t.Fatal("nil consensus control handler")
+	}
 	clientKey := certificatePrivateKey(91)
 	clientCertificate, clientBinding, err := IssueIdentityCertificate(
 		certificateTestSessionID,
@@ -791,7 +824,7 @@ func newConsensusHarness(t *testing.T) *consensusHarness {
 		}),
 		AuthorizePeer:        authorize(&harness.serverAllowed),
 		AuthorizationChanges: harness.serverChanges,
-		ControlHandler:       http.NotFoundHandler(),
+		ControlHandler:       controlHandler,
 	})
 	if err != nil {
 		t.Fatalf("NewConsensusStreamLayer(server): %v", err)

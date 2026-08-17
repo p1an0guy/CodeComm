@@ -26,9 +26,11 @@ const (
 	ConsensusActiveHandlersMax       = 128
 	ConsensusEndpointCandidatesMax   = 64
 	ConsensusHeaderMaxBytes          = 32 << 10
+	ConsensusControlBodyMaxBytes     = 1 << 20
 
 	consensusConnectionIdle = 120 * time.Second
 	consensusRequestHeader  = 10 * time.Second
+	consensusControlRequest = 30 * time.Second
 	consensusStreamProgress = 30 * time.Second
 	consensusPingTimeout    = 10 * time.Second
 	consensusCopyBufferSize = 32 << 10
@@ -56,7 +58,21 @@ var (
 	ErrConsensusRequestHeaderTimeout = errors.New(
 		"transport: consensus request header timed out",
 	)
+	ErrInvalidConsensusControlRequest = errors.New(
+		"transport: invalid consensus control request",
+	)
+	ErrConsensusControlResponse = errors.New(
+		"transport: invalid consensus control response",
+	)
 )
+
+// ConsensusControlResponse is one bounded response from the fixed consensus
+// proof route. Body storage belongs to the caller.
+type ConsensusControlResponse struct {
+	StatusCode int
+	MediaType  string
+	Body       []byte
+}
 
 // ConsensusEndpointResolver supplies bounded, verified literal dial targets
 // without coupling the transport to discovery retention or priority policy.

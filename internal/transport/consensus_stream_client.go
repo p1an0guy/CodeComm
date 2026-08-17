@@ -1,18 +1,259 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"sync"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"golang.org/x/net/http2"
 )
+
+const (
+	consensusJSONMediaType    = "application/json"
+	consensusProblemMediaType = "application/problem+json"
+	consensusProofPath        = "/v1/consensus/prove"
+)
+
+// RequestConsensusProof sends one bounded JSON request to the fixed proof
+// route over the peer's existing authenticated consensus connection.
+func (layer *ConsensusStreamLayer) RequestConsensusProof(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	if layer == nil ||
+		layer.ctx == nil ||
+		ctx == nil ||
+		!deviceID.Valid() ||
+		deviceID == layer.localDeviceID ||
+		len(body) == 0 ||
+		len(body) > ConsensusControlBodyMaxBytes {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusControlRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	requestContext, cancel := context.WithTimeout(
+		ctx,
+		consensusControlRequest,
+	)
+	stopLayerCancellation := context.AfterFunc(layer.ctx, cancel)
+	defer func() {
+		stopLayerCancellation()
+		cancel()
+	}()
+
+	if err := layer.authorize(deviceID); err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	peer, err := layer.peer(deviceID)
+	if err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	if err := peer.acquire(requestContext); err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	defer peer.release()
+
+	physical, err := layer.beginConsensusControlRequest(
+		requestContext,
+		peer,
+		deviceID,
+	)
+	if err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	defer peer.streamClosed()
+
+	request, err := http.NewRequestWithContext(
+		requestContext,
+		http.MethodPost,
+		"https://"+ConsensusRaftAuthority+consensusProofPath,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusControlRequest
+	}
+	request.Header.Set("Accept", consensusJSONMediaType+", "+consensusProblemMediaType)
+	request.Header.Set("Content-Type", consensusJSONMediaType)
+
+	response, err := physical.http2.RoundTrip(request)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if requestErr := requestContext.Err(); requestErr != nil {
+			return ConsensusControlResponse{}, requestErr
+		}
+		return ConsensusControlResponse{}, fmt.Errorf(
+			"%w: round trip",
+			ErrConsensusControlResponse,
+		)
+	}
+	if response == nil || response.Body == nil {
+		return ConsensusControlResponse{},
+			ErrConsensusControlResponse
+	}
+	defer response.Body.Close()
+
+	mediaType, err := consensusResponseMediaType(response)
+	if err != nil {
+		return ConsensusControlResponse{}, err
+	}
+	if response.ContentLength > ConsensusControlBodyMaxBytes {
+		return ConsensusControlResponse{},
+			ErrConsensusControlResponse
+	}
+	limited := io.LimitReader(
+		response.Body,
+		ConsensusControlBodyMaxBytes+1,
+	)
+	responseBody, err := io.ReadAll(limited)
+	if err != nil {
+		if requestErr := requestContext.Err(); requestErr != nil {
+			return ConsensusControlResponse{}, requestErr
+		}
+		return ConsensusControlResponse{}, fmt.Errorf(
+			"%w: read body",
+			ErrConsensusControlResponse,
+		)
+	}
+	if len(responseBody) > ConsensusControlBodyMaxBytes {
+		return ConsensusControlResponse{},
+			ErrConsensusControlResponse
+	}
+	if err := layer.verifyExpected(deviceID, physical.identity); err != nil {
+		layer.invalidateConsensusPeer(peer, deviceID)
+		return ConsensusControlResponse{}, err
+	}
+	if err := layer.authorize(deviceID); err != nil {
+		layer.invalidateConsensusPeer(peer, deviceID)
+		return ConsensusControlResponse{}, err
+	}
+	return ConsensusControlResponse{
+		StatusCode: response.StatusCode,
+		MediaType:  mediaType,
+		Body:       responseBody,
+	}, nil
+}
+
+func (layer *ConsensusStreamLayer) beginConsensusControlRequest(
+	ctx context.Context,
+	peer *consensusPeerClient,
+	deviceID domain.DeviceID,
+) (*consensusPhysicalClient, error) {
+	if layer == nil || peer == nil || ctx == nil {
+		return nil, ErrInvalidConsensusControlRequest
+	}
+	peer.mu.Lock()
+
+	if err := layer.openError(); err != nil {
+		peer.mu.Unlock()
+		return nil, err
+	}
+	if peer.physical == nil || !peer.physical.usable() {
+		if peer.openStreams != 0 {
+			peer.mu.Unlock()
+			return nil, ErrConsensusEndpointUnavailable
+		}
+		if peer.physical != nil {
+			_ = peer.physical.close()
+			peer.physical = nil
+		}
+		physical, err := layer.dialPhysical(ctx, deviceID)
+		if err != nil {
+			peer.mu.Unlock()
+			return nil, err
+		}
+		peer.physical = physical
+	}
+	if err := layer.verifyExpected(
+		deviceID,
+		peer.physical.identity,
+	); err != nil {
+		physical := peer.physical
+		peer.physical = nil
+		peer.mu.Unlock()
+		_ = physical.close()
+		layer.closeStreamsForDevice(deviceID)
+		return nil, err
+	}
+	if err := layer.authorize(deviceID); err != nil {
+		physical := peer.physical
+		peer.physical = nil
+		peer.mu.Unlock()
+		_ = physical.close()
+		layer.closeStreamsForDevice(deviceID)
+		return nil, err
+	}
+	peer.openStreams++
+	physical := peer.physical
+	peer.mu.Unlock()
+	return physical, nil
+}
+
+func (layer *ConsensusStreamLayer) invalidateConsensusPeer(
+	peer *consensusPeerClient,
+	deviceID domain.DeviceID,
+) {
+	if layer == nil || peer == nil {
+		return
+	}
+	peer.mu.Lock()
+	physical := peer.physical
+	peer.physical = nil
+	peer.mu.Unlock()
+	if physical != nil {
+		_ = physical.close()
+	}
+	layer.closeStreamsForDevice(deviceID)
+}
+
+func consensusResponseMediaType(
+	response *http.Response,
+) (string, error) {
+	if response == nil ||
+		response.StatusCode < http.StatusContinue ||
+		response.StatusCode > 599 ||
+		response.Header.Get("Content-Encoding") != "" {
+		return "", ErrConsensusControlResponse
+	}
+	contentLength := response.Header.Get("Content-Length")
+	if contentLength != "" {
+		value, err := strconv.ParseInt(contentLength, 10, 64)
+		if err != nil ||
+			value < 0 ||
+			value > ConsensusControlBodyMaxBytes {
+			return "", ErrConsensusControlResponse
+		}
+	}
+	mediaType, parameters, err := mime.ParseMediaType(
+		response.Header.Get("Content-Type"),
+	)
+	if err != nil || len(parameters) != 0 {
+		return "", ErrConsensusControlResponse
+	}
+	expected := consensusProblemMediaType
+	if response.StatusCode >= http.StatusOK &&
+		response.StatusCode < http.StatusMultipleChoices {
+		expected = consensusJSONMediaType
+	}
+	if mediaType != expected {
+		return "", ErrConsensusControlResponse
+	}
+	return mediaType, nil
+}
 
 func (layer *ConsensusStreamLayer) dialPhysical(
 	ctx context.Context,

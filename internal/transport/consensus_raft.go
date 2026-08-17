@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ type ConsensusNetworkTransportOptions struct {
 // log entries and snapshots from bypassing CodeComm's applied-leader gate.
 type ConsensusNetworkTransport struct {
 	delegate             *raft.NetworkTransport
+	control              *ConsensusStreamLayer
 	localDeviceID        domain.DeviceID
 	authorizeReplication ConsensusReplicationAuthorizer
 	authorizeCommitProbe ConsensusCommitProbeAuthorizer
@@ -89,10 +91,27 @@ func NewConsensusNetworkTransport(
 	)
 	return &ConsensusNetworkTransport{
 		delegate:             delegate,
+		control:              options.Stream,
 		localDeviceID:        localDeviceID,
 		authorizeReplication: options.AuthorizeReplication,
 		authorizeCommitProbe: options.AuthorizeCommitProbe,
 	}, nil
+}
+
+// RequestConsensusProof forwards the fixed proof route through the same
+// authenticated HTTP/2 connection pool used by the Raft stream adapter.
+func (transport *ConsensusNetworkTransport) RequestConsensusProof(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.RequestConsensusProof(ctx, deviceID, body)
 }
 
 // Consumer returns inbound Raft RPCs decoded by the maintained transport.
