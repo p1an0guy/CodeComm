@@ -518,22 +518,10 @@ func (record CheckpointRecord) canonicalJSON(
 	if err != nil || !includeSignature {
 		return unsigned, err
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(unsigned, &object); err != nil {
-		return nil, err
-	}
-	signature, err := json.Marshal(codec.EncodeBase64URL(
-		record.AuthoritySignature[:],
-	))
-	if err != nil {
-		return nil, err
-	}
-	object["authority_signature"] = signature
-	encoded, err := json.Marshal(object)
-	if err != nil {
-		return nil, err
-	}
-	return codec.CanonicalizeSignedObject(encoded)
+	return event.EncodeCheckpointPayload(
+		record.checkpoint(),
+		[ed25519.SignatureSize]byte(record.AuthoritySignature),
+	)
 }
 
 func (record CheckpointRecord) matchesPayload(payload []byte) bool {

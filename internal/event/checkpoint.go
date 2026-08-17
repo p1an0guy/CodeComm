@@ -89,6 +89,52 @@ func EncodeCheckpoint(checkpoint domain.Checkpoint) ([]byte, error) {
 	return canonical, nil
 }
 
+// EncodeCheckpointPayload returns the exact canonical consensus.checkpoint
+// payload. The authority signature covers only EncodeCheckpoint's unsigned
+// object and is therefore added afterward.
+func EncodeCheckpointPayload(
+	checkpoint domain.Checkpoint,
+	signature [ed25519.SignatureSize]byte,
+) ([]byte, error) {
+	unsigned, err := EncodeCheckpoint(checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(unsigned, &object); err != nil {
+		return nil, fmt.Errorf(
+			"%w: decode unsigned JSON",
+			ErrInvalidCheckpoint,
+		)
+	}
+	encodedSignature, err := json.Marshal(
+		codec.EncodeBase64URL(signature[:]),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: encode signature",
+			ErrInvalidCheckpoint,
+		)
+	}
+	object["authority_signature"] = encodedSignature
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: encode payload JSON",
+			ErrInvalidCheckpoint,
+		)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: canonicalize payload JSON: %v",
+			ErrInvalidCheckpoint,
+			err,
+		)
+	}
+	return canonical, nil
+}
+
 // DecodeCheckpoint accepts only the exact canonical unsigned checkpoint
 // object and returns values backed by no caller-owned memory.
 func DecodeCheckpoint(encoded []byte) (domain.Checkpoint, error) {

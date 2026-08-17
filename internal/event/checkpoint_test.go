@@ -94,6 +94,55 @@ func TestCheckpointCodecRejectsShapeAndEncodingChanges(t *testing.T) {
 	}
 }
 
+func TestEncodeCheckpointPayloadAddsSignatureOutsidePreimage(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := checkpointCodecFixture()
+	signature := [ed25519.SignatureSize]byte{0x91}
+	unsigned, err := EncodeCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := EncodeCheckpointPayload(checkpoint, signature)
+	if err != nil {
+		t.Fatalf("EncodeCheckpointPayload(): %v", err)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(payload)
+	if err != nil || !bytes.Equal(canonical, payload) {
+		t.Fatalf("payload is not canonical: %v", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatal(err)
+	}
+	encodedSignature, exists := object["authority_signature"]
+	if !exists {
+		t.Fatal("payload has no authority_signature")
+	}
+	delete(object, "authority_signature")
+	withoutSignature, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutSignature, err = codec.CanonicalizeSignedObject(
+		withoutSignature,
+	)
+	if err != nil || !bytes.Equal(withoutSignature, unsigned) {
+		t.Fatalf("payload changed unsigned checkpoint: %v", err)
+	}
+	var signatureText string
+	if err := json.Unmarshal(encodedSignature, &signatureText); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := codec.DecodeBase64URLExact(
+		signatureText,
+		ed25519.SignatureSize,
+	)
+	if err != nil || !bytes.Equal(decoded, signature[:]) {
+		t.Fatalf("payload signature = %x, %v", decoded, err)
+	}
+}
+
 func TestSignCheckpointBindsNamedDeviceAndLabel(t *testing.T) {
 	t.Parallel()
 
