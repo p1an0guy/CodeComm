@@ -130,6 +130,7 @@ defect.
 | Log retention | 7 days or 100 MiB per session, whichever first | Local |
 | Pairing message / invite endpoint-hint count | 64 KiB / 16 | Local hard input bounds; invite secret and nonce lengths remain protocol-fixed (§4.5) |
 | Signed endpoint-set encoded maximum | 16 KiB | Local hard input bound before JCS/signature work (§4.4) |
+| `canonical_coverage_receipt_max_bytes` | 4 KiB | Local hard input bound before JCS/signature work (§§3, 8.1) |
 | `endpoint_hints_per_member_max` / `manual_endpoints_per_member_max` / `endpoint_hints_per_session_max` / `manual_endpoints_per_session_max` | 16 / 16 / 128 / 128 | Local hard ceilings; latest valid signed sets replace atomically, nonmanual guesses expire then evict oldest, and manual additions refuse at capacity (§§2.3, 4.4) |
 | TLS/pairing handshake timeout / pending cap / source rate | 10 s / 32 per daemon / 10 attempts per source IP per minute, burst 20 | Local, before expensive certificate/pairing state |
 | `handshake_tracked_sources_max` / `handshake_source_idle_seconds` / `handshake_state_max_bytes` | 1,024 / 600 / 8 MiB | Local; expire then evict oldest idle source, otherwise silently drop excess attempts (§4.6) |
