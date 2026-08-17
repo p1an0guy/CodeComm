@@ -292,6 +292,9 @@ Required unit/component subjects:
   committed is refused owner-level operations for the remainder of that epoch;
 - leader-only replication (§4.6): a non-leader serves no entries/snapshot, asserted on exchanged
   bytes; an elected leader that has not applied through committed membership replicates nothing;
+  after cold restart with a zero volatile commit index and a shared unapplied committed tail, only
+  no-op-only commit probes flow, mixed/command/configuration/snapshot transfer remains blocked, and
+  the quorum re-establishes commitment and applies the tail before ordinary replication resumes;
   once eligible it replicates only to active live voters and staging nonvoters, never settled
   application nonvoters; a compacted staging target catches up by leader `InstallSnapshot` before
   producing its checkpoint proof, while settled nonvoters use signed batches/snapshots;

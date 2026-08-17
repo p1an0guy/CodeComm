@@ -51,6 +51,9 @@ type FSMOptions struct {
 	OriginBootID domain.UUIDv7
 	Clock        ApplyClock
 	LogStore     raft.LogStore
+	// ValidateConfiguration may be omitted only by direct, non-Raft harnesses;
+	// the default rejects every configuration callback.
+	ValidateConfiguration func(raft.Configuration) error
 }
 
 // ApplyResponse is returned through raft.ApplyFuture.Response. Result is the
@@ -64,14 +67,19 @@ type ApplyResponse struct {
 // FSM adapts committed Raft commands to the deterministic reducer and the
 // atomic SQLite apply transaction.
 type FSM struct {
-	store            *store.Store
-	originBootID     domain.UUIDv7
-	clock            ApplyClock
-	logStore         raft.LogStore
-	admission        atomic.Pointer[peerAdmissionPublication]
-	admissionChanged chan struct{}
-	admissionMu      sync.Mutex
-	admissionClosed  bool
+	store                *store.Store
+	originBootID         domain.UUIDv7
+	clock                ApplyClock
+	logStore             raft.LogStore
+	validateConfig       func(raft.Configuration) error
+	admission            atomic.Pointer[peerAdmissionPublication]
+	admissionMu          sync.Mutex
+	authorizationChanges *changeFeed
+	// admissionChanged is the compatibility subscription used by direct FSM
+	// tests. Node consumers receive independent subscriptions.
+	admissionChanged    <-chan struct{}
+	committedConfig     atomic.Pointer[committedRaftConfiguration]
+	appliedCommandIndex atomic.Uint64
 
 	haltOnce sync.Once
 	haltMu   sync.RWMutex
@@ -87,14 +95,56 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 		options.Clock == nil {
 		return nil, ErrInvalidFSMOptions
 	}
-	return &FSM{
-		store:            options.Store,
-		originBootID:     options.OriginBootID,
-		clock:            options.Clock,
-		logStore:         options.LogStore,
-		admissionChanged: make(chan struct{}, 1),
-		halted:           make(chan error, 1),
-	}, nil
+	validateConfiguration := options.ValidateConfiguration
+	if validateConfiguration == nil {
+		validateConfiguration = func(raft.Configuration) error {
+			return ErrInvalidRaftTopology
+		}
+	}
+	view, err := options.Store.View(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("%w: load durable state: %v", ErrInvalidFSMOptions, err)
+	}
+	feed := newChangeFeed()
+	fsm := &FSM{
+		store:                options.Store,
+		originBootID:         options.OriginBootID,
+		clock:                options.Clock,
+		logStore:             options.LogStore,
+		validateConfig:       validateConfiguration,
+		authorizationChanges: feed,
+		admissionChanged:     feed.subscribeWithoutInitial(),
+		halted:               make(chan error, 1),
+	}
+	if view.LastRaftAppliedLogIndex != nil {
+		fsm.appliedCommandIndex.Store(*view.LastRaftAppliedLogIndex)
+	}
+	record, found, err := options.Store.CommittedRaftConfiguration(
+		context.Background(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: load committed Raft configuration: %v",
+			ErrInvalidFSMOptions,
+			err,
+		)
+	}
+	if found {
+		configuration, err := decodeRaftConfigurationJSON(
+			record.ConfigurationJSON,
+		)
+		if err != nil || validateConfiguration(configuration) != nil {
+			return nil, fmt.Errorf(
+				"%w: invalid durable Raft configuration",
+				ErrInvalidFSMOptions,
+			)
+		}
+		fsm.committedConfig.Store(&committedRaftConfiguration{
+			Index:         record.LogIndex,
+			Configuration: configuration,
+		})
+	}
+	return fsm, nil
 }
 
 // Halted yields the first terminal FSM error. The channel remains open and
@@ -204,6 +254,7 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 				err,
 			))
 		}
+		fsm.publishAppliedCommand(log.Index)
 		return ApplyResponse{
 			LogIndex: log.Index,
 			Result: store.ApplyResult{
@@ -259,6 +310,7 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 				err,
 			))
 		}
+		fsm.publishAppliedCommand(log.Index)
 		return ApplyResponse{LogIndex: log.Index, Result: result}
 	}
 	outcome, err := reduceCommitted(
@@ -302,7 +354,96 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		result.AdmissionRevision,
 		admissionAccessChanged(outcome.Changes),
 	)
+	fsm.publishAppliedCommand(log.Index)
 	return ApplyResponse{LogIndex: log.Index, Result: result}
+}
+
+// StoreConfiguration implements raft.ConfigurationStore. HashiCorp Raft calls
+// it serially only after the configuration entry is committed.
+func (fsm *FSM) StoreConfiguration(
+	index uint64,
+	configuration raft.Configuration,
+) {
+	if fsm == nil || fsm.HaltError() != nil {
+		return
+	}
+	log := &raft.Log{
+		Index: index,
+		Type:  raft.LogConfiguration,
+	}
+	if index < 1 ||
+		!domain.ValidUnsignedInteger(index) ||
+		fsm.validateConfig == nil ||
+		fsm.validateConfig(configuration) != nil {
+		fsm.halt(log, ErrInvalidRaftTopology)
+		return
+	}
+	encoded, err := encodeRaftConfiguration(configuration)
+	if err != nil {
+		fsm.halt(log, err)
+		return
+	}
+	stored, err := fsm.store.StoreCommittedRaftConfiguration(
+		context.Background(),
+		index,
+		encoded,
+	)
+	if err != nil {
+		fsm.halt(log, fmt.Errorf(
+			"persist committed Raft configuration: %w",
+			err,
+		))
+		return
+	}
+	current := fsm.committedConfig.Load()
+	if !stored && current != nil && current.Index >= index {
+		return
+	}
+	if !stored {
+		record, found, readErr := fsm.store.CommittedRaftConfiguration(
+			context.Background(),
+		)
+		if readErr != nil || !found {
+			fsm.halt(log, fmt.Errorf(
+				"reload committed Raft configuration: %v",
+				readErr,
+			))
+			return
+		}
+		index = record.LogIndex
+		configuration, err = decodeRaftConfigurationJSON(
+			record.ConfigurationJSON,
+		)
+		if err != nil || fsm.validateConfig(configuration) != nil {
+			fsm.halt(log, ErrInvalidRaftTopology)
+			return
+		}
+	}
+	fsm.committedConfig.Store(&committedRaftConfiguration{
+		Index:         index,
+		Configuration: configuration.Clone(),
+	})
+	fsm.authorizationChanges.signal()
+}
+
+func (fsm *FSM) publishAppliedCommand(index uint64) {
+	if fsm == nil || index == 0 {
+		return
+	}
+	for {
+		current := fsm.appliedCommandIndex.Load()
+		if current >= index ||
+			fsm.appliedCommandIndex.CompareAndSwap(current, index) {
+			return
+		}
+	}
+}
+
+func (fsm *FSM) committedConfiguration() *committedRaftConfiguration {
+	if fsm == nil {
+		return nil
+	}
+	return cloneCommittedRaftConfiguration(fsm.committedConfig.Load())
 }
 
 type peerAdmissionPublication struct {
@@ -317,7 +458,7 @@ func (fsm *FSM) publishPeerAdmission(
 ) {
 	fsm.admissionMu.Lock()
 	defer fsm.admissionMu.Unlock()
-	if fsm.admissionClosed {
+	if fsm.authorizationChanges.isClosed() {
 		return
 	}
 	fsm.admission.Store(&peerAdmissionPublication{
@@ -325,10 +466,7 @@ func (fsm *FSM) publishPeerAdmission(
 		snapshot: snapshot,
 	})
 	if notify {
-		select {
-		case fsm.admissionChanged <- struct{}{}:
-		default:
-		}
+		fsm.authorizationChanges.signal()
 	}
 }
 
@@ -338,11 +476,7 @@ func (fsm *FSM) closePeerAdmissionChanges() {
 	}
 	fsm.admissionMu.Lock()
 	defer fsm.admissionMu.Unlock()
-	if fsm.admissionClosed {
-		return
-	}
-	fsm.admissionClosed = true
-	close(fsm.admissionChanged)
+	fsm.authorizationChanges.close()
 }
 
 func admissionAccessChanged(changes reducer.Changes) bool {
@@ -431,3 +565,5 @@ func raftLogIndex(log *raft.Log) uint64 {
 	}
 	return log.Index
 }
+
+var _ raft.ConfigurationStore = (*FSM)(nil)

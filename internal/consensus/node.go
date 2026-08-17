@@ -9,15 +9,18 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
@@ -36,6 +39,8 @@ var (
 	ErrRaftStateMissing         = errors.New("consensus: initialized SQLite has no Raft state")
 	ErrStateInitialization      = errors.New("consensus: state initialization required")
 	ErrSingleVoterTopology      = errors.New("consensus: Phase 2 requires exactly one local voter")
+	ErrInvalidBootstrapTopology = errors.New("consensus: invalid bootstrap voter topology")
+	ErrInvalidRaftTopology      = errors.New("consensus: invalid device-addressed Raft topology")
 	ErrUnexpectedFSMResponse    = errors.New("consensus: unexpected Raft FSM response")
 	ErrSnapshotAnchorCoverage   = errors.New("consensus: SQLite does not cover Raft snapshot anchor")
 	ErrRaftLogCoverage          = errors.New("consensus: Raft log/snapshot coverage is invalid")
@@ -62,17 +67,61 @@ type SingleNodeOptions struct {
 	LogOutput  io.Writer
 }
 
-// SingleNode is the real one-voter Raft/SQLite runtime used by the walking
-// skeleton. Phase 3 replaces only its transport/topology boundary.
+// RaftTransport is the owned transport boundary required by a consensus node.
+type RaftTransport interface {
+	raft.Transport
+	raft.WithClose
+}
+
+// ConsensusTransportGate is the fail-closed authorization capability passed
+// to a mesh transport factory before the resulting node exists.
+type ConsensusTransportGate interface {
+	PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+	AuthorizePeer(domain.DeviceID) error
+	AuthorizeReplication(domain.DeviceID) error
+	AuthorizeCommitProbe(domain.DeviceID) error
+	AuthorizationChanges() <-chan struct{}
+}
+
+// RaftTransportFactory constructs the owned transport around a late-bound
+// authorization gate.
+type RaftTransportFactory func(ConsensusTransportGate) (RaftTransport, error)
+
+// NodeOptions configures a device-addressed mesh node. OpenNode takes
+// ownership of a successfully constructed transport and closes it on every
+// later return path. BootstrapVoterDeviceIDs is required while creating Raft
+// state, completing interrupted initialization, or awaiting the first durable
+// committed-configuration callback.
+type NodeOptions struct {
+	ServerID     domain.DeviceID
+	StatePath    string
+	ConsensusDir string
+	OriginBootID domain.UUIDv7
+	InitialState *store.InitialState
+
+	TransportFactory        RaftTransportFactory
+	BootstrapVoterDeviceIDs []domain.DeviceID
+
+	Clock      ApplyClock
+	RaftConfig *raft.Config
+	LogOutput  io.Writer
+}
+
+// SingleNode is the durable Raft/SQLite runtime. Its historical name remains
+// for API compatibility; OpenNode may construct a multi-voter mesh runtime.
 type SingleNode struct {
-	raft      *raft.Raft
-	fsm       *FSM
-	state     *store.Store
-	stable    *raftboltdb.BoltStore
-	snapshots *raft.FileSnapshotStore
-	transport *raft.NetworkTransport
-	serverID  raft.ServerID
-	clock     ApplyClock
+	raft          *raft.Raft
+	fsm           *FSM
+	state         *store.Store
+	stable        *raftboltdb.BoltStore
+	snapshots     *raft.FileSnapshotStore
+	transport     RaftTransport
+	serverID      raft.ServerID
+	clock         ApplyClock
+	single        bool
+	transportGate *nodeTransportGate
+
+	peerAdmissionChangesClaimed atomic.Bool
 
 	monitorStop chan struct{}
 	monitorDone chan struct{}
@@ -98,8 +147,33 @@ type SingleNode struct {
 	addressMu         sync.Mutex
 	addressReconciled bool
 
+	fsmScanMu                      sync.Mutex
+	fsmScannedCommit               uint64
+	committedCommandLogIndex       uint64
+	committedConfigurationLogIndex uint64
+
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// Node is the topology-neutral name for the consensus runtime.
+type Node = SingleNode
+
+type nodeOpenOptions struct {
+	ServerID     domain.DeviceID
+	StatePath    string
+	ConsensusDir string
+	OriginBootID domain.UUIDv7
+	InitialState *store.InitialState
+
+	Transport              RaftTransport
+	TransportFactory       RaftTransportFactory
+	BootstrapConfiguration raft.Configuration
+	Single                 bool
+
+	Clock      ApplyClock
+	RaftConfig *raft.Config
+	LogOutput  io.Writer
 }
 
 // OpenSingleNode opens durable stores, completes a one-time bootstrap if
@@ -111,6 +185,63 @@ func OpenSingleNode(
 	if err := validateSingleNodeOptions(ctx, options); err != nil {
 		return nil, err
 	}
+	return openNode(ctx, nodeOpenOptions{
+		ServerID:     options.ServerID,
+		StatePath:    options.StatePath,
+		ConsensusDir: options.ConsensusDir,
+		OriginBootID: options.OriginBootID,
+		InitialState: options.InitialState,
+		Single:       true,
+		Clock:        options.Clock,
+		RaftConfig:   options.RaftConfig,
+		LogOutput:    options.LogOutput,
+	})
+}
+
+// OpenNode opens a durable device-addressed Raft/SQLite mesh node.
+func OpenNode(
+	ctx context.Context,
+	options NodeOptions,
+) (_ *Node, err error) {
+	if err := validateNodeOptions(ctx, options); err != nil {
+		return nil, err
+	}
+	bootstrap, err := meshBootstrapConfiguration(
+		options.ServerID,
+		options.BootstrapVoterDeviceIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return openNode(ctx, nodeOpenOptions{
+		ServerID:               options.ServerID,
+		StatePath:              options.StatePath,
+		ConsensusDir:           options.ConsensusDir,
+		OriginBootID:           options.OriginBootID,
+		InitialState:           options.InitialState,
+		TransportFactory:       options.TransportFactory,
+		BootstrapConfiguration: bootstrap,
+		Clock:                  options.Clock,
+		RaftConfig:             options.RaftConfig,
+		LogOutput:              options.LogOutput,
+	})
+}
+
+func openNode(
+	ctx context.Context,
+	options nodeOpenOptions,
+) (_ *SingleNode, err error) {
+	transport := options.Transport
+	var transportGate *nodeTransportGate
+	defer func() {
+		if err != nil && !nilRaftTransport(transport) {
+			_ = transport.Close()
+		}
+		if err != nil && transportGate != nil {
+			transportGate.close()
+		}
+	}()
+
 	consensusDir := filepath.Clean(options.ConsensusDir)
 	createdDir, err := prepareConsensusDirectory(consensusDir)
 	if err != nil {
@@ -173,23 +304,40 @@ func OpenSingleNode(
 	if err != nil {
 		return nil, fmt.Errorf("consensus: open snapshot store: %w", err)
 	}
-	transport, err := raft.NewTCPTransport(
-		"127.0.0.1:0",
-		nil,
-		3,
-		10*time.Second,
+	if options.Single {
+		transport, err = raft.NewTCPTransport(
+			"127.0.0.1:0",
+			nil,
+			3,
+			10*time.Second,
+			logOutput,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("consensus: open loopback transport: %w", err)
+		}
+	} else {
+		transportGate = newNodeTransportGate(
+			options.BootstrapConfiguration,
+		)
+		transport, err = options.TransportFactory(transportGate)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"consensus: construct mesh transport: %w",
+				err,
+			)
+		}
+		if nilRaftTransport(transport) ||
+			transport.LocalAddr() !=
+				raft.ServerAddress(options.ServerID) {
+			return nil, ErrInvalidRaftTopology
+		}
+	}
+
+	config, err := nodeRaftConfig(
+		options.ServerID,
+		options.RaftConfig,
 		logOutput,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("consensus: open loopback transport: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = transport.Close()
-		}
-	}()
-
-	config, err := singleNodeRaftConfig(options, logOutput)
 	if err != nil {
 		return nil, err
 	}
@@ -226,11 +374,20 @@ func OpenSingleNode(
 		if options.InitialState == nil {
 			return nil, ErrStateInitialization
 		}
-		configuration := raft.Configuration{Servers: []raft.Server{{
-			Suffrage: raft.Voter,
-			ID:       raft.ServerID(options.ServerID),
-			Address:  transport.LocalAddr(),
-		}}}
+		configuration := options.BootstrapConfiguration.Clone()
+		if options.Single {
+			configuration = raft.Configuration{Servers: []raft.Server{{
+				Suffrage: raft.Voter,
+				ID:       raft.ServerID(options.ServerID),
+				Address:  transport.LocalAddr(),
+			}}}
+		}
+		if err := validateInitialBootstrapTarget(
+			*options.InitialState,
+			configuration,
+		); err != nil {
+			return nil, err
+		}
 		if err := raft.BootstrapCluster(
 			config,
 			stable,
@@ -247,10 +404,25 @@ func OpenSingleNode(
 		if options.InitialState == nil {
 			return nil, ErrStateInitialization
 		}
+		configuration := options.BootstrapConfiguration.Clone()
+		if options.Single {
+			configuration = raft.Configuration{Servers: []raft.Server{{
+				Suffrage: raft.Voter,
+				ID:       raft.ServerID(options.ServerID),
+				Address:  transport.LocalAddr(),
+			}}}
+		}
+		if err := validateInitialBootstrapTarget(
+			*options.InitialState,
+			configuration,
+		); err != nil {
+			return nil, err
+		}
 		if err := validateBootstrapOnlyRaftState(
 			stable,
 			snapshots,
-			options.ServerID,
+			configuration,
+			!options.Single,
 		); err != nil {
 			return nil, err
 		}
@@ -279,9 +451,11 @@ func OpenSingleNode(
 	if err != nil {
 		return nil, fmt.Errorf("consensus: decode initial state: %w", err)
 	}
-	voters := decoded.VoterDeviceIDs()
-	if len(voters) != 1 || voters[0] != options.ServerID {
-		return nil, ErrSingleVoterTopology
+	if options.Single {
+		voters := decoded.VoterDeviceIDs()
+		if len(voters) != 1 || voters[0] != options.ServerID {
+			return nil, ErrSingleVoterTopology
+		}
 	}
 	if err := verifyLatestSnapshotAnchor(
 		ctx,
@@ -289,10 +463,40 @@ func OpenSingleNode(
 		state,
 		view,
 		options.ServerID,
+		options.Single,
 	); err != nil {
 		return nil, err
 	}
-	if err := validateRaftReplayCoverage(stable, snapshots); err != nil {
+	if !options.Single {
+		if err := seedCommittedConfigurationFromSnapshot(
+			ctx,
+			snapshots,
+			state,
+		); err != nil {
+			return nil, err
+		}
+		if err := seedCommittedConfigurationFromAppliedLog(
+			ctx,
+			stable,
+			state,
+			view,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := verifyCommittedConfigurationEvidence(
+		ctx,
+		stable,
+		snapshots,
+		state,
+	); err != nil {
+		return nil, err
+	}
+	if err := validateRaftReplayCoverage(
+		stable,
+		snapshots,
+		options.Single,
+	); err != nil {
 		return nil, err
 	}
 
@@ -300,20 +504,64 @@ func OpenSingleNode(
 	if clock == nil {
 		clock = NewSystemApplyClock()
 	}
+	validateConfiguration := validateDeviceAddressedSnapshotConfiguration
+	if options.Single {
+		validateConfiguration = func(configuration raft.Configuration) error {
+			return validateSingleRaftConfiguration(
+				configuration,
+				options.ServerID,
+			)
+		}
+	}
 	fsm, err := NewFSM(FSMOptions{
-		Store:        state,
-		OriginBootID: options.OriginBootID,
-		Clock:        clock,
-		LogStore:     stable,
+		Store:                 state,
+		OriginBootID:          options.OriginBootID,
+		Clock:                 clock,
+		LogStore:              stable,
+		ValidateConfiguration: validateConfiguration,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if !options.Single && fsm.committedConfiguration() == nil {
+		if view.LastRaftAppliedLogIndex != nil ||
+			!configurationMatchesDeviceIDs(
+				options.BootstrapConfiguration,
+				decoded.VoterDeviceIDs(),
+			) {
+			return nil, fmt.Errorf(
+				"%w: no durable committed configuration or safe initial bootstrap",
+				ErrStateInitialization,
+			)
+		}
 	}
 	fsm.publishPeerAdmission(
 		decoded.Admission,
 		view.AdmissionRevision,
 		true,
 	)
+	node := &SingleNode{
+		fsm:           fsm,
+		state:         state,
+		stable:        stable,
+		snapshots:     snapshots,
+		transport:     transport,
+		serverID:      raft.ServerID(options.ServerID),
+		clock:         clock,
+		single:        options.Single,
+		transportGate: transportGate,
+		monitorStop:   make(chan struct{}),
+		monitorDone:   make(chan struct{}),
+		closeStarted:  make(chan struct{}),
+		lineageGate:   make(chan struct{}, 1),
+		fatalSet:      make(chan struct{}),
+		proposalFlights: make(
+			map[domain.UUIDv7]*proposalFlight,
+		),
+		proposalReservations: make(
+			map[domain.UUIDv7][]byte,
+		),
+	}
 	instance, err := newRaftSafely(
 		config,
 		fsm,
@@ -325,30 +573,29 @@ func OpenSingleNode(
 	if err != nil {
 		return nil, fmt.Errorf("consensus: start Raft: %w", err)
 	}
-
-	node := &SingleNode{
-		raft:         instance,
-		fsm:          fsm,
-		state:        state,
-		stable:       stable,
-		snapshots:    snapshots,
-		transport:    transport,
-		serverID:     raft.ServerID(options.ServerID),
-		clock:        clock,
-		monitorStop:  make(chan struct{}),
-		monitorDone:  make(chan struct{}),
-		closeStarted: make(chan struct{}),
-		lineageGate:  make(chan struct{}, 1),
-		fatalSet:     make(chan struct{}),
-		proposalFlights: make(
-			map[domain.UUIDv7]*proposalFlight,
-		),
-		proposalReservations: make(
-			map[domain.UUIDv7][]byte,
-		),
+	node.raft = instance
+	if transportGate != nil {
+		transportGate.bind(node)
 	}
 	go node.monitorFSM()
 	return node, nil
+}
+
+func configurationMatchesDeviceIDs(
+	configuration raft.Configuration,
+	deviceIDs []domain.DeviceID,
+) bool {
+	if len(configuration.Servers) != len(deviceIDs) {
+		return false
+	}
+	for index, server := range configuration.Servers {
+		if server.Suffrage != raft.Voter ||
+			server.ID != raft.ServerID(deviceIDs[index]) ||
+			server.Address != raft.ServerAddress(deviceIDs[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 type raftDurableIndex struct {
@@ -380,30 +627,68 @@ func validateSingleNodeOptions(
 	ctx context.Context,
 	options SingleNodeOptions,
 ) error {
+	return validateNodeIdentityAndPaths(
+		ctx,
+		options.ServerID,
+		options.OriginBootID,
+		options.StatePath,
+		options.ConsensusDir,
+	)
+}
+
+func validateNodeOptions(
+	ctx context.Context,
+	options NodeOptions,
+) error {
+	if err := validateNodeIdentityAndPaths(
+		ctx,
+		options.ServerID,
+		options.OriginBootID,
+		options.StatePath,
+		options.ConsensusDir,
+	); err != nil {
+		return err
+	}
+	if options.TransportFactory == nil {
+		return fmt.Errorf(
+			"%w: nil mesh transport factory",
+			ErrInvalidNodeOptions,
+		)
+	}
+	return nil
+}
+
+func validateNodeIdentityAndPaths(
+	ctx context.Context,
+	serverID domain.DeviceID,
+	originBootID domain.UUIDv7,
+	statePath string,
+	consensusDir string,
+) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrInvalidNodeOptions)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !options.ServerID.Valid() ||
-		!options.OriginBootID.Valid() ||
-		options.StatePath == "" ||
-		!filepath.IsAbs(options.StatePath) ||
-		options.ConsensusDir == "" ||
-		!filepath.IsAbs(options.ConsensusDir) {
+	if !serverID.Valid() ||
+		!originBootID.Valid() ||
+		statePath == "" ||
+		!filepath.IsAbs(statePath) ||
+		consensusDir == "" ||
+		!filepath.IsAbs(consensusDir) {
 		return ErrInvalidNodeOptions
 	}
-	if filepath.Clean(options.StatePath) ==
+	if filepath.Clean(statePath) ==
 		filepath.Join(
-			filepath.Clean(options.ConsensusDir),
+			filepath.Clean(consensusDir),
 			raftStoreFilename,
 		) {
 		return ErrInvalidNodeOptions
 	}
 	relative, err := filepath.Rel(
-		filepath.Clean(options.ConsensusDir),
-		filepath.Clean(options.StatePath),
+		filepath.Clean(consensusDir),
+		filepath.Clean(statePath),
 	)
 	if err != nil ||
 		relative == "." ||
@@ -421,10 +706,115 @@ func validateSingleNodeOptions(
 	return nil
 }
 
+func nilRaftTransport(transport RaftTransport) bool {
+	if transport == nil {
+		return true
+	}
+	value := reflect.ValueOf(transport)
+	switch value.Kind() {
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func meshBootstrapConfiguration(
+	localDeviceID domain.DeviceID,
+	voterDeviceIDs []domain.DeviceID,
+) (raft.Configuration, error) {
+	if len(voterDeviceIDs) == 0 {
+		return raft.Configuration{}, nil
+	}
+	switch len(voterDeviceIDs) {
+	case 1, 3, 5:
+	default:
+		return raft.Configuration{}, fmt.Errorf(
+			"%w: got %d voters, want 1, 3, or 5",
+			ErrInvalidBootstrapTopology,
+			len(voterDeviceIDs),
+		)
+	}
+	configuration := raft.Configuration{
+		Servers: make([]raft.Server, len(voterDeviceIDs)),
+	}
+	var (
+		previous   domain.DeviceID
+		hasLocalID bool
+	)
+	for index, deviceID := range voterDeviceIDs {
+		if !deviceID.Valid() ||
+			index > 0 && previous >= deviceID {
+			return raft.Configuration{}, fmt.Errorf(
+				"%w: voter IDs must be canonical, sorted, and unique",
+				ErrInvalidBootstrapTopology,
+			)
+		}
+		configuration.Servers[index] = raft.Server{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(deviceID),
+			Address:  raft.ServerAddress(deviceID),
+		}
+		hasLocalID = hasLocalID || deviceID == localDeviceID
+		previous = deviceID
+	}
+	if !hasLocalID {
+		return raft.Configuration{}, fmt.Errorf(
+			"%w: local device is not a bootstrap voter",
+			ErrInvalidBootstrapTopology,
+		)
+	}
+	return configuration, nil
+}
+
+func validateInitialBootstrapTarget(
+	initial store.InitialState,
+	configuration raft.Configuration,
+) error {
+	if len(configuration.Servers) == 0 ||
+		len(initial.Projections.VoterSet) != 1 {
+		return fmt.Errorf(
+			"%w: bootstrap configuration and initial voter target are required",
+			ErrInvalidBootstrapTopology,
+		)
+	}
+	target := initial.Projections.VoterSet[0]
+	if err := target.Validate(); err != nil ||
+		target.SessionID != initial.SessionID {
+		return fmt.Errorf(
+			"%w: invalid initial voter target",
+			ErrInvalidBootstrapTopology,
+		)
+	}
+	voterDeviceIDs := target.VoterDeviceIDs()
+	if len(voterDeviceIDs) != len(configuration.Servers) {
+		return fmt.Errorf(
+			"%w: initial voter target differs from bootstrap configuration",
+			ErrInvalidBootstrapTopology,
+		)
+	}
+	for index, server := range configuration.Servers {
+		if server.Suffrage != raft.Voter ||
+			server.ID != raft.ServerID(voterDeviceIDs[index]) {
+			return fmt.Errorf(
+				"%w: initial voter target differs from bootstrap configuration",
+				ErrInvalidBootstrapTopology,
+			)
+		}
+	}
+	return nil
+}
+
 func validateBootstrapOnlyRaftState(
 	logs raft.LogStore,
 	snapshots raft.SnapshotStore,
-	serverID domain.DeviceID,
+	expected raft.Configuration,
+	compareAddresses bool,
 ) error {
 	first, err := logs.FirstIndex()
 	if err != nil {
@@ -464,15 +854,37 @@ func validateBootstrapOnlyRaftState(
 			err,
 		)
 	}
-	if len(configuration.Servers) != 1 ||
-		configuration.Servers[0].Suffrage != raft.Voter ||
-		configuration.Servers[0].ID != raft.ServerID(serverID) {
+	if !sameBootstrapConfiguration(
+		configuration,
+		expected,
+		compareAddresses,
+	) {
 		return fmt.Errorf(
-			"%w: bootstrap config does not name the local voter",
+			"%w: bootstrap configuration differs from the supplied initial topology",
 			ErrStateInitialization,
 		)
 	}
 	return nil
+}
+
+func sameBootstrapConfiguration(
+	actual raft.Configuration,
+	expected raft.Configuration,
+	compareAddresses bool,
+) bool {
+	if len(actual.Servers) != len(expected.Servers) {
+		return false
+	}
+	for index, actualServer := range actual.Servers {
+		expectedServer := expected.Servers[index]
+		if actualServer.Suffrage != expectedServer.Suffrage ||
+			actualServer.ID != expectedServer.ID ||
+			compareAddresses &&
+				actualServer.Address != expectedServer.Address {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeRaftConfiguration(data []byte) (
@@ -518,6 +930,7 @@ func newRaftSafely(
 func validateRaftReplayCoverage(
 	logs raft.LogStore,
 	snapshots raft.SnapshotStore,
+	single bool,
 ) error {
 	if logs == nil || snapshots == nil {
 		return ErrRaftLogCoverage
@@ -599,8 +1012,29 @@ func validateRaftReplayCoverage(
 		switch entry.Type {
 		case raft.LogCommand,
 			raft.LogBarrier,
-			raft.LogConfiguration,
 			raft.LogNoop:
+		case raft.LogConfiguration:
+			if !single {
+				configuration, err := decodeRaftConfiguration(entry.Data)
+				if err != nil {
+					return fmt.Errorf(
+						"%w: decode configuration at %d: %v",
+						ErrRaftLogCoverage,
+						index,
+						err,
+					)
+				}
+				if err := validateDeviceAddressedSnapshotConfiguration(
+					configuration,
+				); err != nil {
+					return fmt.Errorf(
+						"%w: configuration at %d: %w",
+						ErrRaftLogCoverage,
+						index,
+						err,
+					)
+				}
+			}
 		default:
 			return fmt.Errorf(
 				"%w: unsupported log type at %d",
@@ -615,17 +1049,18 @@ func validateRaftReplayCoverage(
 	return nil
 }
 
-func singleNodeRaftConfig(
-	options SingleNodeOptions,
+func nodeRaftConfig(
+	serverID domain.DeviceID,
+	supplied *raft.Config,
 	logOutput io.Writer,
 ) (*raft.Config, error) {
 	var config raft.Config
-	if options.RaftConfig == nil {
+	if supplied == nil {
 		config = *raft.DefaultConfig()
 	} else {
-		config = *options.RaftConfig
+		config = *supplied
 	}
-	config.LocalID = raft.ServerID(options.ServerID)
+	config.LocalID = raft.ServerID(serverID)
 	config.NoSnapshotRestoreOnStart = true
 	config.ShutdownOnRemove = true
 	config.LogOutput = logOutput
@@ -689,6 +1124,7 @@ func verifyLatestSnapshotAnchor(
 	state *store.Store,
 	view store.StateView,
 	serverID domain.DeviceID,
+	single bool,
 ) error {
 	metas, err := snapshots.List()
 	if err != nil {
@@ -709,7 +1145,7 @@ func verifyLatestSnapshotAnchor(
 		return fmt.Errorf("consensus: open latest snapshot: %w", err)
 	}
 	defer reader.Close()
-	if err := validateSingleVoterSnapshotMeta(meta, serverID); err != nil {
+	if err := validateSnapshotMeta(meta, serverID, single); err != nil {
 		return fmt.Errorf(
 			"%w: invalid snapshot metadata: %v",
 			ErrSnapshotAnchorCoverage,
@@ -840,9 +1276,153 @@ func validateSnapshotMetaAnchor(
 	return nil
 }
 
-func validateSingleVoterSnapshotMeta(
+func seedCommittedConfigurationFromSnapshot(
+	ctx context.Context,
+	snapshots raft.SnapshotStore,
+	state *store.Store,
+) error {
+	metas, err := snapshots.List()
+	if err != nil {
+		return fmt.Errorf(
+			"consensus: list snapshots for committed configuration: %w",
+			err,
+		)
+	}
+	if len(metas) == 0 {
+		return nil
+	}
+	meta := metas[0]
+	if meta == nil || meta.ConfigurationIndex < 1 {
+		return ErrSnapshotAnchorCoverage
+	}
+	encoded, err := encodeRaftConfiguration(meta.Configuration)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: encode snapshot configuration: %v",
+			ErrSnapshotAnchorCoverage,
+			err,
+		)
+	}
+	if _, err := state.StoreCommittedRaftConfiguration(
+		ctx,
+		meta.ConfigurationIndex,
+		encoded,
+	); err != nil {
+		return fmt.Errorf(
+			"%w: persist snapshot configuration: %v",
+			ErrSnapshotAnchorCoverage,
+			err,
+		)
+	}
+	return nil
+}
+
+func seedCommittedConfigurationFromAppliedLog(
+	ctx context.Context,
+	logs raft.LogStore,
+	state *store.Store,
+	view store.StateView,
+) error {
+	if ctx == nil || logs == nil || state == nil {
+		return ErrRaftLogCoverage
+	}
+	_, found, err := state.CommittedRaftConfiguration(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: inspect committed configuration migration evidence: %v",
+			ErrRaftLogCoverage,
+			err,
+		)
+	}
+	if found || view.LastRaftAppliedLogIndex == nil {
+		return nil
+	}
+	first, err := logs.FirstIndex()
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read first configuration migration index: %v",
+			ErrRaftLogCoverage,
+			err,
+		)
+	}
+	last, err := logs.LastIndex()
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read last configuration migration index: %v",
+			ErrRaftLogCoverage,
+			err,
+		)
+	}
+	applied := *view.LastRaftAppliedLogIndex
+	if first == 0 || first > applied || last < applied {
+		return fmt.Errorf(
+			"%w: applied command has no retained configuration evidence",
+			ErrStateInitialization,
+		)
+	}
+	var (
+		configuration      raft.Configuration
+		configurationIndex uint64
+	)
+	for index := first; index <= applied; index++ {
+		var entry raft.Log
+		if err := logs.GetLog(index, &entry); err != nil {
+			return fmt.Errorf(
+				"%w: read migration log %d: %v",
+				ErrRaftLogCoverage,
+				index,
+				err,
+			)
+		}
+		if entry.Type == raft.LogConfiguration {
+			candidate, err := decodeRaftConfiguration(entry.Data)
+			if err != nil ||
+				validateDeviceAddressedSnapshotConfiguration(candidate) != nil {
+				return fmt.Errorf(
+					"%w: invalid migration configuration at %d",
+					ErrRaftLogCoverage,
+					index,
+				)
+			}
+			configuration = candidate
+			configurationIndex = index
+		}
+		if index == ^uint64(0) {
+			break
+		}
+	}
+	if configurationIndex == 0 {
+		return fmt.Errorf(
+			"%w: applied command has no prior configuration",
+			ErrStateInitialization,
+		)
+	}
+	encoded, err := encodeRaftConfiguration(configuration)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: encode migration configuration: %v",
+			ErrRaftLogCoverage,
+			err,
+		)
+	}
+	if _, err := state.StoreCommittedRaftConfiguration(
+		ctx,
+		configurationIndex,
+		encoded,
+	); err != nil {
+		return fmt.Errorf(
+			"%w: persist migration configuration: %v",
+			ErrRaftLogCoverage,
+			err,
+		)
+	}
+	return nil
+}
+
+func validateSnapshotMeta(
 	meta *raft.SnapshotMeta,
 	serverID domain.DeviceID,
+	single bool,
 ) error {
 	if meta == nil ||
 		meta.Version != raft.SnapshotVersionMax ||
@@ -850,22 +1430,79 @@ func validateSingleVoterSnapshotMeta(
 		meta.Term < 1 ||
 		meta.ConfigurationIndex < 1 ||
 		meta.ConfigurationIndex > meta.Index ||
-		meta.Size < 1 ||
-		len(meta.Configuration.Servers) != 1 {
+		meta.Size < 1 {
 		return ErrSnapshotAnchorCoverage
 	}
-	server := meta.Configuration.Servers[0]
+	if !single {
+		return validateDeviceAddressedSnapshotConfiguration(
+			meta.Configuration,
+		)
+	}
+	return validateSingleRaftConfiguration(
+		meta.Configuration,
+		serverID,
+	)
+}
+
+func validateSingleVoterSnapshotMeta(
+	meta *raft.SnapshotMeta,
+	serverID domain.DeviceID,
+) error {
+	return validateSnapshotMeta(meta, serverID, true)
+}
+
+func validateSingleRaftConfiguration(
+	configuration raft.Configuration,
+	serverID domain.DeviceID,
+) error {
+	if len(configuration.Servers) != 1 {
+		return ErrSingleVoterTopology
+	}
+	server := configuration.Servers[0]
 	if server.ID != raft.ServerID(serverID) ||
 		server.Suffrage != raft.Voter {
 		return ErrSingleVoterTopology
 	}
 	host, _, err := net.SplitHostPort(string(server.Address))
 	if err != nil {
-		return ErrSnapshotAnchorCoverage
+		return ErrInvalidRaftTopology
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return ErrSnapshotAnchorCoverage
+		return ErrInvalidRaftTopology
+	}
+	return nil
+}
+
+func validateDeviceAddressedSnapshotConfiguration(
+	configuration raft.Configuration,
+) error {
+	if len(configuration.Servers) == 0 ||
+		len(configuration.Servers) > int(policy.MaxMemberDevices) {
+		return ErrInvalidRaftTopology
+	}
+	seen := make(map[domain.DeviceID]struct{}, len(configuration.Servers))
+	voterCount := 0
+	for _, server := range configuration.Servers {
+		deviceID := domain.DeviceID(server.ID)
+		if !deviceID.Valid() ||
+			server.Address != raft.ServerAddress(deviceID) {
+			return ErrInvalidRaftTopology
+		}
+		if _, duplicate := seen[deviceID]; duplicate {
+			return ErrInvalidRaftTopology
+		}
+		seen[deviceID] = struct{}{}
+		switch server.Suffrage {
+		case raft.Voter:
+			voterCount++
+		case raft.Nonvoter:
+		default:
+			return ErrInvalidRaftTopology
+		}
+	}
+	if voterCount == 0 {
+		return ErrInvalidRaftTopology
 	}
 	return nil
 }
@@ -1024,7 +1661,7 @@ func (node *SingleNode) withLineageGate(
 	return operation()
 }
 
-// Address returns the loopback Raft transport address.
+// Address returns this node's Raft transport address.
 func (node *SingleNode) Address() raft.ServerAddress {
 	if node == nil || node.transport == nil {
 		return ""
@@ -1069,7 +1706,9 @@ func (node *SingleNode) LocalTime() (domain.Timestamp, int64, error) {
 	return node.clock()
 }
 
-// WaitForLeader waits until this one-voter node has elected itself.
+// WaitForLeader waits for a valid leader and for this replica to apply through
+// the commit index observed with that leader. A local leader additionally
+// completes a barrier before returning.
 func (node *SingleNode) WaitForLeader(ctx context.Context) error {
 	if node == nil || node.raft == nil || ctx == nil {
 		return ErrInvalidNodeOptions
@@ -1084,15 +1723,61 @@ func (node *SingleNode) WaitForLeader(ctx context.Context) error {
 		if err := node.FatalError(); err != nil {
 			return err
 		}
-		_, id := node.raft.LeaderWithID()
-		if node.raft.State() == raft.Leader && id == node.serverID {
-			if err := node.reconcileLocalAddress(ctx); err != nil {
-				return err
+		address, id := node.raft.LeaderWithID()
+		if id != "" {
+			deviceID := domain.DeviceID(id)
+			if !deviceID.Valid() ||
+				!node.single &&
+					address != raft.ServerAddress(deviceID) {
+				return ErrInvalidRaftTopology
 			}
-			return waitFuture(
-				ctx,
-				node.raft.Barrier(contextTimeout(ctx)),
-			)
+			if node.raft.State() == raft.Leader &&
+				id == node.serverID {
+				if err := node.reconcileLocalAddress(ctx); err != nil {
+					return err
+				}
+				err := waitFuture(
+					ctx,
+					node.raft.Barrier(contextTimeout(ctx)),
+				)
+				if err == nil {
+					commitIndex := node.raft.CommitIndex()
+					ready, readyErr := node.appliedThroughCommit(
+						commitIndex,
+					)
+					if readyErr != nil {
+						return readyErr
+					}
+					if ready && node.IsLeader() {
+						return nil
+					}
+					continue
+				}
+				if !errors.Is(err, raft.ErrNotLeader) &&
+					!errors.Is(err, raft.ErrLeadershipLost) {
+					return err
+				}
+			} else {
+				commitIndex := node.raft.CommitIndex()
+				ready, err := node.appliedThroughCommit(commitIndex)
+				if err != nil {
+					return err
+				}
+				if ready {
+					finalAddress, finalID := node.raft.LeaderWithID()
+					if finalAddress == address &&
+						finalID == id &&
+						node.raft.State() == raft.Follower &&
+						node.FatalError() == nil {
+						select {
+						case <-node.closeStarted:
+							return ErrNodeClosed
+						default:
+						}
+						return nil
+					}
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -1104,7 +1789,34 @@ func (node *SingleNode) WaitForLeader(ctx context.Context) error {
 	}
 }
 
+func (node *SingleNode) appliedThroughCommit(
+	commitIndex uint64,
+) (bool, error) {
+	if node == nil || node.raft == nil || node.fsm == nil ||
+		commitIndex == 0 {
+		return false, nil
+	}
+	commandIndex, configurationIndex, err :=
+		node.committedFSMIndexes(commitIndex)
+	if err != nil {
+		return false, err
+	}
+	if node.fsm.appliedCommandIndex.Load() < commandIndex {
+		return false, nil
+	}
+	committedConfiguration := node.fsm.committedConfiguration()
+	if configurationIndex > 0 &&
+		(committedConfiguration == nil ||
+			committedConfiguration.Index < configurationIndex) {
+		return false, nil
+	}
+	return node.raft.CommitIndex() == commitIndex, nil
+}
+
 func (node *SingleNode) reconcileLocalAddress(ctx context.Context) error {
+	if !node.single {
+		return nil
+	}
 	node.addressMu.Lock()
 	defer node.addressMu.Unlock()
 	if node.addressReconciled {
@@ -1623,14 +2335,17 @@ func (node *SingleNode) PeerAdmissionSnapshot() (*peerauth.Snapshot, error) {
 	return snapshot.snapshot, nil
 }
 
-// PeerAdmissionChanges coalesces access-relevant applied-state changes for the
-// session's single peer-ingress reconciler. Consumers must always reload the
-// current snapshot after receiving a signal.
+// PeerAdmissionChanges claims the access-change subscription for the session's
+// single peer-ingress reconciler. A second claim returns a closed channel and
+// must fail closed. The consumer reloads the snapshot after every signal.
 func (node *SingleNode) PeerAdmissionChanges() <-chan struct{} {
 	if node == nil || node.fsm == nil {
 		return nil
 	}
-	return node.fsm.admissionChanged
+	if !node.peerAdmissionChangesClaimed.CompareAndSwap(false, true) {
+		return closedChangeChannel()
+	}
+	return node.fsm.authorizationChanges.subscribe()
 }
 
 // Status returns one durable coordination cut plus a nearby nonblocking Raft
@@ -1662,22 +2377,22 @@ func (node *SingleNode) Status(
 		LocalDeviceID: localDeviceID,
 		Role:          raftStatusRole(node.raft.State()),
 	}
-	if node.FatalError() != nil {
-		runtime.State = coordstatus.ConsensusHalted
-		runtime.StrongWrites = coordstatus.StrongWritesBlocked
+	configuration := node.fsm.committedConfiguration()
+	if configuration == nil && node.transportGate != nil {
+		configuration = node.transportGate.effectiveConfiguration(node)
+	}
+	if configuration == nil && node.single {
 		runtime.LiveVoterDeviceIDs = durable.VoterSet.VoterDeviceIDs()
+	} else if configuration == nil {
+		return coordstatus.Snapshot{}, ErrConsensusAuthorizationUnavailable
 	} else {
-		configurationFuture := node.raft.GetConfiguration()
-		if err := waitFuture(ctx, configurationFuture); err != nil {
-			return coordstatus.Snapshot{}, err
-		}
-		for _, server := range configurationFuture.Configuration().Servers {
+		for _, server := range configuration.Configuration.Servers {
 			if server.Suffrage != raft.Voter {
 				continue
 			}
 			id := domain.DeviceID(server.ID)
 			if !id.Valid() {
-				return coordstatus.Snapshot{}, ErrSingleVoterTopology
+				return coordstatus.Snapshot{}, ErrInvalidRaftTopology
 			}
 			runtime.LiveVoterDeviceIDs = append(
 				runtime.LiveVoterDeviceIDs,
@@ -1691,24 +2406,43 @@ func (node *SingleNode) Status(
 					runtime.LiveVoterDeviceIDs[right]
 			},
 		)
-		runtime.ConfigurationReconciled = sameDeviceIDs(
-			runtime.LiveVoterDeviceIDs,
-			durable.VoterSet.VoterDeviceIDs(),
-		)
-		_, leaderID := node.raft.LeaderWithID()
-		if leaderID != "" {
+	}
+	runtime.ConfigurationReconciled = sameDeviceIDs(
+		runtime.LiveVoterDeviceIDs,
+		durable.VoterSet.VoterDeviceIDs(),
+	)
+	if node.FatalError() != nil {
+		runtime.State = coordstatus.ConsensusHalted
+		runtime.StrongWrites = coordstatus.StrongWritesBlocked
+	} else {
+		commitIndex := node.raft.CommitIndex()
+		ready, err := node.appliedThroughCommit(commitIndex)
+		if err != nil {
+			return coordstatus.Snapshot{}, err
+		}
+		leaderAddress, leaderID := node.raft.LeaderWithID()
+		if leaderID != "" &&
+			(node.single ||
+				leaderAddress == raft.ServerAddress(leaderID)) &&
+			domain.DeviceID(leaderID).Valid() {
 			runtime.LeaderDeviceID = domain.DeviceID(leaderID)
 		}
 		switch runtime.Role {
 		case coordstatus.RoleLeader:
-			runtime.State = coordstatus.ConsensusReady
-			runtime.StrongWrites = coordstatus.StrongWritesAvailable
+			runtime.State = coordstatus.ConsensusElecting
+			runtime.StrongWrites = coordstatus.StrongWritesWaiting
+			if ready &&
+				runtime.LeaderDeviceID == localDeviceID &&
+				node.IsLeader() {
+				runtime.State = coordstatus.ConsensusReady
+				runtime.StrongWrites = coordstatus.StrongWritesAvailable
+			}
 		case coordstatus.RoleCandidate:
 			runtime.State = coordstatus.ConsensusElecting
 			runtime.StrongWrites = coordstatus.StrongWritesWaiting
 		case coordstatus.RoleFollower:
 			runtime.State = coordstatus.ConsensusElecting
-			if runtime.LeaderDeviceID != "" {
+			if ready && runtime.LeaderDeviceID != "" {
 				runtime.State = coordstatus.ConsensusReady
 			}
 			runtime.StrongWrites = coordstatus.StrongWritesWaiting
@@ -1808,7 +2542,7 @@ func waitFuture(ctx context.Context, future raftFuture) error {
 	}
 }
 
-// Close stops Raft before closing its transport and durable stores.
+// Close stops Raft, which closes its owned transport, before durable stores.
 func (node *SingleNode) Close() error {
 	if node == nil {
 		return ErrInvalidNodeOptions
@@ -1820,6 +2554,9 @@ func (node *SingleNode) Close() error {
 		node.lifecycleMu.Unlock()
 		if node.fsm != nil {
 			node.fsm.closePeerAdmissionChanges()
+		}
+		if node.transportGate != nil {
+			node.transportGate.close()
 		}
 		if node.monitorStop != nil {
 			close(node.monitorStop)
@@ -1834,11 +2571,6 @@ func (node *SingleNode) Close() error {
 		node.active.Wait()
 		if node.monitorDone != nil {
 			<-node.monitorDone
-		}
-		if node.transport != nil {
-			if err := node.transport.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("close transport: %w", err))
-			}
 		}
 		if node.state != nil {
 			if err := node.state.Close(); err != nil {
