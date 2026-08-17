@@ -176,6 +176,59 @@ func TestFSMSnapshotStopsTailAtLaterUnappliedCommand(t *testing.T) {
 	}
 }
 
+func TestFSMSnapshotRefusesTruncatedNonCommandTail(t *testing.T) {
+	t.Parallel()
+
+	fsm := newSnapshotTestFSM(t, true)
+	logs := raft.NewInmemStore()
+	entries := make([]*raft.Log, 0, maxSnapshotRaftTail+1)
+	for offset := range maxSnapshotRaftTail + 1 {
+		entries = append(entries, &raft.Log{
+			Index: uint64(offset + 3),
+			Term:  1,
+			Type:  raft.LogBarrier,
+		})
+	}
+	if err := logs.StoreLogs(entries); err != nil {
+		t.Fatalf("StoreLogs(): %v", err)
+	}
+	fsm.logStore = logs
+
+	if _, err := fsm.Snapshot(); !errors.Is(
+		err,
+		ErrSnapshotRaftTailCoverage,
+	) {
+		t.Fatalf(
+			"Snapshot() error = %v, want ErrSnapshotRaftTailCoverage",
+			err,
+		)
+	}
+	if err := fsm.HaltError(); err != nil {
+		t.Fatalf("capacity refusal halted FSM: %v", err)
+	}
+
+	entries[len(entries)-1].Type = raft.LogCommand
+	entries[len(entries)-1].Data = []byte("later")
+	if err := logs.StoreLog(entries[len(entries)-1]); err != nil {
+		t.Fatalf("StoreLog(command boundary): %v", err)
+	}
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot(command boundary): %v", err)
+	}
+	anchor, err := decodeSnapshotAnchor(snapshot.(*fsmSnapshot).encoded)
+	if err != nil {
+		t.Fatalf("decodeSnapshotAnchor(): %v", err)
+	}
+	if len(anchor.RaftTail) != maxSnapshotRaftTail {
+		t.Fatalf(
+			"RaftTail length = %d, want %d",
+			len(anchor.RaftTail),
+			maxSnapshotRaftTail,
+		)
+	}
+}
+
 func TestSnapshotMetadataRequiresExactSingleLoopbackVoter(t *testing.T) {
 	t.Parallel()
 
@@ -325,8 +378,9 @@ func newSnapshotTestFSM(t *testing.T, applyCommand bool) *FSM {
 		t.Fatalf("Initialize(): %v", err)
 	}
 	fsm, err := NewFSM(FSMOptions{
-		Store:        state,
-		OriginBootID: nodeTestBootID1,
+		Store:                 state,
+		OriginBootID:          nodeTestBootID1,
+		ValidateConfiguration: validateDeviceAddressedSnapshotConfiguration,
 		Clock: func() (domain.Timestamp, int64, error) {
 			return "2026-08-11T13:00:00Z", 1, nil
 		},

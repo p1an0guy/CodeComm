@@ -23,8 +23,9 @@ const (
 var (
 	ErrInvalidSnapshotAnchor      = errors.New("consensus: invalid snapshot anchor")
 	ErrSnapshotStateMismatch      = errors.New("consensus: snapshot does not match durable state")
+	ErrSnapshotRaftTailCoverage   = errors.New("consensus: snapshot Raft tail exceeds anchor capacity")
 	ErrSnapshotRestoreUnsupported = errors.New(
-		"consensus: snapshot restore is disabled in Phase 2",
+		"consensus: snapshot restore is not implemented",
 	)
 )
 
@@ -79,6 +80,9 @@ func (fsm *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	}
 	tail, err := fsm.captureSnapshotRaftTail(view)
 	if err != nil {
+		if errors.Is(err, ErrSnapshotRaftTailCoverage) {
+			return nil, err
+		}
 		return nil, fsm.haltSnapshot(err)
 	}
 	encoded, err := encodeSnapshotAnchor(view, tail)
@@ -92,9 +96,9 @@ func (fsm *FSM) haltSnapshot(cause error) error {
 	return fsm.halt(nil, fmt.Errorf("snapshot integrity: %w", cause)).Err
 }
 
-// Restore rejects every request in Phase 2. The anchor contains no transferable
-// logical state, so accepting InstallSnapshot would advance Raft without
-// replacing SQLite. Phase 3 introduces a real verified restore format.
+// Restore rejects requests until the transferable snapshot format exists. The
+// current anchor cannot replace SQLite, so accepting InstallSnapshot would
+// advance Raft without restoring state.
 func (fsm *FSM) Restore(reader io.ReadCloser) error {
 	if fsm == nil || reader == nil {
 		return ErrInvalidFSMOptions
@@ -157,7 +161,7 @@ func (fsm *FSM) captureSnapshotRaftTail(
 	if lastIndex < appliedIndex {
 		return nil, ErrInvalidSnapshotAnchor
 	}
-	for index := appliedIndex + 1; index <= lastIndex && len(tail) < maxSnapshotRaftTail; index++ {
+	for index := appliedIndex + 1; index <= lastIndex; index++ {
 		var entry raft.Log
 		if err := fsm.logStore.GetLog(index, &entry); err != nil {
 			return nil, fmt.Errorf(
@@ -166,13 +170,22 @@ func (fsm *FSM) captureSnapshotRaftTail(
 				err,
 			)
 		}
+		if len(tail) == maxSnapshotRaftTail {
+			if entry.Type == raft.LogCommand {
+				break
+			}
+			return nil, ErrSnapshotRaftTailCoverage
+		}
 		entryType, ok := snapshotRaftEntryType(entry.Type)
 		if !ok {
 			// Raft may append a later command while its FSM is capturing an
 			// earlier cut. Snapshot metadata cannot include that command
 			// unless SQLite has applied it, so retain only the contiguous
 			// non-command prefix and validate the actual metadata on reopen.
-			break
+			if entry.Type == raft.LogCommand {
+				break
+			}
+			return nil, ErrInvalidSnapshotAnchor
 		}
 		tail = append(tail, snapshotRaftEntry{
 			Index: index,
