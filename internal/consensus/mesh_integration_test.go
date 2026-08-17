@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -18,9 +17,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
@@ -49,6 +50,9 @@ var (
 	)
 	meshCheckpointEventID = domain.UUIDv7(
 		"018f47de-89ab-7def-8123-4823456789ab",
+	)
+	meshForcedCheckpointEventID = domain.UUIDv7(
+		"018f47de-89ab-7def-8123-4923456789ab",
 	)
 	meshFinalTaskID = domain.UUIDv7(
 		"018f47de-89ab-7def-8123-6323456789ab",
@@ -247,6 +251,7 @@ func runSecureThreeVoterConsensusMesh(t *testing.T) {
 		leader,
 		proofTarget,
 	)
+	harness.proveRemoteForcedCheckpoint(t, leader)
 	expectation := checkpointProofTestExpectation(t)
 	expectation.targetDeviceID = proofTarget.identity.deviceID
 	if _, err := requestStagingApplyProof(
@@ -386,12 +391,13 @@ type secureMeshNode struct {
 	nextSequence uint64
 	startCount   int
 
-	node      *Node
-	stream    *transport.ConsensusStreamLayer
-	ingress   *transport.Ingress
-	verifiers *peerauth.Verifiers
-	listener  net.Listener
-	serveDone chan error
+	checkpointSigningDisabled atomic.Bool
+	node                      *Node
+	stream                    *transport.ConsensusStreamLayer
+	ingress                   *transport.Ingress
+	verifiers                 *peerauth.Verifiers
+	listener                  net.Listener
+	serveDone                 chan error
 }
 
 type secureMeshHarness struct {
@@ -400,6 +406,95 @@ type secureMeshHarness struct {
 	nodes     []*secureMeshNode
 	resolver  secureMeshResolver
 	topology  *secureMeshTopology
+}
+
+type secureMeshCheckpointOrigin struct {
+	t         *testing.T
+	harness   *secureMeshHarness
+	candidate *secureMeshNode
+	bootID    domain.UUIDv7
+	exclusive chan struct{}
+	reserved  uint64
+}
+
+func (origin *secureMeshCheckpointOrigin) DeviceID() domain.DeviceID {
+	if origin == nil || origin.candidate == nil {
+		return ""
+	}
+	return origin.candidate.identity.deviceID
+}
+
+func (origin *secureMeshCheckpointOrigin) BootID() domain.UUIDv7 {
+	if origin == nil {
+		return ""
+	}
+	return origin.bootID
+}
+
+func (origin *secureMeshCheckpointOrigin) RunExclusive(
+	ctx context.Context,
+	operation func(CheckpointReservation) error,
+) error {
+	if origin == nil ||
+		origin.t == nil ||
+		origin.harness == nil ||
+		origin.candidate == nil ||
+		ctx == nil ||
+		operation == nil {
+		return ErrCheckpointOriginUnavailable
+	}
+	select {
+	case origin.exclusive <- struct{}{}:
+		defer func() { <-origin.exclusive }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return operation(func(
+		ctx context.Context,
+		checkpoint domain.Checkpoint,
+		signature store.Signature,
+	) (event.SignedEvent, error) {
+		if err := ctx.Err(); err != nil {
+			return event.SignedEvent{}, err
+		}
+		eventID := meshForcedCheckpointEventID
+		if origin.reserved > 0 {
+			generated, err := uuid.NewV7()
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			eventID = domain.UUIDv7(generated.String())
+		}
+		origin.reserved++
+		record := store.CheckpointRecord{
+			CheckpointEventID:        eventID,
+			SessionID:                checkpoint.SessionID,
+			WorkspaceID:              checkpoint.WorkspaceID,
+			RecoveryGeneration:       checkpoint.RecoveryGeneration,
+			AuthorityVoterSetVersion: checkpoint.AuthorityVoterSetVersion,
+			SignerDeviceID:           checkpoint.SignerDeviceID,
+			Term:                     checkpoint.Term,
+			CoveredAppliedLogIndex:   checkpoint.CoveredAppliedLogIndex,
+			CoveredChainIndex:        checkpoint.CoveredChainIndex,
+			CoveredChainHash:         checkpoint.CoveredChainHash,
+			CoveredResultIndex:       checkpoint.CoveredResultIndex,
+			CoveredResultHash:        checkpoint.CoveredResultHash,
+			ProjectionAccumulator:    checkpoint.ProjectionAccumulator,
+			DigestVersion:            checkpoint.DigestVersion,
+			ProjectionSchemaVersion:  checkpoint.ProjectionSchemaVersion,
+			AuthoritySignature:       signature,
+		}
+		encoded, err := event.EncodeCheckpoint(checkpoint)
+		if err != nil {
+			return event.SignedEvent{}, err
+		}
+		record.CheckpointJSON = encoded
+		return origin.harness.checkpointEvent(
+			origin.t,
+			origin.candidate,
+			record,
+		), nil
+	})
 }
 
 func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
@@ -565,6 +660,10 @@ func (harness *secureMeshHarness) startNode(
 				if err := ctx.Err(); err != nil {
 					return store.Signature{}, err
 				}
+				if candidate.checkpointSigningDisabled.Load() {
+					return store.Signature{},
+						errConsensusCheckpointSignerUnavailable
+				}
 				signature, err := event.SignCheckpoint(
 					checkpoint,
 					candidate.identity.private,
@@ -574,6 +673,13 @@ func (harness *secureMeshHarness) startNode(
 				}
 				return store.Signature(signature), nil
 			},
+		},
+		CheckpointOrigin: &secureMeshCheckpointOrigin{
+			t:         t,
+			harness:   harness,
+			candidate: candidate,
+			bootID:    bootID,
+			exclusive: make(chan struct{}, 1),
 		},
 		Clock:      nodeTestClock(),
 		RaftConfig: secureMeshRaftConfig(),
@@ -1011,6 +1117,84 @@ func (harness *secureMeshHarness) proveAuthorityCheckpointSigning(
 	}
 }
 
+func (harness *secureMeshHarness) proveRemoteForcedCheckpoint(
+	t *testing.T,
+	leader *secureMeshNode,
+) {
+	t.Helper()
+	if leader == nil {
+		t.Fatal("forced checkpoint has no leader")
+	}
+	leader.checkpointSigningDisabled.Store(true)
+	defer leader.checkpointSigningDisabled.Store(false)
+
+	var result store.AppliedCheckpointLookup
+	awaitMeshCondition(
+		t,
+		10*time.Second,
+		"remote-signed forced checkpoint",
+		func() bool {
+			var err error
+			result, err = leader.node.ForceCheckpoint(
+				meshTestContext(t),
+			)
+			if err == nil {
+				return true
+			}
+			if !errors.Is(err, ErrCheckpointProofUnavailable) &&
+				!errors.Is(
+					err,
+					ErrConsensusAuthorizationUnavailable,
+				) {
+				t.Fatalf("ForceCheckpoint(): %v", err)
+			}
+			return false
+		},
+	)
+	if result.Record.SignerDeviceID == leader.identity.deviceID ||
+		result.AppliedLogIndex !=
+			result.Record.CoveredAppliedLogIndex+1 {
+		t.Fatalf("forced checkpoint = %#v", result)
+	}
+	var signerPublicKey ed25519.PublicKey
+	for _, candidate := range harness.nodes {
+		if candidate.identity.deviceID ==
+			result.Record.SignerDeviceID {
+			signerPublicKey = candidate.identity.public
+			break
+		}
+	}
+	if codecommcrypto.VerifyEd25519(
+		signerPublicKey,
+		codec.SignatureCheckpoint,
+		result.Record.CheckpointJSON,
+		result.Record.AuthoritySignature[:],
+	) != nil {
+		t.Fatal("forced remote authority signature did not verify")
+	}
+	awaitMeshCondition(
+		t,
+		10*time.Second,
+		"forced checkpoint replication",
+		func() bool {
+			for _, candidate := range harness.runningNodes() {
+				replica, found, err := candidate.node.state.
+					AppliedCheckpoint(
+						context.Background(),
+						meshForcedCheckpointEventID,
+					)
+				if err != nil ||
+					!found ||
+					replica.Record.AuthoritySignature !=
+						result.Record.AuthoritySignature {
+					return false
+				}
+			}
+			return true
+		},
+	)
+}
+
 func (harness *secureMeshHarness) changeMeshSuffrage(
 	t *testing.T,
 	leader *secureMeshNode,
@@ -1135,20 +1319,16 @@ func (harness *secureMeshHarness) checkpointEvent(
 	record store.CheckpointRecord,
 ) event.SignedEvent {
 	t.Helper()
-	var payload map[string]any
-	if err := json.Unmarshal(record.CheckpointJSON, &payload); err != nil {
-		t.Fatalf("decode checkpoint payload: %v", err)
+	checkpoint, err := event.DecodeCheckpoint(record.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("decode checkpoint: %v", err)
 	}
-	payload["authority_signature"] = codec.EncodeBase64URL(
-		record.AuthoritySignature[:],
+	encoded, err := event.EncodeCheckpointPayload(
+		checkpoint,
+		[ed25519.SignatureSize]byte(record.AuthoritySignature),
 	)
-	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("encode checkpoint payload: %v", err)
-	}
-	encoded, err = codec.CanonicalizeSignedObject(encoded)
-	if err != nil {
-		t.Fatalf("canonicalize checkpoint payload: %v", err)
 	}
 	authority, err := event.NewLocalAuthority(
 		leader.identity.deviceID,

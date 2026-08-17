@@ -19,8 +19,13 @@ import (
 
 const consensusProofModeCheckpointSign = "checkpoint_sign"
 
-var ErrInvalidCheckpointSigner = errors.New(
-	"consensus: invalid checkpoint signer",
+var (
+	ErrInvalidCheckpointSigner = errors.New(
+		"consensus: invalid checkpoint signer",
+	)
+	errCheckpointSignerNotApplied = errors.New(
+		"consensus: checkpoint signer has not applied the requested cut",
+	)
 )
 
 // CheckpointSigner is an opaque device-identity signing capability. Consensus
@@ -169,6 +174,15 @@ func requestCheckpointSignature(
 		classification := ErrCheckpointProofRejected
 		if problem.Retryable {
 			classification = ErrCheckpointProofUnavailable
+		}
+		if problem.Code == "checkpoint_not_applied" {
+			return checkpointSignatureProof{}, fmt.Errorf(
+				"%w: %w: remote code %s, HTTP status %d",
+				classification,
+				errCheckpointSignerNotApplied,
+				problem.Code,
+				response.StatusCode,
+			)
 		}
 		return checkpointSignatureProof{}, fmt.Errorf(
 			"%w: remote code %s, HTTP status %d",

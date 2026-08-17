@@ -195,9 +195,137 @@ func TestRequestCheckpointSignatureClassifiesResponses(t *testing.T) {
 		}),
 		expectation,
 	)
-	if !errors.Is(err, ErrCheckpointProofUnavailable) {
+	if !errors.Is(err, ErrCheckpointProofUnavailable) ||
+		!errors.Is(err, errCheckpointSignerNotApplied) {
 		t.Fatalf("retryable response error = %v", err)
 	}
+}
+
+func TestRetryRemoteCheckpointSignaturesIsBoundedAndCancellable(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	expectation, privateKey := checkpointSigningTestExpectation(t)
+	expected := checkpointSignatureProof{expectation: expectation}
+	copy(
+		expected.signature[:],
+		checkpointSigningTestSignature(
+			t,
+			privateKey,
+			expectation.checkpointJSON,
+		),
+	)
+	successBody, err := encodeCheckpointSignResponse(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notAppliedBody, err := json.Marshal(consensusProofProblem{
+		Type:          "urn:codecomm:problem:checkpoint_not_applied",
+		Title:         "Checkpoint not applied",
+		Status:        http.StatusConflict,
+		Code:          "checkpoint_not_applied",
+		CorrelationID: "018f47de-89ab-7def-8123-0123456789ab",
+		Retryable:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notApplied := transport.ConsensusControlResponse{
+		StatusCode: http.StatusConflict,
+		MediaType:  "application/problem+json",
+		Body:       notAppliedBody,
+	}
+
+	t.Run("eventual success", func(t *testing.T) {
+		calls := 0
+		requester := checkpointProofRequesterFunc(func(
+			context.Context,
+			domain.DeviceID,
+			[]byte,
+		) (transport.ConsensusControlResponse, error) {
+			calls++
+			if calls == 1 {
+				return notApplied, nil
+			}
+			return transport.ConsensusControlResponse{
+				StatusCode: http.StatusOK,
+				MediaType:  "application/json",
+				Body:       successBody,
+			}, nil
+		})
+		proof, err := retryRemoteCheckpointSignatures(
+			t.Context(),
+			requester,
+			[]checkpointSigningExpectation{expectation},
+		)
+		if err != nil ||
+			proof.signature != expected.signature ||
+			calls != 2 {
+			t.Fatalf(
+				"retryRemoteCheckpointSignatures() = (%#v, %v), calls %d",
+				proof,
+				err,
+				calls,
+			)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		calls := 0
+		requester := checkpointProofRequesterFunc(func(
+			context.Context,
+			domain.DeviceID,
+			[]byte,
+		) (transport.ConsensusControlResponse, error) {
+			calls++
+			cancel()
+			return notApplied, nil
+		})
+		_, err := retryRemoteCheckpointSignatures(
+			ctx,
+			requester,
+			[]checkpointSigningExpectation{expectation},
+		)
+		if !errors.Is(err, context.Canceled) || calls != 1 {
+			t.Fatalf(
+				"retryRemoteCheckpointSignatures() error = %v, calls %d",
+				err,
+				calls,
+			)
+		}
+	})
+
+	t.Run("permanent lag", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(
+			t.Context(),
+			3*checkpointSignerCatchUpRetry,
+		)
+		defer cancel()
+		calls := 0
+		requester := checkpointProofRequesterFunc(func(
+			context.Context,
+			domain.DeviceID,
+			[]byte,
+		) (transport.ConsensusControlResponse, error) {
+			calls++
+			return notApplied, nil
+		})
+		_, err := retryRemoteCheckpointSignatures(
+			ctx,
+			requester,
+			[]checkpointSigningExpectation{expectation},
+		)
+		if !errors.Is(err, context.DeadlineExceeded) ||
+			calls < 1 {
+			t.Fatalf(
+				"retryRemoteCheckpointSignatures() error = %v, calls %d",
+				err,
+				calls,
+			)
+		}
+	})
 }
 
 func TestCheckpointSignerAdapterBindsNodeAndCheckpointDevice(

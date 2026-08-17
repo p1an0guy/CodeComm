@@ -98,20 +98,27 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 	counts := make(map[string]int, len(allowed))
 	forbiddenCounts := make(map[string]int, len(forbidden))
 	adapterCallers := map[string]struct {
-		function string
-		count    int
+		functions map[string]struct{}
+		count     int
 	}{
 		"enqueueRaftApply": {
-			function: "apply",
-			count:    1,
+			functions: map[string]struct{}{
+				"apply":                    {},
+				"applyCheckpointWithGuard": {},
+			},
+			count: 2,
 		},
 		"invokeRaftConfigurationChange": {
-			function: "changeRaftConfiguration",
-			count:    1,
+			functions: map[string]struct{}{
+				"changeRaftConfiguration": {},
+			},
+			count: 1,
 		},
 		"changeRaftConfiguration": {
-			function: "reconcileVoterSet",
-			count:    0,
+			functions: map[string]struct{}{
+				"reconcileVoterSet": {},
+			},
+			count: 0,
 		},
 	}
 	adapterCounts := make(map[string]int, len(adapterCallers))
@@ -150,13 +157,12 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 				}
 				if caller, guarded := adapterCallers[method.Sel.Name]; guarded {
 					adapterCounts[method.Sel.Name]++
-					if function.Name.Name != caller.function {
+					if _, allowed := caller.functions[function.Name.Name]; !allowed {
 						t.Errorf(
-							"%s: %s called in %s; want %s",
+							"%s: %s called in unexpected function %s",
 							path,
 							method.Sel.Name,
 							function.Name.Name,
-							caller.function,
 						)
 					}
 				}

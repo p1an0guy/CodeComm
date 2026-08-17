@@ -56,12 +56,19 @@ func (guard *raftEnqueueGuard) release() {
 func (node *SingleNode) enqueueRaftApply(
 	ctx context.Context,
 	command []byte,
+	heldGuard *raftEnqueueGuard,
 ) (raft.ApplyFuture, error) {
-	guard, err := node.acquireRaftEnqueue(ctx)
-	if err != nil {
-		return nil, err
+	guard := heldGuard
+	if guard == nil {
+		var err error
+		guard, err = node.acquireRaftEnqueue(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer guard.release()
+	} else if guard.node != node {
+		return nil, ErrInvalidNodeOptions
 	}
-	defer guard.release()
 	return node.raft.Apply(command, contextTimeout(ctx)), nil
 }
 

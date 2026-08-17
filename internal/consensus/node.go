@@ -65,6 +65,9 @@ type SingleNodeOptions struct {
 	// CheckpointSigner is optional until checkpoint scheduling is enabled.
 	// When supplied, it remains owned by the caller.
 	CheckpointSigner CheckpointSigner
+	// CheckpointOrigin is optional until checkpoint scheduling is enabled.
+	// When supplied, it remains owned by the caller.
+	CheckpointOrigin CheckpointOrigin
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -108,6 +111,7 @@ type NodeOptions struct {
 	BootstrapVoterDeviceIDs []domain.DeviceID
 	CanonicalCoverage       canonicalcoverage.ReceiptCollector
 	CheckpointSigner        CheckpointSigner
+	CheckpointOrigin        CheckpointOrigin
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -117,18 +121,21 @@ type NodeOptions struct {
 // SingleNode is the durable Raft/SQLite runtime. Its historical name remains
 // for API compatibility; OpenNode may construct a multi-voter mesh runtime.
 type SingleNode struct {
-	raft             *raft.Raft
-	fsm              *FSM
-	state            *store.Store
-	stable           *raftboltdb.BoltStore
-	snapshots        *raft.FileSnapshotStore
-	transport        RaftTransport
-	serverID         raft.ServerID
-	clock            ApplyClock
-	single           bool
-	transportGate    *nodeTransportGate
-	coverageGate     *canonicalcoverage.Gate
-	checkpointSigner CheckpointSigner
+	raft                *raft.Raft
+	fsm                 *FSM
+	state               *store.Store
+	stable              *raftboltdb.BoltStore
+	snapshots           *raft.FileSnapshotStore
+	transport           RaftTransport
+	serverID            raft.ServerID
+	originBootID        domain.UUIDv7
+	clock               ApplyClock
+	single              bool
+	transportGate       *nodeTransportGate
+	coverageGate        *canonicalcoverage.Gate
+	checkpointSigner    CheckpointSigner
+	checkpointOrigin    CheckpointOrigin
+	checkpointRequester consensusProofRequester
 
 	peerAdmissionChangesClaimed atomic.Bool
 
@@ -180,6 +187,7 @@ type nodeOpenOptions struct {
 	BootstrapConfiguration raft.Configuration
 	CanonicalCoverage      canonicalcoverage.ReceiptCollector
 	CheckpointSigner       CheckpointSigner
+	CheckpointOrigin       CheckpointOrigin
 	Single                 bool
 
 	Clock      ApplyClock
@@ -203,6 +211,7 @@ func OpenSingleNode(
 		OriginBootID:     options.OriginBootID,
 		InitialState:     options.InitialState,
 		CheckpointSigner: options.CheckpointSigner,
+		CheckpointOrigin: options.CheckpointOrigin,
 		Single:           true,
 		Clock:            options.Clock,
 		RaftConfig:       options.RaftConfig,
@@ -235,6 +244,7 @@ func OpenNode(
 		BootstrapConfiguration: bootstrap,
 		CanonicalCoverage:      options.CanonicalCoverage,
 		CheckpointSigner:       options.CheckpointSigner,
+		CheckpointOrigin:       options.CheckpointOrigin,
 		Clock:                  options.Clock,
 		RaftConfig:             options.RaftConfig,
 		LogOutput:              options.LogOutput,
@@ -562,6 +572,17 @@ func openNode(
 			coverageGate = nil
 		}
 	}
+	checkpointOrigin := normalizedCheckpointOrigin(
+		options.CheckpointOrigin,
+	)
+	checkpointRequester, err := checkpointRequesterForTransport(
+		options.Single,
+		checkpointOrigin,
+		transport,
+	)
+	if err != nil {
+		return nil, err
+	}
 	node := &SingleNode{
 		fsm:           fsm,
 		state:         state,
@@ -569,6 +590,7 @@ func openNode(
 		snapshots:     snapshots,
 		transport:     transport,
 		serverID:      raft.ServerID(options.ServerID),
+		originBootID:  options.OriginBootID,
 		clock:         clock,
 		single:        options.Single,
 		transportGate: transportGate,
@@ -576,12 +598,14 @@ func openNode(
 		checkpointSigner: normalizedCheckpointSigner(
 			options.CheckpointSigner,
 		),
-		monitorStop:  make(chan struct{}),
-		monitorDone:  make(chan struct{}),
-		closeStarted: make(chan struct{}),
-		lineageGate:  make(chan struct{}, 1),
-		raftEnqueue:  make(chan struct{}, 1),
-		fatalSet:     make(chan struct{}),
+		checkpointOrigin:    checkpointOrigin,
+		checkpointRequester: checkpointRequester,
+		monitorStop:         make(chan struct{}),
+		monitorDone:         make(chan struct{}),
+		closeStarted:        make(chan struct{}),
+		lineageGate:         make(chan struct{}, 1),
+		raftEnqueue:         make(chan struct{}, 1),
+		fatalSet:            make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -664,9 +688,22 @@ func validateSingleNodeOptions(
 	); err != nil {
 		return err
 	}
-	return validateCheckpointSigner(
+	if err := validateCheckpointSigner(
 		options.ServerID,
 		options.CheckpointSigner,
+	); err != nil {
+		return err
+	}
+	if err := validateCheckpointOrigin(
+		options.ServerID,
+		options.OriginBootID,
+		options.CheckpointOrigin,
+	); err != nil {
+		return err
+	}
+	return validateCheckpointCapabilities(
+		options.CheckpointSigner,
+		options.CheckpointOrigin,
 	)
 }
 
@@ -689,9 +726,22 @@ func validateNodeOptions(
 			ErrInvalidNodeOptions,
 		)
 	}
-	return validateCheckpointSigner(
+	if err := validateCheckpointSigner(
 		options.ServerID,
 		options.CheckpointSigner,
+	); err != nil {
+		return err
+	}
+	if err := validateCheckpointOrigin(
+		options.ServerID,
+		options.OriginBootID,
+		options.CheckpointOrigin,
+	); err != nil {
+		return err
+	}
+	return validateCheckpointCapabilities(
+		options.CheckpointSigner,
+		options.CheckpointOrigin,
 	)
 }
 
@@ -2094,7 +2144,7 @@ func (node *SingleNode) apply(
 		return committed, nil
 	}
 	if owner {
-		future, enqueueErr := node.enqueueRaftApply(ctx, canonical)
+		future, enqueueErr := node.enqueueRaftApply(ctx, canonical, nil)
 		if enqueueErr != nil {
 			node.finishProposal(
 				proposal.EventID,
