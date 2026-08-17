@@ -289,9 +289,11 @@ unchanged target but emits no voter-set mutation. One row per session, so `sessi
 | `voter_set_version` | integer ≥1 | CAS token; `membership.device_revoked` carries it as `expected_voter_set_version` (§3, §5.4) |
 
 This entity is the target, never the Raft library's live configuration. That configuration lives
-in the library's own stable store under `consensus/` (§6.2), is not a projection, and is not
-digest-covered — two replicas mid-reconciliation legitimately hold different live configurations
-while agreeing on this row (§3, §5.6).
+in the library's own stable store under `consensus/` (§6.2).
+`raft_committed_configuration` mirrors only the latest post-commit callback so authorization never
+consults the library's possibly uncommitted latest configuration. It is local evidence, not a
+projection or protocol-digest-covered state: replicas mid-reconciliation legitimately hold
+different live configurations while agreeing on this row (§3, §5.6).
 
 **Credential authority** — the last voter target proven active by §3's handoff, kept separate so an
 unreachable desired target cannot deadlock renewal.
@@ -378,6 +380,7 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 | `chain_checkpoints` | Committed checkpoints with authority signature, both covered chain heads, and projection accumulator (§5.2.1) |
 | `command_results` | One immutable first-seen record per `event_id`: exact proposal/digest, canonical accepted-or-rejected outcome, exact canonical projection-mutation list, accepted chain tuple or nulls, dense result index, predecessor hash, and result hash. Retained for lineage lifetime, historical replay, and every FSM/logical snapshot (§5.2.1) |
 | `raft_command_applications` | **Local Raft evidence**: one immutable `(recovery_generation, log_index, term, event_id, proposal_digest)` binding for every command this FSM applies after its latest installed-snapshot baseline, including exact duplicates. It joins `command_results` by event ID/digest; its application generation may differ from that result's immutable first-seen generation after recovery. Written with the FSM transaction; imports never synthesize it |
+| `raft_committed_configuration` | **Local Raft evidence**: the latest generation-bound configuration delivered by Raft's post-commit `ConfigurationStore` callback, as canonical server tuples plus digest and log index. Startup binds it to the exact retained configuration log or snapshot metadata; it is authorization evidence, never replicated projection state |
 | `raft_snapshot_installs` | **Local Raft evidence**: the latest successfully installed Raft snapshot baseline, binding authenticated source, exact Raft metadata/configuration, payload digest, imported command/result/event cuts, both heads, accumulator, and full state digest. A standalone logical-snapshot import never creates it |
 | `replication_attestations` | **Local evidence**: verified signed batch envelope/signature and covered ranges, plus trusted snapshot-root/checkpoint attestations. Exact `results[]` reconstruct from immutable `command_results`; contiguous coverage supports settled-nonvoter backup/recovery (§5.3) |
 | `origin_scopes`, `audit_counters` | Digest-covered protocol projections for strict origin ordering and bounded rejection audit (§§5.2, 5.4, 6.1) |
@@ -441,7 +444,9 @@ supported defensive settings. `synchronous=NORMAL` is insufficient: WAL's defaul
 transactions on power loss, which could make a Raft participant's
 `last_raft_applied_log_index` regress below its log or, on a truncated log, exceed it. A store with
 Raft state MUST assert `last_raft_applied_log_index <= last Raft log or installed-snapshot command
-cut` at startup and fail closed on violation. Without an install baseline, every current-generation
+cut` and that the committed-configuration index does not exceed retained log/snapshot state, then
+bind that configuration's exact bytes to its configuration log or snapshot metadata. It fails
+closed on any violation. Without an install baseline, every current-generation
 command result must have an exact first-seen local command binding and every binding must match a
 result. With one, results through its `result_index` are covered by the verified baseline; every
 later result needs a first-seen binding, every retained binding must be after the baseline command

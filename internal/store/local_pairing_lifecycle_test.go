@@ -750,6 +750,9 @@ func TestPairingAuthorityMigrationRevokesUnboundFinalization(t *testing.T) {
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
 			return err
 		}
+		if err := execute(conn, "DROP TABLE raft_committed_configuration;"); err != nil {
+			return err
+		}
 		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")
 	}); err != nil {
 		t.Fatal(err)
@@ -807,6 +810,9 @@ func TestPairingAuthorityMigrationPreservesLegacyCompletion(t *testing.T) {
 
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
+			return err
+		}
+		if err := execute(conn, "DROP TABLE raft_committed_configuration;"); err != nil {
 			return err
 		}
 		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")
@@ -1022,6 +1028,9 @@ func TestPairingFinalizationMigrationRevokesPredecessorAttempts(t *testing.T) {
 			return err
 		}
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
+			return err
+		}
+		if err := execute(conn, "DROP TABLE raft_committed_configuration;"); err != nil {
 			return err
 		}
 		return execute(conn, "DELETE FROM schema_migrations WHERE version >= 3;")

@@ -110,6 +110,13 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err := assertRaftIndex(conn, options.RaftLog); err != nil {
 		return nil, err
 	}
+	if err := verifyCommittedRaftConfiguration(conn); err != nil {
+		return nil, normalizeSQLiteError(
+			ctx,
+			"verify committed Raft configuration",
+			err,
+		)
+	}
 	if err := verifyCurrentCommitmentTip(conn); err != nil {
 		return nil, normalizeSQLiteError(ctx, "verify commitment tip", err)
 	}
@@ -246,6 +253,30 @@ func assertRaftIndex(conn *sqlite.Conn, raftLog RaftLog) error {
 			"%w: SQLite applied %d, Raft last index %d",
 			ErrRaftIndexAhead,
 			applied,
+			lastIndex,
+		)
+	}
+	var configurationIndex int64
+	if err := queryOne(
+		conn,
+		`SELECT coalesce(max(log_index), 0)
+		   FROM raft_committed_configuration;`,
+		func(stmt *sqlite.Stmt) {
+			configurationIndex = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return normalizeSQLiteError(
+			context.Background(),
+			"read committed Raft configuration index",
+			err,
+		)
+	}
+	if configurationIndex > 0 &&
+		uint64(configurationIndex) > lastIndex {
+		return fmt.Errorf(
+			"%w: SQLite configuration %d, Raft last index %d",
+			ErrRaftIndexAhead,
+			configurationIndex,
 			lastIndex,
 		)
 	}
