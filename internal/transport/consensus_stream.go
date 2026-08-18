@@ -64,6 +64,12 @@ var (
 	ErrConsensusControlResponse = errors.New(
 		"transport: invalid consensus control response",
 	)
+	ErrConsensusPeerUnreachable = errors.New(
+		"transport: consensus peer is unreachable",
+	)
+	ErrConsensusReachabilityTokenStale = errors.New(
+		"transport: consensus reachability token is stale",
+	)
 )
 
 // ConsensusControlResponse is one bounded response from the fixed consensus
@@ -72,6 +78,14 @@ type ConsensusControlResponse struct {
 	StatusCode int
 	MediaType  string
 	Body       []byte
+}
+
+// ConsensusPeerReachabilityToken is bounded evidence that one authenticated
+// physical consensus connection answered an active HTTP/2 PING. The verifying
+// transport validates both fields against its current connection state.
+type ConsensusPeerReachabilityToken struct {
+	DeviceID   domain.DeviceID
+	Generation uint64
 }
 
 // ConsensusEndpointResolver supplies bounded, verified literal dial targets
@@ -170,6 +184,7 @@ type consensusPeerClient struct {
 
 	mu          sync.Mutex
 	physical    *consensusPhysicalClient
+	generation  uint64
 	openStreams int
 }
 
@@ -326,30 +341,32 @@ func (layer *ConsensusStreamLayer) Dial(
 			return nil, ErrConsensusEndpointUnavailable
 		}
 		if peer.physical != nil {
-			_ = peer.physical.close()
-			peer.physical = nil
+			physical := peer.detachPhysicalLocked()
+			_ = physical.close()
 		}
 		physical, dialErr := layer.dialPhysical(ctx, deviceID)
 		if dialErr != nil {
 			peer.mu.Unlock()
 			return nil, dialErr
 		}
-		peer.physical = physical
+		if !peer.attachPhysicalLocked(physical) {
+			peer.mu.Unlock()
+			_ = physical.close()
+			return nil, ErrConsensusEndpointUnavailable
+		}
 	}
 	if err := layer.verifyExpected(
 		deviceID,
 		peer.physical.identity,
 	); err != nil {
-		physical := peer.physical
-		peer.physical = nil
+		physical := peer.detachPhysicalLocked()
 		peer.mu.Unlock()
 		_ = physical.close()
 		layer.closeStreamsForDevice(deviceID)
 		return nil, err
 	}
 	if err := layer.authorize(deviceID); err != nil {
-		physical := peer.physical
-		peer.physical = nil
+		physical := peer.detachPhysicalLocked()
 		peer.mu.Unlock()
 		_ = physical.close()
 		layer.closeStreamsForDevice(deviceID)
@@ -362,8 +379,8 @@ func (layer *ConsensusStreamLayer) Dial(
 	)
 	if streamErr != nil {
 		if !peer.physical.usable() && peer.openStreams == 0 {
-			_ = peer.physical.close()
-			peer.physical = nil
+			physical := peer.detachPhysicalLocked()
+			_ = physical.close()
 		}
 		peer.mu.Unlock()
 		return nil, streamErr
@@ -782,13 +799,36 @@ func (peer *consensusPeerClient) close() error {
 		return nil
 	}
 	peer.mu.Lock()
-	physical := peer.physical
-	peer.physical = nil
+	physical := peer.detachPhysicalLocked()
 	peer.mu.Unlock()
 	if physical == nil {
 		return nil
 	}
 	return physical.close()
+}
+
+func (peer *consensusPeerClient) attachPhysicalLocked(
+	physical *consensusPhysicalClient,
+) bool {
+	if peer == nil || physical == nil || peer.physical != nil ||
+		peer.generation == ^uint64(0) {
+		return false
+	}
+	peer.generation++
+	peer.physical = physical
+	return true
+}
+
+func (peer *consensusPeerClient) detachPhysicalLocked() *consensusPhysicalClient {
+	if peer == nil || peer.physical == nil {
+		return nil
+	}
+	physical := peer.physical
+	peer.physical = nil
+	if peer.generation != ^uint64(0) {
+		peer.generation++
+	}
+	return physical
 }
 
 func (physical *consensusPhysicalClient) usable() bool {

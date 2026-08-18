@@ -168,30 +168,32 @@ func (layer *ConsensusStreamLayer) beginConsensusControlRequest(
 			return nil, ErrConsensusEndpointUnavailable
 		}
 		if peer.physical != nil {
-			_ = peer.physical.close()
-			peer.physical = nil
+			physical := peer.detachPhysicalLocked()
+			_ = physical.close()
 		}
 		physical, err := layer.dialPhysical(ctx, deviceID)
 		if err != nil {
 			peer.mu.Unlock()
 			return nil, err
 		}
-		peer.physical = physical
+		if !peer.attachPhysicalLocked(physical) {
+			peer.mu.Unlock()
+			_ = physical.close()
+			return nil, ErrConsensusEndpointUnavailable
+		}
 	}
 	if err := layer.verifyExpected(
 		deviceID,
 		peer.physical.identity,
 	); err != nil {
-		physical := peer.physical
-		peer.physical = nil
+		physical := peer.detachPhysicalLocked()
 		peer.mu.Unlock()
 		_ = physical.close()
 		layer.closeStreamsForDevice(deviceID)
 		return nil, err
 	}
 	if err := layer.authorize(deviceID); err != nil {
-		physical := peer.physical
-		peer.physical = nil
+		physical := peer.detachPhysicalLocked()
 		peer.mu.Unlock()
 		_ = physical.close()
 		layer.closeStreamsForDevice(deviceID)
@@ -211,8 +213,7 @@ func (layer *ConsensusStreamLayer) invalidateConsensusPeer(
 		return
 	}
 	peer.mu.Lock()
-	physical := peer.physical
-	peer.physical = nil
+	physical := peer.detachPhysicalLocked()
 	peer.mu.Unlock()
 	if physical != nil {
 		_ = physical.close()

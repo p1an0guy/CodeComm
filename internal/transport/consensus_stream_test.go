@@ -282,6 +282,22 @@ func testConsensusStartupEnabled(t *testing.T) {
 		"proof control denial closes active streams",
 		testConsensusProofDenialClosesActiveStreamsWithoutDeadlock,
 	)
+	t.Run(
+		"authenticated reachability",
+		testConsensusReachabilitySuccess,
+	)
+	t.Run(
+		"reachability token invalidation",
+		testConsensusReachabilityTokenInvalidation,
+	)
+	t.Run(
+		"reachability cancellation",
+		testConsensusReachabilityCancellation,
+	)
+	t.Run(
+		"reachability verification is local",
+		testConsensusReachabilityVerificationIsLocal,
+	)
 }
 
 func testConsensusDuplexAndReuse(t *testing.T) {

@@ -114,6 +114,34 @@ func (transport *ConsensusNetworkTransport) RequestConsensusProof(
 	return transport.control.RequestConsensusProof(ctx, deviceID, body)
 }
 
+// ProbeConsensusPeer forwards an active reachability probe through the
+// authenticated consensus connection pool.
+func (transport *ConsensusNetworkTransport) ProbeConsensusPeer(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (ConsensusPeerReachabilityToken, error) {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ConsensusPeerReachabilityToken{},
+			ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.ProbeConsensusPeer(ctx, deviceID)
+}
+
+// VerifyConsensusPeerReachability forwards the in-memory token freshness
+// check without performing network I/O.
+func (transport *ConsensusNetworkTransport) VerifyConsensusPeerReachability(
+	token ConsensusPeerReachabilityToken,
+) error {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.VerifyConsensusPeerReachability(token)
+}
+
 // Consumer returns inbound Raft RPCs decoded by the maintained transport.
 func (transport *ConsensusNetworkTransport) Consumer() <-chan raft.RPC {
 	if transport == nil || transport.delegate == nil {
