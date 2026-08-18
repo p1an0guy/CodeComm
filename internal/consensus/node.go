@@ -65,6 +65,9 @@ type SingleNodeOptions struct {
 	// CheckpointSigner is optional until checkpoint scheduling is enabled.
 	// When supplied, it remains owned by the caller.
 	CheckpointSigner CheckpointSigner
+	// VoterActivationSigner is optional until voter reconciliation is enabled.
+	// When supplied, it remains owned by the caller.
+	VoterActivationSigner VoterActivationSigner
 	// CheckpointOrigin is optional until checkpoint scheduling is enabled.
 	// When supplied, it remains owned by the caller.
 	CheckpointOrigin CheckpointOrigin
@@ -115,6 +118,7 @@ type NodeOptions struct {
 	BootstrapVoterDeviceIDs []domain.DeviceID
 	CanonicalCoverage       canonicalcoverage.ReceiptCollector
 	CheckpointSigner        CheckpointSigner
+	VoterActivationSigner   VoterActivationSigner
 	CheckpointOrigin        CheckpointOrigin
 
 	Clock      ApplyClock
@@ -125,21 +129,30 @@ type NodeOptions struct {
 // SingleNode is the durable Raft/SQLite runtime. Its historical name remains
 // for API compatibility; OpenNode may construct a multi-voter mesh runtime.
 type SingleNode struct {
-	raft                *raft.Raft
-	fsm                 *FSM
-	state               *store.Store
-	stable              *raftboltdb.BoltStore
-	snapshots           *raft.FileSnapshotStore
-	transport           RaftTransport
-	serverID            raft.ServerID
-	originBootID        domain.UUIDv7
-	clock               ApplyClock
-	single              bool
-	transportGate       *nodeTransportGate
-	coverageGate        *canonicalcoverage.Gate
-	checkpointSigner    CheckpointSigner
-	checkpointOrigin    CheckpointOrigin
-	checkpointRequester consensusProofRequester
+	raft                   *raft.Raft
+	fsm                    *FSM
+	state                  *store.Store
+	stable                 *raftboltdb.BoltStore
+	snapshots              *raft.FileSnapshotStore
+	transport              RaftTransport
+	serverID               raft.ServerID
+	originBootID           domain.UUIDv7
+	clock                  ApplyClock
+	single                 bool
+	transportGate          *nodeTransportGate
+	coverageGate           *canonicalcoverage.Gate
+	readinessGate          *configurationReadinessGate
+	checkpointSigner       CheckpointSigner
+	voterActivationSigner  VoterActivationSigner
+	checkpointOrigin       CheckpointOrigin
+	checkpointRequester    consensusProofRequester
+	voterActivationOrigin  VoterActivationOrigin
+	voterReconcileGate     chan struct{}
+	voterReconcileDone     chan struct{}
+	voterReconcileStatus   voterReconciliationStatus
+	voterReconcileNow      func() time.Time
+	stagingProofAttempt    *stagingVoterProofAttempt
+	voterActivationAttempt *voterActivationAttempt
 
 	peerAdmissionChangesClaimed atomic.Bool
 
@@ -186,14 +199,18 @@ type nodeOpenOptions struct {
 	OriginBootID domain.UUIDv7
 	InitialState *store.InitialState
 
-	Transport               RaftTransport
-	TransportFactory        RaftTransportFactory
-	BootstrapConfiguration  raft.Configuration
-	CanonicalCoverage       canonicalcoverage.ReceiptCollector
-	CheckpointSigner        CheckpointSigner
-	CheckpointOrigin        CheckpointOrigin
-	CheckpointOriginFactory CheckpointOriginFactory
-	Single                  bool
+	Transport                  RaftTransport
+	TransportFactory           RaftTransportFactory
+	BootstrapConfiguration     raft.Configuration
+	CanonicalCoverage          canonicalcoverage.ReceiptCollector
+	ConfigurationReadiness     ConfigurationReadinessProvider
+	VoterReconciliationNow     func() time.Time
+	CheckpointSigner           CheckpointSigner
+	VoterActivationSigner      VoterActivationSigner
+	CheckpointOrigin           CheckpointOrigin
+	CheckpointOriginFactory    CheckpointOriginFactory
+	Single                     bool
+	DisableVoterReconciliation bool
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -216,6 +233,7 @@ func OpenSingleNode(
 		OriginBootID:            options.OriginBootID,
 		InitialState:            options.InitialState,
 		CheckpointSigner:        options.CheckpointSigner,
+		VoterActivationSigner:   options.VoterActivationSigner,
 		CheckpointOrigin:        options.CheckpointOrigin,
 		CheckpointOriginFactory: options.CheckpointOriginFactory,
 		Single:                  true,
@@ -250,6 +268,7 @@ func OpenNode(
 		BootstrapConfiguration: bootstrap,
 		CanonicalCoverage:      options.CanonicalCoverage,
 		CheckpointSigner:       options.CheckpointSigner,
+		VoterActivationSigner:  options.VoterActivationSigner,
 		CheckpointOrigin:       options.CheckpointOrigin,
 		Clock:                  options.Clock,
 		RaftConfig:             options.RaftConfig,
@@ -596,13 +615,18 @@ func openNode(
 		checkpointSigner: normalizedCheckpointSigner(
 			options.CheckpointSigner,
 		),
-		checkpointOrigin: checkpointOrigin,
-		monitorStop:      make(chan struct{}),
-		monitorDone:      make(chan struct{}),
-		closeStarted:     make(chan struct{}),
-		lineageGate:      make(chan struct{}, 1),
-		raftEnqueue:      make(chan struct{}, 1),
-		fatalSet:         make(chan struct{}),
+		voterActivationSigner: normalizedVoterActivationSigner(
+			options.VoterActivationSigner,
+		),
+		checkpointOrigin:   checkpointOrigin,
+		monitorStop:        make(chan struct{}),
+		monitorDone:        make(chan struct{}),
+		closeStarted:       make(chan struct{}),
+		lineageGate:        make(chan struct{}, 1),
+		raftEnqueue:        make(chan struct{}, 1),
+		voterReconcileGate: make(chan struct{}, 1),
+		voterReconcileNow:  options.VoterReconciliationNow,
+		fatalSet:           make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -623,6 +647,21 @@ func openNode(
 	}
 	node.raft = instance
 	node.readLeadershipEpoch = node.currentLeadershipEpoch
+	if node.voterReconcileNow == nil {
+		node.voterReconcileNow = time.Now
+	}
+	readinessProvider := options.ConfigurationReadiness
+	if !options.Single &&
+		nilConfigurationReadinessProvider(readinessProvider) {
+		readinessProvider = newNodeConfigurationReadinessProvider(
+			node,
+			transport,
+			time.Now,
+		)
+	}
+	node.readinessGate = newConfigurationReadinessGate(
+		readinessProvider,
+	)
 	defer func() {
 		if err != nil {
 			_ = instance.Shutdown().Error()
@@ -681,10 +720,23 @@ func openNode(
 		return nil, err
 	}
 	node.checkpointRequester = checkpointRequester
+	node.voterActivationOrigin = voterActivationOriginForCheckpoint(
+		checkpointOrigin,
+	)
+	if err := validateVoterActivationOrigin(
+		options.ServerID,
+		options.OriginBootID,
+		node.voterActivationOrigin,
+	); err != nil {
+		return nil, err
+	}
 	if transportGate != nil {
 		transportGate.bind(node)
 	}
 	go node.monitorFSM()
+	if !options.DisableVoterReconciliation {
+		node.startVoterReconciliation()
+	}
 	return node, nil
 }
 
@@ -749,6 +801,12 @@ func validateSingleNodeOptions(
 	); err != nil {
 		return err
 	}
+	if err := validateVoterActivationSigner(
+		options.ServerID,
+		options.VoterActivationSigner,
+	); err != nil {
+		return err
+	}
 	if err := validateCheckpointOrigin(
 		options.ServerID,
 		options.OriginBootID,
@@ -785,6 +843,12 @@ func validateNodeOptions(
 	if err := validateCheckpointSigner(
 		options.ServerID,
 		options.CheckpointSigner,
+	); err != nil {
+		return err
+	}
+	if err := validateVoterActivationSigner(
+		options.ServerID,
+		options.VoterActivationSigner,
 	); err != nil {
 		return err
 	}
@@ -1925,10 +1989,7 @@ func (node *SingleNode) WaitForLeader(ctx context.Context) error {
 			}
 			if node.raft.State() == raft.Leader &&
 				id == node.serverID {
-				err := waitFuture(
-					ctx,
-					node.raft.Barrier(contextTimeout(ctx)),
-				)
+				err := node.waitRaftBarrier(ctx)
 				if err == nil {
 					commitIndex := node.raft.CommitIndex()
 					ready, readyErr := node.appliedThroughCommit(
@@ -2442,7 +2503,7 @@ func (node *SingleNode) Barrier(ctx context.Context) error {
 	if err := node.FatalError(); err != nil {
 		return err
 	}
-	return waitFuture(ctx, node.raft.Barrier(contextTimeout(ctx)))
+	return node.waitRaftBarrier(ctx)
 }
 
 // Snapshot asks Raft to persist the current SQLite-bound FSM anchor.
@@ -2534,8 +2595,13 @@ func (node *SingleNode) Status(
 		return coordstatus.Snapshot{}, err
 	}
 	runtime := coordstatus.RuntimeSnapshot{
-		LocalDeviceID: localDeviceID,
-		Role:          raftStatusRole(node.raft.State()),
+		LocalDeviceID:         localDeviceID,
+		Role:                  raftStatusRole(node.raft.State()),
+		LiveVoterDeviceIDs:    []domain.DeviceID{},
+		LiveNonvoterDeviceIDs: []domain.DeviceID{},
+		ReconciliationStep:    coordstatus.ReconciliationStepObserve,
+		ReconciliationBlocker: coordstatus.ReconciliationBlockerNone,
+		ReconciliationState:   coordstatus.ReconciliationPending,
 	}
 	configuration := node.fsm.committedConfiguration()
 	if configuration == nil && node.transportGate != nil {
@@ -2547,17 +2613,24 @@ func (node *SingleNode) Status(
 		return coordstatus.Snapshot{}, ErrConsensusAuthorizationUnavailable
 	} else {
 		for _, server := range configuration.Configuration.Servers {
-			if server.Suffrage != raft.Voter {
-				continue
-			}
 			id := domain.DeviceID(server.ID)
 			if !id.Valid() {
 				return coordstatus.Snapshot{}, ErrInvalidRaftTopology
 			}
-			runtime.LiveVoterDeviceIDs = append(
-				runtime.LiveVoterDeviceIDs,
-				id,
-			)
+			switch server.Suffrage {
+			case raft.Voter:
+				runtime.LiveVoterDeviceIDs = append(
+					runtime.LiveVoterDeviceIDs,
+					id,
+				)
+			case raft.Nonvoter:
+				runtime.LiveNonvoterDeviceIDs = append(
+					runtime.LiveNonvoterDeviceIDs,
+					id,
+				)
+			default:
+				return coordstatus.Snapshot{}, ErrInvalidRaftTopology
+			}
 		}
 		sort.Slice(
 			runtime.LiveVoterDeviceIDs,
@@ -2566,11 +2639,57 @@ func (node *SingleNode) Status(
 					runtime.LiveVoterDeviceIDs[right]
 			},
 		)
+		sort.Slice(
+			runtime.LiveNonvoterDeviceIDs,
+			func(left, right int) bool {
+				return runtime.LiveNonvoterDeviceIDs[left] <
+					runtime.LiveNonvoterDeviceIDs[right]
+			},
+		)
 	}
-	runtime.ConfigurationReconciled = sameDeviceIDs(
-		runtime.LiveVoterDeviceIDs,
-		durable.VoterSet.VoterDeviceIDs(),
-	)
+	targetIDs := durable.VoterSet.VoterDeviceIDs()
+	runtime.ConfigurationReconciled =
+		len(runtime.LiveNonvoterDeviceIDs) == 0 &&
+			sameDeviceIDs(runtime.LiveVoterDeviceIDs, targetIDs) &&
+			durable.CredentialAuthority.VoterSetVersion ==
+				durable.VoterSet.VoterSetVersion &&
+			sameDeviceIDs(
+				durable.CredentialAuthority.VoterDeviceIDs(),
+				targetIDs,
+			)
+	if runtime.ConfigurationReconciled {
+		runtime.ReconciliationState,
+			runtime.ReconciliationStep,
+			runtime.ReconciliationBlocker,
+			runtime.ReconciliationDeviceID =
+			node.voterReconcileStatus.snapshot(
+				voterReconciliationStatusCut{
+					sessionID:          durable.SessionID,
+					recoveryGeneration: durable.RecoveryGeneration,
+					targetVersion: durable.VoterSet.
+						VoterSetVersion,
+					targetDeviceIDs: targetIDs,
+				},
+				true,
+				node.voterReconciliationTime(),
+			)
+	} else {
+		runtime.ReconciliationState,
+			runtime.ReconciliationStep,
+			runtime.ReconciliationBlocker,
+			runtime.ReconciliationDeviceID =
+			node.voterReconcileStatus.snapshot(
+				voterReconciliationStatusCut{
+					sessionID:          durable.SessionID,
+					recoveryGeneration: durable.RecoveryGeneration,
+					targetVersion: durable.VoterSet.
+						VoterSetVersion,
+					targetDeviceIDs: targetIDs,
+				},
+				false,
+				node.voterReconciliationTime(),
+			)
+	}
 	if node.FatalError() != nil {
 		runtime.State = coordstatus.ConsensusHalted
 		runtime.StrongWrites = coordstatus.StrongWritesBlocked
@@ -2729,6 +2848,9 @@ func (node *SingleNode) Close() error {
 			}
 		}
 		node.active.Wait()
+		if node.voterReconcileDone != nil {
+			<-node.voterReconcileDone
+		}
 		if node.monitorDone != nil {
 			<-node.monitorDone
 		}

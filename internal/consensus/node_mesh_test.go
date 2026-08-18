@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/store"
+	peertransport "github.com/ijonahch/codecomm/internal/transport"
 )
 
 func TestOpenNodeUsesInjectedDeviceAddressedTransport(t *testing.T) {
@@ -42,6 +43,9 @@ func TestOpenNodeUsesInjectedDeviceAddressedTransport(t *testing.T) {
 	t.Cleanup(func() { _ = node.Close() })
 	if err := node.WaitForLeader(testContext(t)); err != nil {
 		t.Fatalf("WaitForLeader(): %v", err)
+	}
+	if node.readinessGate != nil {
+		t.Fatal("transport without reachability installed a readiness gate")
 	}
 	if got := node.Address(); got != raft.ServerAddress(deviceID) {
 		t.Fatalf("Address() = %q, want %q", got, deviceID)
@@ -82,6 +86,48 @@ func TestOpenNodeUsesInjectedDeviceAddressedTransport(t *testing.T) {
 	}
 	if got := ownedTransport.closes.Load(); got != 1 {
 		t.Fatalf("transport Close calls = %d, want 1", got)
+	}
+}
+
+func TestOpenNodeOwnsProductionConfigurationReadiness(t *testing.T) {
+	root := t.TempDir()
+	initial, _, deviceID := nodeTestInitialState(t)
+	_, delegate := raft.NewInmemTransport(raft.ServerAddress(deviceID))
+	owned := &readinessCapableRaftTransport{
+		countingRaftTransport: &countingRaftTransport{
+			Transport: delegate,
+		},
+	}
+	node, err := OpenNode(context.Background(), NodeOptions{
+		ServerID:                deviceID,
+		StatePath:               filepath.Join(root, "state", "state.db"),
+		ConsensusDir:            filepath.Join(root, "consensus"),
+		OriginBootID:            nodeTestBootID1,
+		InitialState:            &initial,
+		BootstrapVoterDeviceIDs: []domain.DeviceID{deviceID},
+		Clock:                   nodeTestClock(),
+		RaftConfig:              nodeTestRaftConfig(),
+		TransportFactory: func(ConsensusTransportGate) (
+			RaftTransport,
+			error,
+		) {
+			return owned, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("OpenNode(): %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	if node.readinessGate == nil {
+		t.Fatal("readiness-capable transport did not install a readiness gate")
+	}
+	provider, ok := node.readinessGate.provider.(*nodeConfigurationReadinessProvider)
+	if !ok ||
+		provider.localDeviceID != deviceID ||
+		provider.admissionSnapshot == nil ||
+		provider.localReachable == nil ||
+		provider.now == nil {
+		t.Fatalf("production readiness provider = %#v", provider)
 	}
 }
 
@@ -440,6 +486,24 @@ type countingRaftTransport struct {
 	closes atomic.Int32
 }
 
+type readinessCapableRaftTransport struct {
+	*countingRaftTransport
+}
+
+func (*readinessCapableRaftTransport) ProbeConsensusPeer(
+	context.Context,
+	domain.DeviceID,
+) (peertransport.ConsensusPeerReachabilityToken, error) {
+	return peertransport.ConsensusPeerReachabilityToken{},
+		peertransport.ErrConsensusPeerUnreachable
+}
+
+func (*readinessCapableRaftTransport) VerifyConsensusPeerReachability(
+	peertransport.ConsensusPeerReachabilityToken,
+) error {
+	return peertransport.ErrConsensusReachabilityTokenStale
+}
+
 func (transport *countingRaftTransport) Close() error {
 	transport.closes.Add(1)
 	if closeable, ok := transport.Transport.(raft.WithClose); ok {
@@ -453,3 +517,4 @@ func meshTestDeviceID(digit byte) domain.DeviceID {
 }
 
 var _ RaftTransport = (*countingRaftTransport)(nil)
+var _ consensusPeerReachability = (*readinessCapableRaftTransport)(nil)

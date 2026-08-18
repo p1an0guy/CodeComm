@@ -65,16 +65,22 @@ func (change raftConfigurationChange) validate() error {
 // configuration enqueue are serialized with every application enqueue.
 func (node *SingleNode) changeRaftConfiguration(
 	ctx context.Context,
-	change raftConfigurationChange,
+	expectedPlan voterReconciliationPlan,
+	eligibility voterEligibilitySet,
 ) (uint64, error) {
+	change, planned := reconciliationConfigurationChange(expectedPlan)
 	if node == nil ||
 		node.raft == nil ||
 		node.state == nil ||
 		ctx == nil ||
 		node.single ||
-		change.validate() != nil {
+		!planned ||
+		change.validate() != nil ||
+		expectedPlan.configurationIndex < 1 ||
+		!domain.ValidUnsignedInteger(expectedPlan.configurationIndex) {
 		return 0, ErrInvalidConfigurationChange
 	}
+	eligibility = eligibility.clone()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -96,10 +102,7 @@ func (node *SingleNode) changeRaftConfiguration(
 	if err != nil {
 		return 0, err
 	}
-	if err := waitFuture(
-		ctx,
-		node.raft.Barrier(contextTimeout(ctx)),
-	); err != nil {
+	if err := node.waitRaftBarrier(ctx); err != nil {
 		return 0, err
 	}
 	if err := node.requireConfigurationLeadershipEpoch(
@@ -108,8 +111,51 @@ func (node *SingleNode) changeRaftConfiguration(
 		return 0, err
 	}
 
-	_, baseline, err := node.canonicalCoverageState(ctx)
+	baselineState, baseline, baselineConfiguration, err :=
+		node.configurationChangeCut(ctx)
 	if err != nil {
+		return 0, err
+	}
+	if baselineConfiguration.Index != expectedPlan.configurationIndex {
+		return 0, ErrStaleConfigurationChange
+	}
+	if err := validateRaftConfigurationChange(
+		baselineState,
+		baselineConfiguration.Configuration,
+		change,
+		node.serverID,
+	); err != nil {
+		return 0, err
+	}
+	readinessRequirement, err := configurationReadinessRequirement(
+		baselineState,
+		baselineConfiguration,
+		change,
+	)
+	if err != nil {
+		return 0, err
+	}
+	readiness, err := node.readinessGate.collect(
+		ctx,
+		readinessRequirement,
+	)
+	if err != nil {
+		return 0, err
+	}
+	baselinePlan, err := reconciliationPlanAtCut(
+		baselineState,
+		baselineConfiguration,
+		domain.DeviceID(node.serverID),
+		readiness.candidate,
+		eligibility,
+	)
+	if err != nil {
+		return 0, errVoterReconciliationChanged
+	}
+	if err := requireExpectedReconciliationPlan(
+		expectedPlan,
+		baselinePlan,
+	); err != nil {
 		return 0, err
 	}
 	candidate, err := node.coverageGate.Collect(ctx, baseline)
@@ -128,7 +174,10 @@ func (node *SingleNode) changeRaftConfiguration(
 		}
 	}()
 
-	barrier := node.raft.Barrier(contextTimeout(ctx))
+	barrier, err := node.enqueueRaftBarrier(ctx)
+	if err != nil {
+		return 0, err
+	}
 	if err, ownsGuard = node.waitRaftFutureWithGuard(
 		ctx,
 		barrier,
@@ -137,28 +186,10 @@ func (node *SingleNode) changeRaftConfiguration(
 		return 0, err
 	}
 
-	currentState, currentCoverage, err := node.canonicalCoverageState(ctx)
+	currentState, currentCoverage, committed, err :=
+		node.configurationChangeCut(ctx)
 	if err != nil {
 		return 0, err
-	}
-	configurationFuture := node.raft.GetConfiguration()
-	if err := waitFuture(ctx, configurationFuture); err != nil {
-		return 0, err
-	}
-	configuration := configurationFuture.Configuration()
-	if err := validateDeviceAddressedSnapshotConfiguration(
-		configuration,
-	); err != nil {
-		return 0, err
-	}
-	committed := node.fsm.committedConfiguration()
-	if committed == nil ||
-		committed.Index < 1 ||
-		!sameRaftConfiguration(
-			committed.Configuration,
-			configuration,
-		) {
-		return 0, ErrStaleConfigurationChange
 	}
 	if err := node.coverageGate.VerifyCurrent(
 		currentCoverage,
@@ -173,9 +204,39 @@ func (node *SingleNode) changeRaftConfiguration(
 	}
 	if err := validateRaftConfigurationChange(
 		currentState,
-		configuration,
+		committed.Configuration,
 		change,
 		node.serverID,
+	); err != nil {
+		return 0, err
+	}
+	currentReadiness, err := configurationReadinessRequirement(
+		currentState,
+		committed,
+		change,
+	)
+	if err != nil {
+		return 0, err
+	}
+	currentPlan, err := reconciliationPlanAtCut(
+		currentState,
+		committed,
+		domain.DeviceID(node.serverID),
+		readiness.candidate,
+		eligibility,
+	)
+	if err != nil {
+		return 0, errVoterReconciliationChanged
+	}
+	if err := requireExpectedReconciliationPlan(
+		expectedPlan,
+		currentPlan,
+	); err != nil {
+		return 0, err
+	}
+	if err := node.readinessGate.verifyCurrent(
+		currentReadiness,
+		readiness,
 	); err != nil {
 		return 0, err
 	}
@@ -304,6 +365,52 @@ func (node *SingleNode) canonicalCoverageState(
 	return decoded, snapshot, nil
 }
 
+func (node *SingleNode) configurationChangeCut(
+	ctx context.Context,
+) (
+	decodedState,
+	canonicalcoverage.Snapshot,
+	*committedRaftConfiguration,
+	error,
+) {
+	state, coverage, err := node.canonicalCoverageState(ctx)
+	if err != nil {
+		return decodedState{},
+			canonicalcoverage.Snapshot{},
+			nil,
+			err
+	}
+	future := node.raft.GetConfiguration()
+	if err := waitFuture(ctx, future); err != nil {
+		return decodedState{},
+			canonicalcoverage.Snapshot{},
+			nil,
+			err
+	}
+	configuration := future.Configuration()
+	if err := validateDeviceAddressedSnapshotConfiguration(
+		configuration,
+	); err != nil {
+		return decodedState{},
+			canonicalcoverage.Snapshot{},
+			nil,
+			err
+	}
+	committed := node.fsm.committedConfiguration()
+	if committed == nil ||
+		committed.Index < 1 ||
+		!sameRaftConfiguration(
+			committed.Configuration,
+			configuration,
+		) {
+		return decodedState{},
+			canonicalcoverage.Snapshot{},
+			nil,
+			ErrStaleConfigurationChange
+	}
+	return state, coverage, committed, nil
+}
+
 func validateRaftConfigurationChange(
 	state decodedState,
 	configuration raft.Configuration,
@@ -342,13 +449,25 @@ func validateRaftConfigurationChange(
 			return ErrStaleConfigurationChange
 		}
 	case raftChangeRemoveServer:
-		if target || !found || current.ID == localServerID {
+		if target ||
+			!found ||
+			current.ID == localServerID ||
+			!credentialAuthorityMatchesTarget(state) {
 			return ErrStaleConfigurationChange
 		}
 	default:
 		return ErrInvalidConfigurationChange
 	}
 	return nil
+}
+
+func credentialAuthorityMatchesTarget(state decodedState) bool {
+	return state.CredentialAuthority.VoterSetVersion ==
+		state.VoterSet.VoterSetVersion &&
+		sameDeviceIDs(
+			state.CredentialAuthority.VoterDeviceIDs,
+			state.VoterSet.VoterDeviceIDs(),
+		)
 }
 
 func (node *SingleNode) invokeRaftConfigurationChange(

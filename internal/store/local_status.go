@@ -50,6 +50,13 @@ func (state LocalState) StatusSnapshot(
 		if err != nil {
 			return err
 		}
+		authority, err := readStatusCredentialAuthority(
+			conn,
+			lineage.sessionID,
+		)
+		if err != nil {
+			return err
+		}
 		sessions, err := readStatusAgentSessions(conn)
 		if err != nil {
 			return err
@@ -73,11 +80,12 @@ func (state LocalState) StatusSnapshot(
 				DigestVersion:           heads.DigestVersion,
 				ProjectionSchemaVersion: heads.ProjectionSchemaVersion,
 			},
-			Member:        member,
-			VoterSet:      target,
-			AgentSessions: sessions,
-			Tasks:         tasks,
-			TaskTotal:     taskTotal,
+			Member:              member,
+			VoterSet:            target,
+			CredentialAuthority: authority,
+			AgentSessions:       sessions,
+			Tasks:               tasks,
+			TaskTotal:           taskTotal,
 			TasksTruncated: taskTotal >
 				uint64(len(tasks)),
 		}
@@ -153,6 +161,43 @@ func readStatusMember(
 		}
 	}
 	return member, found, nil
+}
+
+func readStatusCredentialAuthority(
+	conn *sqlite.Conn,
+	sessionID domain.UUIDv7,
+) (voterset.Set, error) {
+	var (
+		encoded string
+		version int64
+		count   int
+	)
+	if err := queryArgs(
+		conn,
+		`SELECT voter_device_ids_json, voter_set_version
+		   FROM credential_authority
+		  WHERE session_id = ?1;`,
+		[]any{string(sessionID)},
+		func(stmt *sqlite.Stmt) {
+			count++
+			encoded = stmt.ColumnText(0)
+			version = stmt.ColumnInt64(1)
+		},
+	); err != nil {
+		return voterset.Set{}, err
+	}
+	if count != 1 || version < 1 {
+		return voterset.Set{}, ErrLocalStateIntegrity
+	}
+	ids, err := decodeCanonicalJSONArray[domain.DeviceID](encoded)
+	if err != nil {
+		return voterset.Set{}, ErrLocalStateIntegrity
+	}
+	authority, err := voterset.New(sessionID, ids, uint64(version))
+	if err != nil {
+		return voterset.Set{}, ErrLocalStateIntegrity
+	}
+	return authority, nil
 }
 
 func readStatusVoterSet(

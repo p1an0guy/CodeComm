@@ -40,6 +40,7 @@ type decodedState struct {
 	VoterSet            voterset.Set
 	CredentialAuthority credentialauthority.Authority
 	CanonicalRef        publication.CanonicalRef
+	recoveryGeneration  uint64
 	workspaceID         domain.UUIDv4
 	identityPublicKeys  map[domain.DeviceID]ed25519.PublicKey
 }
@@ -151,6 +152,7 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 		VoterSet:            snapshot.VoterSet,
 		CredentialAuthority: snapshot.CredentialAuthority.Clone(),
 		CanonicalRef:        snapshot.CanonicalRef,
+		recoveryGeneration:  view.RecoveryGeneration,
 		workspaceID:         view.WorkspaceID,
 		identityPublicKeys:  copyIdentityPublicKeys(snapshot.Devices),
 	}

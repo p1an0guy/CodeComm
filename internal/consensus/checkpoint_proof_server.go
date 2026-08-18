@@ -196,8 +196,27 @@ func (node *SingleNode) serveConsensusControl(
 		)
 		return
 	}
-	if mode == consensusProofModeCheckpointSign {
+	switch mode {
+	case consensusProofModeCheckpointSign:
 		node.serveCheckpointSign(
+			writer,
+			callContext,
+			peer,
+			requestAuthority,
+			body,
+		)
+		return
+	case consensusProofModeTargetActivation:
+		node.serveTargetActivation(
+			writer,
+			callContext,
+			peer,
+			requestAuthority,
+			body,
+		)
+		return
+	case consensusProofModeAuthorityHandoff:
+		node.serveAuthorityHandoff(
 			writer,
 			callContext,
 			peer,

@@ -31,6 +31,35 @@ type configurationCoverageCollector struct {
 	afterCollect func()
 }
 
+type configurationReadinessProvider struct{}
+
+func (configurationReadinessProvider) CollectConfigurationReadiness(
+	ctx context.Context,
+	requirement ConfigurationReadinessRequirement,
+) (ConfigurationReadinessCandidate, error) {
+	if err := ctx.Err(); err != nil {
+		return ConfigurationReadinessCandidate{}, err
+	}
+	return ConfigurationReadinessCandidate{
+		ReachableDeviceIDs: append(
+			[]domain.DeviceID(nil),
+			requirement.PostChangeVoterDeviceIDs...,
+		),
+		CurrentCredentialDeviceIDs: append(
+			[]domain.DeviceID(nil),
+			requirement.PostChangeVoterDeviceIDs...,
+		),
+		Token: []byte("fixture-ready"),
+	}, nil
+}
+
+func (configurationReadinessProvider) VerifyCurrentConfigurationReadiness(
+	ConfigurationReadinessRequirement,
+	ConfigurationReadinessCandidate,
+) error {
+	return nil
+}
+
 func (collector *configurationCoverageCollector) CollectCanonicalCoverage(
 	ctx context.Context,
 	requirement canonicalcoverage.Requirement,
@@ -82,15 +111,25 @@ type configurationChangeFixture struct {
 	collector    *configurationCoverageCollector
 }
 
+func (fixture configurationChangeFixture) stagePlan(
+	t *testing.T,
+) voterReconciliationPlan {
+	t.Helper()
+	configuration := raftConfiguration(t, fixture.node)
+	return voterReconciliationPlan{
+		action:             voterReconciliationAddNonvoter,
+		deviceID:           fixture.stageID,
+		configurationIndex: configuration.Index,
+	}
+}
+
 func TestConfigurationChangeRequiresCanonicalCoverage(t *testing.T) {
 	fixture := openConfigurationChangeFixture(t, false)
 	before := raftConfiguration(t, fixture.node)
 	_, err := fixture.node.changeRaftConfiguration(
 		testContext(t),
-		raftConfigurationChange{
-			kind:     raftChangeAddNonvoter,
-			deviceID: fixture.stageID,
-		},
+		fixture.stagePlan(t),
+		nil,
 	)
 	if !errors.Is(err, canonicalcoverage.ErrObjectCoverageDegraded) ||
 		!errors.Is(err, canonicalcoverage.ErrCollectorUnavailable) {
@@ -103,15 +142,33 @@ func TestConfigurationChangeRequiresCanonicalCoverage(t *testing.T) {
 	}
 }
 
+func TestConfigurationChangeRequiresReadinessProvider(t *testing.T) {
+	fixture := openConfigurationChangeFixture(t, true)
+	fixture.node.readinessGate = nil
+	before := raftConfiguration(t, fixture.node)
+	_, err := fixture.node.changeRaftConfiguration(
+		testContext(t),
+		fixture.stagePlan(t),
+		nil,
+	)
+	if !errors.Is(err, ErrConfigurationReadinessUnavailable) {
+		t.Fatalf("changeRaftConfiguration() error = %v", err)
+	}
+	after := raftConfiguration(t, fixture.node)
+	if after.Index != before.Index ||
+		!sameRaftConfiguration(after.Configuration, before.Configuration) {
+		t.Fatal("missing readiness provider changed the Raft configuration")
+	}
+}
+
 func TestConfigurationChangeStagesOneCoveredTarget(t *testing.T) {
 	fixture := openConfigurationChangeFixture(t, true)
 	before := raftConfiguration(t, fixture.node)
+	plan := fixture.stagePlan(t)
 	index, err := fixture.node.changeRaftConfiguration(
 		testContext(t),
-		raftConfigurationChange{
-			kind:     raftChangeAddNonvoter,
-			deviceID: fixture.stageID,
-		},
+		plan,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("changeRaftConfiguration(): %v", err)
@@ -135,10 +192,8 @@ func TestConfigurationChangeStagesOneCoveredTarget(t *testing.T) {
 
 	secondIndex, err := fixture.node.changeRaftConfiguration(
 		testContext(t),
-		raftConfigurationChange{
-			kind:     raftChangeAddNonvoter,
-			deviceID: fixture.stageID,
-		},
+		plan,
+		nil,
 	)
 	if !errors.Is(err, ErrStaleConfigurationChange) || secondIndex != 0 {
 		t.Fatalf(
@@ -157,22 +212,56 @@ func TestConfigurationChangeStagesOneCoveredTarget(t *testing.T) {
 	}
 }
 
+func TestConfigurationChangeRefusesPromotionWithoutStagingEvidence(
+	t *testing.T,
+) {
+	fixture := openConfigurationChangeFixture(t, true)
+	if _, err := fixture.node.changeRaftConfiguration(
+		testContext(t),
+		fixture.stagePlan(t),
+		nil,
+	); err != nil {
+		t.Fatalf("stage target: %v", err)
+	}
+	if err := fixture.node.Barrier(testContext(t)); err != nil {
+		t.Fatalf("Barrier(): %v", err)
+	}
+	before := raftConfiguration(t, fixture.node)
+	plan := voterReconciliationPlan{
+		action:             voterReconciliationPromoteVoter,
+		deviceID:           fixture.stageID,
+		configurationIndex: before.Index,
+	}
+	index, err := fixture.node.changeRaftConfiguration(
+		testContext(t),
+		plan,
+		nil,
+	)
+	if !errors.Is(err, errVoterReconciliationChanged) || index != 0 {
+		t.Fatalf("promotion without proof = (%d, %v)", index, err)
+	}
+	after := raftConfiguration(t, fixture.node)
+	if after.Index != before.Index ||
+		!sameRaftConfiguration(after.Configuration, before.Configuration) {
+		t.Fatal("proofless promotion changed the Raft configuration")
+	}
+}
+
 func TestConfigurationCollectionDoesNotBlockApplyAndFreshnessWins(
 	t *testing.T,
 ) {
 	fixture := openConfigurationChangeFixture(t, true)
 	fixture.collector.entered = make(chan struct{})
 	fixture.collector.release = make(chan struct{})
+	plan := fixture.stagePlan(t)
 
 	changeDone := make(chan error, 1)
 	changeContext := testContext(t)
 	go func() {
 		_, err := fixture.node.changeRaftConfiguration(
 			changeContext,
-			raftConfigurationChange{
-				kind:     raftChangeAddNonvoter,
-				deviceID: fixture.stageID,
-			},
+			plan,
+			nil,
 		)
 		changeDone <- err
 	}()
@@ -221,15 +310,14 @@ func TestConfigurationCollectionIsCanceledByNodeClose(t *testing.T) {
 	fixture := openConfigurationChangeFixture(t, true)
 	fixture.collector.entered = make(chan struct{})
 	fixture.collector.release = make(chan struct{})
+	plan := fixture.stagePlan(t)
 
 	changeDone := make(chan error, 1)
 	go func() {
 		_, err := fixture.node.changeRaftConfiguration(
 			context.Background(),
-			raftConfigurationChange{
-				kind:     raftChangeAddNonvoter,
-				deviceID: fixture.stageID,
-			},
+			plan,
+			nil,
 		)
 		changeDone <- err
 	}()
@@ -281,10 +369,8 @@ func TestConfigurationChangeRejectsLeadershipEpochChange(t *testing.T) {
 
 	_, err := fixture.node.changeRaftConfiguration(
 		testContext(t),
-		raftConfigurationChange{
-			kind:     raftChangeAddNonvoter,
-			deviceID: fixture.stageID,
-		},
+		fixture.stagePlan(t),
+		nil,
 	)
 	if !errors.Is(err, ErrLeadershipEpochChanged) {
 		t.Fatalf("changeRaftConfiguration() error = %v", err)
@@ -348,16 +434,22 @@ func openConfigurationChangeFixture(
 
 	root := t.TempDir()
 	_, transport := raft.NewInmemTransport(raft.ServerAddress(ownerID))
-	node, err := OpenNode(context.Background(), NodeOptions{
-		ServerID:                ownerID,
-		StatePath:               filepath.Join(root, "state", "state.db"),
-		ConsensusDir:            filepath.Join(root, "consensus"),
-		OriginBootID:            nodeTestBootID1,
-		InitialState:            &initial,
-		BootstrapVoterDeviceIDs: []domain.DeviceID{ownerID},
-		CanonicalCoverage:       configuredCollector,
-		Clock:                   nodeTestClock(),
-		RaftConfig:              nodeTestRaftConfig(),
+	node, err := openNode(context.Background(), nodeOpenOptions{
+		ServerID:     ownerID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		BootstrapConfiguration: raft.Configuration{Servers: []raft.Server{{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(ownerID),
+			Address:  raft.ServerAddress(ownerID),
+		}}},
+		CanonicalCoverage:          configuredCollector,
+		ConfigurationReadiness:     configurationReadinessProvider{},
+		DisableVoterReconciliation: true,
+		Clock:                      nodeTestClock(),
+		RaftConfig:                 nodeTestRaftConfig(),
 		TransportFactory: func(ConsensusTransportGate) (
 			RaftTransport,
 			error,

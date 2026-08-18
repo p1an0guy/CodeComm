@@ -9,6 +9,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/agentsession"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
@@ -39,6 +40,15 @@ func TestStatusSnapshotReturnsOneBoundedTransactionalView(t *testing.T) {
 		member.ID,
 	}) {
 		t.Fatalf("voter target = %#v", snapshot.VoterSet.VoterDeviceIDs())
+	}
+	if !reflect.DeepEqual(
+		snapshot.CredentialAuthority.VoterDeviceIDs(),
+		[]domain.DeviceID{member.ID},
+	) {
+		t.Fatalf(
+			"credential authority = %#v",
+			snapshot.CredentialAuthority.VoterDeviceIDs(),
+		)
 	}
 	assertLocalQueryValues(t, snapshot.AgentSessions, []agentsession.Session{live})
 	assertLocalQueryValues(t, snapshot.Tasks, tasks[:1])
@@ -158,8 +168,14 @@ func openStatusSnapshotTestStore(
 			domain.UUIDv7(testSessionID),
 			0,
 			ProjectionWrites{
-				Devices:       []device.Device{member},
-				VoterSet:      []voterset.Set{voterSet},
+				Devices:  []device.Device{member},
+				VoterSet: []voterset.Set{voterSet},
+				CredentialAuthority: []CredentialAuthorityRow{{
+					SessionID:        domain.UUIDv7(testSessionID),
+					VoterDeviceIDs:   []domain.DeviceID{member.ID},
+					VoterSetVersion:  1,
+					ActivationSource: credentialauthority.ActivationGenesis,
+				}},
 				AgentSessions: []agentsession.Session{ended, live},
 				Tasks:         tasks,
 			},

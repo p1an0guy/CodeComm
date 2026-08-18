@@ -52,6 +52,84 @@ const (
 	StrongWritesBlocked   StrongWriteState = "blocked"
 )
 
+// ReconciliationState is the local operator view of voter-set convergence.
+type ReconciliationState string
+
+const (
+	ReconciliationStable      ReconciliationState = "stable"
+	ReconciliationPending     ReconciliationState = "pending"
+	ReconciliationReconciling ReconciliationState = "reconciling"
+)
+
+// ReconciliationStep names the next or currently blocked protocol action.
+type ReconciliationStep string
+
+const (
+	ReconciliationStepObserve            ReconciliationStep = "observe"
+	ReconciliationStepAddNonvoter        ReconciliationStep = "add-nonvoter"
+	ReconciliationStepProveNonvoter      ReconciliationStep = "prove-nonvoter"
+	ReconciliationStepPromoteVoter       ReconciliationStep = "promote-voter"
+	ReconciliationStepActivateAuthority  ReconciliationStep = "activate-authority"
+	ReconciliationStepTransferLeadership ReconciliationStep = "transfer-leadership"
+	ReconciliationStepRemoveVoter        ReconciliationStep = "remove-voter"
+	ReconciliationStepRemoveNonvoter     ReconciliationStep = "remove-nonvoter"
+	ReconciliationStepComplete           ReconciliationStep = "complete"
+)
+
+// Valid reports whether step belongs to the closed status vocabulary.
+func (step ReconciliationStep) Valid() bool {
+	switch step {
+	case ReconciliationStepObserve,
+		ReconciliationStepAddNonvoter,
+		ReconciliationStepProveNonvoter,
+		ReconciliationStepPromoteVoter,
+		ReconciliationStepActivateAuthority,
+		ReconciliationStepTransferLeadership,
+		ReconciliationStepRemoveVoter,
+		ReconciliationStepRemoveNonvoter,
+		ReconciliationStepComplete:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReconciliationBlocker is the bounded, non-sensitive failure class exposed
+// to operators while the committed voter target remains unchanged.
+type ReconciliationBlocker string
+
+const (
+	ReconciliationBlockerNone                  ReconciliationBlocker = "none"
+	ReconciliationBlockerCapabilityDisabled    ReconciliationBlocker = "capability-disabled"
+	ReconciliationBlockerObjectCoverage        ReconciliationBlocker = "object-coverage-degraded"
+	ReconciliationBlockerReadiness             ReconciliationBlocker = "credential-or-reachability"
+	ReconciliationBlockerTargetUnavailable     ReconciliationBlocker = "target-unavailable"
+	ReconciliationBlockerProofUnavailable      ReconciliationBlocker = "proof-unavailable"
+	ReconciliationBlockerActivationUnavailable ReconciliationBlocker = "activation-unavailable"
+	ReconciliationBlockerLeadershipTransfer    ReconciliationBlocker = "leadership-transfer-unavailable"
+	ReconciliationBlockerQuorum                ReconciliationBlocker = "quorum-unavailable"
+	ReconciliationBlockerRetrying              ReconciliationBlocker = "retrying"
+)
+
+// Valid reports whether blocker belongs to the closed status vocabulary.
+func (blocker ReconciliationBlocker) Valid() bool {
+	switch blocker {
+	case ReconciliationBlockerNone,
+		ReconciliationBlockerCapabilityDisabled,
+		ReconciliationBlockerObjectCoverage,
+		ReconciliationBlockerReadiness,
+		ReconciliationBlockerTargetUnavailable,
+		ReconciliationBlockerProofUnavailable,
+		ReconciliationBlockerActivationUnavailable,
+		ReconciliationBlockerLeadershipTransfer,
+		ReconciliationBlockerQuorum,
+		ReconciliationBlockerRetrying:
+		return true
+	default:
+		return false
+	}
+}
+
 // AppliedHeads names the durable positions represented by a status read.
 type AppliedHeads struct {
 	CurrentTerm             *uint64
@@ -65,16 +143,17 @@ type AppliedHeads struct {
 // DurableSnapshot is one transactionally consistent read of the local
 // coordination projections.
 type DurableSnapshot struct {
-	SessionID          domain.UUIDv7
-	WorkspaceID        domain.UUIDv4
-	RecoveryGeneration uint64
-	Heads              AppliedHeads
-	Member             device.Device
-	VoterSet           voterset.Set
-	AgentSessions      []agentsession.Session
-	Tasks              []task.Task
-	TaskTotal          uint64
-	TasksTruncated     bool
+	SessionID           domain.UUIDv7
+	WorkspaceID         domain.UUIDv4
+	RecoveryGeneration  uint64
+	Heads               AppliedHeads
+	Member              device.Device
+	VoterSet            voterset.Set
+	CredentialAuthority voterset.Set
+	AgentSessions       []agentsession.Session
+	Tasks               []task.Task
+	TaskTotal           uint64
+	TasksTruncated      bool
 }
 
 // RuntimeSnapshot contains volatile local consensus observations. It does not
@@ -85,9 +164,14 @@ type RuntimeSnapshot struct {
 	LocalDeviceID           domain.DeviceID
 	LeaderDeviceID          domain.DeviceID
 	LiveVoterDeviceIDs      []domain.DeviceID
+	LiveNonvoterDeviceIDs   []domain.DeviceID
 	QuorumRequired          int
 	StrongWrites            StrongWriteState
 	ConfigurationReconciled bool
+	ReconciliationState     ReconciliationState
+	ReconciliationStep      ReconciliationStep
+	ReconciliationBlocker   ReconciliationBlocker
+	ReconciliationDeviceID  domain.DeviceID
 }
 
 // Snapshot combines one durable cut with a nearby volatile observation.
@@ -121,16 +205,25 @@ func (snapshot Snapshot) Validate() error {
 		return invalid("strong-write state")
 	}
 	if len(runtime.LiveVoterDeviceIDs) < 1 ||
-		len(runtime.LiveVoterDeviceIDs) > voterset.MaxVoters ||
+		len(runtime.LiveVoterDeviceIDs) > int(policy.MaxMemberDevices) ||
+		len(runtime.LiveVoterDeviceIDs)+
+			len(runtime.LiveNonvoterDeviceIDs) >
+			int(policy.MaxMemberDevices) ||
 		runtime.QuorumRequired != len(runtime.LiveVoterDeviceIDs)/2+1 {
 		return invalid("live voter configuration")
 	}
-	var previous domain.DeviceID
-	for index, id := range runtime.LiveVoterDeviceIDs {
-		if !id.Valid() || index > 0 && previous >= id {
-			return invalid("live voter order")
+	if !validOrderedDeviceIDs(runtime.LiveVoterDeviceIDs) ||
+		!validOrderedDeviceIDs(runtime.LiveNonvoterDeviceIDs) {
+		return invalid("live configuration order")
+	}
+	voters := make(map[domain.DeviceID]struct{}, len(runtime.LiveVoterDeviceIDs))
+	for _, id := range runtime.LiveVoterDeviceIDs {
+		voters[id] = struct{}{}
+	}
+	for _, id := range runtime.LiveNonvoterDeviceIDs {
+		if _, exists := voters[id]; exists {
+			return invalid("live configuration overlap")
 		}
-		previous = id
 	}
 	if runtime.LeaderDeviceID != "" &&
 		!runtime.LeaderDeviceID.Valid() {
@@ -152,6 +245,40 @@ func (snapshot Snapshot) Validate() error {
 		runtime.StrongWrites != StrongWritesBlocked {
 		return invalid("halted strong writes")
 	}
+	if !runtime.ReconciliationStep.Valid() ||
+		!runtime.ReconciliationBlocker.Valid() {
+		return invalid("reconciliation detail")
+	}
+	switch runtime.ReconciliationState {
+	case ReconciliationStable:
+		if !runtime.ConfigurationReconciled ||
+			runtime.ReconciliationStep != ReconciliationStepComplete ||
+			runtime.ReconciliationBlocker != ReconciliationBlockerNone ||
+			runtime.ReconciliationDeviceID != "" {
+			return invalid("stable reconciliation")
+		}
+	case ReconciliationPending, ReconciliationReconciling:
+		if runtime.ConfigurationReconciled ||
+			runtime.ReconciliationStep == ReconciliationStepComplete {
+			return invalid("unfinished reconciliation")
+		}
+	default:
+		return invalid("reconciliation state")
+	}
+	if runtime.ReconciliationDeviceID != "" &&
+		!runtime.ReconciliationDeviceID.Valid() {
+		return invalid("reconciliation device")
+	}
+	targetIDs := snapshot.Durable.VoterSet.VoterDeviceIDs()
+	authorityIDs := snapshot.Durable.CredentialAuthority.VoterDeviceIDs()
+	exactlyReconciled := len(runtime.LiveNonvoterDeviceIDs) == 0 &&
+		sameDeviceIDs(runtime.LiveVoterDeviceIDs, targetIDs) &&
+		snapshot.Durable.CredentialAuthority.VoterSetVersion ==
+			snapshot.Durable.VoterSet.VoterSetVersion &&
+		sameDeviceIDs(authorityIDs, targetIDs)
+	if runtime.ConfigurationReconciled != exactlyReconciled {
+		return invalid("reconciliation exactness")
+	}
 	return nil
 }
 
@@ -171,6 +298,12 @@ func (snapshot DurableSnapshot) Validate() error {
 	if err := snapshot.VoterSet.Validate(); err != nil ||
 		snapshot.VoterSet.SessionID != snapshot.SessionID {
 		return invalid("voter target: %v", err)
+	}
+	if err := snapshot.CredentialAuthority.Validate(); err != nil ||
+		snapshot.CredentialAuthority.SessionID != snapshot.SessionID ||
+		snapshot.CredentialAuthority.VoterSetVersion >
+			snapshot.VoterSet.VoterSetVersion {
+		return invalid("credential authority: %v", err)
 	}
 	if len(snapshot.AgentSessions) > MaxAgentSessions {
 		return invalid("agent-session count")
@@ -209,6 +342,29 @@ func (snapshot DurableSnapshot) Validate() error {
 		priorTaskID = value.ID
 	}
 	return nil
+}
+
+func validOrderedDeviceIDs(values []domain.DeviceID) bool {
+	var previous domain.DeviceID
+	for index, id := range values {
+		if !id.Valid() || index > 0 && previous >= id {
+			return false
+		}
+		previous = id
+	}
+	return true
+}
+
+func sameDeviceIDs(left, right []domain.DeviceID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (snapshot DurableSnapshot) validateHeads() error {

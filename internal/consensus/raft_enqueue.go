@@ -3,9 +3,12 @@ package consensus
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/raft"
 )
+
+const raftCommitRecoveryPollInterval = 10 * time.Millisecond
 
 // raftEnqueueGuard serializes the ordering cut shared by application commands
 // and membership changes. Slow receipt collection happens before acquisition.
@@ -30,7 +33,7 @@ func (node *SingleNode) acquireRaftEnqueue(
 	}
 	select {
 	case node.raftEnqueue <- struct{}{}:
-		if err := node.preEnqueueError(ctx); err != nil {
+		if err := node.waitForRaftCommitRecovery(ctx); err != nil {
 			<-node.raftEnqueue
 			return nil, err
 		}
@@ -70,6 +73,65 @@ func (node *SingleNode) enqueueRaftApply(
 		return nil, ErrInvalidNodeOptions
 	}
 	return node.raft.Apply(command, contextTimeout(ctx)), nil
+}
+
+// waitForRaftCommitRecovery prevents a cold leader from accepting an
+// application or barrier before its election no-op has recovered the volatile
+// commit index. Calling Raft while this node is not leader is also forbidden:
+// an API send racing a follower-to-leader transition could otherwise be
+// consumed by the new leader before that no-op commits.
+func (node *SingleNode) waitForRaftCommitRecovery(
+	ctx context.Context,
+) error {
+	if node == nil ||
+		node.raft == nil ||
+		node.closeStarted == nil ||
+		node.fatalSet == nil ||
+		ctx == nil {
+		return ErrInvalidNodeOptions
+	}
+	ticker := time.NewTicker(raftCommitRecoveryPollInterval)
+	defer ticker.Stop()
+	for {
+		if err := node.preEnqueueError(ctx); err != nil {
+			return err
+		}
+		if node.raft.State() != raft.Leader {
+			return raft.ErrNotLeader
+		}
+		if node.raft.CommitIndex() > 0 {
+			if node.raft.State() != raft.Leader {
+				return raft.ErrNotLeader
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-node.closeStarted:
+			return ErrNodeClosed
+		case <-node.fatalSet:
+			return node.FatalError()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (node *SingleNode) waitRaftBarrier(ctx context.Context) error {
+	future, err := node.enqueueRaftBarrier(ctx)
+	if err != nil {
+		return err
+	}
+	return waitFuture(ctx, future)
+}
+
+func (node *SingleNode) enqueueRaftBarrier(
+	ctx context.Context,
+) (raft.Future, error) {
+	if err := node.waitForRaftCommitRecovery(ctx); err != nil {
+		return nil, err
+	}
+	return node.raft.Barrier(contextTimeout(ctx)), nil
 }
 
 // waitRaftFutureWithGuard keeps the enqueue cut closed until future resolves.

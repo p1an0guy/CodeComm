@@ -112,7 +112,9 @@ func decodeConsensusProofMode(encoded []byte) (string, error) {
 	}
 	switch header.Mode {
 	case consensusProofModeStagingApply,
-		consensusProofModeCheckpointSign:
+		consensusProofModeCheckpointSign,
+		consensusProofModeTargetActivation,
+		consensusProofModeAuthorityHandoff:
 		return header.Mode, nil
 	default:
 		return "", ErrInvalidCheckpointProof

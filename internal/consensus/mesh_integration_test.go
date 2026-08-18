@@ -36,6 +36,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
+	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"go.etcd.io/bbolt"
 )
 
@@ -392,6 +393,7 @@ type secureMeshNode struct {
 	startCount   int
 
 	checkpointSigningDisabled atomic.Bool
+	commitProbeRelease        <-chan struct{}
 	node                      *Node
 	stream                    *transport.ConsensusStreamLayer
 	ingress                   *transport.Ingress
@@ -401,11 +403,13 @@ type secureMeshNode struct {
 }
 
 type secureMeshHarness struct {
-	initial   store.InitialState
-	bootstrap []domain.DeviceID
-	nodes     []*secureMeshNode
-	resolver  secureMeshResolver
-	topology  *secureMeshTopology
+	initial                   store.InitialState
+	bootstrap                 []domain.DeviceID
+	nodes                     []*secureMeshNode
+	resolver                  secureMeshResolver
+	topology                  *secureMeshTopology
+	coverage                  *configurationCoverageCollector
+	manualVoterReconciliation bool
 }
 
 type secureMeshCheckpointOrigin struct {
@@ -415,6 +419,7 @@ type secureMeshCheckpointOrigin struct {
 	bootID    domain.UUIDv7
 	exclusive chan struct{}
 	reserved  uint64
+	dynamicID bool
 }
 
 func (origin *secureMeshCheckpointOrigin) DeviceID() domain.DeviceID {
@@ -458,7 +463,7 @@ func (origin *secureMeshCheckpointOrigin) RunExclusive(
 			return event.SignedEvent{}, err
 		}
 		eventID := meshForcedCheckpointEventID
-		if origin.reserved > 0 {
+		if origin.dynamicID || origin.reserved > 0 {
 			generated, err := uuid.NewV7()
 			if err != nil {
 				return event.SignedEvent{}, err
@@ -498,6 +503,13 @@ func (origin *secureMeshCheckpointOrigin) RunExclusive(
 }
 
 func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
+	return newSecureMeshHarnessWithManualReconciliation(t, false)
+}
+
+func newSecureMeshHarnessWithManualReconciliation(
+	t *testing.T,
+	manual bool,
+) *secureMeshHarness {
 	t.Helper()
 	root := t.TempDir()
 	identities := make([]secureMeshIdentity, 3)
@@ -542,10 +554,16 @@ func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
 	})
 
 	harness := &secureMeshHarness{
-		topology: newSecureMeshTopology(),
-		resolver: make(secureMeshResolver, len(identities)),
+		topology:                  newSecureMeshTopology(),
+		resolver:                  make(secureMeshResolver, len(identities)),
+		manualVoterReconciliation: manual,
 	}
+	coverageKeys := make(
+		map[domain.DeviceID]ed25519.PrivateKey,
+		len(identities),
+	)
 	for index, identity := range identities {
+		coverageKeys[identity.deviceID] = identity.private
 		endpoint := netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 10)}),
 			47831,
@@ -561,6 +579,9 @@ func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
 		harness.nodes = append(harness.nodes, candidate)
 		harness.bootstrap = append(harness.bootstrap, identity.deviceID)
 		harness.resolver[identity.deviceID] = endpoint
+	}
+	harness.coverage = &configurationCoverageCollector{
+		privateKeys: coverageKeys,
 	}
 	harness.initial = secureMeshInitialState(t, identities)
 	for _, candidate := range harness.nodes {
@@ -644,91 +665,155 @@ func (harness *secureMeshHarness) startNode(
 	bootID := candidate.identity.bootIDs[candidate.startCount]
 	candidate.startCount++
 	candidate.nextSequence = 1
-	node, err := OpenNode(context.Background(), NodeOptions{
-		ServerID:                candidate.identity.deviceID,
-		StatePath:               candidate.statePath,
-		ConsensusDir:            candidate.consensusDir,
-		OriginBootID:            bootID,
-		InitialState:            initial,
-		BootstrapVoterDeviceIDs: harness.bootstrap,
-		CheckpointSigner: CheckpointSignerAdapter{
-			SignerDeviceID: candidate.identity.deviceID,
-			Sign: func(
-				ctx context.Context,
-				checkpoint domain.Checkpoint,
-			) (store.Signature, error) {
-				if err := ctx.Err(); err != nil {
-					return store.Signature{}, err
-				}
-				if candidate.checkpointSigningDisabled.Load() {
-					return store.Signature{},
-						errConsensusCheckpointSignerUnavailable
-				}
-				signature, err := event.SignCheckpoint(
-					checkpoint,
-					candidate.identity.private,
-				)
-				if err != nil {
-					return store.Signature{}, err
-				}
-				return store.Signature(signature), nil
+	checkpointSigner := CheckpointSignerAdapter{
+		SignerDeviceID: candidate.identity.deviceID,
+		Sign: func(
+			ctx context.Context,
+			checkpoint domain.Checkpoint,
+		) (store.Signature, error) {
+			if err := ctx.Err(); err != nil {
+				return store.Signature{}, err
+			}
+			if candidate.checkpointSigningDisabled.Load() {
+				return store.Signature{},
+					errConsensusCheckpointSignerUnavailable
+			}
+			signature, err := event.SignCheckpoint(
+				checkpoint,
+				candidate.identity.private,
+			)
+			if err != nil {
+				return store.Signature{}, err
+			}
+			return store.Signature(signature), nil
+		},
+	}
+	activationSigner := VoterActivationSignerAdapter{
+		SignerDeviceID: candidate.identity.deviceID,
+		SignProof: func(
+			ctx context.Context,
+			unsigned voteractivation.UnsignedProof,
+		) ([ed25519.SignatureSize]byte, error) {
+			if err := ctx.Err(); err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			proof, err := voteractivation.SignProof(
+				unsigned,
+				candidate.identity.private,
+			)
+			if err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			return proof.VoterSignature(), nil
+		},
+		SignHandoff: func(
+			ctx context.Context,
+			unsigned voteractivation.UnsignedAuthorityHandoff,
+		) ([ed25519.SignatureSize]byte, error) {
+			if err := ctx.Err(); err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			payload, err := voteractivation.SignAuthorityHandoff(
+				unsigned,
+				candidate.identity.private,
+			)
+			if err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			return payload.HandoffSignature(), nil
+		},
+	}
+	checkpointOrigin := &secureMeshCheckpointOrigin{
+		t:         t,
+		harness:   harness,
+		candidate: candidate,
+		bootID:    bootID,
+		exclusive: make(chan struct{}, 1),
+		dynamicID: harness.manualVoterReconciliation,
+	}
+	commitProbeRelease := candidate.commitProbeRelease
+	transportFactory := func(
+		gate ConsensusTransportGate,
+	) (RaftTransport, error) {
+		verifiers, err := peerauth.NewVerifiers(
+			gate.PeerAdmissionSnapshot,
+			time.Now,
+		)
+		if err != nil {
+			return nil, err
+		}
+		stream, err := transport.NewConsensusStreamLayer(
+			transport.ConsensusStreamOptions{
+				LocalDeviceID:       candidate.identity.deviceID,
+				IdentityCertificate: candidate.identity.certificate,
+				Endpoints:           harness.resolver,
+				Dialer: secureMeshDialer{
+					localDeviceID: candidate.identity.deviceID,
+					topology:      harness.topology,
+				},
+				VerifyExpectedPeer:   verifiers.VerifyExpectedConsensusPeer,
+				AuthorizePeer:        gate.AuthorizePeer,
+				AuthorizationChanges: gate.AuthorizationChanges(),
+				ControlHandler:       gate.ConsensusControlHandler(),
 			},
-		},
-		CheckpointOrigin: &secureMeshCheckpointOrigin{
-			t:         t,
-			harness:   harness,
-			candidate: candidate,
-			bootID:    bootID,
-			exclusive: make(chan struct{}, 1),
-		},
-		Clock:      nodeTestClock(),
-		RaftConfig: secureMeshRaftConfig(),
-		TransportFactory: func(
-			gate ConsensusTransportGate,
-		) (RaftTransport, error) {
-			verifiers, err := peerauth.NewVerifiers(
-				gate.PeerAdmissionSnapshot,
-				time.Now,
-			)
-			if err != nil {
-				return nil, err
+		)
+		if err != nil {
+			return nil, err
+		}
+		authorizeCommitProbe := gate.AuthorizeCommitProbe
+		if commitProbeRelease != nil {
+			authorizeCommitProbe = func(
+				deviceID domain.DeviceID,
+			) error {
+				<-commitProbeRelease
+				return gate.AuthorizeCommitProbe(deviceID)
 			}
-			stream, err := transport.NewConsensusStreamLayer(
-				transport.ConsensusStreamOptions{
-					LocalDeviceID:       candidate.identity.deviceID,
-					IdentityCertificate: candidate.identity.certificate,
-					Endpoints:           harness.resolver,
-					Dialer: secureMeshDialer{
-						localDeviceID: candidate.identity.deviceID,
-						topology:      harness.topology,
-					},
-					VerifyExpectedPeer:   verifiers.VerifyExpectedConsensusPeer,
-					AuthorizePeer:        gate.AuthorizePeer,
-					AuthorizationChanges: gate.AuthorizationChanges(),
-					ControlHandler:       gate.ConsensusControlHandler(),
-				},
-			)
-			if err != nil {
-				return nil, err
-			}
-			raftTransport, err := transport.NewConsensusNetworkTransport(
-				transport.ConsensusNetworkTransportOptions{
-					Stream:               stream,
-					LocalServerID:        raft.ServerID(candidate.identity.deviceID),
-					Timeout:              2 * time.Second,
-					Logger:               hclog.NewNullLogger(),
-					AuthorizeReplication: gate.AuthorizeReplication,
-					AuthorizeCommitProbe: gate.AuthorizeCommitProbe,
-				},
-			)
-			if err != nil {
-				_ = stream.Close()
-				return nil, err
-			}
-			candidate.stream = stream
-			candidate.verifiers = verifiers
-			return raftTransport, nil
-		},
+		}
+		raftTransport, err := transport.NewConsensusNetworkTransport(
+			transport.ConsensusNetworkTransportOptions{
+				Stream:               stream,
+				LocalServerID:        raft.ServerID(candidate.identity.deviceID),
+				Timeout:              2 * time.Second,
+				Logger:               hclog.NewNullLogger(),
+				AuthorizeReplication: gate.AuthorizeReplication,
+				AuthorizeCommitProbe: authorizeCommitProbe,
+			},
+		)
+		if err != nil {
+			_ = stream.Close()
+			return nil, err
+		}
+		candidate.stream = stream
+		candidate.verifiers = verifiers
+		return raftTransport, nil
+	}
+	bootstrap, bootstrapErr := meshBootstrapConfiguration(
+		candidate.identity.deviceID,
+		harness.bootstrap,
+	)
+	if bootstrapErr != nil {
+		_ = listener.Close()
+		t.Fatalf(
+			"meshBootstrapConfiguration(%s): %v",
+			candidate.identity.deviceID,
+			bootstrapErr,
+		)
+	}
+	node, err := openNode(context.Background(), nodeOpenOptions{
+		ServerID:                   candidate.identity.deviceID,
+		StatePath:                  candidate.statePath,
+		ConsensusDir:               candidate.consensusDir,
+		OriginBootID:               bootID,
+		InitialState:               initial,
+		TransportFactory:           transportFactory,
+		BootstrapConfiguration:     bootstrap,
+		CanonicalCoverage:          harness.coverage,
+		CheckpointSigner:           checkpointSigner,
+		VoterActivationSigner:      activationSigner,
+		CheckpointOrigin:           checkpointOrigin,
+		DisableVoterReconciliation: true,
+		Clock:                      nodeTestClock(),
+		RaftConfig:                 secureMeshRaftConfig(),
 	})
 	if err != nil {
 		_ = listener.Close()

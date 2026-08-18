@@ -239,10 +239,7 @@ func (node *SingleNode) forceCheckpointAttempt(
 	if err != nil {
 		return store.AppliedCheckpointLookup{}, false, err
 	}
-	if err := waitFuture(
-		ctx,
-		node.raft.Barrier(contextTimeout(ctx)),
-	); err != nil {
+	if err := node.waitRaftBarrier(ctx); err != nil {
 		return store.AppliedCheckpointLookup{}, false, err
 	}
 	if err := node.requireConfigurationLeadershipEpoch(

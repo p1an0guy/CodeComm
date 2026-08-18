@@ -81,19 +81,23 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 
 	const (
 		applyAdapter         = "enqueueRaftApply"
+		barrierAdapter       = "enqueueRaftBarrier"
 		configurationAdapter = "invokeRaftConfigurationChange"
 	)
 	allowed := map[string]string{
-		"Apply":        applyAdapter,
-		"AddVoter":     configurationAdapter,
-		"AddNonvoter":  configurationAdapter,
-		"DemoteVoter":  configurationAdapter,
-		"RemoveServer": configurationAdapter,
+		"Apply":                      applyAdapter,
+		"Barrier":                    barrierAdapter,
+		"AddVoter":                   configurationAdapter,
+		"AddNonvoter":                configurationAdapter,
+		"DemoteVoter":                configurationAdapter,
+		"RemoveServer":               configurationAdapter,
+		"LeadershipTransferToServer": "invokeRaftLeadershipTransfer",
 	}
 	forbidden := map[string]struct{}{
-		"ApplyLog":   {},
-		"AddPeer":    {},
-		"RemovePeer": {},
+		"ApplyLog":           {},
+		"AddPeer":            {},
+		"RemovePeer":         {},
+		"LeadershipTransfer": {},
 	}
 	counts := make(map[string]int, len(allowed))
 	forbiddenCounts := make(map[string]int, len(forbidden))
@@ -108,6 +112,25 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 			},
 			count: 2,
 		},
+		"enqueueRaftBarrier": {
+			functions: map[string]struct{}{
+				"waitRaftBarrier":         {},
+				"changeRaftConfiguration": {},
+				"transferLeadership":      {},
+			},
+			count: 3,
+		},
+		"waitRaftBarrier": {
+			functions: map[string]struct{}{
+				"WaitForLeader":           {},
+				"Barrier":                 {},
+				"forceCheckpointAttempt":  {},
+				"voterReconciliationCut":  {},
+				"changeRaftConfiguration": {},
+				"transferLeadership":      {},
+			},
+			count: 6,
+		},
 		"invokeRaftConfigurationChange": {
 			functions: map[string]struct{}{
 				"changeRaftConfiguration": {},
@@ -118,7 +141,19 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 			functions: map[string]struct{}{
 				"reconcileVoterSet": {},
 			},
-			count: 0,
+			count: 1,
+		},
+		"invokeRaftLeadershipTransfer": {
+			functions: map[string]struct{}{
+				"transferLeadership": {},
+			},
+			count: 1,
+		},
+		"transferLeadership": {
+			functions: map[string]struct{}{
+				"reconcileVoterSet": {},
+			},
+			count: 1,
 		},
 	}
 	adapterCounts := make(map[string]int, len(adapterCallers))
