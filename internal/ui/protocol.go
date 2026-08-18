@@ -8,6 +8,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/agentsession"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 )
@@ -39,15 +40,22 @@ type SessionStatus struct {
 }
 
 type ConsensusStatus struct {
-	State                   string   `json:"state"`
-	Role                    string   `json:"role"`
-	LeaderDeviceID          *string  `json:"leader_device_id"`
-	LiveVoterDeviceIDs      []string `json:"live_voter_device_ids"`
-	TargetVoterDeviceIDs    []string `json:"target_voter_device_ids"`
-	VoterSetVersion         uint64   `json:"voter_set_version"`
-	QuorumRequired          int      `json:"quorum_required"`
-	StrongWrites            string   `json:"strong_writes"`
-	ConfigurationReconciled bool     `json:"configuration_reconciled"`
+	State                    string   `json:"state"`
+	Role                     string   `json:"role"`
+	LeaderDeviceID           *string  `json:"leader_device_id"`
+	LiveVoterDeviceIDs       []string `json:"live_voter_device_ids"`
+	LiveNonvoterDeviceIDs    []string `json:"live_nonvoter_device_ids"`
+	TargetVoterDeviceIDs     []string `json:"target_voter_device_ids"`
+	ActivatedVoterDeviceIDs  []string `json:"activated_voter_device_ids"`
+	VoterSetVersion          uint64   `json:"voter_set_version"`
+	ActivatedVoterSetVersion uint64   `json:"activated_voter_set_version"`
+	QuorumRequired           int      `json:"quorum_required"`
+	StrongWrites             string   `json:"strong_writes"`
+	ConfigurationReconciled  bool     `json:"configuration_reconciled"`
+	ReconciliationState      string   `json:"reconciliation_state"`
+	ReconciliationStep       string   `json:"reconciliation_step"`
+	ReconciliationBlocker    string   `json:"reconciliation_blocker"`
+	ReconciliationDeviceID   *string  `json:"reconciliation_device_id"`
 }
 
 type AgentStatus struct {
@@ -177,21 +185,44 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 		return fmt.Errorf("ui: invalid strong-write state")
 	}
 	if value.LiveVoterDeviceIDs == nil ||
+		value.LiveNonvoterDeviceIDs == nil ||
 		value.TargetVoterDeviceIDs == nil ||
+		value.ActivatedVoterDeviceIDs == nil ||
 		len(value.LiveVoterDeviceIDs) < 1 ||
-		len(value.LiveVoterDeviceIDs) > 5 ||
-		len(value.TargetVoterDeviceIDs) < 1 ||
-		len(value.TargetVoterDeviceIDs) > 5 ||
+		len(value.LiveVoterDeviceIDs) > int(policy.MaxMemberDevices) ||
+		len(value.LiveVoterDeviceIDs)+
+			len(value.LiveNonvoterDeviceIDs) >
+			int(policy.MaxMemberDevices) ||
+		!validVoterSetSize(len(value.TargetVoterDeviceIDs)) ||
+		!validVoterSetSize(len(value.ActivatedVoterDeviceIDs)) ||
 		value.QuorumRequired != len(value.LiveVoterDeviceIDs)/2+1 ||
 		value.VoterSetVersion < 1 ||
-		!domain.ValidUnsignedInteger(value.VoterSetVersion) {
+		!domain.ValidUnsignedInteger(value.VoterSetVersion) ||
+		value.ActivatedVoterSetVersion < 1 ||
+		value.ActivatedVoterSetVersion > value.VoterSetVersion ||
+		!domain.ValidUnsignedInteger(value.ActivatedVoterSetVersion) {
 		return fmt.Errorf("ui: invalid voter status")
 	}
 	if err := validateDeviceIDs(value.LiveVoterDeviceIDs); err != nil {
 		return err
 	}
+	if err := validateDeviceIDs(value.LiveNonvoterDeviceIDs); err != nil {
+		return err
+	}
 	if err := validateDeviceIDs(value.TargetVoterDeviceIDs); err != nil {
 		return err
+	}
+	if err := validateDeviceIDs(value.ActivatedVoterDeviceIDs); err != nil {
+		return err
+	}
+	liveVoters := make(map[string]struct{}, len(value.LiveVoterDeviceIDs))
+	for _, id := range value.LiveVoterDeviceIDs {
+		liveVoters[id] = struct{}{}
+	}
+	for _, id := range value.LiveNonvoterDeviceIDs {
+		if _, exists := liveVoters[id]; exists {
+			return fmt.Errorf("ui: overlapping live voter and nonvoter")
+		}
 	}
 	if value.LeaderDeviceID != nil &&
 		!domain.DeviceID(*value.LeaderDeviceID).Valid() {
@@ -208,7 +239,76 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 		value.StrongWrites != string(coordstatus.StrongWritesBlocked) {
 		return fmt.Errorf("ui: halted consensus is not blocked")
 	}
+	reconciliationState := coordstatus.ReconciliationState(
+		value.ReconciliationState,
+	)
+	switch reconciliationState {
+	case coordstatus.ReconciliationStable,
+		coordstatus.ReconciliationPending,
+		coordstatus.ReconciliationReconciling:
+	default:
+		return fmt.Errorf("ui: invalid reconciliation state")
+	}
+	reconciliationStep := coordstatus.ReconciliationStep(
+		value.ReconciliationStep,
+	)
+	reconciliationBlocker := coordstatus.ReconciliationBlocker(
+		value.ReconciliationBlocker,
+	)
+	if !reconciliationStep.Valid() ||
+		!reconciliationBlocker.Valid() {
+		return fmt.Errorf("ui: invalid reconciliation detail")
+	}
+	if value.ReconciliationDeviceID != nil &&
+		!domain.DeviceID(*value.ReconciliationDeviceID).Valid() {
+		return fmt.Errorf("ui: invalid reconciliation device")
+	}
+	exactlyReconciled := len(value.LiveNonvoterDeviceIDs) == 0 &&
+		value.VoterSetVersion == value.ActivatedVoterSetVersion &&
+		sameStrings(
+			value.LiveVoterDeviceIDs,
+			value.TargetVoterDeviceIDs,
+		) &&
+		sameStrings(
+			value.ActivatedVoterDeviceIDs,
+			value.TargetVoterDeviceIDs,
+		)
+	if value.ConfigurationReconciled != exactlyReconciled {
+		return fmt.Errorf("ui: invalid reconciliation exactness")
+	}
+	switch reconciliationState {
+	case coordstatus.ReconciliationStable:
+		if !value.ConfigurationReconciled ||
+			reconciliationStep != coordstatus.ReconciliationStepComplete ||
+			reconciliationBlocker !=
+				coordstatus.ReconciliationBlockerNone ||
+			value.ReconciliationDeviceID != nil {
+			return fmt.Errorf("ui: invalid stable reconciliation")
+		}
+	case coordstatus.ReconciliationPending,
+		coordstatus.ReconciliationReconciling:
+		if value.ConfigurationReconciled ||
+			reconciliationStep == coordstatus.ReconciliationStepComplete {
+			return fmt.Errorf("ui: invalid unfinished reconciliation")
+		}
+	}
 	return nil
+}
+
+func validVoterSetSize(size int) bool {
+	return size == 1 || size == 3 || size == 5
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateDeviceIDs(values []string) error {

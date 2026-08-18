@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 )
 
 func TestModelRetainsLastGoodStatusAsExplicitlyStale(t *testing.T) {
@@ -121,6 +123,56 @@ func TestModelViewFitsTerminalAndSanitizesUntrustedText(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestModelViewNamesVoterReconciliationBlocker(t *testing.T) {
+	snapshot := snapshotFromCoordination(uiTestStatusSnapshot(t))
+	targets := []string{
+		snapshot.Session.LocalDeviceID,
+		"cc1" + strings.Repeat("a", 64),
+		"cc1" + strings.Repeat("b", 64),
+	}
+	sort.Strings(targets)
+	blockedDevice := targets[0]
+	if blockedDevice == snapshot.Session.LocalDeviceID {
+		blockedDevice = targets[1]
+	}
+	snapshot.Consensus.TargetVoterDeviceIDs = targets
+	snapshot.Consensus.VoterSetVersion++
+	snapshot.Consensus.ConfigurationReconciled = false
+	snapshot.Consensus.ReconciliationState = string(
+		coordstatus.ReconciliationReconciling,
+	)
+	snapshot.Consensus.ReconciliationStep = string(
+		coordstatus.ReconciliationStepAddNonvoter,
+	)
+	snapshot.Consensus.ReconciliationBlocker = string(
+		coordstatus.ReconciliationBlockerObjectCoverage,
+	)
+	snapshot.Consensus.ReconciliationDeviceID = &blockedDevice
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("transition snapshot: %v", err)
+	}
+
+	model := Model{
+		snapshot:    snapshot,
+		hasSnapshot: true,
+		connection:  ConnectionLive,
+		lastGoodAt:  time.Now(),
+		clock:       time.Now,
+		width:       80,
+		height:      24,
+	}
+	view := model.View()
+	for _, expected := range []string{
+		"Voter transition RECONCILING",
+		"step add-nonvoter",
+		"object-coverage-degraded",
+	} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("view omitted %q:\n%s", expected, view)
+		}
 	}
 }
 

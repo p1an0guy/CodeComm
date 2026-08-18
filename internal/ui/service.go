@@ -170,6 +170,11 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 	for index, value := range durable.Tasks {
 		tasks[index] = taskStatus(value)
 	}
+	var reconciliationDevice *string
+	if runtime.ReconciliationDeviceID != "" {
+		value := string(runtime.ReconciliationDeviceID)
+		reconciliationDevice = &value
+	}
 	return Snapshot{
 		Session: SessionStatus{
 			SessionID:          string(durable.SessionID),
@@ -191,15 +196,27 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 			ProjectionVersion: durable.Heads.ProjectionSchemaVersion,
 		},
 		Consensus: ConsensusStatus{
-			State:                   string(runtime.State),
-			Role:                    string(runtime.Role),
-			LeaderDeviceID:          leader,
-			LiveVoterDeviceIDs:      deviceIDStrings(runtime.LiveVoterDeviceIDs),
-			TargetVoterDeviceIDs:    deviceIDStrings(durable.VoterSet.VoterDeviceIDs()),
-			VoterSetVersion:         durable.VoterSet.VoterSetVersion,
+			State:              string(runtime.State),
+			Role:               string(runtime.Role),
+			LeaderDeviceID:     leader,
+			LiveVoterDeviceIDs: deviceIDStrings(runtime.LiveVoterDeviceIDs),
+			LiveNonvoterDeviceIDs: deviceIDStrings(
+				runtime.LiveNonvoterDeviceIDs,
+			),
+			TargetVoterDeviceIDs: deviceIDStrings(durable.VoterSet.VoterDeviceIDs()),
+			ActivatedVoterDeviceIDs: deviceIDStrings(
+				durable.CredentialAuthority.VoterDeviceIDs(),
+			),
+			VoterSetVersion: durable.VoterSet.VoterSetVersion,
+			ActivatedVoterSetVersion: durable.CredentialAuthority.
+				VoterSetVersion,
 			QuorumRequired:          runtime.QuorumRequired,
 			StrongWrites:            string(runtime.StrongWrites),
 			ConfigurationReconciled: runtime.ConfigurationReconciled,
+			ReconciliationState:     string(runtime.ReconciliationState),
+			ReconciliationStep:      string(runtime.ReconciliationStep),
+			ReconciliationBlocker:   string(runtime.ReconciliationBlocker),
+			ReconciliationDeviceID:  reconciliationDevice,
 		},
 		Agents:    agents,
 		Tasks:     tasks,

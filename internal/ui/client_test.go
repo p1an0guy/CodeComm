@@ -99,6 +99,20 @@ func TestDecodeStatusResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {
 				consensus["state"] = "healthy"
 			},
 		},
+		{
+			name: "unknown reconciliation blocker",
+			mutate: func(value map[string]any) {
+				consensus := value["consensus"].(map[string]any)
+				consensus["reconciliation_blocker"] = "anything-goes"
+			},
+		},
+		{
+			name: "false reconciliation exactness",
+			mutate: func(value map[string]any) {
+				consensus := value["consensus"].(map[string]any)
+				consensus["configuration_reconciled"] = false
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

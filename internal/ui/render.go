@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/charmbracelet/x/ansi"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 )
 
 func (model Model) View() string {
@@ -135,6 +136,31 @@ func (model Model) View() string {
 				width,
 			)...,
 		)
+	}
+	if snapshot.Consensus.ReconciliationState !=
+		string(coordstatus.ReconciliationStable) {
+		reconciliation := fmt.Sprintf(
+			"Voter transition %s  step %s",
+			strings.ToUpper(
+				sanitizeTerminalText(
+					snapshot.Consensus.ReconciliationState,
+				),
+			),
+			sanitizeTerminalText(
+				snapshot.Consensus.ReconciliationStep,
+			),
+		)
+		if snapshot.Consensus.ReconciliationBlocker !=
+			string(coordstatus.ReconciliationBlockerNone) {
+			reconciliation += "  blocker " + sanitizeTerminalText(
+				snapshot.Consensus.ReconciliationBlocker,
+			)
+		}
+		if snapshot.Consensus.ReconciliationDeviceID != nil {
+			reconciliation += "  device " +
+				deviceIDs[*snapshot.Consensus.ReconciliationDeviceID]
+		}
+		lines = append(lines, wrapLine(reconciliation, width)...)
 	}
 
 	lines = append(lines, "", fitLine(
@@ -307,8 +333,22 @@ func statusIDMaps(
 	)
 	deviceValues = append(
 		deviceValues,
+		snapshot.Consensus.LiveNonvoterDeviceIDs...,
+	)
+	deviceValues = append(
+		deviceValues,
 		snapshot.Consensus.TargetVoterDeviceIDs...,
 	)
+	deviceValues = append(
+		deviceValues,
+		snapshot.Consensus.ActivatedVoterDeviceIDs...,
+	)
+	if snapshot.Consensus.ReconciliationDeviceID != nil {
+		deviceValues = append(
+			deviceValues,
+			*snapshot.Consensus.ReconciliationDeviceID,
+		)
+	}
 	agentValues := make([]string, 0, len(snapshot.Agents))
 	taskValues := make([]string, 0, len(snapshot.Tasks))
 	for _, agent := range snapshot.Agents {
