@@ -162,6 +162,22 @@ func (authorization Authorization) Validate() error {
 	return nil
 }
 
+// ActiveAt reports whether an otherwise-valid authorization is active at the
+// exact supplied instant. Activation includes NotBefore and excludes expiry.
+func (authorization Authorization) ActiveAt(at time.Time) bool {
+	if at.IsZero() || authorization.Validate() != nil {
+		return false
+	}
+	notBefore, err := authorization.NotBefore.Time()
+	if err != nil {
+		return false
+	}
+	expiresAt := notBefore.Add(
+		time.Duration(authorization.ValiditySeconds) * time.Second,
+	)
+	return !at.Before(notBefore) && at.Before(expiresAt)
+}
+
 // ValidateTransition checks the deterministic first/successor time clamps.
 func ValidateTransition(
 	previous *Authorization,

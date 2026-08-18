@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
@@ -226,6 +227,76 @@ func (snapshot *Snapshot) Authorization(
 	}
 	authorization, exists := snapshot.authorizations[key]
 	if !exists {
+		return credentialauthorization.Authorization{}, false
+	}
+	return authorization.Clone(), true
+}
+
+// ActiveCredentialAuthorizationAt returns an active member's greatest
+// retained epoch that is valid at the exact supplied instant. Before a
+// committed successor reaches not_before, its overlap predecessor remains
+// the active credential.
+func (snapshot *Snapshot) ActiveCredentialAuthorizationAt(
+	deviceID domain.DeviceID,
+	at time.Time,
+) (credentialauthorization.Authorization, bool) {
+	if snapshot == nil ||
+		!snapshot.valid ||
+		!deviceID.Valid() ||
+		at.IsZero() ||
+		!snapshot.sessionID.Valid() ||
+		!domain.ValidUnsignedInteger(snapshot.appliedChainIndex) {
+		return credentialauthorization.Authorization{}, false
+	}
+	member, exists := snapshot.devices[deviceID]
+	if !exists ||
+		member.ID != deviceID ||
+		member.Status != device.StatusActive ||
+		member.Validate() != nil {
+		return credentialauthorization.Authorization{}, false
+	}
+	epoch, exists := snapshot.credentialEpochs[deviceID]
+	if !exists ||
+		epoch == 0 ||
+		!domain.ValidUnsignedInteger(epoch) {
+		return credentialauthorization.Authorization{}, false
+	}
+	currentKey := credentialauthorization.Key{
+		SessionID: snapshot.sessionID,
+		DeviceID:  deviceID,
+		Epoch:     epoch,
+	}
+	current, valid := snapshot.appliedAuthorization(currentKey)
+	if !valid {
+		return credentialauthorization.Authorization{}, false
+	}
+	if current.ActiveAt(at) {
+		return current, true
+	}
+	if epoch == 1 {
+		return credentialauthorization.Authorization{}, false
+	}
+	previous, valid := snapshot.appliedAuthorization(
+		credentialauthorization.Key{
+			SessionID: snapshot.sessionID,
+			DeviceID:  deviceID,
+			Epoch:     epoch - 1,
+		},
+	)
+	if !valid || !previous.ActiveAt(at) {
+		return credentialauthorization.Authorization{}, false
+	}
+	return previous, true
+}
+
+func (snapshot *Snapshot) appliedAuthorization(
+	key credentialauthorization.Key,
+) (credentialauthorization.Authorization, bool) {
+	authorization, exists := snapshot.authorizations[key]
+	if !exists ||
+		authorization.PrimaryKey() != key ||
+		authorization.AuthorizationChainIndex > snapshot.appliedChainIndex ||
+		authorization.Validate() != nil {
 		return credentialauthorization.Authorization{}, false
 	}
 	return authorization.Clone(), true

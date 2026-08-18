@@ -112,6 +112,192 @@ func TestSnapshotAdvanceAppliesCredentialAndMembershipChanges(t *testing.T) {
 	}
 }
 
+func TestSnapshotActiveCredentialAuthorizationAt(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	authorization, found := snapshot.ActiveCredentialAuthorizationAt(
+		fixture.deviceID,
+		snapshotTestNow(),
+	)
+	if !found || authorization.Epoch != 1 {
+		t.Fatalf(
+			"ActiveCredentialAuthorizationAt() = (%+v, %t), want epoch 1",
+			authorization,
+			found,
+		)
+	}
+	authorization.ClockEndorsements[0].Signature[0] ^= 0xff
+	again, found := snapshot.ActiveCredentialAuthorizationAt(
+		fixture.deviceID,
+		snapshotTestNow(),
+	)
+	if !found || again.ClockEndorsements[0].Signature[0] != 0 {
+		t.Fatal("mutating returned authorization changed snapshot state")
+	}
+}
+
+func TestSnapshotUsesOverlapPredecessorUntilSuccessorActivates(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 2)
+	successorKey := credentialauthorization.Key{
+		SessionID: snapshotTestSessionID,
+		DeviceID:  fixture.deviceID,
+		Epoch:     2,
+	}
+	successor := fixture.input.CredentialAuthorizations[successorKey]
+	successor.IssuedAt = domain.WholeSecondTimestamp(
+		"2026-08-14T12:25:00Z",
+	)
+	successor.NotBefore = domain.WholeSecondTimestamp(
+		"2026-08-14T12:28:00Z",
+	)
+	fixture.input.CredentialAuthorizations[successorKey] = successor
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+
+	beforeActivation := time.Date(
+		2026, 8, 14, 12, 27, 59, 0, time.UTC,
+	)
+	authorization, found := snapshot.ActiveCredentialAuthorizationAt(
+		fixture.deviceID,
+		beforeActivation,
+	)
+	if !found || authorization.Epoch != 1 {
+		t.Fatalf(
+			"authorization before successor activation = (%+v, %t), want epoch 1",
+			authorization,
+			found,
+		)
+	}
+	atActivation := time.Date(2026, 8, 14, 12, 28, 0, 0, time.UTC)
+	authorization, found = snapshot.ActiveCredentialAuthorizationAt(
+		fixture.deviceID,
+		atActivation,
+	)
+	if !found || authorization.Epoch != 2 {
+		t.Fatalf(
+			"authorization at successor activation = (%+v, %t), want epoch 2",
+			authorization,
+			found,
+		)
+	}
+}
+
+func TestSnapshotActiveCredentialAuthorizationAtFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		epoch  uint64
+		at     time.Time
+		mutate func(*snapshotFixture, *Snapshot)
+	}{
+		{
+			name:  "zero epoch",
+			epoch: 0,
+			at:    snapshotTestNow(),
+		},
+		{
+			name:  "absent member",
+			epoch: 1,
+			at:    snapshotTestNow(),
+			mutate: func(fixture *snapshotFixture, _ *Snapshot) {
+				fixture.deviceID = domain.DeviceID(
+					"cc1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+				)
+			},
+		},
+		{
+			name:  "inactive member",
+			epoch: 1,
+			at:    snapshotTestNow(),
+			mutate: func(fixture *snapshotFixture, snapshot *Snapshot) {
+				member := snapshot.devices[fixture.deviceID]
+				member.Status = device.StatusRevoked
+				snapshot.devices[fixture.deviceID] = member
+			},
+		},
+		{
+			name:  "before activation",
+			epoch: 1,
+			at: time.Date(
+				2026, 8, 14, 11, 59, 59, 999_999_999, time.UTC,
+			),
+		},
+		{
+			name:  "at expiry",
+			epoch: 1,
+			at: time.Date(
+				2026, 8, 14, 12, 30, 0, 0, time.UTC,
+			),
+		},
+		{
+			name:  "zero time",
+			epoch: 1,
+			at:    time.Time{},
+		},
+		{
+			name:  "missing current row",
+			epoch: 1,
+			at:    snapshotTestNow(),
+			mutate: func(fixture *snapshotFixture, snapshot *Snapshot) {
+				delete(snapshot.authorizations, credentialauthorization.Key{
+					SessionID: snapshotTestSessionID,
+					DeviceID:  fixture.deviceID,
+					Epoch:     1,
+				})
+			},
+		},
+		{
+			name:  "corrupt current row",
+			epoch: 1,
+			at:    snapshotTestNow(),
+			mutate: func(fixture *snapshotFixture, snapshot *Snapshot) {
+				key := credentialauthorization.Key{
+					SessionID: snapshotTestSessionID,
+					DeviceID:  fixture.deviceID,
+					Epoch:     1,
+				}
+				authorization := snapshot.authorizations[key]
+				authorization.KeyDigest[0] ^= 0xff
+				snapshot.authorizations[key] = authorization
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newSnapshotFixture(t, test.epoch)
+			snapshot, err := NewSnapshot(fixture.input)
+			if err != nil {
+				t.Fatalf("NewSnapshot() error = %v", err)
+			}
+			if test.mutate != nil {
+				test.mutate(&fixture, snapshot)
+			}
+			if authorization, found :=
+				snapshot.ActiveCredentialAuthorizationAt(
+					fixture.deviceID,
+					test.at,
+				); found {
+				t.Fatalf(
+					"ActiveCredentialAuthorizationAt() = (%+v, true), want false",
+					authorization,
+				)
+			}
+		})
+	}
+}
+
 func TestSnapshotRejectsInconsistentOrUnappliedState(t *testing.T) {
 	t.Parallel()
 

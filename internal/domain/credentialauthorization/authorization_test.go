@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 )
@@ -50,6 +51,87 @@ func TestPrimaryKeyIncludesSessionIdentity(t *testing.T) {
 	)
 	if first.PrimaryKey() == second.PrimaryKey() {
 		t.Fatal("credential primary key collapsed distinct sessions")
+	}
+}
+
+func TestAuthorizationActiveAtUsesClosedOpenInterval(t *testing.T) {
+	t.Parallel()
+
+	authorization := validAuthorization()
+	notBefore, err := authorization.NotBefore.Time()
+	if err != nil {
+		t.Fatalf("NotBefore.Time() error = %v", err)
+	}
+	expiresAt := notBefore.Add(
+		time.Duration(authorization.ValiditySeconds) * time.Second,
+	)
+	tests := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{name: "zero", at: time.Time{}, want: false},
+		{name: "before", at: notBefore.Add(-time.Nanosecond), want: false},
+		{name: "not before", at: notBefore, want: true},
+		{name: "active", at: notBefore.Add(time.Minute), want: true},
+		{name: "before expiry", at: expiresAt.Add(-time.Nanosecond), want: true},
+		{name: "expiry", at: expiresAt, want: false},
+		{name: "after expiry", at: expiresAt.Add(time.Nanosecond), want: false},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := authorization.ActiveAt(test.at); got != test.want {
+				t.Fatalf("ActiveAt(%s) = %t, want %t", test.at, got, test.want)
+			}
+		})
+	}
+}
+
+func TestAuthorizationActiveAtRejectsInvalidAuthorization(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2024, 1, 1, 0, 1, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*Authorization)
+	}{
+		{
+			name: "zero authorization",
+			mutate: func(value *Authorization) {
+				*value = Authorization{}
+			},
+		},
+		{
+			name: "invalid timestamp",
+			mutate: func(value *Authorization) {
+				value.NotBefore = "invalid"
+			},
+		},
+		{
+			name: "invalid validity",
+			mutate: func(value *Authorization) {
+				value.ValiditySeconds = 0
+			},
+		},
+		{
+			name: "invalid key digest",
+			mutate: func(value *Authorization) {
+				value.KeyDigest[0] ^= 0xff
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			authorization := validAuthorization()
+			test.mutate(&authorization)
+			if authorization.ActiveAt(at) {
+				t.Fatal("ActiveAt() accepted invalid authorization")
+			}
+		})
 	}
 }
 
