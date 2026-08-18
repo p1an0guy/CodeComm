@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
@@ -53,6 +56,154 @@ const (
 		"018f47de-89ab-7def-8123-e123456789ab",
 	)
 )
+
+func TestBootOriginSubmitVoterSetActivationDurablyResolvesExactPayload(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	payload := bootOriginActivationPayload(
+		t,
+		harness,
+		agentTestSessionID,
+		agentTestWorkspaceID,
+		0,
+	)
+	encoded, err := voteractivation.EncodeActivationPayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingCheckpointConsensus{
+		delegate:  harness.consensus,
+		completed: make(chan struct{}),
+	}
+	harness.boot.consensus = recorder
+
+	outcome, err := harness.boot.SubmitVoterSetActivation(
+		bootOriginTestContext(t),
+		payload,
+	)
+	if err != nil {
+		t.Fatalf(
+			"SubmitVoterSetActivation(): %v (fatal=%v, proposals=%d, consensus=%v)",
+			err,
+			harness.boot.FatalError(),
+			len(recorder.proposals()),
+			harness.consensus.err,
+		)
+	}
+	if outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("activation outcome = %#v", outcome)
+	}
+	proposals := recorder.proposals()
+	if len(proposals) != 1 {
+		t.Fatalf("submitted proposals = %d, want 1", len(proposals))
+	}
+	signed, err := event.ParseAndVerify(
+		proposals[0],
+		event.VerificationContext{
+			SessionID:         agentTestSessionID,
+			WorkspaceID:       agentTestWorkspaceID,
+			IdentityPublicKey: harness.private.Public().(ed25519.PublicKey),
+		},
+	)
+	if err != nil {
+		t.Fatalf("ParseAndVerify(): %v", err)
+	}
+	proposal := signed.Proposal()
+	entityID, entityPresent := proposal.EntityID.Value()
+	if proposal.Kind != event.KindMembershipVoterSetActivated ||
+		proposal.ExpectedEntityVersion != nil ||
+		!entityPresent ||
+		entityID != string(agentTestSessionID) ||
+		proposal.Origin.Sequence() != 1 ||
+		!bytes.Equal(proposal.Payload, encoded) {
+		t.Fatalf("activation proposal = %#v", proposal)
+	}
+
+	record, found, err := harness.local.LookupRequest(
+		bootOriginTestContext(t),
+		agentTestBootID,
+		bootOriginTestRequestID,
+	)
+	if err != nil || !found {
+		t.Fatalf("LookupRequest() = (%#v, %t, %v)", record, found, err)
+	}
+	canonicalRequest, err := canonicalObject(map[string]any{
+		"activation": json.RawMessage(encoded),
+		"operation":  event.KindMembershipVoterSetActivated,
+		"request_id": bootOriginTestRequestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.EventID != bootOriginTestEventID ||
+		record.State != store.LocalRequestResolved ||
+		record.RequestDigest != store.Digest(sha256.Sum256(canonicalRequest)) {
+		t.Fatalf("durable activation request = %#v", record)
+	}
+}
+
+func TestBootOriginSubmitVoterSetActivationRejectsLineageBeforeReservation(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	tests := []struct {
+		name       string
+		sessionID  domain.UUIDv7
+		workspace  domain.UUIDv4
+		generation uint64
+	}{
+		{
+			name:       "session",
+			sessionID:  bootOriginTestNextBootID,
+			workspace:  agentTestWorkspaceID,
+			generation: 0,
+		},
+		{
+			name:       "workspace",
+			sessionID:  agentTestSessionID,
+			workspace:  domain.UUIDv4("550e8400-e29b-41d4-a716-446655440001"),
+			generation: 0,
+		},
+		{
+			name:       "recovery generation",
+			sessionID:  agentTestSessionID,
+			workspace:  agentTestWorkspaceID,
+			generation: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := bootOriginActivationPayload(
+				t,
+				harness,
+				test.sessionID,
+				test.workspace,
+				test.generation,
+			)
+			_, err := harness.boot.SubmitVoterSetActivation(
+				bootOriginTestContext(t),
+				payload,
+			)
+			if !errors.Is(err, ErrInvalidOptions) {
+				t.Fatalf(
+					"SubmitVoterSetActivation() error = %v, want ErrInvalidOptions",
+					err,
+				)
+			}
+		})
+	}
+	records, err := harness.local.OutboxRecords(bootOriginTestContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("outbox records after mismatches = %d, want 0", len(records))
+	}
+	if remaining := harness.ids.remaining(); remaining != 2 {
+		t.Fatalf("remaining generated IDs = %d, want 2", remaining)
+	}
+}
 
 func TestBootOriginForceCheckpointDrainsPredecessorAndSettles(
 	t *testing.T,
@@ -938,6 +1089,245 @@ func (generator *fixedIDGenerator) next() (domain.UUIDv7, error) {
 	value := generator.values[0]
 	generator.values = generator.values[1:]
 	return value, nil
+}
+
+func (generator *fixedIDGenerator) remaining() int {
+	generator.mu.Lock()
+	defer generator.mu.Unlock()
+	return len(generator.values)
+}
+
+type bootOriginActivationHarness struct {
+	state     *store.Store
+	local     store.LocalState
+	boot      *BootOrigin
+	consensus *fsmConsensus
+	deviceID  domain.DeviceID
+	private   ed25519.PrivateKey
+	target    []domain.DeviceID
+	keys      map[domain.DeviceID]ed25519.PrivateKey
+	ids       *fixedIDGenerator
+}
+
+func newBootOriginActivationHarness(
+	t *testing.T,
+) *bootOriginActivationHarness {
+	t.Helper()
+	initial, privateKey, deviceID := bootOriginInitialState(t)
+	keys := map[domain.DeviceID]ed25519.PrivateKey{
+		deviceID: privateKey,
+	}
+	target := []domain.DeviceID{deviceID}
+	for _, fill := range []byte{0x41, 0x51} {
+		key := ed25519.NewKeyFromSeed(
+			bytes.Repeat([]byte{fill}, ed25519.SeedSize),
+		)
+		memberID, err := device.DeriveID(
+			key.Public().(ed25519.PublicKey),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[memberID] = key
+		target = append(target, memberID)
+		initial.Projections.Devices = append(
+			initial.Projections.Devices,
+			device.Device{
+				ID:                memberID,
+				Role:              device.RoleEditor,
+				IdentityPublicKey: key.Public().(ed25519.PublicKey),
+				DaemonVersion:     "0.1.0",
+				MaxApplyLevel:     1,
+				Status:            device.StatusActive,
+				EntityVersion:     1,
+			},
+		)
+		initial.Projections.AuditCounters = append(
+			initial.Projections.AuditCounters,
+			auditcounter.Counter{DeviceID: memberID},
+		)
+	}
+	sort.Slice(target, func(left, right int) bool {
+		return target[left] < target[right]
+	})
+	voterTarget, err := voterset.New(agentTestSessionID, target, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial.Projections.VoterSet = []voterset.Set{voterTarget}
+
+	state, err := store.Open(context.Background(), store.Options{
+		Path: filepath.Join(t.TempDir(), "state", "state.db"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Initialize(context.Background(), initial); err != nil {
+		_ = state.Close()
+		t.Fatalf("Initialize(): %v", err)
+	}
+	applyClock := func() (domain.Timestamp, int64, error) {
+		return agentTestTimestamp, int64(time.Second), nil
+	}
+	fsm, err := consensus.NewFSM(consensus.FSMOptions{
+		Store:        state,
+		OriginBootID: agentTestBootID,
+		Clock:        applyClock,
+	})
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	runtime := &fsmConsensus{
+		fsm:   fsm,
+		store: state,
+		clock: applyClock,
+	}
+	runtime.leader.Store(true)
+	authority, err := event.NewLocalAuthority(deviceID, agentTestBootID)
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	binding, err := authority.DaemonBinding()
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	ids := &fixedIDGenerator{values: []domain.UUIDv7{
+		bootOriginTestRequestID,
+		bootOriginTestEventID,
+	}}
+	boot, err := NewBootOrigin(BootOriginOptions{
+		Consensus:          runtime,
+		LocalState:         state.LocalState(),
+		SessionID:          agentTestSessionID,
+		WorkspaceID:        agentTestWorkspaceID,
+		DeviceID:           deviceID,
+		OriginBootID:       agentTestBootID,
+		IdentityPrivateKey: privateKey,
+		DaemonOrigin:       binding,
+		Clock: func() domain.Timestamp {
+			return agentTestTimestamp
+		},
+		GenerateID: ids.next,
+	})
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = boot.Close()
+		_ = state.Close()
+		for _, key := range keys {
+			clear(key)
+		}
+	})
+	return &bootOriginActivationHarness{
+		state:     state,
+		local:     state.LocalState(),
+		boot:      boot,
+		consensus: runtime,
+		deviceID:  deviceID,
+		private:   privateKey,
+		target:    target,
+		keys:      keys,
+		ids:       ids,
+	}
+}
+
+func bootOriginActivationPayload(
+	t *testing.T,
+	harness *bootOriginActivationHarness,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+) voteractivation.ActivationPayload {
+	t.Helper()
+	checkpoint := domain.Checkpoint{
+		SessionID:                sessionID,
+		WorkspaceID:              workspaceID,
+		RecoveryGeneration:       generation,
+		AuthorityVoterSetVersion: 1,
+		SignerDeviceID:           harness.deviceID,
+		Term:                     1,
+		CoveredAppliedLogIndex:   1,
+		CoveredChainIndex:        1,
+		CoveredResultIndex:       1,
+		DigestVersion:            1,
+		ProjectionSchemaVersion:  1,
+	}
+	copy(
+		checkpoint.CoveredChainHash[:],
+		bytes.Repeat([]byte{0x61}, len(checkpoint.CoveredChainHash)),
+	)
+	copy(
+		checkpoint.CoveredResultHash[:],
+		bytes.Repeat([]byte{0x62}, len(checkpoint.CoveredResultHash)),
+	)
+	copy(
+		checkpoint.ProjectionAccumulator[:],
+		bytes.Repeat([]byte{0x63}, len(checkpoint.ProjectionAccumulator)),
+	)
+	checkpointSignature, err := event.SignCheckpoint(
+		checkpoint,
+		harness.private,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofs := make([]voteractivation.Proof, len(harness.target))
+	for index, voterID := range harness.target {
+		unsigned, err := voteractivation.NewUnsignedProof(
+			voteractivation.ProofInput{
+				SessionID:                       sessionID,
+				WorkspaceID:                     workspaceID,
+				RecoveryGeneration:              generation,
+				TargetVoterSetVersion:           2,
+				CurrentAuthorityVoterSetVersion: 1,
+				VoterSet:                        harness.target,
+				VoterDeviceID:                   voterID,
+				LiveConfigurationIndex:          1,
+				CheckpointEventID:               bootOriginTestPriorEventID,
+				Checkpoint:                      checkpoint,
+				CheckpointSignature:             checkpointSignature,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proofs[index], err = voteractivation.SignProof(
+			unsigned,
+			harness.keys[voterID],
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	handoff, err := voteractivation.NewUnsignedAuthorityHandoff(
+		voteractivation.AuthorityHandoffInput{
+			SessionID:                        sessionID,
+			WorkspaceID:                      workspaceID,
+			RecoveryGeneration:               generation,
+			TargetVoterSetVersion:            2,
+			ExpectedAuthorityVoterSetVersion: 1,
+			VoterSet:                         harness.target,
+			ActivationCheckpointEventID:      bootOriginTestPriorEventID,
+			ActivationProofs:                 proofs,
+			PriorAuthoritySigner:             harness.deviceID,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := voteractivation.SignAuthorityHandoff(
+		handoff,
+		harness.private,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 type releasingCheckpointConsensus struct {

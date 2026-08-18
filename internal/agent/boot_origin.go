@@ -15,6 +15,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -479,6 +480,137 @@ func (origin *BootOrigin) reserveCheckpoint(
 		return event.SignedEvent{}, err
 	}
 	return origin.parseReserved(record)
+}
+
+// SubmitVoterSetActivation durably reserves and resolves one complete
+// payload-CAS voter-authority handoff.
+func (origin *BootOrigin) SubmitVoterSetActivation(
+	ctx context.Context,
+	activation voteractivation.ActivationPayload,
+) (store.CommandOutcome, error) {
+	if err := origin.available(); err != nil {
+		return store.CommandOutcome{}, err
+	}
+	if ctx == nil {
+		return store.CommandOutcome{}, ErrInvalidOptions
+	}
+	payload, err := voteractivation.EncodeActivationPayload(activation)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	lineage := activation.UnsignedHandoff().Input()
+	if lineage.SessionID != origin.sessionID ||
+		lineage.WorkspaceID != origin.workspaceID {
+		return store.CommandOutcome{}, ErrInvalidOptions
+	}
+
+	operationContext, cancel := origin.operationContext(ctx)
+	defer cancel()
+	if err := origin.acquireShared(operationContext); err != nil {
+		return store.CommandOutcome{}, err
+	}
+	generation, err := origin.local.CurrentRecoveryGeneration(
+		operationContext,
+		origin.sessionID,
+		origin.workspaceID,
+	)
+	if err != nil {
+		origin.releaseShared()
+		return store.CommandOutcome{}, err
+	}
+	if lineage.RecoveryGeneration != generation {
+		origin.releaseShared()
+		return store.CommandOutcome{}, ErrInvalidOptions
+	}
+	record, err := origin.reserveVoterSetActivationLocked(
+		operationContext,
+		payload,
+	)
+	origin.releaseShared()
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	origin.wakeWorker()
+	resolved, err := origin.waitResolved(operationContext, record)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	if resolved.Outcome == nil {
+		return store.CommandOutcome{}, ErrCommandForwarding
+	}
+	return *resolved.Outcome, nil
+}
+
+func (origin *BootOrigin) reserveVoterSetActivationLocked(
+	ctx context.Context,
+	payload []byte,
+) (store.LocalCommandRecord, error) {
+	requestID, err := origin.generateID()
+	if err != nil {
+		return store.LocalCommandRecord{}, err
+	}
+	if !requestID.Valid() {
+		return store.LocalCommandRecord{}, ErrInvalidOptions
+	}
+	now := origin.clock()
+	if !now.Valid() {
+		return store.LocalCommandRecord{}, ErrInvalidOptions
+	}
+	canonicalRequest, err := canonicalObject(map[string]any{
+		"activation": json.RawMessage(payload),
+		"operation":  event.KindMembershipVoterSetActivated,
+		"request_id": requestID,
+	})
+	if err != nil {
+		return store.LocalCommandRecord{}, err
+	}
+	record, _, err := origin.local.ReserveCommand(
+		ctx,
+		store.LocalCommandInput{
+			ClientInstanceID: origin.originBootID,
+			RequestID:        requestID,
+			SessionID:        origin.sessionID,
+			WorkspaceID:      origin.workspaceID,
+			BindingClass:     store.LocalBindingDaemon,
+			OriginDeviceID:   origin.deviceID,
+			OriginScopeKind:  store.OriginScopeKindBoot,
+			OriginScopeID:    origin.originBootID,
+			RequestKind:      event.KindMembershipVoterSetActivated,
+			CanonicalRequest: canonicalRequest,
+			CreatedAt:        now,
+		},
+		store.UUIDv7Generator(origin.generateID),
+		func(
+			eventID domain.UUIDv7,
+			originSequence uint64,
+		) (event.SignedEvent, error) {
+			proposal, err := event.BuildProposal(
+				event.Command{
+					Kind: event.KindMembershipVoterSetActivated,
+					EntityID: event.StringEntityID(
+						string(origin.sessionID),
+					),
+					RationaleSummary: "",
+					Actions:          []event.Action{},
+					Payload:          payload,
+					Redaction:        defaultRedaction(),
+				},
+				origin.daemonBinding,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      origin.sessionID,
+					WorkspaceID:    origin.workspaceID,
+					CreatedAt:      now,
+					OriginSequence: originSequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, origin.privateKey)
+		},
+	)
+	return record, err
 }
 
 func (origin *BootOrigin) submitDaemonCommand(
