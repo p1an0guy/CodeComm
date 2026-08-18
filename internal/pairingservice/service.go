@@ -81,6 +81,19 @@ type FinalizationAuthorizer interface {
 	) (*store.PairingFinalizationAuthorization, error)
 }
 
+// BootReservationLane serializes the atomic SAS-confirmation reservation with
+// daemon checkpoint capture for the same boot origin.
+type BootReservationLane interface {
+	RunOrderedBootReservation(
+		context.Context,
+		domain.UUIDv7,
+		domain.UUIDv4,
+		domain.DeviceID,
+		domain.UUIDv7,
+		func(context.Context) error,
+	) error
+}
+
 // SettledNonvoterGuard excludes a subject from live Raft configuration while
 // an existing-device invite is transactionally consumed.
 type SettledNonvoterGuard interface {
@@ -100,6 +113,7 @@ type Options struct {
 	Secrets             SecretStore
 	Authorizer          FinalizationAuthorizer
 	Finalizer           Finalizer
+	Reservations        BootReservationLane
 	Nonvoters           SettledNonvoterGuard
 	IdentityPublicKey   []byte
 	Clock               Clock
@@ -112,6 +126,7 @@ type Service struct {
 	secrets             SecretStore
 	authorizer          FinalizationAuthorizer
 	finalizer           Finalizer
+	reservations        BootReservationLane
 	nonvoters           SettledNonvoterGuard
 	identityPublicKey   [ed25519.PublicKeySize]byte
 	deviceID            domain.DeviceID
@@ -153,6 +168,7 @@ type AttemptDetails struct {
 func New(options Options) (*Service, error) {
 	if options.State == nil || options.Secrets == nil ||
 		options.Authorizer == nil || options.Finalizer == nil ||
+		options.Reservations == nil ||
 		options.Nonvoters == nil ||
 		len(options.IdentityPublicKey) != ed25519.PublicKeySize ||
 		options.MaintenanceInterval < 0 {
@@ -176,7 +192,8 @@ func New(options Options) (*Service, error) {
 	service := &Service{
 		state: options.State, secrets: options.Secrets,
 		authorizer: options.Authorizer, finalizer: options.Finalizer,
-		nonvoters: options.Nonvoters, deviceID: deviceID, clock: clock,
+		reservations: options.Reservations,
+		nonvoters:    options.Nonvoters, deviceID: deviceID, clock: clock,
 		maintenanceInterval: interval, ctx: serviceContext, cancel: cancel,
 	}
 	copy(service.identityPublicKey[:], options.IdentityPublicKey)

@@ -62,9 +62,9 @@ func (service *Service) Recover(ctx context.Context) error {
 	return nil
 }
 
-// Close stops maintenance. Callers must stop network dispatch before closing
-// the durable dependencies supplied to this service.
-func (service *Service) Close() error {
+// BeginClose cancels maintenance without waiting for an already-enqueued
+// consensus future. The daemon shuts down Raft before calling Wait.
+func (service *Service) BeginClose() error {
 	if service == nil {
 		return ErrInvalidInput
 	}
@@ -76,8 +76,25 @@ func (service *Service) Close() error {
 	service.closed = true
 	service.cancel()
 	service.mu.Unlock()
+	return nil
+}
+
+// Wait joins maintenance after producers and consensus have stopped.
+func (service *Service) Wait() error {
+	if err := service.BeginClose(); err != nil {
+		return err
+	}
 	service.done.Wait()
 	return nil
+}
+
+// Close stops maintenance. A production owner with live consensus uses
+// BeginClose, stops Raft, then calls Wait.
+func (service *Service) Close() error {
+	if err := service.BeginClose(); err != nil {
+		return err
+	}
+	return service.Wait()
 }
 
 // FatalError returns an asynchronous durable-maintenance failure.

@@ -139,14 +139,35 @@ func (service *Service) ConfirmLocal(
 			return AttemptDetails{}, ErrUnavailable
 		}
 	}
-	updated, _, err := service.state.RecordLocalPairingConfirmation(
-		ctx,
-		store.PairingConfirmationInput{
-			AttemptID: attemptID, Party: store.PairingConfirmationLocal,
-			Confirmed: confirmed, DecidedAt: decidedAt,
-		},
-		authorization,
-	)
+	var updated store.PairingAttemptRecord
+	recordDecision := func(reservationContext context.Context) error {
+		var reservationErr error
+		updated, _, reservationErr =
+			service.state.RecordLocalPairingConfirmation(
+				reservationContext,
+				store.PairingConfirmationInput{
+					AttemptID: attemptID,
+					Party:     store.PairingConfirmationLocal,
+					Confirmed: confirmed,
+					DecidedAt: decidedAt,
+				},
+				authorization,
+			)
+		return reservationErr
+	}
+	if authorization != nil && authorization.Admission != nil {
+		request := authorization.Request
+		err = service.reservations.RunOrderedBootReservation(
+			ctx,
+			request.SessionID,
+			request.WorkspaceID,
+			request.OriginDeviceID,
+			request.OriginBootID,
+			recordDecision,
+		)
+	} else {
+		err = recordDecision(ctx)
+	}
 	if err != nil {
 		return AttemptDetails{}, service.stateError(ctx, err)
 	}

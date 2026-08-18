@@ -49,6 +49,8 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 	t.Parallel()
 
 	fixture := newServiceFixture(t)
+	reservations := &recordingBootReservationLane{}
+	fixture.service.reservations = reservations
 	request := fixture.request(t, serviceTestUUID(601), fixture.exporter)
 	fixture.clock.set("2026-08-13T12:01:00Z")
 	result, err := fixture.service.HandleRequest(
@@ -126,6 +128,27 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 	if err != nil || confirmed.Attempt.State != store.PairingAttemptCompleted {
 		t.Fatalf("ConfirmLocal() = (%+v, %v)", confirmed, err)
 	}
+	if calls, concurrent := reservations.snapshot(); calls != 1 ||
+		concurrent {
+		t.Fatalf(
+			"boot reservation lane = (calls=%d, concurrent=%t)",
+			calls,
+			concurrent,
+		)
+	}
+	sessionID, workspaceID, deviceID, bootID := reservations.binding()
+	if sessionID != serviceTestSessionID ||
+		workspaceID != serviceTestWorkspaceID ||
+		deviceID != fixture.invite.Invite().InviterDeviceID ||
+		bootID != serviceTestUUID(500) {
+		t.Fatalf(
+			"boot reservation binding = (%s, %s, %s, %s)",
+			sessionID,
+			workspaceID,
+			deviceID,
+			bootID,
+		)
+	}
 	admission, found, err := fixture.state.LookupRequest(
 		context.Background(),
 		result.Attempt.AttemptID,
@@ -174,6 +197,40 @@ func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
 	fixture.clock.set("2026-08-13T12:03:01Z")
 	if processed, err := fixture.service.CleanupOneSecret(context.Background()); err != nil || processed {
 		t.Fatalf("CleanupOneSecret(empty) = (%t, %v)", processed, err)
+	}
+}
+
+func TestPairingServiceDeclineBypassesBootReservationLane(t *testing.T) {
+	t.Parallel()
+
+	fixture := newServiceFixture(t)
+	reservations := &recordingBootReservationLane{}
+	fixture.service.reservations = reservations
+	request := fixture.request(t, serviceTestUUID(609), fixture.exporter)
+	fixture.clock.set("2026-08-13T12:03:10Z")
+	result, err := fixture.service.HandleRequest(
+		context.Background(),
+		request.CanonicalBytes(),
+		fixture.exporter,
+		fixture.peer,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := [32]byte(result.Attempt.RequestDigest)
+	fixture.clock.set("2026-08-13T12:03:11Z")
+	declined, err := fixture.service.ConfirmLocal(
+		context.Background(),
+		result.Attempt.AttemptID,
+		requestDigest,
+		false,
+	)
+	if err != nil ||
+		declined.Attempt.State != store.PairingAttemptDeclined {
+		t.Fatalf("ConfirmLocal(decline) = (%+v, %v)", declined, err)
+	}
+	if calls, _ := reservations.snapshot(); calls != 0 {
+		t.Fatalf("decline entered boot reservation lane %d times", calls)
 	}
 }
 
@@ -565,7 +622,8 @@ func TestPairingServiceRequiresRecoveryAndStopsCleanly(t *testing.T) {
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -662,7 +720,8 @@ func TestPairingServiceRestartResumesFinalization(t *testing.T) {
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -711,7 +770,8 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -794,7 +854,8 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -853,7 +914,8 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -936,7 +998,8 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1016,7 +1079,8 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 				Authorizer:        fixture.authorizer,
 				IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 				Clock:             fixture.clock.read, Finalizer: finalizer,
-				Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
+				Reservations: noOpBootReservationLane{},
+				Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: time.Hour,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1139,7 +1203,8 @@ func TestPairingServiceMaintenanceRetriesSecretDeletion(t *testing.T) {
 		Authorizer:        fixture.authorizer,
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
-		Nonvoters: noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    noOpNonvoterGuard{}, MaintenanceInterval: 5 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1361,7 +1426,8 @@ func newServiceFixtureWithMode(
 	service, err := New(Options{
 		State: localState, Secrets: secrets, IdentityPublicKey: inviterPublicKey,
 		Clock: clock.read, Authorizer: authorizer, Finalizer: finalizer,
-		Nonvoters: nonvoters, MaintenanceInterval: time.Hour,
+		Reservations: noOpBootReservationLane{},
+		Nonvoters:    nonvoters, MaintenanceInterval: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1664,6 +1730,82 @@ func (finalizer *blockingFinalizer) FinalizePairing(
 }
 
 type noOpNonvoterGuard struct{}
+
+type noOpBootReservationLane struct{}
+
+type recordingBootReservationLane struct {
+	mu          sync.Mutex
+	calls       int
+	active      bool
+	concurrent  bool
+	sessionID   domain.UUIDv7
+	workspaceID domain.UUIDv4
+	deviceID    domain.DeviceID
+	bootID      domain.UUIDv7
+}
+
+func (lane *recordingBootReservationLane) RunOrderedBootReservation(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	deviceID domain.DeviceID,
+	bootID domain.UUIDv7,
+	operation func(context.Context) error,
+) error {
+	lane.mu.Lock()
+	lane.calls++
+	lane.sessionID = sessionID
+	lane.workspaceID = workspaceID
+	lane.deviceID = deviceID
+	lane.bootID = bootID
+	if lane.active {
+		lane.concurrent = true
+	}
+	lane.active = true
+	lane.mu.Unlock()
+	defer func() {
+		lane.mu.Lock()
+		lane.active = false
+		lane.mu.Unlock()
+	}()
+	return operation(ctx)
+}
+
+func (lane *recordingBootReservationLane) snapshot() (int, bool) {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	return lane.calls, lane.concurrent
+}
+
+func (lane *recordingBootReservationLane) binding() (
+	domain.UUIDv7,
+	domain.UUIDv4,
+	domain.DeviceID,
+	domain.UUIDv7,
+) {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	return lane.sessionID, lane.workspaceID, lane.deviceID, lane.bootID
+}
+
+func (noOpBootReservationLane) RunOrderedBootReservation(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	deviceID domain.DeviceID,
+	bootID domain.UUIDv7,
+	operation func(context.Context) error,
+) error {
+	if ctx == nil ||
+		operation == nil ||
+		!sessionID.Valid() ||
+		!workspaceID.Valid() ||
+		!deviceID.Valid() ||
+		!bootID.Valid() {
+		return ErrInvalidOptions
+	}
+	return operation(ctx)
+}
 
 func (noOpNonvoterGuard) AcquireSettledNonvoter(
 	context.Context,

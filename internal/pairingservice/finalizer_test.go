@@ -293,7 +293,7 @@ func TestDurableFinalizerClassifiesApplyFailures(t *testing.T) {
 		{
 			name:     "event ID collision",
 			applyErr: store.ErrIdempotencyConflict,
-			wantErr:  ErrFinalizationRejected,
+			wantErr:  ErrFinalizationIntegrity,
 		},
 		{
 			name:     "stale generation",

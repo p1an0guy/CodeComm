@@ -183,8 +183,8 @@ func (finalizer *DurableFinalizer) finalizeAdmission(
 				return classifyFinalizationOutcome(record.Outcome)
 			}
 			if record.State == store.LocalRequestAbandoned {
-				return rejectedFinalization(
-					"admission event ID is bound to another proposal",
+				return integrityFinalization(
+					"admission event ID collision poisoned the operator origin",
 				)
 			}
 			if record.State != store.LocalRequestSigned &&
@@ -261,8 +261,8 @@ func (finalizer *DurableFinalizer) finalizeAdmission(
 					"colliding admission was not durably abandoned",
 				)
 			}
-			return rejectedFinalization(
-				"admission event ID is bound to another proposal",
+			return integrityFinalization(
+				"admission event ID collision poisoned the operator origin",
 			)
 		}
 		return err
@@ -485,8 +485,4 @@ func finalizationStateError(operation string, err error) error {
 
 func integrityFinalization(reason string) error {
 	return fmt.Errorf("%w: %s", ErrFinalizationIntegrity, reason)
-}
-
-func rejectedFinalization(reason string) error {
-	return fmt.Errorf("%w: %s", ErrFinalizationRejected, reason)
 }
