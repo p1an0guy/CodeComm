@@ -34,9 +34,9 @@ var (
 	ErrRandomSource      = errors.New("agent: secure random source failed")
 )
 
-// Consensus is the narrow committed-command boundary needed by the agent
-// service.
-type Consensus interface {
+// CommandConsensus is the committed-command boundary shared by local outbox
+// owners.
+type CommandConsensus interface {
 	ApplyAtGeneration(
 		context.Context,
 		domain.UUIDv7,
@@ -44,6 +44,21 @@ type Consensus interface {
 		event.SignedEvent,
 	) (store.ApplyResult, error)
 	IsLeader() bool
+}
+
+type CheckpointConsensus interface {
+	CommandConsensus
+	FatalError() error
+	VerifyCheckpointReplay(
+		context.Context,
+		event.SignedEvent,
+		store.ApplyResult,
+	) error
+}
+
+// Consensus adds the same-boot clock needed by agent lease management.
+type Consensus interface {
+	CommandConsensus
 	LocalTime() (domain.Timestamp, int64, error)
 }
 
@@ -59,6 +74,7 @@ type Options struct {
 	OriginBootID       domain.UUIDv7
 	IdentityPrivateKey ed25519.PrivateKey
 	LifecycleOrigin    event.Binding
+	BootOrigin         *BootOrigin
 
 	Clock      Clock
 	GenerateID IDGenerator
@@ -67,22 +83,23 @@ type Options struct {
 
 // Service is a concurrency-safe local IPC binder and durable outbox owner.
 type Service struct {
-	consensus     Consensus
-	local         store.LocalState
-	sessionID     domain.UUIDv7
-	workspaceID   domain.UUIDv4
-	deviceID      domain.DeviceID
-	originBootID  domain.UUIDv7
-	privateKey    ed25519.PrivateKey
-	publicKey     ed25519.PublicKey
-	daemonBinding event.Binding
-	clock         Clock
-	generateID    IDGenerator
-	random        io.Reader
+	consensus    Consensus
+	local        store.LocalState
+	sessionID    domain.UUIDv7
+	workspaceID  domain.UUIDv4
+	deviceID     domain.DeviceID
+	originBootID domain.UUIDv7
+	privateKey   ed25519.PrivateKey
+	publicKey    ed25519.PublicKey
+	clock        Clock
+	generateID   IDGenerator
+	random       io.Reader
+	bootOrigin   *BootOrigin
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   sync.WaitGroup
+	clear  sync.Once
 
 	randomMu  sync.Mutex
 	recoverMu sync.Mutex
@@ -106,6 +123,7 @@ type Service struct {
 
 func New(options Options) (*Service, error) {
 	if options.Consensus == nil ||
+		options.BootOrigin == nil ||
 		!options.SessionID.Valid() ||
 		!options.WorkspaceID.Valid() ||
 		!options.DeviceID.Valid() ||
@@ -130,6 +148,18 @@ func New(options Options) (*Service, error) {
 		daemonOrigin.OriginBootID() != options.OriginBootID ||
 		daemonOrigin.AgentSessionID() != "" {
 		return nil, fmt.Errorf("%w: invalid daemon binding", ErrInvalidOptions)
+	}
+	if !options.BootOrigin.matches(
+		options.LocalState,
+		options.SessionID,
+		options.WorkspaceID,
+		options.DeviceID,
+		options.OriginBootID,
+	) {
+		return nil, fmt.Errorf(
+			"%w: boot origin does not match service",
+			ErrInvalidOptions,
+		)
 	}
 	clock := options.Clock
 	if clock == nil {
@@ -166,10 +196,10 @@ func New(options Options) (*Service, error) {
 		originBootID:      options.OriginBootID,
 		privateKey:        append(ed25519.PrivateKey(nil), options.IdentityPrivateKey...),
 		publicKey:         append(ed25519.PublicKey(nil), publicKey...),
-		daemonBinding:     options.LifecycleOrigin,
 		clock:             clock,
 		generateID:        generateID,
 		random:            randomSource,
+		bootOrigin:        options.BootOrigin,
 		ctx:               ctx,
 		cancel:            cancel,
 		active:            make(map[domain.UUIDv7]struct{}),
@@ -260,6 +290,9 @@ func (service *Service) Recover(ctx context.Context) error {
 	}
 	service.recoverMu.Lock()
 	defer service.recoverMu.Unlock()
+	if err := service.available(); err != nil {
+		return err
+	}
 	if service.recovered {
 		return nil
 	}
@@ -267,6 +300,9 @@ func (service *Service) Recover(ctx context.Context) error {
 		return err
 	}
 	if err := service.local.ClearPendingLaunches(ctx); err != nil {
+		return err
+	}
+	if err := service.bootOrigin.Recover(ctx); err != nil {
 		return err
 	}
 	scopes, err := service.local.OutboxScopes(ctx)
@@ -618,8 +654,15 @@ func (service *Service) FatalError() error {
 		return ErrInvalidOptions
 	}
 	service.fatalMu.RLock()
-	defer service.fatalMu.RUnlock()
-	return service.fatalErr
+	fatal := service.fatalErr
+	service.fatalMu.RUnlock()
+	if fatal != nil {
+		return fatal
+	}
+	if service.bootOrigin != nil {
+		return service.bootOrigin.FatalError()
+	}
+	return nil
 }
 
 func (service *Service) randomBytes(size int) ([]byte, error) {
@@ -690,11 +733,14 @@ func (service *Service) releaseActive(id domain.UUIDv7) {
 	service.mu.Unlock()
 }
 
-// Close stops background workers. Durable queued commands remain recoverable.
-func (service *Service) Close() error {
+// BeginClose cancels background work without waiting for an already-enqueued
+// consensus future. The daemon closes Raft before joining the service.
+func (service *Service) BeginClose() error {
 	if service == nil {
 		return ErrInvalidOptions
 	}
+	service.recoverMu.Lock()
+	defer service.recoverMu.Unlock()
 	service.mu.Lock()
 	if service.closed {
 		service.mu.Unlock()
@@ -703,11 +749,30 @@ func (service *Service) Close() error {
 	service.closed = true
 	service.cancel()
 	service.mu.Unlock()
-	service.done.Wait()
-	for index := range service.privateKey {
-		service.privateKey[index] = 0
-	}
 	return nil
+}
+
+// Wait joins background work and clears the service's private-key copy.
+func (service *Service) Wait() error {
+	if service == nil {
+		return ErrInvalidOptions
+	}
+	if err := service.BeginClose(); err != nil {
+		return err
+	}
+	service.done.Wait()
+	service.clear.Do(func() {
+		clear(service.privateKey)
+	})
+	return nil
+}
+
+// Close stops background workers. Durable queued commands remain recoverable.
+func (service *Service) Close() error {
+	if err := service.BeginClose(); err != nil {
+		return err
+	}
+	return service.Wait()
 }
 
 func cloneString(value *string) *string {

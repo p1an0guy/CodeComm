@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 )
 
@@ -30,6 +31,10 @@ func (service *Service) wakeCommand(record store.LocalCommandRecord) {
 }
 
 func (service *Service) wakeScope(scope store.OutboxScope) {
+	if scope.OriginScopeKind == store.OriginScopeKindBoot {
+		service.bootOrigin.wakeWorker()
+		return
+	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	if service.closed {
@@ -74,6 +79,13 @@ func (worker *originWorker) run() {
 
 // drain returns true only after observing an empty durable queue.
 func (worker *originWorker) drain() bool {
+	if worker.scope.OriginScopeKind != store.OriginScopeKindAgent {
+		worker.service.recordFatal(fmt.Errorf(
+			"%w: generic worker received a non-agent scope",
+			ErrCommandForwarding,
+		))
+		return false
+	}
 	for {
 		record, found, err := worker.service.local.ClaimNextOutbox(
 			worker.service.ctx,
@@ -142,20 +154,80 @@ func (worker *originWorker) drain() bool {
 			}
 			continue
 		}
-		_, err = worker.service.consensus.ApplyAtGeneration(
+		result, err := worker.service.consensus.ApplyAtGeneration(
 			worker.service.ctx,
 			record.SessionID,
 			record.RecoveryGeneration,
 			signed,
 		)
 		if err != nil {
+			if errors.Is(err, store.ErrIdempotencyConflict) {
+				resolved, abandonErr := abandonOutboxCollision(
+					worker.service.ctx,
+					worker.service.local,
+					record,
+				)
+				if abandonErr != nil {
+					worker.service.recordFatal(fmt.Errorf(
+						"%w: abandon colliding outbox command: %v",
+						ErrCommandForwarding,
+						abandonErr,
+					))
+					return false
+				}
+				if resolved {
+					worker.service.signalResult()
+					continue
+				}
+				worker.service.recordFatal(fmt.Errorf(
+					"%w: event ID collision poisoned origin scope",
+					ErrCommandForwarding,
+				))
+				return false
+			}
 			if !worker.retry() {
 				return false
 			}
 			continue
 		}
+		if originSequenceRejected(result.Outcome) {
+			worker.service.recordFatal(fmt.Errorf(
+				"%w: committed local command rejected its durable origin sequence",
+				ErrCommandForwarding,
+			))
+			worker.service.signalResult()
+			return false
+		}
 		worker.service.signalResult()
 	}
+}
+
+func abandonOutboxCollision(
+	ctx context.Context,
+	local store.LocalState,
+	record store.OutboxRecord,
+) (bool, error) {
+	settled, _, err := local.AbandonCommandCollision(
+		ctx,
+		store.LocalCommandCollisionInput{
+			ClientInstanceID:   record.ClientInstanceID,
+			RequestID:          record.RequestID,
+			SessionID:          record.SessionID,
+			RecoveryGeneration: record.RecoveryGeneration,
+			EventID:            record.EventID,
+			ProposalDigest:     record.ProposalDigest,
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+	return settled.State == store.LocalRequestResolved, nil
+}
+
+func originSequenceRejected(outcome store.CommandOutcome) bool {
+	return outcome.Status == store.OutcomeRejected &&
+		(outcome.Code == string(reducer.CodeOriginSequenceGap) ||
+			outcome.Code == string(reducer.CodeOriginSequenceReused))
 }
 
 func outboxRecordMatchesSigned(
@@ -171,12 +243,18 @@ func outboxRecordMatchesSigned(
 		proposal.CreatedAt != record.QueuedAt {
 		return false
 	}
-	switch record.OriginScopeKind {
-	case store.OriginScopeKindAgent:
-		return proposal.Origin.AgentSessionID() == record.OriginScopeID &&
+	switch record.BindingClass {
+	case store.LocalBindingAgent:
+		return proposal.Origin.ActorType() == event.ActorAgent &&
+			proposal.Origin.AgentSessionID() == record.OriginScopeID &&
 			proposal.Origin.OriginBootID() == ""
-	case store.OriginScopeKindBoot:
-		return proposal.Origin.OriginBootID() == record.OriginScopeID &&
+	case store.LocalBindingOperator:
+		return proposal.Origin.ActorType() == event.ActorHuman &&
+			proposal.Origin.OriginBootID() == record.OriginScopeID &&
+			proposal.Origin.AgentSessionID() == ""
+	case store.LocalBindingDaemon:
+		return proposal.Origin.ActorType() == event.ActorDaemon &&
+			proposal.Origin.OriginBootID() == record.OriginScopeID &&
 			proposal.Origin.AgentSessionID() == ""
 	default:
 		return false

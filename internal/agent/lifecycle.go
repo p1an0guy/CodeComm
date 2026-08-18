@@ -121,86 +121,17 @@ func (service *Service) submitDaemonCommand(
 	payload []byte,
 	requestFields map[string]any,
 ) (store.CommandOutcome, error) {
-	_, knownKind := event.LookupKind(kind)
-	if ctx == nil ||
-		!knownKind ||
-		expectedVersion < 1 ||
-		!domain.ValidUnsignedInteger(expectedVersion) ||
-		len(payload) == 0 ||
-		requestFields == nil {
+	if service == nil || service.bootOrigin == nil {
 		return store.CommandOutcome{}, ErrInvalidOptions
 	}
-	requestID, err := service.generateID()
-	if err != nil {
-		return store.CommandOutcome{}, err
-	}
-	now := service.clock()
-	if !now.Valid() {
-		return store.CommandOutcome{}, ErrInvalidOptions
-	}
-	requestFields["expected_entity_version"] = expectedVersion
-	requestFields["operation"] = kind
-	requestFields["request_id"] = requestID
-	canonicalRequest, err := canonicalObject(requestFields)
-	if err != nil {
-		return store.CommandOutcome{}, err
-	}
-	record, _, err := service.local.ReserveCommand(
+	return service.bootOrigin.submitDaemonCommand(
 		ctx,
-		store.LocalCommandInput{
-			ClientInstanceID: service.originBootID,
-			RequestID:        requestID,
-			SessionID:        service.sessionID,
-			WorkspaceID:      service.workspaceID,
-			BindingClass:     store.LocalBindingDaemon,
-			OriginDeviceID:   service.deviceID,
-			OriginScopeKind:  store.OriginScopeKindBoot,
-			OriginScopeID:    service.originBootID,
-			RequestKind:      kind,
-			CanonicalRequest: canonicalRequest,
-			CreatedAt:        now,
-		},
-		func() (domain.UUIDv7, error) {
-			return service.generateID()
-		},
-		func(eventID domain.UUIDv7, sequence uint64) (event.SignedEvent, error) {
-			proposal, err := event.BuildProposal(
-				event.Command{
-					Kind:                  kind,
-					EntityID:              entityID,
-					ExpectedEntityVersion: &expectedVersion,
-					RationaleSummary:      "",
-					Actions:               []event.Action{},
-					Payload:               payload,
-					Redaction:             defaultRedaction(),
-				},
-				service.daemonBinding,
-				event.BuildContext{
-					EventID:        eventID,
-					SessionID:      service.sessionID,
-					WorkspaceID:    service.workspaceID,
-					CreatedAt:      now,
-					OriginSequence: sequence,
-				},
-			)
-			if err != nil {
-				return event.SignedEvent{}, err
-			}
-			return event.Sign(proposal, service.privateKey)
-		},
+		kind,
+		entityID,
+		expectedVersion,
+		payload,
+		requestFields,
 	)
-	if err != nil {
-		return store.CommandOutcome{}, err
-	}
-	service.wakeCommand(record)
-	resolved, err := service.waitResolved(ctx, record)
-	if err != nil {
-		return store.CommandOutcome{}, err
-	}
-	if resolved.Outcome == nil {
-		return store.CommandOutcome{}, ErrCommandForwarding
-	}
-	return *resolved.Outcome, nil
 }
 
 func (service *Service) onDisconnected(agentSessionID domain.UUIDv7) {

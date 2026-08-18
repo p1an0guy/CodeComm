@@ -30,6 +30,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 	"net/http"
 	"net/http/httptest"
@@ -63,6 +64,13 @@ type cancellationBlockingConsensus struct {
 	once     sync.Once
 }
 
+type recoveryBlockingConsensus struct {
+	delegate Consensus
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
 func (runtime *cancellationBlockingConsensus) ApplyAtGeneration(
 	ctx context.Context,
 	_ domain.UUIDv7,
@@ -80,12 +88,51 @@ func (runtime *cancellationBlockingConsensus) IsLeader() bool {
 	return runtime.delegate.IsLeader()
 }
 
+func (runtime *cancellationBlockingConsensus) FatalError() error {
+	if delegate, ok := runtime.delegate.(interface{ FatalError() error }); ok {
+		return delegate.FatalError()
+	}
+	return nil
+}
+
 func (runtime *cancellationBlockingConsensus) LocalTime() (
 	domain.Timestamp,
 	int64,
 	error,
 ) {
 	return runtime.delegate.LocalTime()
+}
+
+func (runtime *recoveryBlockingConsensus) ApplyAtGeneration(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	generation uint64,
+	signed event.SignedEvent,
+) (store.ApplyResult, error) {
+	return runtime.delegate.ApplyAtGeneration(
+		ctx,
+		sessionID,
+		generation,
+		signed,
+	)
+}
+
+func (runtime *recoveryBlockingConsensus) IsLeader() bool {
+	return runtime.delegate.IsLeader()
+}
+
+func (runtime *recoveryBlockingConsensus) LocalTime() (
+	domain.Timestamp,
+	int64,
+	error,
+) {
+	runtime.once.Do(func() { close(runtime.entered) })
+	select {
+	case <-runtime.release:
+		return runtime.delegate.LocalTime()
+	case <-time.After(5 * time.Second):
+		return "", 0, errors.New("recovery clock remained blocked")
+	}
 }
 
 func (runtime *fsmConsensus) ApplyAtGeneration(
@@ -133,6 +180,56 @@ func (runtime *fsmConsensus) View(ctx context.Context) (store.StateView, error) 
 
 func (runtime *fsmConsensus) IsLeader() bool {
 	return runtime.leader.Load()
+}
+
+func (runtime *fsmConsensus) FatalError() error {
+	if runtime == nil || runtime.fsm == nil {
+		return errors.New("missing FSM")
+	}
+	return runtime.fsm.HaltError()
+}
+
+func (runtime *fsmConsensus) VerifyCheckpointReplay(
+	ctx context.Context,
+	signed event.SignedEvent,
+	result store.ApplyResult,
+) error {
+	if signed.Proposal().Kind != event.KindConsensusCheckpoint {
+		return errors.New("not a checkpoint")
+	}
+	if result.Outcome.Status == store.OutcomeRejected {
+		if result.Outcome.Code == string(reducer.CodeStaleCheckpoint) {
+			return nil
+		}
+		return errors.New("unexpected checkpoint rejection")
+	}
+	if result.Outcome.Status != store.OutcomeAccepted {
+		return errors.New("invalid checkpoint outcome")
+	}
+	checkpoint, signature, err := event.DecodeCheckpointPayload(
+		signed.Proposal().Payload,
+	)
+	if err != nil {
+		return err
+	}
+	lookup, found, err := runtime.store.AppliedCheckpoint(
+		ctx,
+		signed.Proposal().EventID,
+	)
+	if err != nil {
+		return err
+	}
+	checkpointJSON, err := event.EncodeCheckpoint(checkpoint)
+	if err != nil {
+		return err
+	}
+	if !found ||
+		lookup.AppliedLogIndex != checkpoint.CoveredAppliedLogIndex+1 ||
+		!bytes.Equal(lookup.Record.CheckpointJSON, checkpointJSON) ||
+		lookup.Record.AuthoritySignature != store.Signature(signature) {
+		return errors.New("checkpoint binding mismatch")
+	}
+	return nil
 }
 
 func (runtime *fsmConsensus) LocalTime() (domain.Timestamp, int64, error) {
@@ -217,6 +314,7 @@ type agentTestHarness struct {
 	state     *store.Store
 	local     store.LocalState
 	service   *Service
+	boot      *BootOrigin
 	consensus *fsmConsensus
 	deviceID  domain.DeviceID
 	private   ed25519.PrivateKey
@@ -379,6 +477,26 @@ func newAgentTestHarnessWithState(
 	}
 	ids := &testIDGenerator{}
 	randomSource := &recordingRandom{}
+	bootOrigin, err := NewBootOrigin(BootOriginOptions{
+		Consensus:          runtime,
+		LocalState:         state.LocalState(),
+		SessionID:          agentTestSessionID,
+		WorkspaceID:        agentTestWorkspaceID,
+		DeviceID:           deviceID,
+		OriginBootID:       agentTestBootID,
+		IdentityPrivateKey: privateKey,
+		DaemonOrigin:       lifecycleOrigin,
+		Clock: func() domain.Timestamp {
+			return agentTestTimestamp
+		},
+		GenerateID: ids.next,
+	})
+	if err != nil {
+		t.Fatalf("new boot origin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = bootOrigin.Close()
+	})
 	service, err := New(Options{
 		Consensus:          runtime,
 		LocalState:         state.LocalState(),
@@ -388,6 +506,7 @@ func newAgentTestHarnessWithState(
 		OriginBootID:       agentTestBootID,
 		IdentityPrivateKey: privateKey,
 		LifecycleOrigin:    lifecycleOrigin,
+		BootOrigin:         bootOrigin,
 		Clock: func() domain.Timestamp {
 			return agentTestTimestamp
 		},
@@ -404,6 +523,7 @@ func newAgentTestHarnessWithState(
 		state:     state,
 		local:     state.LocalState(),
 		service:   service,
+		boot:      bootOrigin,
 		consensus: runtime,
 		deviceID:  deviceID,
 		private:   privateKey,
@@ -727,9 +847,12 @@ func TestRecoveryLeavesPairingAdmissionForFinalizer(t *testing.T) {
 		}
 		if found && current.State == store.LocalRequestResolved {
 			if current.Outcome == nil ||
+				current.Outcome.Status != store.OutcomeRejected ||
+				current.Outcome.Code !=
+					string(reducer.CodeOriginSequenceGap) ||
 				harness.consensus.appliedCount() != 1 {
 				t.Fatalf(
-					"trailing command did not resolve normally: %#v",
+					"poisoned trailing command outcome = %#v",
 					current,
 				)
 			}
@@ -743,6 +866,59 @@ func TestRecoveryLeavesPairingAdmissionForFinalizer(t *testing.T) {
 			)
 		}
 		time.Sleep(time.Millisecond)
+	}
+	deadline = time.Now().Add(time.Second)
+	for harness.service.FatalError() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("poisoned boot sequence did not stop the service")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRecoverSerializesWorkerRegistrationWithClose(t *testing.T) {
+	harness := newAgentTestHarness(t, nil)
+	blocker := &recoveryBlockingConsensus{
+		delegate: harness.service.consensus,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	harness.service.consensus = blocker
+
+	recoverDone := make(chan error, 1)
+	go func() {
+		recoverDone <- harness.service.Recover(context.Background())
+	}()
+	select {
+	case <-blocker.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Recover() did not enter lease rearming")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- harness.service.BeginClose()
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("BeginClose() crossed active recovery: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(blocker.release)
+	if err := <-recoverDone; err != nil {
+		t.Fatalf("Recover(): %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("BeginClose(): %v", err)
+	}
+	if err := harness.service.Wait(); err != nil {
+		t.Fatalf("Wait(): %v", err)
+	}
+	if err := harness.service.Recover(
+		context.Background(),
+	); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Recover(after close) error = %v, want ErrClosed", err)
 	}
 }
 
@@ -852,7 +1028,7 @@ func TestResumeBindCancellationInterruptsWaitWithoutStoppingService(t *testing.T
 		delegate: harness.service.consensus,
 		entered:  make(chan struct{}),
 	}
-	harness.service.consensus = blocker
+	harness.boot.consensus = blocker
 	proof, err := canonicalObject(map[string]any{
 		"resume_capability": codec.EncodeBase64URL(capability),
 	})

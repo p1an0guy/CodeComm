@@ -21,6 +21,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
+	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/ui"
 )
 
@@ -41,6 +42,15 @@ type daemonOptions struct {
 }
 
 type identityHandle interface {
+	Close() error
+}
+
+type phasedDaemonComponent interface {
+	BeginClose() error
+	Wait() error
+}
+
+type daemonConsensusCloser interface {
 	Close() error
 }
 
@@ -221,23 +231,85 @@ func runDaemon(
 			errInvalidDaemonDependencies,
 		)
 	}
+	authority, err := event.NewLocalAuthority(deviceID, originBootID)
+	if err != nil {
+		return fmt.Errorf("codecommd: create local authority: %w", err)
+	}
+	daemonBinding, err := authority.DaemonBinding()
+	if err != nil {
+		return fmt.Errorf("codecommd: create daemon binding: %w", err)
+	}
+	checkpointSigner := consensus.CheckpointSignerAdapter{
+		SignerDeviceID: deviceID,
+		Sign: func(
+			signContext context.Context,
+			checkpoint domain.Checkpoint,
+		) (store.Signature, error) {
+			if err := signContext.Err(); err != nil {
+				return store.Signature{}, err
+			}
+			signature, err := event.SignCheckpoint(
+				checkpoint,
+				identityPrivateKey,
+			)
+			return store.Signature(signature), err
+		},
+	}
 
 	processClock := consensus.NewSystemApplyClock()
+	var bootOrigin *agent.BootOrigin
 	node, err := consensus.OpenSingleNode(
 		ctx,
 		consensus.SingleNodeOptions{
-			ServerID:     deviceID,
-			StatePath:    options.statePath,
-			ConsensusDir: options.consensusDir,
-			OriginBootID: originBootID,
-			Clock:        processClock,
+			ServerID:         deviceID,
+			StatePath:        options.statePath,
+			ConsensusDir:     options.consensusDir,
+			OriginBootID:     originBootID,
+			CheckpointSigner: checkpointSigner,
+			CheckpointOriginFactory: func(
+				localState store.LocalState,
+				submitter consensus.CheckpointCommandSubmitter,
+			) (consensus.CheckpointOrigin, error) {
+				created, err := agent.NewBootOrigin(
+					agent.BootOriginOptions{
+						Consensus:          submitter,
+						LocalState:         localState,
+						SessionID:          options.sessionID,
+						WorkspaceID:        options.workspaceID,
+						DeviceID:           deviceID,
+						OriginBootID:       originBootID,
+						IdentityPrivateKey: identityPrivateKey,
+						DaemonOrigin:       daemonBinding,
+					},
+				)
+				if err == nil {
+					bootOrigin = created
+				}
+				return created, err
+			},
+			Clock: processClock,
 		},
 	)
 	if err != nil {
 		return err
 	}
+	if bootOrigin == nil {
+		_ = node.Close()
+		return errInvalidDaemonDependencies
+	}
+	var agentService *agent.Service
 	defer func() {
-		resultErr = errors.Join(resultErr, node.Close())
+		components := []phasedDaemonComponent{bootOrigin}
+		if agentService != nil {
+			components = append(
+				[]phasedDaemonComponent{agentService},
+				components...,
+			)
+		}
+		resultErr = errors.Join(
+			resultErr,
+			shutdownDaemonComponents(node, nil, components...),
+		)
 	}()
 	if err := node.WaitForLeader(ctx); err != nil {
 		return fmt.Errorf("codecommd: wait for local consensus: %w", err)
@@ -260,15 +332,7 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	authority, err := event.NewLocalAuthority(deviceID, originBootID)
-	if err != nil {
-		return fmt.Errorf("codecommd: create local authority: %w", err)
-	}
-	daemonBinding, err := authority.DaemonBinding()
-	if err != nil {
-		return fmt.Errorf("codecommd: create daemon binding: %w", err)
-	}
-	agentService, err := agent.New(agent.Options{
+	agentService, err = agent.New(agent.Options{
 		Consensus:          node,
 		LocalState:         localState,
 		SessionID:          options.sessionID,
@@ -277,13 +341,11 @@ func runDaemon(
 		OriginBootID:       originBootID,
 		IdentityPrivateKey: identityPrivateKey,
 		LifecycleOrigin:    daemonBinding,
+		BootOrigin:         bootOrigin,
 	})
 	if err != nil {
 		return err
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, agentService.Close())
-	}()
 	if err := agentService.Recover(ctx); err != nil {
 		return fmt.Errorf("codecommd: recover local agent state: %w", err)
 	}
@@ -309,7 +371,13 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	return serveUntilStopped(ctx, localServer, node, agentService)
+	return serveUntilStopped(
+		ctx,
+		localServer,
+		node,
+		agentService,
+		bootOrigin,
+	)
 }
 
 func serveUntilStopped(
@@ -317,6 +385,7 @@ func serveUntilStopped(
 	server *ipc.Server,
 	node *consensus.SingleNode,
 	agentService *agent.Service,
+	bootOrigin *agent.BootOrigin,
 ) error {
 	serveContext, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -327,22 +396,72 @@ func serveUntilStopped(
 
 	ticker := time.NewTicker(fatalPollInterval)
 	defer ticker.Stop()
+	stop := func(cause error) error {
+		cancel()
+		return errors.Join(
+			cause,
+			shutdownDaemonComponents(
+				node,
+				func() error { return <-serveDone },
+				agentService,
+				bootOrigin,
+			),
+		)
+	}
 	for {
 		select {
 		case err := <-serveDone:
 			return err
 		case <-ctx.Done():
-			cancel()
-			return <-serveDone
+			return stop(nil)
 		case <-ticker.C:
 			if fatal := node.FatalError(); fatal != nil {
-				cancel()
-				return errors.Join(fatal, <-serveDone)
+				return stop(fatal)
 			}
 			if fatal := agentService.FatalError(); fatal != nil {
-				cancel()
-				return errors.Join(fatal, <-serveDone)
+				return stop(fatal)
 			}
 		}
 	}
+}
+
+func shutdownDaemonComponents(
+	consensus daemonConsensusCloser,
+	joinServer func() error,
+	components ...phasedDaemonComponent,
+) error {
+	var shutdownErrors []error
+	for _, component := range components {
+		if component == nil {
+			shutdownErrors = append(
+				shutdownErrors,
+				errInvalidDaemonDependencies,
+			)
+			continue
+		}
+		shutdownErrors = append(
+			shutdownErrors,
+			component.BeginClose(),
+		)
+	}
+	if consensus == nil {
+		shutdownErrors = append(
+			shutdownErrors,
+			errInvalidDaemonDependencies,
+		)
+	} else {
+		shutdownErrors = append(shutdownErrors, consensus.Close())
+	}
+	if joinServer != nil {
+		shutdownErrors = append(shutdownErrors, joinServer())
+	}
+	for _, component := range components {
+		if component != nil {
+			shutdownErrors = append(
+				shutdownErrors,
+				component.Wait(),
+			)
+		}
+	}
+	return errors.Join(shutdownErrors...)
 }

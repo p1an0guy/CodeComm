@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -149,6 +150,117 @@ func TestDaemonRecoversUnchangedCommitmentsAfterProcessKill(t *testing.T) {
 			baseline,
 			afterKill,
 		)
+	}
+}
+
+func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	consensusDir := filepath.Join(root, "consensus")
+	endpoint := daemonTestEndpoint(t)
+	initial, identityPrivateKey, deviceID := daemonTestInitialState(t)
+
+	setupNode, err := consensus.OpenSingleNode(
+		context.Background(),
+		consensus.SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    statePath,
+			ConsensusDir: consensusDir,
+			OriginBootID: daemonTestSetupBootID,
+			InitialState: &initial,
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(setup): %v", err)
+	}
+	waitForDaemonTestLeader(t, setupNode)
+	if err := setupNode.Close(); err != nil {
+		t.Fatalf("Close(setup): %v", err)
+	}
+
+	runContext, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runDaemon(
+			runContext,
+			daemonOptions{
+				statePath:    statePath,
+				consensusDir: consensusDir,
+				endpoint:     endpoint,
+				sessionID:    daemonTestSessionID,
+				workspaceID:  daemonTestWorkspaceID,
+			},
+			daemonDependencies{
+				loadIdentity: func(
+					context.Context,
+				) (identityHandle, []byte, error) {
+					return testIdentityHandle{},
+						bytes.Clone(identityPrivateKey),
+						nil
+				},
+				newBootID: func() (domain.UUIDv7, error) {
+					return daemonTestFirstBootID, nil
+				},
+			},
+		)
+	}()
+	waitForDaemonTestStatusOrExit(t, endpoint, runDone)
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runDaemon() after cancellation: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runDaemon() did not complete graceful shutdown")
+	}
+
+	reopened, err := consensus.OpenSingleNode(
+		context.Background(),
+		consensus.SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    statePath,
+			ConsensusDir: consensusDir,
+			OriginBootID: daemonTestVerifyBootID,
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(after graceful shutdown): %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	waitForDaemonTestLeader(t, reopened)
+}
+
+func TestShutdownDaemonComponentsClosesConsensusBeforeWaiting(
+	t *testing.T,
+) {
+	trace := &daemonShutdownTrace{}
+	consensus := &recordingDaemonConsensus{trace: trace}
+	first := &recordingDaemonComponent{name: "first", trace: trace}
+	second := &recordingDaemonComponent{name: "second", trace: trace}
+
+	err := shutdownDaemonComponents(
+		consensus,
+		func() error {
+			trace.events = append(trace.events, "server.join")
+			return nil
+		},
+		first,
+		second,
+	)
+	if err != nil {
+		t.Fatalf("shutdownDaemonComponents(): %v", err)
+	}
+	want := []string{
+		"first.begin",
+		"second.begin",
+		"consensus.close",
+		"server.join",
+		"first.wait",
+		"second.wait",
+	}
+	if !reflect.DeepEqual(trace.events, want) {
+		t.Fatalf("shutdown order = %#v, want %#v", trace.events, want)
 	}
 }
 
@@ -320,10 +432,28 @@ func waitForDaemonTestStatus(
 	t *testing.T,
 	endpoint ipc.Endpoint,
 ) ui.Snapshot {
+	return waitForDaemonTestStatusOrExit(t, endpoint, nil)
+}
+
+func waitForDaemonTestStatusOrExit(
+	t *testing.T,
+	endpoint ipc.Endpoint,
+	runDone <-chan error,
+) ui.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		if runDone != nil {
+			select {
+			case err := <-runDone:
+				t.Fatalf(
+					"daemon exited before becoming ready: %v",
+					err,
+				)
+			default:
+			}
+		}
 		ctx, cancel := context.WithTimeout(
 			context.Background(),
 			500*time.Millisecond,
@@ -351,6 +481,48 @@ func waitForDaemonTestStatus(
 	}
 	t.Fatalf("daemon status did not become ready: %v", lastErr)
 	return ui.Snapshot{}
+}
+
+type daemonShutdownTrace struct {
+	events          []string
+	consensusClosed bool
+}
+
+type recordingDaemonConsensus struct {
+	trace *daemonShutdownTrace
+}
+
+func (consensus *recordingDaemonConsensus) Close() error {
+	consensus.trace.events = append(
+		consensus.trace.events,
+		"consensus.close",
+	)
+	consensus.trace.consensusClosed = true
+	return nil
+}
+
+type recordingDaemonComponent struct {
+	name  string
+	trace *daemonShutdownTrace
+}
+
+func (component *recordingDaemonComponent) BeginClose() error {
+	component.trace.events = append(
+		component.trace.events,
+		component.name+".begin",
+	)
+	return nil
+}
+
+func (component *recordingDaemonComponent) Wait() error {
+	if !component.trace.consensusClosed {
+		return errors.New("component waited before consensus closed")
+	}
+	component.trace.events = append(
+		component.trace.events,
+		component.name+".wait",
+	)
+	return nil
 }
 
 func assertDaemonStatusMatchesView(
