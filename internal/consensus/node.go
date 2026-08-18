@@ -68,6 +68,10 @@ type SingleNodeOptions struct {
 	// CheckpointOrigin is optional until checkpoint scheduling is enabled.
 	// When supplied, it remains owned by the caller.
 	CheckpointOrigin CheckpointOrigin
+	// CheckpointOriginFactory constructs an origin after the node has opened
+	// its LocalState. It is mutually exclusive with CheckpointOrigin; the
+	// returned origin remains caller-owned after OpenSingleNode succeeds.
+	CheckpointOriginFactory CheckpointOriginFactory
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -182,13 +186,14 @@ type nodeOpenOptions struct {
 	OriginBootID domain.UUIDv7
 	InitialState *store.InitialState
 
-	Transport              RaftTransport
-	TransportFactory       RaftTransportFactory
-	BootstrapConfiguration raft.Configuration
-	CanonicalCoverage      canonicalcoverage.ReceiptCollector
-	CheckpointSigner       CheckpointSigner
-	CheckpointOrigin       CheckpointOrigin
-	Single                 bool
+	Transport               RaftTransport
+	TransportFactory        RaftTransportFactory
+	BootstrapConfiguration  raft.Configuration
+	CanonicalCoverage       canonicalcoverage.ReceiptCollector
+	CheckpointSigner        CheckpointSigner
+	CheckpointOrigin        CheckpointOrigin
+	CheckpointOriginFactory CheckpointOriginFactory
+	Single                  bool
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -205,17 +210,18 @@ func OpenSingleNode(
 		return nil, err
 	}
 	return openNode(ctx, nodeOpenOptions{
-		ServerID:         options.ServerID,
-		StatePath:        options.StatePath,
-		ConsensusDir:     options.ConsensusDir,
-		OriginBootID:     options.OriginBootID,
-		InitialState:     options.InitialState,
-		CheckpointSigner: options.CheckpointSigner,
-		CheckpointOrigin: options.CheckpointOrigin,
-		Single:           true,
-		Clock:            options.Clock,
-		RaftConfig:       options.RaftConfig,
-		LogOutput:        options.LogOutput,
+		ServerID:                options.ServerID,
+		StatePath:               options.StatePath,
+		ConsensusDir:            options.ConsensusDir,
+		OriginBootID:            options.OriginBootID,
+		InitialState:            options.InitialState,
+		CheckpointSigner:        options.CheckpointSigner,
+		CheckpointOrigin:        options.CheckpointOrigin,
+		CheckpointOriginFactory: options.CheckpointOriginFactory,
+		Single:                  true,
+		Clock:                   options.Clock,
+		RaftConfig:              options.RaftConfig,
+		LogOutput:               options.LogOutput,
 	})
 }
 
@@ -575,14 +581,6 @@ func openNode(
 	checkpointOrigin := normalizedCheckpointOrigin(
 		options.CheckpointOrigin,
 	)
-	checkpointRequester, err := checkpointRequesterForTransport(
-		options.Single,
-		checkpointOrigin,
-		transport,
-	)
-	if err != nil {
-		return nil, err
-	}
 	node := &SingleNode{
 		fsm:           fsm,
 		state:         state,
@@ -598,14 +596,13 @@ func openNode(
 		checkpointSigner: normalizedCheckpointSigner(
 			options.CheckpointSigner,
 		),
-		checkpointOrigin:    checkpointOrigin,
-		checkpointRequester: checkpointRequester,
-		monitorStop:         make(chan struct{}),
-		monitorDone:         make(chan struct{}),
-		closeStarted:        make(chan struct{}),
-		lineageGate:         make(chan struct{}, 1),
-		raftEnqueue:         make(chan struct{}, 1),
-		fatalSet:            make(chan struct{}),
+		checkpointOrigin: checkpointOrigin,
+		monitorStop:      make(chan struct{}),
+		monitorDone:      make(chan struct{}),
+		closeStarted:     make(chan struct{}),
+		lineageGate:      make(chan struct{}, 1),
+		raftEnqueue:      make(chan struct{}, 1),
+		fatalSet:         make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -626,6 +623,64 @@ func openNode(
 	}
 	node.raft = instance
 	node.readLeadershipEpoch = node.currentLeadershipEpoch
+	defer func() {
+		if err != nil {
+			_ = instance.Shutdown().Error()
+		}
+	}()
+
+	var factoryOrigin CheckpointOrigin
+	defer func() {
+		originToClose := normalizedCheckpointOrigin(factoryOrigin)
+		if err == nil || originToClose == nil {
+			return
+		}
+		if closer, ok := originToClose.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}()
+	if options.CheckpointOriginFactory != nil {
+		if !options.Single {
+			return nil, fmt.Errorf(
+				"%w: checkpoint origin factory requires a routed mesh submitter",
+				ErrInvalidNodeOptions,
+			)
+		}
+		factoryOrigin, err = options.CheckpointOriginFactory(
+			state.LocalState(),
+			node,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"consensus: construct checkpoint origin: %w",
+				err,
+			)
+		}
+		checkpointOrigin = normalizedCheckpointOrigin(factoryOrigin)
+		if checkpointOrigin == nil {
+			return nil, fmt.Errorf(
+				"%w: checkpoint origin factory returned nil",
+				ErrInvalidNodeOptions,
+			)
+		}
+		if err := validateCheckpointOrigin(
+			options.ServerID,
+			options.OriginBootID,
+			checkpointOrigin,
+		); err != nil {
+			return nil, err
+		}
+		node.checkpointOrigin = checkpointOrigin
+	}
+	checkpointRequester, err := checkpointRequesterForTransport(
+		options.Single,
+		checkpointOrigin,
+		transport,
+	)
+	if err != nil {
+		return nil, err
+	}
+	node.checkpointRequester = checkpointRequester
 	if transportGate != nil {
 		transportGate.bind(node)
 	}
@@ -701,9 +756,10 @@ func validateSingleNodeOptions(
 	); err != nil {
 		return err
 	}
-	return validateCheckpointCapabilities(
+	return validateCheckpointOriginConfiguration(
 		options.CheckpointSigner,
 		options.CheckpointOrigin,
+		options.CheckpointOriginFactory,
 	)
 }
 
@@ -742,6 +798,24 @@ func validateNodeOptions(
 	return validateCheckpointCapabilities(
 		options.CheckpointSigner,
 		options.CheckpointOrigin,
+	)
+}
+
+func validateCheckpointOriginConfiguration(
+	signer CheckpointSigner,
+	origin CheckpointOrigin,
+	factory CheckpointOriginFactory,
+) error {
+	hasOrigin := normalizedCheckpointOrigin(origin) != nil
+	if hasOrigin && factory != nil {
+		return fmt.Errorf(
+			"%w: checkpoint origin and factory are mutually exclusive",
+			ErrInvalidNodeOptions,
+		)
+	}
+	return validateCheckpointCapabilityPresence(
+		signer,
+		hasOrigin || factory != nil,
 	)
 }
 

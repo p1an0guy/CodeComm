@@ -41,7 +41,7 @@ var (
 
 // CheckpointReservation durably reserves and signs one exact daemon-origin
 // checkpoint event. A successful reservation must survive process restart.
-type CheckpointReservation func(
+type CheckpointReservation = func(
 	context.Context,
 	domain.Checkpoint,
 	store.Signature,
@@ -63,6 +63,33 @@ type CheckpointOrigin interface {
 		func(CheckpointReservation) error,
 	) error
 }
+
+// CheckpointCommandSubmitter is the narrow local-consensus boundary available
+// to a single-node durable checkpoint-origin owner. A mesh owner requires a
+// leader-routing submitter and is not constructed through this boundary.
+type CheckpointCommandSubmitter interface {
+	ApplyAtGeneration(
+		context.Context,
+		domain.UUIDv7,
+		uint64,
+		event.SignedEvent,
+	) (store.ApplyResult, error)
+	FatalError() error
+	IsLeader() bool
+	VerifyCheckpointReplay(
+		context.Context,
+		event.SignedEvent,
+		store.ApplyResult,
+	) error
+}
+
+// CheckpointOriginFactory resolves the single-node construction cycle between
+// the node-owned LocalState capability and the durable boot-origin queue
+// owner. The factory must not start background work before returning.
+type CheckpointOriginFactory func(
+	store.LocalState,
+	CheckpointCommandSubmitter,
+) (CheckpointOrigin, error)
 
 type checkpointCapture struct {
 	leadership      raftLeadershipEpoch
@@ -330,14 +357,113 @@ func (node *SingleNode) handleCheckpointLookupError(err error) error {
 		return nil
 	}
 	if errors.Is(err, store.ErrAppliedCheckpointIntegrity) ||
+		errors.Is(err, store.ErrCommandResultCorrupt) ||
 		errors.Is(err, store.ErrIntegrityCheck) ||
-		errors.Is(err, store.ErrCorrupt) {
+		errors.Is(err, store.ErrCorrupt) ||
+		errors.Is(err, store.ErrIdempotencyConflict) {
 		return node.haltNode(fmt.Errorf(
 			"committed checkpoint lookup failed integrity checks: %w",
 			err,
 		))
 	}
 	return err
+}
+
+// VerifyCheckpointReplay proves that a generic outbox replay reached the only
+// two legal terminal checkpoint outcomes. It integrity-halts on any mismatch.
+func (node *SingleNode) VerifyCheckpointReplay(
+	ctx context.Context,
+	signed event.SignedEvent,
+	result store.ApplyResult,
+) error {
+	if node == nil ||
+		node.state == nil ||
+		ctx == nil ||
+		signed.Proposal().Kind != event.KindConsensusCheckpoint {
+		return ErrInvalidNodeOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := node.beginOperation(); err != nil {
+		return err
+	}
+	defer node.endOperation()
+	if err := node.FatalError(); err != nil {
+		return err
+	}
+	committed, found, err := node.lookupCommitted(ctx, signed)
+	if err != nil {
+		return node.handleCheckpointLookupError(err)
+	}
+	if !found ||
+		committed.Outcome.Status != result.Outcome.Status ||
+		committed.Outcome.Code != result.Outcome.Code ||
+		!bytes.Equal(committed.Outcome.JSON, result.Outcome.JSON) {
+		return node.haltNode(errors.New(
+			"replayed checkpoint lacks its exact durable command result",
+		))
+	}
+
+	eventID := signed.Proposal().EventID
+	switch result.Outcome.Status {
+	case store.OutcomeRejected:
+		if result.Outcome.Code != string(reducer.CodeStaleCheckpoint) {
+			return node.haltNode(fmt.Errorf(
+				"%w: %s",
+				ErrCheckpointCommitRejected,
+				result.Outcome.Code,
+			))
+		}
+		if _, exists, err := node.state.AppliedCheckpoint(
+			ctx,
+			eventID,
+		); err != nil {
+			return node.handleCheckpointLookupError(err)
+		} else if exists {
+			return node.haltNode(errors.New(
+				"rejected checkpoint has an accepted checkpoint row",
+			))
+		}
+		return nil
+	case store.OutcomeAccepted:
+		// Continue below.
+	default:
+		return node.haltNode(ErrCheckpointCommitRejected)
+	}
+
+	checkpoint, authoritySignature, err :=
+		event.DecodeCheckpointPayload(signed.Proposal().Payload)
+	if err != nil {
+		return node.haltNode(fmt.Errorf(
+			"%w: decode replayed checkpoint: %v",
+			ErrInvalidCheckpointEvent,
+			err,
+		))
+	}
+	checkpointJSON, err := event.EncodeCheckpoint(checkpoint)
+	if err != nil {
+		return node.haltNode(fmt.Errorf(
+			"%w: encode replayed checkpoint: %v",
+			ErrInvalidCheckpointEvent,
+			err,
+		))
+	}
+	lookup, exists, err := node.state.AppliedCheckpoint(ctx, eventID)
+	if err != nil {
+		return node.handleCheckpointLookupError(err)
+	}
+	if !exists ||
+		lookup.Record.CheckpointEventID != eventID ||
+		lookup.AppliedLogIndex != checkpoint.CoveredAppliedLogIndex+1 ||
+		!bytes.Equal(lookup.Record.CheckpointJSON, checkpointJSON) ||
+		lookup.Record.AuthoritySignature !=
+			store.Signature(authoritySignature) {
+		return node.haltNode(errors.New(
+			"accepted replayed checkpoint lacks its exact durable binding",
+		))
+	}
+	return nil
 }
 
 func (node *SingleNode) captureCheckpointState(
@@ -859,8 +985,17 @@ func validateCheckpointCapabilities(
 	signer CheckpointSigner,
 	origin CheckpointOrigin,
 ) error {
-	if normalizedCheckpointOrigin(origin) != nil &&
-		normalizedCheckpointSigner(signer) == nil {
+	return validateCheckpointCapabilityPresence(
+		signer,
+		normalizedCheckpointOrigin(origin) != nil,
+	)
+}
+
+func validateCheckpointCapabilityPresence(
+	signer CheckpointSigner,
+	hasOrigin bool,
+) error {
+	if hasOrigin && normalizedCheckpointSigner(signer) == nil {
 		return fmt.Errorf(
 			"%w: checkpoint origin requires a local signer",
 			ErrInvalidNodeOptions,

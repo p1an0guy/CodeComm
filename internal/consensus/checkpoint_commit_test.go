@@ -37,6 +37,7 @@ type checkpointCommitOrigin struct {
 	exclusive      chan struct{}
 	nextSequence   uint64
 	reservations   int
+	signed         []event.SignedEvent
 	reserveEntered chan struct{}
 	reserveRelease chan struct{}
 	beforeReserve  func(context.Context, domain.Checkpoint) error
@@ -162,6 +163,7 @@ func (origin *checkpointCommitOrigin) reserve(
 	}
 	origin.nextSequence++
 	origin.reservations++
+	origin.signed = append(origin.signed, signed)
 	return signed, nil
 }
 
@@ -185,6 +187,142 @@ func TestForceCheckpointCommitsExactCapturedSuccessor(t *testing.T) {
 		result.Record.AuthoritySignature[:],
 	); err != nil {
 		t.Fatalf("stored authority signature: %v", err)
+	}
+}
+
+func TestVerifyCheckpointReplayRequiresExactDurableOutcome(t *testing.T) {
+	node, origin, _, _ := openCheckpointCommitNode(t, nil)
+	result, err := node.ForceCheckpoint(testContext(t))
+	if err != nil {
+		t.Fatalf("ForceCheckpoint(): %v", err)
+	}
+	committed, found, err := node.state.LookupCommandResult(
+		testContext(t),
+		result.Record.CheckpointEventID,
+	)
+	if err != nil || !found || len(origin.signed) != 1 {
+		t.Fatalf(
+			"checkpoint lookup = (%#v, %t, %v), proposals=%d",
+			committed,
+			found,
+			err,
+			len(origin.signed),
+		)
+	}
+	replayed := store.ApplyResult{
+		Heads:   committed.CurrentHeads,
+		Outcome: committed.Outcome,
+	}
+	if err := node.VerifyCheckpointReplay(
+		testContext(t),
+		origin.signed[0],
+		replayed,
+	); err != nil {
+		t.Fatalf("VerifyCheckpointReplay(exact): %v", err)
+	}
+	replayed.Outcome.Code = "unexpected_checkpoint_result"
+	if err := node.VerifyCheckpointReplay(
+		testContext(t),
+		origin.signed[0],
+		replayed,
+	); err == nil {
+		t.Fatal("VerifyCheckpointReplay(tampered) succeeded")
+	}
+	if node.FatalError() == nil {
+		t.Fatal("tampered replay outcome did not halt the node")
+	}
+}
+
+func TestVerifyCheckpointReplayAllowsCurrentHeadsAfterLaterCommand(
+	t *testing.T,
+) {
+	node, origin, privateKey, deviceID := openCheckpointCommitNode(t, nil)
+	checkpoint, err := node.ForceCheckpoint(testContext(t))
+	if err != nil {
+		t.Fatalf("ForceCheckpoint(): %v", err)
+	}
+	if len(origin.signed) != 1 {
+		t.Fatalf("checkpoint proposals = %d, want 1", len(origin.signed))
+	}
+	later := nodeTestTaskEvent(
+		t,
+		privateKey,
+		deviceID,
+		nodeTestBootID1,
+		nodeTestEventID1,
+		nodeTestTaskID1,
+		nodeTestTimestamp2,
+		2,
+		"later task",
+	)
+	if result, err := node.Apply(
+		testContext(t),
+		later,
+	); err != nil || result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("Apply(later) = (%#v, %v)", result, err)
+	}
+	replayed, err := node.Apply(testContext(t), origin.signed[0])
+	if err != nil {
+		t.Fatalf("Apply(checkpoint duplicate): %v", err)
+	}
+	if !replayed.Duplicate ||
+		replayed.Heads.ResultIndex <= checkpoint.Record.CoveredResultIndex+1 {
+		t.Fatalf("checkpoint replay result = %#v", replayed)
+	}
+	if err := node.VerifyCheckpointReplay(
+		testContext(t),
+		origin.signed[0],
+		replayed,
+	); err != nil {
+		t.Fatalf("VerifyCheckpointReplay(current heads): %v", err)
+	}
+}
+
+func TestVerifyCheckpointReplayHaltsOnCorruptDurableResult(t *testing.T) {
+	node, origin, _, _ := openCheckpointCommitNode(t, nil)
+	result, err := node.ForceCheckpoint(testContext(t))
+	if err != nil {
+		t.Fatalf("ForceCheckpoint(): %v", err)
+	}
+	committed, found, err := node.state.LookupCommandResult(
+		testContext(t),
+		result.Record.CheckpointEventID,
+	)
+	if err != nil || !found || len(origin.signed) != 1 {
+		t.Fatalf(
+			"checkpoint lookup = (%#v, %t, %v), proposals=%d",
+			committed,
+			found,
+			err,
+			len(origin.signed),
+		)
+	}
+	tamperSQLite(
+		t,
+		node.state.Path(),
+		`UPDATE command_results
+		    SET outcome_json = '{"code":"accepted","status":"accepted","x":1}'
+		  WHERE event_id = '`+string(result.Record.CheckpointEventID)+`';`,
+	)
+	err = node.VerifyCheckpointReplay(
+		testContext(t),
+		origin.signed[0],
+		store.ApplyResult{
+			Heads:   committed.CurrentHeads,
+			Outcome: committed.Outcome,
+		},
+	)
+	if !errors.Is(err, store.ErrCommandResultCorrupt) {
+		t.Fatalf(
+			"VerifyCheckpointReplay() error = %v, want ErrCommandResultCorrupt",
+			err,
+		)
+	}
+	if !errors.Is(node.FatalError(), store.ErrCommandResultCorrupt) {
+		t.Fatalf(
+			"FatalError() = %v, want ErrCommandResultCorrupt",
+			node.FatalError(),
+		)
 	}
 }
 
@@ -341,6 +479,19 @@ func TestForceCheckpointRetriesStaleInterleavingWithFreshEvent(t *testing.T) {
 			found,
 			err,
 		)
+	}
+	if len(origin.signed) != 2 {
+		t.Fatalf("reserved proposals = %d, want 2", len(origin.signed))
+	}
+	if err := node.VerifyCheckpointReplay(
+		testContext(t),
+		origin.signed[0],
+		store.ApplyResult{
+			Heads:   stale.CurrentHeads,
+			Outcome: stale.Outcome,
+		},
+	); err != nil {
+		t.Fatalf("VerifyCheckpointReplay(stale): %v", err)
 	}
 	if origin.reservations != 2 || origin.nextSequence != 4 {
 		t.Fatalf(
