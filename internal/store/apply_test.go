@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -841,31 +842,44 @@ func insertOutbox(t *testing.T, store *Store, signed event.SignedEvent) {
 	t.Helper()
 	proposal := signed.Proposal()
 	scopeKind, scopeID := proposalScope(proposal)
-	digest := proposalDigest(signed)
-	err := store.withConn(context.Background(), func(conn *sqlite.Conn) error {
-		return execute(
-			conn,
-			`INSERT INTO outbox(
-			    event_id, session_id, recovery_generation,
-			    origin_device_id, origin_scope_kind, origin_scope_id,
-			    origin_sequence, kind, signed_proposal_json,
-			    proposal_digest, state, queued_at
-			) VALUES (
-			    ?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-			    'queued', ?10
-			);`,
-			string(proposal.EventID),
-			string(proposal.SessionID),
-			string(proposal.Origin.DeviceID()),
-			scopeKind,
-			scopeID,
-			proposal.Origin.Sequence(),
-			string(proposal.Kind),
-			string(signed.CanonicalBytes()),
-			digest[:],
-			string(testAppliedAt),
-		)
-	})
+	bindingClass := LocalBindingDaemon
+	switch proposal.Origin.ActorType() {
+	case event.ActorAgent:
+		bindingClass = LocalBindingAgent
+	case event.ActorHuman:
+		bindingClass = LocalBindingOperator
+	}
+	canonicalRequest := []byte(`{"operation":"test"}`)
+	requestDigest := Digest(sha256.Sum256(canonicalRequest))
+	err := store.LocalState().withImmediate(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			lineage, err := readLocalLineage(conn)
+			if err != nil {
+				return err
+			}
+			_, err = insertLocalCommand(
+				conn,
+				lineage,
+				LocalCommandInput{
+					ClientInstanceID: proposal.EventID,
+					RequestID:        proposal.EventID,
+					SessionID:        proposal.SessionID,
+					WorkspaceID:      proposal.WorkspaceID,
+					BindingClass:     bindingClass,
+					OriginDeviceID:   proposal.Origin.DeviceID(),
+					OriginScopeKind:  scopeKind,
+					OriginScopeID:    domain.UUIDv7(scopeID),
+					RequestKind:      proposal.Kind,
+					CanonicalRequest: canonicalRequest,
+					CreatedAt:        proposal.CreatedAt,
+				},
+				requestDigest,
+				signed,
+			)
+			return err
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

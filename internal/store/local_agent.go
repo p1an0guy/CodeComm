@@ -590,6 +590,7 @@ func (state LocalState) ReserveLaunchStart(
 			lineage,
 			OriginScopeKindAgent,
 			launch.AgentSessionID,
+			event.KindAgentSessionStarted,
 		); err != nil {
 			return err
 		}

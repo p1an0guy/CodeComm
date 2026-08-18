@@ -7,6 +7,17 @@ import (
 	"github.com/ijonahch/codecomm/internal/event"
 )
 
+func TestCheckpointStaleCodeMatchesWireContract(t *testing.T) {
+	t.Parallel()
+	if string(CodeStaleCheckpoint) != event.CheckpointStaleOutcomeCode {
+		t.Fatalf(
+			"checkpoint stale code = %q, wire contract = %q",
+			CodeStaleCheckpoint,
+			event.CheckpointStaleOutcomeCode,
+		)
+	}
+}
+
 func TestValidateCheckpointAtApplyClassifiesStaleAndDivergentState(
 	t *testing.T,
 ) {

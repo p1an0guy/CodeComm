@@ -155,6 +155,60 @@ func TestParseAndVerifyRejectsWrongBindingKeyAndSignatureEncoding(t *testing.T) 
 	}
 }
 
+func TestInspectUnverifiedProposalIsStrictButDoesNotAuthenticate(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	_, _, privateKey := testIdentity(t)
+	signed := mustSignedEvent(t, privateKey)
+	changedSignature := replaceSignature(
+		t,
+		signed.CanonicalBytes(),
+		func(value string) string {
+			replacement := byte('A')
+			if value[0] == replacement {
+				replacement = 'B'
+			}
+			return string(replacement) + value[1:]
+		},
+	)
+	proposal, err := InspectUnverifiedProposal(changedSignature)
+	if err != nil {
+		t.Fatalf("InspectUnverifiedProposal(): %v", err)
+	}
+	if proposal.EventID != testEventID ||
+		proposal.SessionID != testSessionID ||
+		proposal.WorkspaceID != testWorkspaceID {
+		t.Fatalf("inspected proposal = %#v", proposal)
+	}
+
+	withUnknown := addUnknownField(
+		t,
+		signed.CanonicalBytes(),
+		json.RawMessage(`true`),
+		nil,
+	)
+	if _, err := InspectUnverifiedProposal(
+		withUnknown,
+	); !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("unknown field error = %v, want ErrUnknownField", err)
+	}
+	padded := replaceSignature(
+		t,
+		signed.CanonicalBytes(),
+		func(value string) string { return value + "=" },
+	)
+	if _, err := InspectUnverifiedProposal(
+		padded,
+	); !errors.Is(err, codec.ErrInvalidBase64URL) {
+		t.Fatalf(
+			"padded signature error = %v, want ErrInvalidBase64URL",
+			err,
+		)
+	}
+}
+
 func TestBuildProposalEnforcesKindCASAndEntityContracts(t *testing.T) {
 	t.Parallel()
 

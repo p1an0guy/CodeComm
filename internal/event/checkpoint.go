@@ -14,6 +14,10 @@ import (
 
 var ErrInvalidCheckpoint = errors.New("event: invalid checkpoint")
 
+// CheckpointStaleOutcomeCode is the only ordinary rejection produced after a
+// locally reserved checkpoint reaches its Raft position.
+const CheckpointStaleOutcomeCode = "stale_checkpoint"
+
 var checkpointRequiredFields = map[string]struct{}{
 	"session_id":                  {},
 	"workspace_id":                {},
@@ -30,6 +34,15 @@ var checkpointRequiredFields = map[string]struct{}{
 	"digest_version":              {},
 	"projection_schema_version":   {},
 }
+
+var checkpointPayloadRequiredFields = func() map[string]struct{} {
+	fields := make(map[string]struct{}, len(checkpointRequiredFields)+1)
+	for field := range checkpointRequiredFields {
+		fields[field] = struct{}{}
+	}
+	fields["authority_signature"] = struct{}{}
+	return fields
+}()
 
 type checkpointWire struct {
 	SessionID                string `json:"session_id"`
@@ -133,6 +146,82 @@ func EncodeCheckpointPayload(
 		)
 	}
 	return canonical, nil
+}
+
+// DecodeCheckpointPayload accepts only the exact canonical signed payload and
+// returns values backed by no caller-owned memory.
+func DecodeCheckpointPayload(
+	encoded []byte,
+) (domain.Checkpoint, [ed25519.SignatureSize]byte, error) {
+	var signature [ed25519.SignatureSize]byte
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil || !bytes.Equal(canonical, encoded) {
+		return domain.Checkpoint{}, signature, fmt.Errorf(
+			"%w: noncanonical payload JSON",
+			ErrInvalidCheckpoint,
+		)
+	}
+	var members map[string]json.RawMessage
+	if err := decodeStrict(encoded, &members); err != nil ||
+		validateMemberSet(
+			members,
+			checkpointPayloadRequiredFields,
+			map[string]struct{}{},
+		) != nil ||
+		rejectNullMembers(members, map[string]struct{}{}) != nil {
+		return domain.Checkpoint{}, signature, fmt.Errorf(
+			"%w: invalid payload field set",
+			ErrInvalidCheckpoint,
+		)
+	}
+	var signatureText string
+	if err := json.Unmarshal(
+		members["authority_signature"],
+		&signatureText,
+	); err != nil {
+		return domain.Checkpoint{}, signature, fmt.Errorf(
+			"%w: invalid authority signature",
+			ErrInvalidCheckpoint,
+		)
+	}
+	decodedSignature, err := codec.DecodeBase64URLExact(
+		signatureText,
+		ed25519.SignatureSize,
+	)
+	if err != nil {
+		return domain.Checkpoint{}, signature, fmt.Errorf(
+			"%w: invalid authority signature",
+			ErrInvalidCheckpoint,
+		)
+	}
+	copy(signature[:], decodedSignature)
+	delete(members, "authority_signature")
+	unsignedJSON, err := json.Marshal(members)
+	if err != nil {
+		return domain.Checkpoint{}, [ed25519.SignatureSize]byte{}, fmt.Errorf(
+			"%w: encode unsigned JSON",
+			ErrInvalidCheckpoint,
+		)
+	}
+	unsigned, err := codec.CanonicalizeSignedObject(unsignedJSON)
+	if err != nil {
+		return domain.Checkpoint{}, [ed25519.SignatureSize]byte{}, fmt.Errorf(
+			"%w: canonicalize unsigned JSON",
+			ErrInvalidCheckpoint,
+		)
+	}
+	checkpoint, err := DecodeCheckpoint(unsigned)
+	if err != nil {
+		return domain.Checkpoint{}, [ed25519.SignatureSize]byte{}, err
+	}
+	reencoded, err := EncodeCheckpointPayload(checkpoint, signature)
+	if err != nil || !bytes.Equal(reencoded, encoded) {
+		return domain.Checkpoint{}, [ed25519.SignatureSize]byte{}, fmt.Errorf(
+			"%w: payload fields do not round trip",
+			ErrInvalidCheckpoint,
+		)
+	}
+	return checkpoint, signature, nil
 }
 
 // DecodeCheckpoint accepts only the exact canonical unsigned checkpoint

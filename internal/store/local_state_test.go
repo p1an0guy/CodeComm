@@ -192,6 +192,170 @@ func TestLocalStateRejectsStaleGenerationOutbox(t *testing.T) {
 	}
 }
 
+func TestLocalStateOutboxRequiresExactPendingRequestBinding(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*sqlite.Conn) error
+	}{
+		{
+			name: "request kind",
+			mutate: func(conn *sqlite.Conn) error {
+				return execute(
+					conn,
+					`UPDATE local_requests
+					    SET request_kind = ?2
+					  WHERE event_id = ?1;`,
+					string(testEventID),
+					string(event.KindTaskUpdated),
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, privateKey, deviceID := newLocalStateFixture(t)
+			input := LocalCommandInput{
+				ClientInstanceID: testClientInstanceID,
+				RequestID:        testRequestID,
+				SessionID:        domain.UUIDv7(testSessionID),
+				WorkspaceID:      testWorkspaceID,
+				BindingClass:     LocalBindingOperator,
+				OriginDeviceID:   deviceID,
+				OriginScopeKind:  OriginScopeKindBoot,
+				OriginScopeID:    testBootID,
+				RequestKind:      event.KindTaskCreated,
+				CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+				CreatedAt:        testAppliedAt,
+			}
+			if _, _, err := state.ReserveCommand(
+				context.Background(),
+				input,
+				func() (domain.UUIDv7, error) { return testEventID, nil },
+				operatorTaskBuilder(t, privateKey, deviceID),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := state.store.withConn(
+				context.Background(),
+				test.mutate,
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := state.OutboxRecords(
+				context.Background(),
+			); !errors.Is(err, ErrLocalStateIntegrity) {
+				t.Fatalf(
+					"OutboxRecords() error = %v, want %v",
+					err,
+					ErrLocalStateIntegrity,
+				)
+			}
+			if _, _, err := state.ClaimNextOutbox(
+				context.Background(),
+				OutboxScope{
+					OriginDeviceID:  deviceID,
+					OriginScopeKind: OriginScopeKindBoot,
+					OriginScopeID:   testBootID,
+				},
+			); !errors.Is(err, ErrLocalStateIntegrity) {
+				t.Fatalf(
+					"ClaimNextOutbox() error = %v, want %v",
+					err,
+					ErrLocalStateIntegrity,
+				)
+			}
+		})
+	}
+}
+
+func TestLocalStateOutboxRejectsCorrelatedEnvelopeCorruption(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := operatorTaskBuilder(
+		t,
+		privateKey,
+		deviceID,
+	)(testEventID2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementDigest := Digest(
+		sha256.Sum256(replacement.CanonicalBytes()),
+	)
+	if err := state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			if err := execute(
+				conn,
+				`UPDATE local_requests
+				    SET signed_proposal_json = ?2,
+				        proposal_digest = ?3
+				  WHERE event_id = ?1;`,
+				string(testEventID),
+				string(replacement.CanonicalBytes()),
+				replacementDigest[:],
+			); err != nil {
+				return err
+			}
+			return execute(
+				conn,
+				`UPDATE outbox
+				    SET signed_proposal_json = ?2,
+				        proposal_digest = ?3
+				  WHERE event_id = ?1;`,
+				string(testEventID),
+				string(replacement.CanonicalBytes()),
+				replacementDigest[:],
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := state.OutboxRecords(
+		context.Background(),
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"OutboxRecords() error = %v, want ErrLocalStateIntegrity",
+			err,
+		)
+	}
+	if _, _, err := state.ClaimNextOutbox(
+		context.Background(),
+		OutboxScope{
+			OriginDeviceID:  deviceID,
+			OriginScopeKind: OriginScopeKindBoot,
+			OriginScopeID:   testBootID,
+		},
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"ClaimNextOutbox() error = %v, want ErrLocalStateIntegrity",
+			err,
+		)
+	}
+}
+
 func TestLocalStateBackpressurePrecedesIDAndSequenceAllocation(t *testing.T) {
 	state, privateKey, deviceID := newLocalStateFixture(t)
 	err := state.store.withConn(context.Background(), func(conn *sqlite.Conn) (err error) {
@@ -270,6 +434,417 @@ func TestLocalStateBackpressurePrecedesIDAndSequenceAllocation(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalStateReservesSessionCapacityForCheckpoint(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	err := state.withImmediate(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(
+				conn,
+				`WITH digits(d) AS (
+				    VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+				),
+				numbers(i) AS (
+				    SELECT a.d + 10*b.d + 100*c.d + 1000*d.d + 1
+				      FROM digits AS a
+				      CROSS JOIN digits AS b
+				      CROSS JOIN digits AS c
+				      CROSS JOIN digits AS d
+				     WHERE a.d + 10*b.d + 100*c.d + 1000*d.d < ?1
+				)
+				INSERT INTO local_requests(
+				    client_instance_id, request_id, session_id,
+				    workspace_id, recovery_generation, binding_class,
+				    origin_device_id, origin_scope_kind, origin_scope_id,
+				    request_digest, event_id, request_kind, state,
+				    signed_proposal_json, proposal_digest, created_at
+				)
+				SELECT
+				    printf('018f47de-89ab-7def-8123-%012x', i),
+				    printf('018f47de-89ab-7def-8123-%012x', i),
+				    ?2, ?3, 0, 'agent', ?4, 'agent',
+				    printf('018f47de-89ab-7def-8123-%012x', i),
+				    zeroblob(32),
+				    printf('018f47de-89ab-7def-8123-f%011x', i),
+				    'task.created', 'signed', '{}', zeroblob(32), ?5
+				  FROM numbers;`,
+				MaxUnresolvedCommandsPerSession-
+					ReservedCheckpointCommandsPerSession,
+				testSessionID,
+				string(testWorkspaceID),
+				string(deviceID),
+				string(testAppliedAt),
+			)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normalInput := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create"}`),
+		CreatedAt:        testAppliedAt,
+	}
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		normalInput,
+		func() (domain.UUIDv7, error) {
+			return testEventID, nil
+		},
+		operatorTaskBuilder(t, privateKey, deviceID),
+	); !errors.Is(err, ErrLocalBackpressure) {
+		t.Fatalf(
+			"normal ReserveCommand() error = %v, want ErrLocalBackpressure",
+			err,
+		)
+	}
+
+	authority, err := event.NewLocalAuthority(deviceID, testBootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, err := authority.DaemonBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointInput := normalInput
+	checkpointInput.ClientInstanceID = testLaunchID
+	checkpointInput.RequestID = testLaunchID
+	checkpointInput.BindingClass = LocalBindingDaemon
+	checkpointInput.RequestKind = event.KindConsensusCheckpoint
+	checkpointInput.CanonicalRequest = []byte(
+		`{"operation":"consensus.checkpoint"}`,
+	)
+	buildCheckpoint := func(
+		eventID domain.UUIDv7,
+		sequence uint64,
+	) (event.SignedEvent, error) {
+		proposal, err := event.BuildProposal(
+			event.Command{
+				Kind:     event.KindConsensusCheckpoint,
+				EntityID: event.NullEntityID(),
+				Actions:  []event.Action{},
+				Payload:  []byte(`{}`),
+				Redaction: event.Redaction{
+					Policy:        event.RedactionDefault,
+					FieldsRemoved: []event.RedactionField{},
+				},
+			},
+			daemon,
+			event.BuildContext{
+				EventID:        eventID,
+				SessionID:      domain.UUIDv7(testSessionID),
+				WorkspaceID:    testWorkspaceID,
+				CreatedAt:      testAppliedAt,
+				OriginSequence: sequence,
+			},
+		)
+		if err != nil {
+			return event.SignedEvent{}, err
+		}
+		return event.Sign(proposal, privateKey)
+	}
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		checkpointInput,
+		func() (domain.UUIDv7, error) {
+			return testLaunchEventID, nil
+		},
+		buildCheckpoint,
+	); err != nil {
+		t.Fatalf("checkpoint ReserveCommand(): %v", err)
+	}
+
+	checkpointInput.ClientInstanceID = testManagedRootID
+	checkpointInput.RequestID = testManagedRootID
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		checkpointInput,
+		func() (domain.UUIDv7, error) {
+			return testEventID2, nil
+		},
+		buildCheckpoint,
+	); !errors.Is(err, ErrLocalBackpressure) {
+		t.Fatalf(
+			"full checkpoint ReserveCommand() error = %v, want ErrLocalBackpressure",
+			err,
+		)
+	}
+}
+
+func TestApplyResolvesLocalCheckpointOnlyForDurableTerminalStates(
+	t *testing.T,
+) {
+	tests := []struct {
+		name      string
+		code      string
+		wantError bool
+	}{
+		{
+			name:      "unexpected rejection",
+			code:      "invalid_payload",
+			wantError: true,
+		},
+		{
+			name: "stale checkpoint",
+			code: event.CheckpointStaleOutcomeCode,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, _, _ := newLocalStateFixture(t)
+			checkpointRequest := nextCheckpointApplyRequest(
+				t,
+				ApplyHeads{
+					DigestVersion:           1,
+					ProjectionSchemaVersion: 1,
+				},
+				testCheckpointEventID,
+				1,
+				2,
+				testAppliedAt,
+			)
+			signed := checkpointRequest.Proposal
+			input := LocalCommandInput{
+				ClientInstanceID: testClientInstanceID,
+				RequestID:        testRequestID,
+				SessionID:        domain.UUIDv7(testSessionID),
+				WorkspaceID:      testWorkspaceID,
+				BindingClass:     LocalBindingDaemon,
+				OriginDeviceID: signed.Proposal().
+					Origin.DeviceID(),
+				OriginScopeKind: OriginScopeKindBoot,
+				OriginScopeID:   testBootID,
+				RequestKind:     event.KindConsensusCheckpoint,
+				CanonicalRequest: []byte(
+					`{"operation":"consensus.checkpoint"}`,
+				),
+				CreatedAt: testAppliedAt,
+			}
+			if _, _, err := state.ReserveCommand(
+				context.Background(),
+				input,
+				func() (domain.UUIDv7, error) {
+					return testCheckpointEventID, nil
+				},
+				func(
+					eventID domain.UUIDv7,
+					sequence uint64,
+				) (event.SignedEvent, error) {
+					if eventID != signed.Proposal().EventID ||
+						sequence != signed.Proposal().Origin.Sequence() {
+						return event.SignedEvent{}, errors.New(
+							"unexpected checkpoint reservation identity",
+						)
+					}
+					return signed, nil
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			request := ApplyRequest{
+				Term:               1,
+				LogIndex:           1,
+				AppliedAt:          testAppliedAt,
+				RecoveryGeneration: 0,
+				Proposal:           signed,
+				Outcome: CommandOutcome{
+					Status: OutcomeRejected,
+					Code:   test.code,
+					JSON: []byte(fmt.Sprintf(
+						`{"code":%q,"status":"rejected"}`,
+						test.code,
+					)),
+				},
+			}
+			_, err := state.store.Apply(
+				context.Background(),
+				request,
+			)
+			if test.wantError {
+				if !errors.Is(err, ErrLocalStateIntegrity) {
+					t.Fatalf(
+						"Apply() error = %v, want ErrLocalStateIntegrity",
+						err,
+					)
+				}
+				assertCounts(t, state.store, map[string]int64{
+					"command_results": 0,
+					"outbox":          1,
+				})
+				assertConsensus(t, state.store, 0, 0, 0)
+				return
+			}
+			if err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+			resolved, found, err := state.LookupRequest(
+				context.Background(),
+				testClientInstanceID,
+				testRequestID,
+			)
+			if err != nil ||
+				!found ||
+				resolved.State != LocalRequestResolved ||
+				resolved.Outcome == nil ||
+				resolved.Outcome.Code != test.code {
+				t.Fatalf(
+					"resolved checkpoint = (%#v, %t, %v)",
+					resolved,
+					found,
+					err,
+				)
+			}
+			assertCounts(t, state.store, map[string]int64{"outbox": 0})
+			reopened := reopenLocalTestStore(t, state.store)
+			resolved, found, err = reopened.LocalState().LookupRequest(
+				context.Background(),
+				testClientInstanceID,
+				testRequestID,
+			)
+			if err != nil ||
+				!found ||
+				resolved.State != LocalRequestResolved ||
+				resolved.Outcome == nil ||
+				resolved.Outcome.Code != test.code {
+				t.Fatalf(
+					"reopened checkpoint = (%#v, %t, %v)",
+					resolved,
+					found,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestApplyResolvesAcceptedLocalCheckpointAndReopens(t *testing.T) {
+	state, _, _ := newLocalStateFixture(t)
+	predecessor := acceptedApplyRequest(
+		t,
+		testSignedTaskEvent(t, testEventID, 1),
+	)
+	predecessorResult, err := state.store.Apply(
+		context.Background(),
+		predecessor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := nextCheckpointApplyRequest(
+		t,
+		predecessorResult.Heads,
+		testCheckpointEventID,
+		1,
+		2,
+		testAppliedAt,
+	)
+	signed := request.Proposal
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		LocalCommandInput{
+			ClientInstanceID: testClientInstanceID,
+			RequestID:        testRequestID,
+			SessionID:        domain.UUIDv7(testSessionID),
+			WorkspaceID:      testWorkspaceID,
+			BindingClass:     LocalBindingDaemon,
+			OriginDeviceID:   signed.Proposal().Origin.DeviceID(),
+			OriginScopeKind:  OriginScopeKindBoot,
+			OriginScopeID:    testBootID,
+			RequestKind:      event.KindConsensusCheckpoint,
+			CanonicalRequest: []byte(
+				`{"operation":"consensus.checkpoint"}`,
+			),
+			CreatedAt: signed.Proposal().CreatedAt,
+		},
+		func() (domain.UUIDv7, error) {
+			return signed.Proposal().EventID, nil
+		},
+		func(
+			eventID domain.UUIDv7,
+			sequence uint64,
+		) (event.SignedEvent, error) {
+			if eventID != signed.Proposal().EventID ||
+				sequence != signed.Proposal().Origin.Sequence() {
+				return event.SignedEvent{}, errors.New(
+					"unexpected checkpoint reservation identity",
+				)
+			}
+			return signed, nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.store.Apply(
+		context.Background(),
+		request,
+	); err != nil {
+		t.Fatalf("Apply(): %v", err)
+	}
+	resolved, found, err := state.LookupRequest(
+		context.Background(),
+		testClientInstanceID,
+		testRequestID,
+	)
+	if err != nil ||
+		!found ||
+		resolved.State != LocalRequestResolved ||
+		resolved.Outcome == nil ||
+		resolved.Outcome.Status != OutcomeAccepted {
+		t.Fatalf(
+			"resolved checkpoint = (%#v, %t, %v)",
+			resolved,
+			found,
+			err,
+		)
+	}
+	if _, found, err := state.store.AppliedCheckpoint(
+		context.Background(),
+		testCheckpointEventID,
+	); err != nil || !found {
+		t.Fatalf("AppliedCheckpoint() = (found=%t, err=%v)", found, err)
+	}
+
+	reopened := reopenLocalTestStore(t, state.store)
+	resolved, found, err = reopened.LocalState().LookupRequest(
+		context.Background(),
+		testClientInstanceID,
+		testRequestID,
+	)
+	if err != nil ||
+		!found ||
+		resolved.State != LocalRequestResolved ||
+		resolved.Outcome == nil ||
+		resolved.Outcome.Status != OutcomeAccepted {
+		t.Fatalf(
+			"reopened checkpoint = (%#v, %t, %v)",
+			resolved,
+			found,
+			err,
+		)
+	}
+	if _, found, err := reopened.AppliedCheckpoint(
+		context.Background(),
+		testCheckpointEventID,
+	); err != nil || !found {
+		t.Fatalf(
+			"reopened AppliedCheckpoint() = (found=%t, err=%v)",
+			found,
+			err,
+		)
 	}
 }
 
@@ -387,6 +962,122 @@ func TestApplyResolvesAndCompactsLocalRequestAtomically(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsCorruptLocalBindingAtomically(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	record, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := parseLocalSignedEvent(t, record.SignedProposal, privateKey)
+	if err := state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(
+				conn,
+				`UPDATE local_requests
+				    SET binding_class = 'daemon'
+				  WHERE event_id = ?1;`,
+				string(testEventID),
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := state.store.Apply(
+		context.Background(),
+		nextAcceptedApplyRequest(signed, 1, 1, testAppliedAt),
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"Apply() error = %v, want ErrLocalStateIntegrity",
+			err,
+		)
+	}
+	assertCounts(t, state.store, map[string]int64{
+		"events":           0,
+		"command_results":  0,
+		"event_provenance": 0,
+		"outbox":           1,
+		"local_requests":   1,
+	})
+	assertConsensus(t, state.store, 0, 0, 0)
+}
+
+func TestApplyRejectsOrphanedOutboxAtomically(t *testing.T) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	record, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := parseLocalSignedEvent(t, record.SignedProposal, privateKey)
+	if err := state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(
+				conn,
+				"DELETE FROM local_requests WHERE event_id = ?1;",
+				string(testEventID),
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := state.store.Apply(
+		context.Background(),
+		nextAcceptedApplyRequest(signed, 1, 1, testAppliedAt),
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"Apply() error = %v, want ErrLocalStateIntegrity",
+			err,
+		)
+	}
+	assertCounts(t, state.store, map[string]int64{
+		"events":           0,
+		"command_results":  0,
+		"event_provenance": 0,
+		"outbox":           1,
+		"local_requests":   0,
+	})
+	assertConsensus(t, state.store, 0, 0, 0)
+}
+
 func TestApplyAbandonsFirstSeenLocalEventIDCollision(t *testing.T) {
 	state, privateKey, deviceID := newLocalStateFixture(t)
 	input := LocalCommandInput{
@@ -437,6 +1128,88 @@ func TestApplyAbandonsFirstSeenLocalEventIDCollision(t *testing.T) {
 		t.Fatalf("collision tombstone = %#v, found = %v", record, found)
 	}
 	assertCounts(t, state.store, map[string]int64{"outbox": 0})
+	reopened := reopenLocalTestStore(t, state.store)
+	record, found, err = reopened.LocalState().LookupRequest(
+		context.Background(),
+		testClientInstanceID,
+		testRequestID,
+	)
+	if err != nil ||
+		!found ||
+		record.State != LocalRequestAbandoned ||
+		record.TerminalCode != LocalEventIDCollisionCode ||
+		record.Outcome != nil {
+		t.Fatalf(
+			"reopened collision tombstone = (%#v, %t, %v)",
+			record,
+			found,
+			err,
+		)
+	}
+}
+
+func TestApplyCollisionPreservesMalformedLocalProposalEvidence(
+	t *testing.T,
+) {
+	state, privateKey, deviceID := newLocalStateFixture(t)
+	input := LocalCommandInput{
+		ClientInstanceID: testClientInstanceID,
+		RequestID:        testRequestID,
+		SessionID:        domain.UUIDv7(testSessionID),
+		WorkspaceID:      testWorkspaceID,
+		BindingClass:     LocalBindingOperator,
+		OriginDeviceID:   deviceID,
+		OriginScopeKind:  OriginScopeKindBoot,
+		OriginScopeID:    testBootID,
+		RequestKind:      event.KindTaskCreated,
+		CanonicalRequest: []byte(`{"operation":"task.create","payload":{}}`),
+		CreatedAt:        testAppliedAt,
+	}
+	local, _, err := state.ReserveCommand(
+		context.Background(),
+		input,
+		func() (domain.UUIDv7, error) { return testEventID, nil },
+		operatorTaskBuilder(t, privateKey, deviceID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := testSignedTaskEvent(t, testEventID, 1)
+	if bytes.Equal(local.SignedProposal, incoming.CanonicalBytes()) {
+		t.Fatal("collision fixture proposals are equal")
+	}
+	if err := state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(
+				conn,
+				`UPDATE local_requests
+				    SET binding_class = 'daemon'
+				  WHERE event_id = ?1;`,
+				string(testEventID),
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := state.store.Apply(
+		context.Background(),
+		acceptedApplyRequest(t, incoming),
+	); !errors.Is(err, ErrLocalStateIntegrity) {
+		t.Fatalf(
+			"Apply(collision) error = %v, want ErrLocalStateIntegrity",
+			err,
+		)
+	}
+	assertCounts(t, state.store, map[string]int64{
+		"events":           0,
+		"command_results":  0,
+		"event_provenance": 0,
+		"outbox":           1,
+		"local_requests":   1,
+	})
+	assertConsensus(t, state.store, 0, 0, 0)
 }
 
 func TestAbandonCommandCollisionIsDurableAndIdempotent(t *testing.T) {
@@ -1050,6 +1823,24 @@ func newLocalStateFixture(
 	initializeTestStore(t, store)
 	privateKey, deviceID := localTestIdentity(t)
 	return store.LocalState(), privateKey, deviceID
+}
+
+func reopenLocalTestStore(t *testing.T, current *Store) *Store {
+	t.Helper()
+	path := current.Path()
+	if err := current.Close(); err != nil {
+		t.Fatalf("Close(before reopen): %v", err)
+	}
+	reopened, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open(reopen): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close(reopened): %v", err)
+		}
+	})
+	return reopened
 }
 
 func localTestIdentity(t *testing.T) (ed25519.PrivateKey, domain.DeviceID) {

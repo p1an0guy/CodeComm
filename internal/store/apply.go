@@ -138,9 +138,10 @@ func (store *Store) Apply(
 			if err := compactLocalProposal(
 				conn,
 				stored.recoveryGeneration,
-				request.Proposal.Proposal().EventID,
+				request.Proposal,
 				stored.proposalJSON,
 				stored.proposalDigest,
+				stored.outcome.Status,
 				stored.outcome.Code,
 			); err != nil {
 				return err
@@ -306,9 +307,10 @@ func (store *Store) Apply(
 		if err := compactLocalProposal(
 			conn,
 			request.RecoveryGeneration,
-			request.Proposal.Proposal().EventID,
+			request.Proposal,
 			request.Proposal.CanonicalBytes(),
 			proposalDigest(request.Proposal),
+			request.Outcome.Status,
 			request.Outcome.Code,
 		); err != nil {
 			return err

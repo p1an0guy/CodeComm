@@ -171,6 +171,66 @@ func DecodeLocalCommand(input []byte) (Command, error) {
 	return command, nil
 }
 
+// InspectUnverifiedProposal validates the exact canonical envelope and closed
+// schema without authenticating its origin signature. It exists only for
+// integrity-checking already durable local evidence; authorization paths must
+// use ParseAndVerify.
+func InspectUnverifiedProposal(input []byte) (Proposal, error) {
+	if len(input) > MaxEventBytes {
+		return Proposal{}, fmt.Errorf(
+			"%w: got %d bytes, limit %d",
+			ErrEventTooLarge,
+			len(input),
+			MaxEventBytes,
+		)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(input)
+	if err != nil {
+		return Proposal{}, fmt.Errorf("%w: %w", ErrInvalidEnvelope, err)
+	}
+	if !bytes.Equal(input, canonical) {
+		return Proposal{}, ErrNoncanonicalEvent
+	}
+	_, encodedSignature, err := codec.RemoveCanonicalObjectMember(
+		canonical,
+		"origin_signature",
+	)
+	if err != nil {
+		if errors.Is(err, codec.ErrObjectMemberAbsent) {
+			return Proposal{}, fmt.Errorf(
+				"%w: origin_signature",
+				ErrMissingField,
+			)
+		}
+		return Proposal{}, fmt.Errorf(
+			"%w: origin_signature: %v",
+			ErrInvalidEnvelope,
+			err,
+		)
+	}
+	var signatureText string
+	if err := json.Unmarshal(encodedSignature, &signatureText); err != nil {
+		return Proposal{}, fmt.Errorf(
+			"%w: origin_signature",
+			ErrInvalidEnvelope,
+		)
+	}
+	if _, err := codec.DecodeBase64URLExact(
+		signatureText,
+		codecommcrypto.Ed25519SignatureSize,
+	); err != nil {
+		return Proposal{}, err
+	}
+	proposal, err := decodeProposal(canonical)
+	if err != nil {
+		return Proposal{}, err
+	}
+	if err := proposal.ValidateEnvelope(); err != nil {
+		return Proposal{}, err
+	}
+	return proposal, nil
+}
+
 // ParseAndVerify validates a canonical network proposal, verifies its exact
 // unknown-field-preserving signature preimage, then applies the closed typed
 // envelope schema. Domain outcomes remain reducer work.

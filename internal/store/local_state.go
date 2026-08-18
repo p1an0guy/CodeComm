@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	MaxUnresolvedCommandsPerOrigin  = 256
-	MaxUnresolvedCommandsPerSession = 4096
+	MaxUnresolvedCommandsPerOrigin       = 256
+	MaxUnresolvedCommandsPerSession      = 4096
+	ReservedCheckpointCommandsPerSession = 1
 )
 
 var (
@@ -189,6 +190,9 @@ func (scope OutboxScope) validate() error {
 // OutboxRecord is the exact signed proposal at the head of an origin queue.
 type OutboxRecord struct {
 	OutboxID           int64
+	ClientInstanceID   domain.UUIDv7
+	RequestID          domain.UUIDv7
+	BindingClass       LocalBindingClass
 	EventID            domain.UUIDv7
 	SessionID          domain.UUIDv7
 	RecoveryGeneration uint64
@@ -406,6 +410,7 @@ func reserveLocalCommand(
 		lineage,
 		input.OriginScopeKind,
 		input.OriginScopeID,
+		input.RequestKind,
 	); err != nil {
 		return LocalCommandRecord{}, false, err
 	}
@@ -473,7 +478,22 @@ func validateReservedProposal(
 	sequence uint64,
 	signed event.SignedEvent,
 ) error {
-	proposal := signed.Proposal()
+	return validateReservedProposalFields(
+		input,
+		eventID,
+		sequence,
+		signed.Proposal(),
+		signed.CanonicalBytes(),
+	)
+}
+
+func validateReservedProposalFields(
+	input LocalCommandInput,
+	eventID domain.UUIDv7,
+	sequence uint64,
+	proposal event.Proposal,
+	canonical []byte,
+) error {
 	if proposal.EventID != eventID ||
 		proposal.SessionID != input.SessionID ||
 		proposal.WorkspaceID != input.WorkspaceID ||
@@ -481,7 +501,7 @@ func validateReservedProposal(
 		proposal.Kind != input.RequestKind ||
 		proposal.Origin.DeviceID() != input.OriginDeviceID ||
 		proposal.Origin.Sequence() != sequence ||
-		len(signed.CanonicalBytes()) == 0 {
+		len(canonical) == 0 {
 		return ErrInvalidLocalState
 	}
 	switch input.BindingClass {
@@ -514,6 +534,7 @@ func checkLocalBackpressure(
 	lineage localLineage,
 	scopeKind OriginScopeKind,
 	scopeID domain.UUIDv7,
+	kind event.Kind,
 ) error {
 	var scopeCount, sessionCount int64
 	if err := queryOneArgs(
@@ -540,8 +561,15 @@ func checkLocalBackpressure(
 	); err != nil {
 		return err
 	}
+	sessionLimit := int64(
+		MaxUnresolvedCommandsPerSession -
+			ReservedCheckpointCommandsPerSession,
+	)
+	if kind == event.KindConsensusCheckpoint {
+		sessionLimit = MaxUnresolvedCommandsPerSession
+	}
 	if scopeCount >= MaxUnresolvedCommandsPerOrigin ||
-		sessionCount >= MaxUnresolvedCommandsPerSession {
+		sessionCount >= sessionLimit {
 		return ErrLocalBackpressure
 	}
 	return nil
@@ -809,40 +837,7 @@ func readLocalRequestByKey(
 				return
 			}
 			found = true
-			record.ClientInstanceID = domain.UUIDv7(stmt.ColumnText(0))
-			record.RequestID = domain.UUIDv7(stmt.ColumnText(1))
-			record.SessionID = domain.UUIDv7(stmt.ColumnText(2))
-			record.WorkspaceID = domain.UUIDv4(stmt.ColumnText(3))
-			generation := stmt.ColumnInt64(4)
-			if generation < 0 {
-				rowErr = ErrLocalStateIntegrity
-				return
-			}
-			record.RecoveryGeneration = uint64(generation)
-			record.BindingClass = LocalBindingClass(stmt.ColumnText(5))
-			record.OriginDeviceID = domain.DeviceID(stmt.ColumnText(6))
-			record.OriginScopeKind = stmt.ColumnText(7)
-			record.OriginScopeID = domain.UUIDv7(stmt.ColumnText(8))
-			if err := copyDigestColumn(&record.RequestDigest, stmt, 9); err != nil {
-				rowErr = err
-				return
-			}
-			record.EventID = domain.UUIDv7(stmt.ColumnText(10))
-			record.RequestKind = event.Kind(stmt.ColumnText(11))
-			record.State = LocalRequestState(stmt.ColumnText(12))
-			if stmt.ColumnType(13) != sqlite.TypeNull {
-				record.SignedProposal = []byte(stmt.ColumnText(13))
-			}
-			if stmt.ColumnType(14) != sqlite.TypeNull {
-				if err := copyDigestColumn(&record.ProposalDigest, stmt, 14); err != nil {
-					rowErr = err
-					return
-				}
-			}
-			if stmt.ColumnType(15) != sqlite.TypeNull {
-				record.TerminalCode = stmt.ColumnText(15)
-			}
-			record.CreatedAt = domain.Timestamp(stmt.ColumnText(16))
+			record, rowErr = scanLocalCommandRecord(stmt)
 		},
 	)
 	if err != nil {
@@ -901,6 +896,49 @@ func readLocalRequestByKey(
 		record.OriginSequence = uint64(sequence)
 	}
 	return record, true, nil
+}
+
+func scanLocalCommandRecord(
+	stmt *sqlite.Stmt,
+) (LocalCommandRecord, error) {
+	record := LocalCommandRecord{
+		ClientInstanceID: domain.UUIDv7(stmt.ColumnText(0)),
+		RequestID:        domain.UUIDv7(stmt.ColumnText(1)),
+		SessionID:        domain.UUIDv7(stmt.ColumnText(2)),
+		WorkspaceID:      domain.UUIDv4(stmt.ColumnText(3)),
+		BindingClass:     LocalBindingClass(stmt.ColumnText(5)),
+		OriginDeviceID:   domain.DeviceID(stmt.ColumnText(6)),
+		OriginScopeKind:  stmt.ColumnText(7),
+		OriginScopeID:    domain.UUIDv7(stmt.ColumnText(8)),
+		EventID:          domain.UUIDv7(stmt.ColumnText(10)),
+		RequestKind:      event.Kind(stmt.ColumnText(11)),
+		State:            LocalRequestState(stmt.ColumnText(12)),
+		CreatedAt:        domain.Timestamp(stmt.ColumnText(16)),
+	}
+	generation := stmt.ColumnInt64(4)
+	if generation < 0 {
+		return LocalCommandRecord{}, ErrLocalStateIntegrity
+	}
+	record.RecoveryGeneration = uint64(generation)
+	if err := copyDigestColumn(&record.RequestDigest, stmt, 9); err != nil {
+		return LocalCommandRecord{}, err
+	}
+	if stmt.ColumnType(13) != sqlite.TypeNull {
+		record.SignedProposal = []byte(stmt.ColumnText(13))
+	}
+	if stmt.ColumnType(14) != sqlite.TypeNull {
+		if err := copyDigestColumn(
+			&record.ProposalDigest,
+			stmt,
+			14,
+		); err != nil {
+			return LocalCommandRecord{}, err
+		}
+	}
+	if stmt.ColumnType(15) != sqlite.TypeNull {
+		record.TerminalCode = stmt.ColumnText(15)
+	}
+	return record, nil
 }
 
 func validateLocalCommandRecord(record LocalCommandRecord) error {
@@ -977,46 +1015,42 @@ func (state LocalState) ClaimNextOutbox(
 		count := 0
 		if err := queryArgs(
 			conn,
-			`SELECT outbox_id, event_id, session_id, recovery_generation,
-			        origin_device_id, origin_scope_kind, origin_scope_id,
-			        origin_sequence, kind, signed_proposal_json,
-			        proposal_digest, state, queued_at
-			   FROM outbox
-			  WHERE origin_device_id = ?1
-			    AND origin_scope_kind = ?2
-			    AND origin_scope_id = ?3
-			  ORDER BY origin_sequence, outbox_id
-			  LIMIT 1;`,
+			`SELECT o.outbox_id, r.client_instance_id, r.request_id,
+				        r.binding_class, o.event_id, o.session_id,
+				        o.recovery_generation,
+				        o.origin_device_id, o.origin_scope_kind,
+				        o.origin_scope_id, o.origin_sequence, o.kind,
+				        o.signed_proposal_json, o.proposal_digest,
+				        o.state, o.queued_at
+				   FROM outbox AS o
+				   LEFT JOIN local_requests AS r
+				     ON r.event_id = o.event_id
+				    AND r.session_id = o.session_id
+				    AND r.workspace_id = ?4
+				    AND r.recovery_generation = o.recovery_generation
+				    AND r.origin_device_id = o.origin_device_id
+				    AND r.origin_scope_kind = o.origin_scope_kind
+				    AND r.origin_scope_id = o.origin_scope_id
+				    AND r.request_kind = o.kind
+				    AND r.signed_proposal_json = o.signed_proposal_json
+				    AND r.proposal_digest = o.proposal_digest
+				    AND r.created_at = o.queued_at
+				    AND r.state IN ('signed', 'pending')
+				  WHERE o.origin_device_id = ?1
+				    AND o.origin_scope_kind = ?2
+				    AND o.origin_scope_id = ?3
+				  ORDER BY o.origin_sequence, o.outbox_id
+				  LIMIT 1;`,
 			[]any{
 				string(scope.OriginDeviceID),
 				scope.OriginScopeKind,
 				string(scope.OriginScopeID),
+				string(lineage.workspaceID),
 			},
 			func(stmt *sqlite.Stmt) {
 				count++
 				found = true
-				record.OutboxID = stmt.ColumnInt64(0)
-				record.EventID = domain.UUIDv7(stmt.ColumnText(1))
-				record.SessionID = domain.UUIDv7(stmt.ColumnText(2))
-				generation := stmt.ColumnInt64(3)
-				record.OriginDeviceID = domain.DeviceID(stmt.ColumnText(4))
-				record.OriginScopeKind = stmt.ColumnText(5)
-				record.OriginScopeID = domain.UUIDv7(stmt.ColumnText(6))
-				sequence := stmt.ColumnInt64(7)
-				if generation < 0 || sequence < 1 {
-					rowErr = ErrLocalStateIntegrity
-					return
-				}
-				record.RecoveryGeneration = uint64(generation)
-				record.OriginSequence = uint64(sequence)
-				record.Kind = event.Kind(stmt.ColumnText(8))
-				record.SignedProposal = []byte(stmt.ColumnText(9))
-				if err := copyDigestColumn(&record.ProposalDigest, stmt, 10); err != nil {
-					rowErr = err
-					return
-				}
-				record.State = stmt.ColumnText(11)
-				record.QueuedAt = domain.Timestamp(stmt.ColumnText(12))
+				record, rowErr = scanOutboxRecord(stmt)
 			},
 		); err != nil {
 			return err
@@ -1058,12 +1092,133 @@ func (state LocalState) ClaimNextOutbox(
 	return record, found, nil
 }
 
+// OutboxRecords returns an integrity-checked snapshot of every durable
+// proposal awaiting forwarding. It does not claim or mutate any row.
+func (state LocalState) OutboxRecords(
+	ctx context.Context,
+) ([]OutboxRecord, error) {
+	var records []OutboxRecord
+	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		lineage, err := readLocalLineage(conn)
+		if err != nil {
+			return err
+		}
+		var rowErr error
+		seen := make(map[int64]struct{})
+		if err := queryArgs(
+			conn,
+			`SELECT o.outbox_id, r.client_instance_id, r.request_id,
+			        r.binding_class, o.event_id, o.session_id,
+			        o.recovery_generation,
+			        o.origin_device_id, o.origin_scope_kind,
+			        o.origin_scope_id, o.origin_sequence, o.kind,
+			        o.signed_proposal_json, o.proposal_digest,
+			        o.state, o.queued_at
+			   FROM outbox AS o
+			   LEFT JOIN local_requests AS r
+			     ON r.event_id = o.event_id
+			    AND r.session_id = o.session_id
+			    AND r.workspace_id = ?1
+			    AND r.recovery_generation = o.recovery_generation
+			    AND r.origin_device_id = o.origin_device_id
+			    AND r.origin_scope_kind = o.origin_scope_kind
+			    AND r.origin_scope_id = o.origin_scope_id
+			    AND r.request_kind = o.kind
+			    AND r.signed_proposal_json = o.signed_proposal_json
+			    AND r.proposal_digest = o.proposal_digest
+			    AND r.created_at = o.queued_at
+			    AND r.state IN ('signed', 'pending')
+			  ORDER BY o.outbox_id;`,
+			[]any{string(lineage.workspaceID)},
+			func(stmt *sqlite.Stmt) {
+				if rowErr != nil {
+					return
+				}
+				record, err := scanOutboxRecord(stmt)
+				if err != nil {
+					rowErr = err
+					return
+				}
+				scope := OutboxScope{
+					OriginDeviceID:  record.OriginDeviceID,
+					OriginScopeKind: record.OriginScopeKind,
+					OriginScopeID:   record.OriginScopeID,
+				}
+				if _, duplicate := seen[record.OutboxID]; duplicate {
+					rowErr = ErrLocalStateIntegrity
+					return
+				}
+				if err := scope.validate(); err != nil {
+					rowErr = ErrLocalStateIntegrity
+					return
+				}
+				if err := validateOutboxRecord(
+					record,
+					scope,
+					lineage,
+				); err != nil {
+					rowErr = err
+					return
+				}
+				seen[record.OutboxID] = struct{}{}
+				record.SignedProposal = bytes.Clone(
+					record.SignedProposal,
+				)
+				records = append(records, record)
+			},
+		); err != nil {
+			return err
+		}
+		return rowErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func scanOutboxRecord(stmt *sqlite.Stmt) (OutboxRecord, error) {
+	record := OutboxRecord{
+		OutboxID:         stmt.ColumnInt64(0),
+		ClientInstanceID: domain.UUIDv7(stmt.ColumnText(1)),
+		RequestID:        domain.UUIDv7(stmt.ColumnText(2)),
+		BindingClass:     LocalBindingClass(stmt.ColumnText(3)),
+		EventID:          domain.UUIDv7(stmt.ColumnText(4)),
+		SessionID:        domain.UUIDv7(stmt.ColumnText(5)),
+		OriginDeviceID:   domain.DeviceID(stmt.ColumnText(7)),
+		OriginScopeKind:  stmt.ColumnText(8),
+		OriginScopeID:    domain.UUIDv7(stmt.ColumnText(9)),
+		Kind:             event.Kind(stmt.ColumnText(11)),
+		SignedProposal:   []byte(stmt.ColumnText(12)),
+		State:            stmt.ColumnText(14),
+		QueuedAt:         domain.Timestamp(stmt.ColumnText(15)),
+	}
+	generation := stmt.ColumnInt64(6)
+	sequence := stmt.ColumnInt64(10)
+	if generation < 0 || sequence < 1 {
+		return OutboxRecord{}, ErrLocalStateIntegrity
+	}
+	record.RecoveryGeneration = uint64(generation)
+	record.OriginSequence = uint64(sequence)
+	if err := copyDigestColumn(
+		&record.ProposalDigest,
+		stmt,
+		13,
+	); err != nil {
+		return OutboxRecord{}, err
+	}
+	return record, nil
+}
+
 func validateOutboxRecord(
 	record OutboxRecord,
 	scope OutboxScope,
 	lineage localLineage,
 ) error {
 	if record.OutboxID < 1 ||
+		!record.ClientInstanceID.Valid() ||
+		!record.RequestID.Valid() ||
+		!record.BindingClass.valid() ||
 		!record.EventID.Valid() ||
 		!record.SessionID.Valid() ||
 		record.SessionID != lineage.sessionID ||
@@ -1080,6 +1235,40 @@ func validateOutboxRecord(
 		return ErrLocalStateIntegrity
 	}
 	if _, exists := event.LookupKind(record.Kind); !exists {
+		return ErrLocalStateIntegrity
+	}
+	switch record.BindingClass {
+	case LocalBindingAgent:
+		if record.OriginScopeKind != OriginScopeKindAgent {
+			return ErrLocalStateIntegrity
+		}
+	case LocalBindingOperator, LocalBindingDaemon:
+		if record.OriginScopeKind != OriginScopeKindBoot {
+			return ErrLocalStateIntegrity
+		}
+	default:
+		return ErrLocalStateIntegrity
+	}
+	proposal, err := event.InspectUnverifiedProposal(
+		record.SignedProposal,
+	)
+	if err != nil ||
+		validateReservedProposalFields(
+			LocalCommandInput{
+				SessionID:       record.SessionID,
+				WorkspaceID:     lineage.workspaceID,
+				BindingClass:    record.BindingClass,
+				OriginDeviceID:  record.OriginDeviceID,
+				OriginScopeKind: record.OriginScopeKind,
+				OriginScopeID:   record.OriginScopeID,
+				RequestKind:     record.Kind,
+				CreatedAt:       record.QueuedAt,
+			},
+			record.EventID,
+			record.OriginSequence,
+			proposal,
+			record.SignedProposal,
+		) != nil {
 		return ErrLocalStateIntegrity
 	}
 	if Digest(sha256.Sum256(record.SignedProposal)) != record.ProposalDigest {
@@ -1153,174 +1342,443 @@ const LocalEventIDCollisionCode = "local_event_id_collision"
 func compactLocalProposal(
 	conn *sqlite.Conn,
 	recoveryGeneration uint64,
-	eventID domain.UUIDv7,
+	signed event.SignedEvent,
 	authoritativeProposal []byte,
 	authoritativeDigest Digest,
+	terminalStatus OutcomeStatus,
 	terminalCode string,
 ) error {
+	proposal := signed.Proposal()
+	eventID := proposal.EventID
 	if !domain.ValidUnsignedInteger(recoveryGeneration) ||
 		!eventID.Valid() ||
 		len(authoritativeProposal) == 0 ||
+		!bytes.Equal(signed.CanonicalBytes(), authoritativeProposal) ||
 		Digest(sha256.Sum256(authoritativeProposal)) != authoritativeDigest ||
+		!terminalStatus.valid() ||
 		!validCode(terminalCode, false) {
 		return ErrLocalStateIntegrity
 	}
-	var (
-		found            bool
-		state            LocalRequestState
-		localGeneration  uint64
-		localProposal    []byte
-		localDigest      Digest
-		digestPresent    bool
-		storedCode       string
-		outboxFound      bool
-		outboxGeneration uint64
-		outboxProposal   []byte
-		outboxDigest     Digest
-		rowErr           error
-	)
-	count := 0
-	if err := queryArgs(
-		conn,
-		`SELECT recovery_generation, state, signed_proposal_json,
-		        proposal_digest, terminal_code
-		   FROM local_requests
-		  WHERE event_id = ?1;`,
-		[]any{string(eventID)},
-		func(stmt *sqlite.Stmt) {
-			count++
-			found = true
-			generation := stmt.ColumnInt64(0)
-			if generation < 0 {
-				rowErr = ErrLocalStateIntegrity
-				return
-			}
-			localGeneration = uint64(generation)
-			state = LocalRequestState(stmt.ColumnText(1))
-			if stmt.ColumnType(2) != sqlite.TypeNull {
-				localProposal = []byte(stmt.ColumnText(2))
-			}
-			if stmt.ColumnType(3) != sqlite.TypeNull {
-				if err := copyDigestColumn(&localDigest, stmt, 3); err != nil {
-					rowErr = err
-					return
-				}
-				digestPresent = true
-			}
-			if stmt.ColumnType(4) != sqlite.TypeNull {
-				storedCode = stmt.ColumnText(4)
-			}
-		},
-	); err != nil {
+	local, found, err := readLocalRequestForCompaction(conn, eventID)
+	if err != nil {
 		return err
 	}
-	if rowErr != nil || count > 1 {
-		return ErrLocalStateIntegrity
-	}
-	count = 0
-	if err := queryArgs(
-		conn,
-		`SELECT recovery_generation, signed_proposal_json, proposal_digest
-		   FROM outbox
-		  WHERE event_id = ?1;`,
-		[]any{string(eventID)},
-		func(stmt *sqlite.Stmt) {
-			count++
-			outboxFound = true
-			generation := stmt.ColumnInt64(0)
-			if generation < 0 {
-				rowErr = ErrLocalStateIntegrity
-				return
-			}
-			outboxGeneration = uint64(generation)
-			outboxProposal = []byte(stmt.ColumnText(1))
-			if err := copyDigestColumn(&outboxDigest, stmt, 2); err != nil {
-				rowErr = err
-			}
-		},
-	); err != nil {
+	outbox, outboxFound, err := readOutboxForCompaction(conn, eventID)
+	if err != nil {
 		return err
-	}
-	if rowErr != nil || count > 1 {
-		return ErrLocalStateIntegrity
 	}
 	if !found {
 		if !outboxFound {
 			return nil
 		}
-		if outboxGeneration != recoveryGeneration ||
-			outboxDigest != authoritativeDigest ||
-			!bytes.Equal(outboxProposal, authoritativeProposal) {
-			return ErrLocalStateIntegrity
-		}
-		return execute(
-			conn,
-			"DELETE FROM outbox WHERE event_id = ?1;",
-			string(eventID),
-		)
-	}
-	if localGeneration != recoveryGeneration ||
-		outboxFound && outboxGeneration != localGeneration {
 		return ErrLocalStateIntegrity
 	}
-	if outboxFound &&
-		(Digest(sha256.Sum256(outboxProposal)) != outboxDigest) {
+	if local.RecoveryGeneration != recoveryGeneration {
 		return ErrLocalStateIntegrity
 	}
-	switch state {
+	switch local.State {
 	case LocalRequestSigned, LocalRequestPending:
-		if !digestPresent ||
-			len(localProposal) == 0 ||
-			Digest(sha256.Sum256(localProposal)) != localDigest ||
-			!outboxFound ||
-			outboxDigest != localDigest ||
-			!bytes.Equal(outboxProposal, localProposal) {
+		if !outboxFound ||
+			!outbox.matchesLocal(local) {
 			return ErrLocalStateIntegrity
 		}
-		exact := localDigest == authoritativeDigest &&
-			bytes.Equal(localProposal, authoritativeProposal)
+		localProposal, err := inspectAndValidateLocalProposal(conn, local)
+		if err != nil ||
+			!outbox.matchesProposal(
+				local.RecoveryGeneration,
+				localProposal,
+				local.SignedProposal,
+				local.ProposalDigest,
+			) {
+			return ErrLocalStateIntegrity
+		}
+		exact := local.ProposalDigest == authoritativeDigest &&
+			bytes.Equal(local.SignedProposal, authoritativeProposal)
 		nextState := LocalRequestResolved
 		nextCode := terminalCode
 		if !exact {
 			nextState = LocalRequestAbandoned
 			nextCode = LocalEventIDCollisionCode
+		} else {
+			if err := verifyLocalCheckpointResolution(
+				conn,
+				signed,
+				terminalStatus,
+				terminalCode,
+			); err != nil {
+				return err
+			}
+		}
+		if err := deleteExactOutbox(conn, outbox); err != nil {
+			return err
 		}
 		if err := execute(
 			conn,
-			"DELETE FROM outbox WHERE event_id = ?1;",
-			string(eventID),
-		); err != nil {
-			return err
-		}
-		return execute(
-			conn,
 			`UPDATE local_requests
-			    SET state = ?2,
+			    SET state = ?4,
 			        publication_metadata_json = NULL,
 			        publication_metadata_digest = NULL,
 			        artifact_digest = NULL,
 			        signed_proposal_json = NULL,
-			        terminal_code = ?3
-			  WHERE event_id = ?1
+			        terminal_code = ?5
+			  WHERE client_instance_id = ?1
+			    AND request_id = ?2
+			    AND event_id = ?3
 			    AND state IN ('signed', 'pending');`,
+			string(local.ClientInstanceID),
+			string(local.RequestID),
 			string(eventID),
 			string(nextState),
 			nextCode,
-		)
+		); err != nil {
+			return err
+		}
+		return requireOneChangedRow(conn)
 	case LocalRequestResolved:
-		if !digestPresent ||
-			localDigest != authoritativeDigest ||
-			storedCode != terminalCode ||
+		if local.ProposalDigest != authoritativeDigest ||
+			local.TerminalCode != terminalCode ||
 			outboxFound {
 			return ErrLocalStateIntegrity
 		}
-		return nil
+		if err := validateLocalProposalBinding(local, signed); err != nil {
+			return err
+		}
+		return verifyLocalCheckpointResolution(
+			conn,
+			signed,
+			terminalStatus,
+			terminalCode,
+		)
 	case LocalRequestAbandoned:
-		if storedCode != LocalEventIDCollisionCode || outboxFound {
+		if local.TerminalCode != LocalEventIDCollisionCode || outboxFound {
 			return ErrLocalStateIntegrity
 		}
 		return nil
 	default:
 		return ErrLocalStateIntegrity
 	}
+}
+
+type compactOutboxRecord struct {
+	outboxID           int64
+	eventID            domain.UUIDv7
+	sessionID          domain.UUIDv7
+	recoveryGeneration uint64
+	originDeviceID     domain.DeviceID
+	originScopeKind    string
+	originScopeID      domain.UUIDv7
+	originSequence     uint64
+	kind               event.Kind
+	signedProposal     []byte
+	proposalDigest     Digest
+	state              string
+	queuedAt           domain.Timestamp
+}
+
+func readLocalRequestForCompaction(
+	conn *sqlite.Conn,
+	eventID domain.UUIDv7,
+) (LocalCommandRecord, bool, error) {
+	var (
+		record LocalCommandRecord
+		found  bool
+		rowErr error
+		count  int
+	)
+	err := queryArgs(
+		conn,
+		`SELECT client_instance_id, request_id, session_id, workspace_id,
+		        recovery_generation, binding_class, origin_device_id,
+		        origin_scope_kind, origin_scope_id, request_digest, event_id,
+		        request_kind, state, signed_proposal_json, proposal_digest,
+		        terminal_code, created_at
+		   FROM local_requests
+		  WHERE event_id = ?1;`,
+		[]any{string(eventID)},
+		func(stmt *sqlite.Stmt) {
+			count++
+			found = true
+			record, rowErr = scanLocalCommandRecord(stmt)
+		},
+	)
+	if err != nil {
+		return LocalCommandRecord{}, false, err
+	}
+	if rowErr != nil || count > 1 {
+		return LocalCommandRecord{}, false, ErrLocalStateIntegrity
+	}
+	if found {
+		if err := validateLocalCommandRecord(record); err != nil {
+			return LocalCommandRecord{}, false, err
+		}
+	}
+	return record, found, nil
+}
+
+func readOutboxForCompaction(
+	conn *sqlite.Conn,
+	eventID domain.UUIDv7,
+) (compactOutboxRecord, bool, error) {
+	var (
+		record compactOutboxRecord
+		found  bool
+		rowErr error
+		count  int
+	)
+	err := queryArgs(
+		conn,
+		`SELECT outbox_id, event_id, session_id, recovery_generation,
+		        origin_device_id, origin_scope_kind, origin_scope_id,
+		        origin_sequence, kind, signed_proposal_json,
+		        proposal_digest, state, queued_at
+		   FROM outbox
+		  WHERE event_id = ?1;`,
+		[]any{string(eventID)},
+		func(stmt *sqlite.Stmt) {
+			count++
+			found = true
+			generation := stmt.ColumnInt64(3)
+			sequence := stmt.ColumnInt64(7)
+			if generation < 0 || sequence < 1 {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			record = compactOutboxRecord{
+				outboxID:           stmt.ColumnInt64(0),
+				eventID:            domain.UUIDv7(stmt.ColumnText(1)),
+				sessionID:          domain.UUIDv7(stmt.ColumnText(2)),
+				recoveryGeneration: uint64(generation),
+				originDeviceID:     domain.DeviceID(stmt.ColumnText(4)),
+				originScopeKind:    stmt.ColumnText(5),
+				originScopeID:      domain.UUIDv7(stmt.ColumnText(6)),
+				originSequence:     uint64(sequence),
+				kind:               event.Kind(stmt.ColumnText(8)),
+				signedProposal:     []byte(stmt.ColumnText(9)),
+				state:              stmt.ColumnText(11),
+				queuedAt:           domain.Timestamp(stmt.ColumnText(12)),
+			}
+			rowErr = copyDigestColumn(
+				&record.proposalDigest,
+				stmt,
+				10,
+			)
+		},
+	)
+	if err != nil {
+		return compactOutboxRecord{}, false, err
+	}
+	if rowErr != nil || count > 1 {
+		return compactOutboxRecord{}, false, ErrLocalStateIntegrity
+	}
+	return record, found, nil
+}
+
+func (record compactOutboxRecord) matchesProposal(
+	recoveryGeneration uint64,
+	proposal event.Proposal,
+	canonical []byte,
+	digest Digest,
+) bool {
+	if record.outboxID < 1 ||
+		record.eventID != proposal.EventID ||
+		record.sessionID != proposal.SessionID ||
+		record.recoveryGeneration != recoveryGeneration ||
+		record.originDeviceID != proposal.Origin.DeviceID() ||
+		record.originSequence != proposal.Origin.Sequence() ||
+		record.kind != proposal.Kind ||
+		!bytes.Equal(record.signedProposal, canonical) ||
+		record.proposalDigest != digest ||
+		Digest(sha256.Sum256(record.signedProposal)) != digest ||
+		(record.state != "queued" && record.state != "forwarding") ||
+		record.queuedAt != proposal.CreatedAt {
+		return false
+	}
+	switch proposal.Origin.ActorType() {
+	case event.ActorAgent:
+		return record.originScopeKind == OriginScopeKindAgent &&
+			record.originScopeID == proposal.Origin.AgentSessionID() &&
+			proposal.Origin.OriginBootID() == ""
+	case event.ActorHuman, event.ActorDaemon:
+		return record.originScopeKind == OriginScopeKindBoot &&
+			record.originScopeID == proposal.Origin.OriginBootID() &&
+			proposal.Origin.AgentSessionID() == ""
+	default:
+		return false
+	}
+}
+
+func (record compactOutboxRecord) matchesLocal(
+	local LocalCommandRecord,
+) bool {
+	return record.outboxID >= 1 &&
+		record.eventID == local.EventID &&
+		record.sessionID == local.SessionID &&
+		record.recoveryGeneration == local.RecoveryGeneration &&
+		record.originDeviceID == local.OriginDeviceID &&
+		record.originScopeKind == local.OriginScopeKind &&
+		record.originScopeID == local.OriginScopeID &&
+		record.originSequence >= 1 &&
+		domain.ValidUnsignedInteger(record.originSequence) &&
+		record.kind == local.RequestKind &&
+		bytes.Equal(record.signedProposal, local.SignedProposal) &&
+		record.proposalDigest == local.ProposalDigest &&
+		Digest(sha256.Sum256(record.signedProposal)) ==
+			record.proposalDigest &&
+		(record.state == "queued" || record.state == "forwarding") &&
+		record.queuedAt == local.CreatedAt
+}
+
+func validateLocalProposalBinding(
+	record LocalCommandRecord,
+	signed event.SignedEvent,
+) error {
+	return validateLocalProposal(
+		record,
+		signed.Proposal(),
+		signed.CanonicalBytes(),
+	)
+}
+
+func validateLocalProposal(
+	record LocalCommandRecord,
+	proposal event.Proposal,
+	canonical []byte,
+) error {
+	input := LocalCommandInput{
+		ClientInstanceID: record.ClientInstanceID,
+		RequestID:        record.RequestID,
+		SessionID:        record.SessionID,
+		WorkspaceID:      record.WorkspaceID,
+		BindingClass:     record.BindingClass,
+		OriginDeviceID:   record.OriginDeviceID,
+		OriginScopeKind:  record.OriginScopeKind,
+		OriginScopeID:    record.OriginScopeID,
+		RequestKind:      record.RequestKind,
+		CreatedAt:        record.CreatedAt,
+	}
+	if err := validateReservedProposalFields(
+		input,
+		record.EventID,
+		proposal.Origin.Sequence(),
+		proposal,
+		canonical,
+	); err != nil {
+		return ErrLocalStateIntegrity
+	}
+	return nil
+}
+
+func inspectAndValidateLocalProposal(
+	conn *sqlite.Conn,
+	record LocalCommandRecord,
+) (event.Proposal, error) {
+	proposal, err := event.InspectUnverifiedProposal(
+		record.SignedProposal,
+	)
+	if err != nil ||
+		validateLocalProposal(
+			record,
+			proposal,
+			record.SignedProposal,
+		) != nil {
+		return event.Proposal{}, ErrLocalStateIntegrity
+	}
+	member, found, err := readStatusMember(conn, record.OriginDeviceID)
+	if err != nil {
+		return event.Proposal{}, ErrLocalStateIntegrity
+	}
+	if found {
+		signed, err := event.ParseAndVerify(
+			record.SignedProposal,
+			event.VerificationContext{
+				SessionID:         record.SessionID,
+				WorkspaceID:       record.WorkspaceID,
+				IdentityPublicKey: member.IdentityPublicKey,
+			},
+		)
+		if err != nil ||
+			!bytes.Equal(
+				signed.CanonicalBytes(),
+				record.SignedProposal,
+			) {
+			return event.Proposal{}, ErrLocalStateIntegrity
+		}
+	}
+	return proposal, nil
+}
+
+func verifyLocalCheckpointResolution(
+	conn *sqlite.Conn,
+	signed event.SignedEvent,
+	status OutcomeStatus,
+	code string,
+) error {
+	proposal := signed.Proposal()
+	if proposal.Kind != event.KindConsensusCheckpoint {
+		return nil
+	}
+	stored, found, err := readStoredCommandResult(conn, proposal.EventID)
+	if err != nil ||
+		!found ||
+		verifyStoredCommandResult(conn, stored) != nil ||
+		stored.outcome.Status != status ||
+		stored.outcome.Code != code ||
+		stored.proposalDigest != proposalDigest(signed) ||
+		!bytes.Equal(stored.proposalJSON, signed.CanonicalBytes()) {
+		return ErrLocalStateIntegrity
+	}
+
+	record, checkpointFound, err := readCheckpointRecord(
+		conn,
+		proposal.EventID,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrLocalStateIntegrity, err)
+	}
+	switch status {
+	case OutcomeRejected:
+		if code != event.CheckpointStaleOutcomeCode || checkpointFound {
+			return ErrLocalStateIntegrity
+		}
+		return nil
+	case OutcomeAccepted:
+		if !checkpointFound {
+			return ErrLocalStateIntegrity
+		}
+	default:
+		return ErrLocalStateIntegrity
+	}
+
+	checkpoint, signature, err := event.DecodeCheckpointPayload(
+		proposal.Payload,
+	)
+	if err != nil ||
+		record.Validate() != nil ||
+		record.CheckpointEventID != proposal.EventID ||
+		record.checkpoint() != checkpoint ||
+		record.AuthoritySignature != Signature(signature) {
+		return ErrLocalStateIntegrity
+	}
+	return nil
+}
+
+func deleteExactOutbox(
+	conn *sqlite.Conn,
+	record compactOutboxRecord,
+) error {
+	if err := execute(
+		conn,
+		`DELETE FROM outbox
+		  WHERE outbox_id = ?1
+		    AND event_id = ?2
+		    AND recovery_generation = ?3
+		    AND proposal_digest = ?4;`,
+		record.outboxID,
+		string(record.eventID),
+		record.recoveryGeneration,
+		record.proposalDigest[:],
+	); err != nil {
+		return err
+	}
+	return requireOneChangedRow(conn)
 }

@@ -143,6 +143,85 @@ func TestEncodeCheckpointPayloadAddsSignatureOutsidePreimage(t *testing.T) {
 	}
 }
 
+func TestDecodeCheckpointPayloadRequiresExactCanonicalRoundTrip(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	checkpoint := checkpointCodecFixture()
+	signature := [ed25519.SignatureSize]byte{0x91, 0x72}
+	payload, err := EncodeCheckpointPayload(checkpoint, signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedCheckpoint, decodedSignature, err :=
+		DecodeCheckpointPayload(payload)
+	if err != nil {
+		t.Fatalf("DecodeCheckpointPayload(): %v", err)
+	}
+	if decodedCheckpoint != checkpoint ||
+		decodedSignature != signature {
+		t.Fatalf(
+			"decoded payload = (%#v, %x)",
+			decodedCheckpoint,
+			decodedSignature,
+		)
+	}
+	for _, malformed := range [][]byte{
+		append(bytes.Clone(payload), ' '),
+		checkpointPayloadMutation(t, payload, func(
+			object map[string]json.RawMessage,
+		) {
+			object["unexpected"] = json.RawMessage("true")
+		}),
+		checkpointPayloadMutation(t, payload, func(
+			object map[string]json.RawMessage,
+		) {
+			var text string
+			if err := json.Unmarshal(
+				object["authority_signature"],
+				&text,
+			); err != nil {
+				t.Fatal(err)
+			}
+			object["authority_signature"], err = json.Marshal(
+				text + "=",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}),
+	} {
+		if _, _, err := DecodeCheckpointPayload(
+			malformed,
+		); !errors.Is(err, ErrInvalidCheckpoint) {
+			t.Fatalf("malformed payload error = %v", err)
+		}
+	}
+}
+
+func checkpointPayloadMutation(
+	t *testing.T,
+	payload []byte,
+	mutate func(map[string]json.RawMessage),
+) []byte {
+	t.Helper()
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatal(err)
+	}
+	mutate(object)
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
+}
+
 func TestSignCheckpointBindsNamedDeviceAndLabel(t *testing.T) {
 	t.Parallel()
 
