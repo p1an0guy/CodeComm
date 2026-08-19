@@ -58,6 +58,25 @@ type stagingProofAuthority struct {
 	targetEntityVersion    uint64
 }
 
+type consensusControlRoute uint8
+
+const (
+	consensusControlRouteProof consensusControlRoute = iota + 1
+	consensusControlRouteCredentialRenewal
+	consensusControlRouteCredentialEndorsement
+)
+
+func (route consensusControlRoute) valid() bool {
+	switch route {
+	case consensusControlRouteProof,
+		consensusControlRouteCredentialRenewal,
+		consensusControlRouteCredentialEndorsement:
+		return true
+	default:
+		return false
+	}
+}
+
 func (gate *nodeTransportGate) ServeHTTP(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -94,14 +113,8 @@ func (node *SingleNode) serveConsensusControl(
 		)
 		return
 	}
-	if request.Method != http.MethodPost ||
-		request.URL == nil ||
-		request.URL.Path != consensusProofPath ||
-		request.URL.RawPath != "" ||
-		request.URL.RawQuery != "" ||
-		request.URL.Fragment != "" ||
-		request.URL.RawFragment != "" ||
-		request.URL.ForceQuery {
+	route, ok := consensusControlRouteForRequest(request)
+	if !ok {
 		writeConsensusProofProblem(
 			writer,
 			http.StatusNotFound,
@@ -115,13 +128,26 @@ func (node *SingleNode) serveConsensusControl(
 	)
 	defer cancel()
 	request = request.WithContext(callContext)
+	invalidProblem := proofProblemInvalid
+	forbiddenProblem := proofProblemForbidden
+	unavailableProblem := proofProblemUnavailable
+	switch route {
+	case consensusControlRouteCredentialRenewal:
+		invalidProblem = credentialRenewalProblemInvalid
+		forbiddenProblem = credentialRenewalProblemForbidden
+		unavailableProblem = credentialRenewalProblemUnavailable
+	case consensusControlRouteCredentialEndorsement:
+		invalidProblem = credentialProblemInvalid
+		forbiddenProblem = credentialProblemForbidden
+		unavailableProblem = credentialProblemUnavailable
+	}
 
 	peer, ok := transport.AuthenticatedPeerFromContext(request.Context())
 	if !ok || peer.Plane != transport.PlaneConsensus {
 		writeConsensusProofProblem(
 			writer,
 			http.StatusForbidden,
-			proofProblemForbidden,
+			forbiddenProblem,
 		)
 		return
 	}
@@ -129,24 +155,31 @@ func (node *SingleNode) serveConsensusControl(
 		request.Context(),
 	); err != nil {
 		status := http.StatusServiceUnavailable
-		problem := proofProblemUnavailable
+		problem := unavailableProblem
 		if errors.Is(err, transport.ErrPeerAuthorizationDenied) {
 			status = http.StatusForbidden
-			problem = proofProblemForbidden
+			problem = forbiddenProblem
 		}
 		writeConsensusProofProblem(writer, status, problem)
 		return
 	}
-	requestAuthority, err := node.consensusProofRequesterAuthority(peer)
-	if err != nil {
-		status := http.StatusServiceUnavailable
-		problem := proofProblemUnavailable
-		if errors.Is(err, errConsensusProofDenied) {
-			status = http.StatusForbidden
-			problem = proofProblemForbidden
+	var (
+		requestAuthority stagingProofAuthority
+		err              error
+	)
+	if route != consensusControlRouteCredentialRenewal {
+		requestAuthority, err =
+			node.consensusProofRequesterAuthority(peer)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			problem := unavailableProblem
+			if errors.Is(err, errConsensusProofDenied) {
+				status = http.StatusForbidden
+				problem = forbiddenProblem
+			}
+			writeConsensusProofProblem(writer, status, problem)
+			return
 		}
-		writeConsensusProofProblem(writer, status, problem)
-		return
 	}
 	if !validConsensusProofContentType(request.Header) {
 		writeConsensusProofProblem(
@@ -169,22 +202,41 @@ func (node *SingleNode) serveConsensusControl(
 			writeConsensusProofProblem(
 				writer,
 				http.StatusRequestTimeout,
-				proofProblemUnavailable,
+				unavailableProblem,
 			)
 		case errors.Is(err, context.Canceled),
 			errors.Is(err, context.DeadlineExceeded):
 			writeConsensusProofProblem(
 				writer,
 				http.StatusRequestTimeout,
-				proofProblemUnavailable,
+				unavailableProblem,
 			)
 		default:
 			writeConsensusProofProblem(
 				writer,
 				http.StatusBadRequest,
-				proofProblemInvalid,
+				invalidProblem,
 			)
 		}
+		return
+	}
+	switch route {
+	case consensusControlRouteCredentialRenewal:
+		node.serveCredentialRenewal(
+			writer,
+			callContext,
+			peer,
+			body,
+		)
+		return
+	case consensusControlRouteCredentialEndorsement:
+		node.serveCredentialEndorsement(
+			writer,
+			callContext,
+			peer,
+			requestAuthority,
+			body,
+		)
 		return
 	}
 	mode, err := decodeConsensusProofMode(body)
@@ -301,6 +353,33 @@ func (node *SingleNode) serveConsensusControl(
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(response)
+}
+
+func consensusControlRouteForRequest(
+	request *http.Request,
+) (consensusControlRoute, bool) {
+	if request == nil ||
+		request.Method != http.MethodPost ||
+		request.URL == nil ||
+		request.URL.RawPath != "" ||
+		request.URL.RawQuery != "" ||
+		request.URL.Fragment != "" ||
+		request.URL.RawFragment != "" ||
+		request.URL.ForceQuery {
+		return 0, false
+	}
+	var route consensusControlRoute
+	switch request.URL.Path {
+	case consensusProofPath:
+		route = consensusControlRouteProof
+	case credentialRenewalPath:
+		route = consensusControlRouteCredentialRenewal
+	case credentialEndorsementPath:
+		route = consensusControlRouteCredentialEndorsement
+	default:
+		return 0, false
+	}
+	return route, route.valid()
 }
 
 func (node *SingleNode) proveStagingApply(
@@ -643,6 +722,23 @@ var (
 	proofProblemInternal = consensusProofProblemDefinition{
 		code:      "internal_error",
 		title:     "Internal server error",
+		retryable: true,
+	}
+	credentialProblemInvalid = consensusProofProblemDefinition{
+		code:  "invalid_credential_endorsement",
+		title: "Invalid credential endorsement request",
+	}
+	credentialProblemForbidden = consensusProofProblemDefinition{
+		code:  "credential_endorsement_forbidden",
+		title: "Credential endorsement request forbidden",
+	}
+	credentialProblemClock = consensusProofProblemDefinition{
+		code:  "credential_time_out_of_range",
+		title: "Credential time outside local clock allowance",
+	}
+	credentialProblemUnavailable = consensusProofProblemDefinition{
+		code:      "credential_endorsement_unavailable",
+		title:     "Credential endorsement unavailable",
 		retryable: true,
 	}
 )

@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/credential"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
@@ -28,10 +30,26 @@ import (
 	"github.com/ijonahch/codecomm/internal/voteractivation"
 )
 
-const secureMeshVoterReconciliationChild = "voter-reconciliation"
+const (
+	secureMeshVoterReconciliationChild = "voter-reconciliation"
+	secureMeshMinoritySecurityChild    = "minority-security"
+)
+
+var (
+	meshMinorityMarkerEventID = domain.UUIDv7(
+		"018f47de-89ab-7def-8a23-5023456789ab",
+	)
+	meshMinorityMarkerTaskID = domain.UUIDv7(
+		"018f47de-89ab-7def-8b23-5123456789ab",
+	)
+	meshMinorityMarkerTimestamp = domain.Timestamp(
+		"2026-08-11T12:04:00Z",
+	)
+)
 
 func TestSecureMeshVoterReconciliationTransitions(t *testing.T) {
-	if os.Getenv(secureMeshChild) == secureMeshVoterReconciliationChild {
+	if secureMeshRunsInProcess() ||
+		os.Getenv(secureMeshChild) == secureMeshVoterReconciliationChild {
 		runSecureMeshVoterReconciliationTransitions(t)
 		return
 	}
@@ -53,6 +71,262 @@ func TestSecureMeshVoterReconciliationTransitions(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("voter-reconciliation child failed: %v\n%s", err, output)
+	}
+}
+
+func TestSecureMeshIsolatedMinorityCannotEscalate(t *testing.T) {
+	if secureMeshRunsInProcess() ||
+		os.Getenv(secureMeshChild) == secureMeshMinoritySecurityChild {
+		runSecureMeshIsolatedMinorityCannotEscalate(t)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		os.Args[0],
+		"-test.run=^TestSecureMeshIsolatedMinorityCannotEscalate$",
+		"-test.count=1",
+	)
+	command.Env = secureMeshChildEnvironmentWithMode(
+		os.Environ(),
+		secureMeshMinoritySecurityChild,
+	)
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("minority-security child timed out: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("minority-security child failed: %v\n%s", err, output)
+	}
+}
+
+func runSecureMeshIsolatedMinorityCannotEscalate(t *testing.T) {
+	harness := newSecureMeshHarnessWithManualReconciliation(t, true)
+	defer harness.close(t)
+
+	isolated := harness.waitForLeader(t, harness.runningNodes())
+	all := harness.runningNodes()
+	harness.waitForCommittedConfiguration(t, all)
+	harness.issueCurrentCredentials(t, isolated)
+	harness.applyVoterTarget(
+		t,
+		isolated,
+		[]domain.DeviceID{isolated.identity.deviceID},
+		1,
+	)
+	harness.waitForVoterTarget(
+		t,
+		all,
+		[]domain.DeviceID{isolated.identity.deviceID},
+		2,
+	)
+	for _, candidate := range all {
+		if !secureMeshConfigurationEquals(candidate, harness.bootstrap) {
+			t.Fatalf(
+				"configuration on %s = %#v, want voters %v",
+				candidate.identity.deviceID,
+				candidate.node.fsm.committedConfiguration(),
+				harness.bootstrap,
+			)
+		}
+		assertSecureMeshAuthority(t, candidate, harness.bootstrap, 1)
+	}
+
+	before, err := isolated.node.state.View(meshTestContext(t))
+	if err != nil {
+		t.Fatalf("minority state before partition: %v", err)
+	}
+	beforeConfiguration := isolated.node.fsm.committedConfiguration()
+	if beforeConfiguration == nil {
+		t.Fatal("minority has no committed configuration before partition")
+	}
+	beforeLastIndex, err := isolated.node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("minority LastIndex before partition: %v", err)
+	}
+	beforeCredentialRows := secureMeshProjectionRows(
+		before,
+		"credential_authorizations",
+	)
+	if len(beforeCredentialRows) != len(harness.nodes) {
+		t.Fatalf(
+			"credential rows before partition = %d, want %d",
+			len(beforeCredentialRows),
+			len(harness.nodes),
+		)
+	}
+
+	awaitMeshCondition(
+		t,
+		10*time.Second,
+		"established connection to minority",
+		func() bool {
+			return harness.topology.activeConnectionCount(
+				isolated.identity.deviceID,
+			) > 0
+		},
+	)
+	selfLeadership := make(chan raft.Observation, 1)
+	selfObserver := raft.NewObserver(
+		selfLeadership,
+		false,
+		func(observation *raft.Observation) bool {
+			leader, ok := observation.Data.(raft.LeaderObservation)
+			return ok &&
+				leader.LeaderID == raft.ServerID(isolated.identity.deviceID)
+		},
+	)
+	isolated.node.raft.RegisterObserver(selfObserver)
+	defer isolated.node.raft.DeregisterObserver(selfObserver)
+
+	if closed := harness.topology.setPartition(
+		isolated.identity.deviceID,
+		true,
+	); closed == 0 {
+		t.Fatal("minority partition closed no established connections")
+	}
+	if got := harness.topology.activeConnectionCount(
+		isolated.identity.deviceID,
+	); got != 0 {
+		t.Fatalf("minority retained %d established connections", got)
+	}
+	if _, allowed := harness.topology.resolve(
+		harness.nodes[0].identity.deviceID,
+		isolated.fakeEndpoint,
+	); allowed {
+		t.Fatal("minority remained dialable after partition")
+	}
+
+	majority := make([]*secureMeshNode, 0, len(all)-1)
+	for _, candidate := range all {
+		if candidate != isolated {
+			majority = append(majority, candidate)
+		}
+	}
+	replacement := harness.waitForLeader(t, majority)
+	if replacement == isolated {
+		t.Fatal("isolated node remained the cluster leader")
+	}
+	awaitMeshCondition(
+		t,
+		5*time.Second,
+		"isolated node to relinquish leadership",
+		func() bool {
+			return !isolated.node.IsLeader() &&
+				isolated.node.raft.State() != raft.Leader
+		},
+	)
+
+	renewal, authorization := harness.credentialRenewalEvent(
+		t,
+		isolated,
+		isolated,
+		0xe1,
+	)
+	applyContext, cancelApply := context.WithTimeout(
+		context.Background(),
+		2*time.Second,
+	)
+	result, applyErr := isolated.node.Apply(applyContext, renewal)
+	cancelApply()
+	harness.nodes[0].nextSequence--
+	if !errors.Is(applyErr, raft.ErrNotLeader) {
+		t.Fatalf(
+			"isolated credential Apply() = (%#v, %v), want raft.ErrNotLeader",
+			result,
+			applyErr,
+		)
+	}
+
+	securityDeadline := time.Now().Add(
+		4 * secureMeshRaftConfig().ElectionTimeout,
+	)
+	for attempt := 1; attempt <= 3; attempt++ {
+		reconcileContext, cancelReconcile := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
+		reconcileErr := isolated.node.ReconcileVoterSet(reconcileContext)
+		cancelReconcile()
+		if !errors.Is(reconcileErr, raft.ErrNotLeader) {
+			t.Fatalf(
+				"isolated ReconcileVoterSet attempt %d error = %v, want raft.ErrNotLeader",
+				attempt,
+				reconcileErr,
+			)
+		}
+		assertSecureMeshNeverLed(t, isolated, selfLeadership)
+		time.Sleep(secureMeshRaftConfig().ElectionTimeout)
+	}
+	for time.Now().Before(securityDeadline) {
+		assertSecureMeshNeverLed(t, isolated, selfLeadership)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	after, err := isolated.node.state.View(meshTestContext(t))
+	if err != nil {
+		t.Fatalf("minority state after rejected operations: %v", err)
+	}
+	afterConfiguration := isolated.node.fsm.committedConfiguration()
+	afterLastIndex, err := isolated.node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("minority LastIndex after rejected operations: %v", err)
+	}
+	if before.Heads != after.Heads ||
+		before.ProjectionStateDigest != after.ProjectionStateDigest ||
+		!reflect.DeepEqual(before.ProjectionRows, after.ProjectionRows) ||
+		!reflect.DeepEqual(beforeConfiguration, afterConfiguration) ||
+		beforeLastIndex != afterLastIndex {
+		t.Fatal("isolated minority changed durable state or configuration")
+	}
+	assertSecureMeshAuthority(t, isolated, harness.bootstrap, 1)
+	harness.assertCredentialAbsent(t, isolated, authorization)
+	if err := isolated.node.FatalError(); err != nil {
+		t.Fatalf("isolated node fatal error: %v", err)
+	}
+
+	marker := harness.taskEvent(
+		t,
+		replacement,
+		meshMinorityMarkerEventID,
+		meshMinorityMarkerTaskID,
+		meshMinorityMarkerTimestamp,
+		"majority marker while minority is isolated",
+	)
+	markerResult, err := replacement.node.Apply(meshTestContext(t), marker)
+	if err != nil ||
+		markerResult.Outcome.Status != store.OutcomeAccepted ||
+		markerResult.Outcome.Code != string(reducer.CodeAccepted) {
+		t.Fatalf("majority marker Apply() = (%#v, %v)", markerResult, err)
+	}
+	harness.waitForTask(t, majority, meshMinorityMarkerTaskID)
+	isolatedView, err := isolated.node.state.View(meshTestContext(t))
+	if err != nil {
+		t.Fatalf("isolated View(marker): %v", err)
+	}
+	if viewContainsTask(isolatedView, meshMinorityMarkerTaskID) {
+		t.Fatal("isolated minority received the majority marker")
+	}
+
+	harness.topology.setPartition(isolated.identity.deviceID, false)
+	harness.waitForTask(t, all, meshMinorityMarkerTaskID)
+	assertMeshViewsConverged(t, all)
+	for _, candidate := range all {
+		view, err := candidate.node.state.View(meshTestContext(t))
+		if err != nil {
+			t.Fatalf("post-heal View(%s): %v", candidate.identity.deviceID, err)
+		}
+		if rows := secureMeshProjectionRows(
+			view,
+			"credential_authorizations",
+		); !reflect.DeepEqual(rows, beforeCredentialRows) {
+			t.Fatalf(
+				"credential rows changed on %s after healing",
+				candidate.identity.deviceID,
+			)
+		}
+		harness.assertCredentialAbsent(t, candidate, authorization)
 	}
 }
 
@@ -570,10 +844,34 @@ func (harness *secureMeshHarness) renewCredential(
 	keySeed byte,
 ) {
 	t.Helper()
-	if harness == nil || leader == nil || subject == nil {
+	signed, _ := harness.credentialRenewalEvent(
+		t,
+		leader,
+		subject,
+		keySeed,
+	)
+	result, err := leader.node.Apply(
+		secureMeshReconciliationContext(t),
+		signed,
+	)
+	if err != nil ||
+		result.Outcome.Status != store.OutcomeAccepted ||
+		result.Outcome.Code != string(reducer.CodeAccepted) {
+		t.Fatalf("Apply(credential renewal) = (%#v, %v)", result, err)
+	}
+}
+
+func (harness *secureMeshHarness) credentialRenewalEvent(
+	t *testing.T,
+	stateSource *secureMeshNode,
+	subject *secureMeshNode,
+	keySeed byte,
+) (event.SignedEvent, credentialauthorization.Authorization) {
+	t.Helper()
+	if harness == nil || stateSource == nil || subject == nil {
 		t.Fatal("invalid credential-renewal fixture")
 	}
-	admission, err := leader.node.PeerAdmissionSnapshot()
+	admission, err := stateSource.node.PeerAdmissionSnapshot()
 	if err != nil {
 		t.Fatalf("PeerAdmissionSnapshot(): %v", err)
 	}
@@ -618,7 +916,7 @@ func (harness *secureMeshHarness) renewCredential(
 		notBeforeTime = issuedAtTime
 	}
 
-	view, err := leader.node.state.View(
+	view, err := stateSource.node.state.View(
 		secureMeshReconciliationContext(t),
 	)
 	if err != nil {
@@ -736,15 +1034,7 @@ func (harness *secureMeshHarness) renewCredential(
 	if err != nil {
 		t.Fatalf("build credential renewal: %v", err)
 	}
-	result, err := leader.node.Apply(
-		secureMeshReconciliationContext(t),
-		signed,
-	)
-	if err != nil ||
-		result.Outcome.Status != store.OutcomeAccepted ||
-		result.Outcome.Code != string(reducer.CodeAccepted) {
-		t.Fatalf("Apply(credential renewal) = (%#v, %v)", result, err)
-	}
+	return signed, authorization
 }
 
 func (harness *secureMeshHarness) credentialPayload(
@@ -887,6 +1177,35 @@ func (harness *secureMeshHarness) applyVoterTarget(
 		result.Outcome.Code != string(reducer.CodeAccepted) {
 		t.Fatalf("Apply(voter target %v) = (%#v, %v)", target, result, err)
 	}
+}
+
+func (harness *secureMeshHarness) waitForVoterTarget(
+	t *testing.T,
+	candidates []*secureMeshNode,
+	want []domain.DeviceID,
+	version uint64,
+) {
+	t.Helper()
+	awaitMeshCondition(
+		t,
+		15*time.Second,
+		fmt.Sprintf("voter target %v at version %d", want, version),
+		func() bool {
+			for _, candidate := range candidates {
+				view, err := candidate.node.state.View(context.Background())
+				if err != nil {
+					return false
+				}
+				state, err := decodeStateView(view)
+				if err != nil ||
+					state.VoterSet.VoterSetVersion != version ||
+					!sameDeviceIDs(state.VoterSet.VoterDeviceIDs(), want) {
+					return false
+				}
+			}
+			return true
+		},
+	)
 }
 
 func secureMeshSignedCommand(
@@ -1146,6 +1465,84 @@ func secureMeshConfigurationEquals(
 		}
 	}
 	return true
+}
+
+func secureMeshProjectionRows(
+	view store.StateView,
+	table string,
+) []chain.LogicalRow {
+	rows := make([]chain.LogicalRow, 0)
+	for _, row := range view.ProjectionRows {
+		if row.Table == table {
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+func assertSecureMeshNeverLed(
+	t *testing.T,
+	candidate *secureMeshNode,
+	observations <-chan raft.Observation,
+) {
+	t.Helper()
+	select {
+	case observation := <-observations:
+		t.Fatalf(
+			"isolated node %s became leader: %#v",
+			candidate.identity.deviceID,
+			observation.Data,
+		)
+	default:
+	}
+	if candidate.node.IsLeader() ||
+		candidate.node.raft.State() == raft.Leader {
+		t.Fatalf(
+			"isolated node %s reports leader state",
+			candidate.identity.deviceID,
+		)
+	}
+}
+
+func (harness *secureMeshHarness) assertCredentialAbsent(
+	t *testing.T,
+	candidate *secureMeshNode,
+	authorization credentialauthorization.Authorization,
+) {
+	t.Helper()
+	if harness == nil || candidate == nil || candidate.node == nil {
+		t.Fatal("invalid credential-absence fixture")
+	}
+	if authorization.Epoch < 2 {
+		t.Fatalf("candidate credential epoch = %d, want at least 2", authorization.Epoch)
+	}
+	admission, err := candidate.node.PeerAdmissionSnapshot()
+	if err != nil {
+		t.Fatalf(
+			"PeerAdmissionSnapshot(%s): %v",
+			candidate.identity.deviceID,
+			err,
+		)
+	}
+	if _, found := admission.Authorization(authorization.PrimaryKey()); found {
+		t.Fatalf(
+			"credential %s epoch %d was authorized on %s",
+			authorization.DeviceID,
+			authorization.Epoch,
+			candidate.identity.deviceID,
+		)
+	}
+	epoch, found := admission.CurrentCredentialEpoch(authorization.DeviceID)
+	if !found || epoch != authorization.Epoch-1 {
+		t.Fatalf(
+			"current credential epoch for %s on %s = (%d, %t), want (%d, true)",
+			authorization.DeviceID,
+			candidate.identity.deviceID,
+			epoch,
+			found,
+			authorization.Epoch-1,
+		)
+	}
 }
 
 func assertSecureMeshActivatedAuthority(

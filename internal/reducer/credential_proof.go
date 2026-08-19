@@ -30,15 +30,6 @@ var clockEndorsementFields = []string{
 	"signature",
 }
 
-type credentialTimeEndorsementWire struct {
-	AuthorityVoterSetVersion uint64 `json:"authority_voter_set_version"`
-	Epoch                    uint64 `json:"epoch"`
-	IssuedAt                 string `json:"issued_at"`
-	KeyDigest                string `json:"key_digest"`
-	SessionID                string `json:"session_id"`
-	SubjectDeviceID          string `json:"subject_device_id"`
-}
-
 func credentialBindingPreimageBytes(
 	sessionID domain.UUIDv7,
 	deviceID domain.DeviceID,
@@ -52,23 +43,6 @@ func credentialBindingPreimageBytes(
 	}
 	copy(binding.EpochPublicKey[:], epochPublicKey[:])
 	return binding.CanonicalPreimage()
-}
-
-func credentialTimeEndorsementPreimageBytes(
-	authorization credentialauthorization.Authorization,
-) ([]byte, error) {
-	encoded, err := json.Marshal(credentialTimeEndorsementWire{
-		AuthorityVoterSetVersion: authorization.AuthorityVoterSetVersion,
-		Epoch:                    authorization.Epoch,
-		IssuedAt:                 string(authorization.IssuedAt),
-		KeyDigest:                codec.EncodeBase64URL(authorization.KeyDigest[:]),
-		SessionID:                string(authorization.SessionID),
-		SubjectDeviceID:          string(authorization.DeviceID),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return codec.CanonicalizeSignedObject(encoded)
 }
 
 func verifyCredentialBinding(

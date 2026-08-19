@@ -328,9 +328,42 @@ func TestPeerAdmissionTracksCredentialRoleAndRevocationApplies(t *testing.T) {
 		}
 	}()
 
+	serverCredentialEvent, serverAuthorization, serverEpochPrivateKey :=
+		nodeTestCredentialAuthorizationEvent(
+			t,
+			fixture,
+			fixture.ownerDeviceID,
+			fixture.ownerIdentityPrivate,
+			0x34,
+			nodeTestEventID3,
+			1,
+			1,
+		)
+	result, err := fixture.node.Apply(
+		testContext(t),
+		serverCredentialEvent,
+	)
+	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf(
+			"Apply(server credential) = (%#v, %v)",
+			result,
+			err,
+		)
+	}
+	awaitPeerAdmissionChange(t, changes, "server credential authorization")
+
 	credentialEvent, authorization, epochPrivateKey :=
-		nodeTestCredentialAuthorizationEvent(t, fixture, 1)
-	result, err := fixture.node.Apply(testContext(t), credentialEvent)
+		nodeTestCredentialAuthorizationEvent(
+			t,
+			fixture,
+			fixture.peerDeviceID,
+			fixture.peerIdentityPrivate,
+			0x33,
+			nodeTestEventID4,
+			2,
+			2,
+		)
+	result, err = fixture.node.Apply(testContext(t), credentialEvent)
 	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
 		t.Fatalf("Apply(credential) = (%#v, %v)", result, err)
 	}
@@ -394,7 +427,7 @@ func TestPeerAdmissionTracksCredentialRoleAndRevocationApplies(t *testing.T) {
 			"role":      device.RoleEditor,
 		},
 		nodeTestEventID5,
-		2,
+		3,
 	)
 	result, err = fixture.node.Apply(testContext(t), roleEvent)
 	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
@@ -420,6 +453,8 @@ func TestPeerAdmissionTracksCredentialRoleAndRevocationApplies(t *testing.T) {
 		fixture,
 		verifiers,
 		changes,
+		serverAuthorization,
+		serverEpochPrivateKey,
 	)
 	consensusConnection := ingress.dial(
 		t,
@@ -468,7 +503,7 @@ func TestPeerAdmissionTracksCredentialRoleAndRevocationApplies(t *testing.T) {
 			"expected_voter_set_version": uint64(1),
 		},
 		nodeTestEventID6,
-		3,
+		4,
 	)
 	result, err = fixture.node.Apply(testContext(t), revokeEvent)
 	if err != nil || result.Outcome.Status != store.OutcomeAccepted {
@@ -2460,7 +2495,12 @@ type nodeTestCredentialEndorsementWire struct {
 func nodeTestCredentialAuthorizationEvent(
 	t *testing.T,
 	fixture peerAdmissionTestFixture,
+	subjectDeviceID domain.DeviceID,
+	subjectIdentityPrivate ed25519.PrivateKey,
+	epochSeed byte,
+	eventID domain.UUIDv7,
 	sequence uint64,
+	authorizationChainIndex uint64,
 ) (
 	event.SignedEvent,
 	credentialauthorization.Authorization,
@@ -2468,21 +2508,21 @@ func nodeTestCredentialAuthorizationEvent(
 ) {
 	t.Helper()
 	epochPrivate := ed25519.NewKeyFromSeed(
-		bytes.Repeat([]byte{0x33}, ed25519.SeedSize),
+		bytes.Repeat([]byte{epochSeed}, ed25519.SeedSize),
 	)
 	binding, err := credential.SignBinding(
 		nodeTestSessionID,
-		fixture.peerDeviceID,
+		subjectDeviceID,
 		1,
 		epochPrivate.Public().(ed25519.PublicKey),
-		fixture.peerIdentityPrivate,
+		subjectIdentityPrivate,
 	)
 	if err != nil {
 		t.Fatalf("credential.SignBinding(): %v", err)
 	}
 	authorization := credentialauthorization.Authorization{
 		SessionID:                nodeTestSessionID,
-		DeviceID:                 fixture.peerDeviceID,
+		DeviceID:                 subjectDeviceID,
 		Epoch:                    1,
 		EpochPublicKey:           binding.EpochPublicKey,
 		KeyDigest:                binding.KeyDigest,
@@ -2492,7 +2532,7 @@ func nodeTestCredentialAuthorizationEvent(
 		ValiditySeconds:          credentialauthorization.ValiditySeconds,
 		AuthorityVoterSetVersion: 1,
 		BindingSignature:         binding.Signature,
-		AuthorizationChainIndex:  1,
+		AuthorizationChainIndex:  authorizationChainIndex,
 	}
 	endorsementJSON, err := json.Marshal(nodeTestCredentialEndorsementWire{
 		AuthorityVoterSetVersion: authorization.AuthorityVoterSetVersion,
@@ -2562,10 +2602,10 @@ func nodeTestCredentialAuthorizationEvent(
 		fixture.ownerDeviceID,
 		event.ActorDaemon,
 		event.KindCredentialAuthorized,
-		fixture.peerDeviceID,
+		subjectDeviceID,
 		nil,
 		payload,
-		nodeTestEventID4,
+		eventID,
 		sequence,
 	)
 	return signed, authorization, epochPrivate
@@ -2691,6 +2731,8 @@ func startPeerAdmissionTestIngress(
 	fixture peerAdmissionTestFixture,
 	verifiers *peerauth.Verifiers,
 	changes <-chan struct{},
+	serverAuthorization credentialauthorization.Authorization,
+	serverEpochPrivate ed25519.PrivateKey,
 ) *peerAdmissionIngress {
 	t.Helper()
 	serverIdentity, _, err := transport.IssueIdentityCertificate(
@@ -2700,36 +2742,6 @@ func startPeerAdmissionTestIngress(
 	)
 	if err != nil {
 		t.Fatalf("IssueIdentityCertificate(server): %v", err)
-	}
-	serverEpochPrivate := ed25519.NewKeyFromSeed(
-		bytes.Repeat([]byte{0x34}, ed25519.SeedSize),
-	)
-	serverBinding, err := credential.SignBinding(
-		nodeTestSessionID,
-		fixture.ownerDeviceID,
-		1,
-		serverEpochPrivate.Public().(ed25519.PublicKey),
-		fixture.ownerIdentityPrivate,
-	)
-	if err != nil {
-		t.Fatalf("credential.SignBinding(server): %v", err)
-	}
-	serverAuthorization := credentialauthorization.Authorization{
-		SessionID:                nodeTestSessionID,
-		DeviceID:                 fixture.ownerDeviceID,
-		Epoch:                    1,
-		EpochPublicKey:           serverBinding.EpochPublicKey,
-		KeyDigest:                serverBinding.KeyDigest,
-		Role:                     credentialauthorization.RoleOwner,
-		IssuedAt:                 "2026-08-14T12:00:00Z",
-		NotBefore:                "2026-08-14T12:00:00Z",
-		ValiditySeconds:          credentialauthorization.ValiditySeconds,
-		AuthorityVoterSetVersion: 1,
-		ClockEndorsements: []credentialauthorization.ClockEndorsement{{
-			DeviceID: fixture.ownerDeviceID,
-		}},
-		BindingSignature:        serverBinding.Signature,
-		AuthorizationChainIndex: 1,
 	}
 	serverContent, _, err := transport.IssueContentCertificate(
 		serverAuthorization,

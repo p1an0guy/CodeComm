@@ -97,11 +97,10 @@ func credentialPayload(
 	}
 	copy(authorization.BindingSignature[:], bindingSignature)
 
-	endorsementPreimage, err := credentialTimeEndorsementPreimageBytes(
-		authorization,
-	)
+	endorsementPreimage, err :=
+		credentialauthorization.CanonicalEndorsementPreimage(authorization)
 	if err != nil {
-		t.Fatalf("credentialTimeEndorsementPreimageBytes() error = %v", err)
+		t.Fatalf("CanonicalEndorsementPreimage() error = %v", err)
 	}
 	endorsementPayloads := make([]map[string]any, len(options.endorsers))
 	authorization.ClockEndorsements = make(

@@ -455,6 +455,18 @@ func validConsensusProofProblemSemantics(
 		return (problem.Status == http.StatusRequestTimeout ||
 			problem.Status == http.StatusServiceUnavailable) &&
 			problem.Retryable
+	case "invalid_credential_endorsement":
+		return problem.Status == http.StatusBadRequest &&
+			!problem.Retryable
+	case "credential_endorsement_forbidden":
+		return problem.Status == http.StatusForbidden &&
+			!problem.Retryable
+	case "credential_time_out_of_range":
+		return problem.Status == http.StatusConflict &&
+			!problem.Retryable
+	case "credential_endorsement_unavailable":
+		return problem.Status == http.StatusServiceUnavailable &&
+			problem.Retryable
 	case "internal_error":
 		return problem.Status == http.StatusInternalServerError &&
 			problem.Retryable

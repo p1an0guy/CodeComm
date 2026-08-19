@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -26,10 +28,12 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/credential"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
@@ -40,7 +44,10 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-const secureMeshChild = "CODECOMM_SECURE_MESH_CHILD"
+const (
+	secureMeshChild     = "CODECOMM_SECURE_MESH_CHILD"
+	secureMeshInProcess = "CODECOMM_SECURE_MESH_IN_PROCESS"
+)
 
 var (
 	meshRejectedEventID = domain.UUIDv7(
@@ -62,7 +69,7 @@ var (
 )
 
 func TestSecureThreeVoterConsensusMesh(t *testing.T) {
-	if os.Getenv(secureMeshChild) == "1" {
+	if secureMeshRunsInProcess() || os.Getenv(secureMeshChild) == "1" {
 		runSecureThreeVoterConsensusMesh(t)
 		return
 	}
@@ -86,7 +93,8 @@ func TestSecureThreeVoterConsensusMesh(t *testing.T) {
 
 func TestSecureThreeVoterColdCommitRecovery(t *testing.T) {
 	const childMode = "cold-commit"
-	if os.Getenv(secureMeshChild) == childMode {
+	if secureMeshRunsInProcess() ||
+		os.Getenv(secureMeshChild) == childMode {
 		runSecureThreeVoterColdCommitRecovery(t)
 		return
 	}
@@ -263,6 +271,7 @@ func runSecureThreeVoterConsensusMesh(t *testing.T) {
 		t.Fatalf("voter staging-proof request error = %v", err)
 	}
 	harness.proveStagingCheckpoint(t, leader, proofTarget)
+	harness.proveCredentialEndorsement(t, leader, proofTarget)
 
 	first := harness.taskEvent(
 		t,
@@ -502,6 +511,75 @@ func (origin *secureMeshCheckpointOrigin) RunExclusive(
 	})
 }
 
+func (origin *secureMeshCheckpointOrigin) SubmitCredentialAuthorization(
+	ctx context.Context,
+	authorization credentialauthorization.Authorization,
+) (store.CommandOutcome, error) {
+	if origin == nil ||
+		origin.candidate == nil ||
+		origin.candidate.node == nil ||
+		ctx == nil ||
+		authorization.AuthorizationChainIndex != 0 {
+		return store.CommandOutcome{},
+			ErrCredentialAuthorizationOriginUnavailable
+	}
+	payload, err := secureMeshCredentialAuthorizationPayload(authorization)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	signed, err := secureMeshSignedCommand(
+		origin.candidate,
+		event.ActorDaemon,
+		event.KindCredentialAuthorized,
+		event.StringEntityID(string(authorization.DeviceID)),
+		nil,
+		payload,
+		secureMeshEventTimestamp(),
+	)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	result, err := origin.candidate.node.Apply(ctx, signed)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	return result.Outcome, nil
+}
+
+func secureMeshCredentialAuthorizationPayload(
+	authorization credentialauthorization.Authorization,
+) ([]byte, error) {
+	endorsements := make(
+		[]map[string]any,
+		len(authorization.ClockEndorsements),
+	)
+	for index, endorsement := range authorization.ClockEndorsements {
+		endorsements[index] = map[string]any{
+			"device_id": endorsement.DeviceID,
+			"signature": codec.EncodeBase64URL(
+				endorsement.Signature[:],
+			),
+		}
+	}
+	return json.Marshal(map[string]any{
+		"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
+		"binding_signature": codec.EncodeBase64URL(
+			authorization.BindingSignature[:],
+		),
+		"clock_endorsements": endorsements,
+		"epoch":              authorization.Epoch,
+		"epoch_public_key": codec.EncodeBase64URL(
+			authorization.EpochPublicKey[:],
+		),
+		"issued_at":         authorization.IssuedAt,
+		"key_digest":        codec.EncodeBase64URL(authorization.KeyDigest[:]),
+		"not_before":        authorization.NotBefore,
+		"role":              authorization.Role,
+		"subject_device_id": authorization.DeviceID,
+		"validity_seconds":  authorization.ValiditySeconds,
+	})
+}
+
 func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
 	return newSecureMeshHarnessWithManualReconciliation(t, false)
 }
@@ -723,6 +801,28 @@ func (harness *secureMeshHarness) startNode(
 			return payload.HandoffSignature(), nil
 		},
 	}
+	credentialSigner := CredentialEndorsementSignerAdapter{
+		SignerDeviceID: candidate.identity.deviceID,
+		Sign: func(
+			ctx context.Context,
+			preimage []byte,
+		) ([ed25519.SignatureSize]byte, error) {
+			if err := ctx.Err(); err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			raw, err := codecommcrypto.SignEd25519(
+				candidate.identity.private,
+				codec.SignatureCredentialTimeEndorsement,
+				preimage,
+			)
+			if err != nil {
+				return [ed25519.SignatureSize]byte{}, err
+			}
+			var signature [ed25519.SignatureSize]byte
+			copy(signature[:], raw)
+			return signature, nil
+		},
+	}
 	checkpointOrigin := &secureMeshCheckpointOrigin{
 		t:         t,
 		harness:   harness,
@@ -800,20 +900,21 @@ func (harness *secureMeshHarness) startNode(
 		)
 	}
 	node, err := openNode(context.Background(), nodeOpenOptions{
-		ServerID:                   candidate.identity.deviceID,
-		StatePath:                  candidate.statePath,
-		ConsensusDir:               candidate.consensusDir,
-		OriginBootID:               bootID,
-		InitialState:               initial,
-		TransportFactory:           transportFactory,
-		BootstrapConfiguration:     bootstrap,
-		CanonicalCoverage:          harness.coverage,
-		CheckpointSigner:           checkpointSigner,
-		VoterActivationSigner:      activationSigner,
-		CheckpointOrigin:           checkpointOrigin,
-		DisableVoterReconciliation: true,
-		Clock:                      nodeTestClock(),
-		RaftConfig:                 secureMeshRaftConfig(),
+		ServerID:                    candidate.identity.deviceID,
+		StatePath:                   candidate.statePath,
+		ConsensusDir:                candidate.consensusDir,
+		OriginBootID:                bootID,
+		InitialState:                initial,
+		TransportFactory:            transportFactory,
+		BootstrapConfiguration:      bootstrap,
+		CanonicalCoverage:           harness.coverage,
+		CheckpointSigner:            checkpointSigner,
+		VoterActivationSigner:       activationSigner,
+		CredentialEndorsementSigner: credentialSigner,
+		CheckpointOrigin:            checkpointOrigin,
+		DisableVoterReconciliation:  true,
+		Clock:                       nodeTestClock(),
+		RaftConfig:                  secureMeshRaftConfig(),
 	})
 	if err != nil {
 		_ = listener.Close()
@@ -990,6 +1091,165 @@ func (harness *secureMeshHarness) taskEvent(
 		timestamp,
 		sequence,
 		title,
+	)
+}
+
+func (harness *secureMeshHarness) proveCredentialEndorsement(
+	t *testing.T,
+	leader *secureMeshNode,
+	endorser *secureMeshNode,
+) {
+	t.Helper()
+	if harness == nil ||
+		leader == nil ||
+		endorser == nil ||
+		leader == endorser {
+		t.Fatal("invalid credential endorsement fixture")
+	}
+	fixedNow := time.Date(
+		2026,
+		time.August,
+		18,
+		12,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	for _, candidate := range harness.runningNodes() {
+		candidate.node.credentialEndorsementNow = func() time.Time {
+			return fixedNow
+		}
+	}
+	view, err := leader.node.View(meshTestContext(t))
+	if err != nil {
+		t.Fatalf("credential endorsement View(): %v", err)
+	}
+	state, err := decodeStateView(view)
+	if err != nil {
+		t.Fatalf("credential endorsement state: %v", err)
+	}
+	epochPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xc1}, ed25519.SeedSize),
+	)
+	epochPublic := epochPrivate.Public().(ed25519.PublicKey)
+	authorization := credentialauthorization.Authorization{
+		SessionID: nodeTestSessionID,
+		DeviceID:  leader.identity.deviceID,
+		Epoch:     1,
+		KeyDigest: sha256.Sum256(epochPublic),
+		IssuedAt: domain.WholeSecondTimestamp(
+			fixedNow.Format(time.RFC3339),
+		),
+		AuthorityVoterSetVersion: state.CredentialAuthority.
+			VoterSetVersion,
+	}
+	copy(authorization.EpochPublicKey[:], epochPublic)
+
+	proof, err := requestCredentialEndorsement(
+		meshTestContext(t),
+		leader.stream,
+		endorser.identity.deviceID,
+		endorser.identity.public,
+		authorization,
+	)
+	if err != nil ||
+		proof.endorserDeviceID != endorser.identity.deviceID {
+		t.Fatalf(
+			"leader credential endorsement = (%#v, %v)",
+			proof,
+			err,
+		)
+	}
+
+	var nonleader *secureMeshNode
+	for _, candidate := range harness.runningNodes() {
+		if candidate != leader && candidate != endorser {
+			nonleader = candidate
+			break
+		}
+	}
+	if nonleader == nil {
+		t.Fatal("secure mesh lacks a nonleader credential requester")
+	}
+	if _, err := requestCredentialEndorsement(
+		meshTestContext(t),
+		nonleader.stream,
+		endorser.identity.deviceID,
+		endorser.identity.public,
+		authorization,
+	); !errors.Is(err, ErrCredentialEndorsementRejected) {
+		t.Fatalf("nonleader credential endorsement error = %v", err)
+	}
+
+	outOfRange := authorization
+	outOfRange.IssuedAt = domain.WholeSecondTimestamp(
+		fixedNow.Add(
+			credentialEndorsementClockSkew + time.Second,
+		).Format(time.RFC3339),
+	)
+	if _, err := requestCredentialEndorsement(
+		meshTestContext(t),
+		leader.stream,
+		endorser.identity.deviceID,
+		endorser.identity.public,
+		outOfRange,
+	); !errors.Is(err, ErrCredentialEndorsementRejected) {
+		t.Fatalf("out-of-range credential endorsement error = %v", err)
+	}
+
+	binding, err := credential.SignBinding(
+		nodeTestSessionID,
+		leader.identity.deviceID,
+		1,
+		epochPublic,
+		leader.identity.private,
+	)
+	if err != nil {
+		t.Fatalf("credential.SignBinding(): %v", err)
+	}
+	committed, outcome, err := leader.node.AuthorizeCredential(
+		meshTestContext(t),
+		binding,
+	)
+	if err != nil ||
+		outcome.Status != store.OutcomeAccepted ||
+		committed.DeviceID != leader.identity.deviceID ||
+		committed.Epoch != 1 ||
+		len(committed.ClockEndorsements) < 2 {
+		t.Fatalf(
+			"AuthorizeCredential() = (%#v, %#v, %v)",
+			committed,
+			outcome,
+			err,
+		)
+	}
+	awaitMeshCondition(
+		t,
+		10*time.Second,
+		"committed credential authorization on every voter",
+		func() bool {
+			for _, candidate := range harness.runningNodes() {
+				admission, err :=
+					candidate.node.PeerAdmissionSnapshot()
+				if err != nil {
+					return false
+				}
+				stored, found := admission.Authorization(
+					credentialauthorization.Key{
+						SessionID: nodeTestSessionID,
+						DeviceID:  leader.identity.deviceID,
+						Epoch:     1,
+					},
+				)
+				if !found ||
+					stored.KeyDigest != committed.KeyDigest ||
+					stored.AuthorizationChainIndex == 0 {
+					return false
+				}
+			}
+			return true
+		},
 	)
 }
 
@@ -1538,6 +1798,75 @@ type secureMeshDialer struct {
 	topology      *secureMeshTopology
 }
 
+func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
+	t *testing.T,
+) {
+	topology := newSecureMeshTopology()
+	localDeviceID := domain.DeviceID("cc1" + strings.Repeat("1", 64))
+	remoteDeviceID := domain.DeviceID("cc1" + strings.Repeat("2", 64))
+	endpoint := netip.MustParseAddrPort("192.0.2.10:47831")
+	const address = "127.0.0.1:47831"
+	topology.register(remoteDeviceID, endpoint, address)
+
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = remote.Close() })
+	tracked, allowed := topology.trackConnection(
+		localDeviceID,
+		endpoint,
+		address,
+		local,
+	)
+	if !allowed || tracked == nil {
+		_ = local.Close()
+		t.Fatal("initial established connection was not tracked")
+	}
+	if got := topology.activeConnectionCount(remoteDeviceID); got != 1 {
+		t.Fatalf("active connection count = %d, want 1", got)
+	}
+	if err := remote.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set peer read deadline: %v", err)
+	}
+
+	if closed := topology.setPartition(remoteDeviceID, true); closed != 1 {
+		t.Fatalf("partition closed %d established connections, want 1", closed)
+	}
+	if got := topology.activeConnectionCount(remoteDeviceID); got != 0 {
+		t.Fatalf("active connection count after partition = %d, want 0", got)
+	}
+	if _, allowed := topology.resolve(localDeviceID, endpoint); allowed {
+		t.Fatal("partitioned endpoint remained resolvable")
+	}
+	if _, err := remote.Read(make([]byte, 1)); err == nil {
+		t.Fatal("partition left the established connection open")
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("partition did not close the established connection")
+	}
+
+	racingLocal, racingRemote := net.Pipe()
+	if connection, allowed := topology.trackConnection(
+		localDeviceID,
+		endpoint,
+		address,
+		racingLocal,
+	); allowed || connection != nil {
+		_ = racingLocal.Close()
+		_ = racingRemote.Close()
+		t.Fatal("partition admitted a newly dialed connection")
+	}
+	_ = racingLocal.Close()
+	_ = racingRemote.Close()
+
+	if closed := topology.setPartition(remoteDeviceID, false); closed != 0 {
+		t.Fatalf("healing closed %d connections, want 0", closed)
+	}
+	if resolved, allowed := topology.resolve(
+		localDeviceID,
+		endpoint,
+	); !allowed || resolved != address {
+		t.Fatalf("healed resolution = (%q, %t), want (%q, true)", resolved, allowed, address)
+	}
+}
+
 func (dialer secureMeshDialer) DialConsensusEndpoint(
 	ctx context.Context,
 	endpoint netip.AddrPort,
@@ -1550,13 +1879,28 @@ func (dialer secureMeshDialer) DialConsensusEndpoint(
 		return nil, transport.ErrConsensusEndpointUnavailable
 	}
 	var networkDialer net.Dialer
-	return networkDialer.DialContext(ctx, "tcp4", address)
+	connection, err := networkDialer.DialContext(ctx, "tcp4", address)
+	if err != nil {
+		return nil, err
+	}
+	tracked, allowed := dialer.topology.trackConnection(
+		dialer.localDeviceID,
+		endpoint,
+		address,
+		connection,
+	)
+	if !allowed {
+		_ = connection.Close()
+		return nil, transport.ErrConsensusEndpointUnavailable
+	}
+	return tracked, nil
 }
 
 type secureMeshTopology struct {
 	mu          sync.RWMutex
 	targets     map[netip.AddrPort]secureMeshTarget
 	partitioned map[domain.DeviceID]bool
+	connections map[*secureMeshTrackedConnection]struct{}
 }
 
 type secureMeshTarget struct {
@@ -1564,10 +1908,33 @@ type secureMeshTarget struct {
 	address  string
 }
 
+type secureMeshTrackedConnection struct {
+	net.Conn
+
+	topology       *secureMeshTopology
+	localDeviceID  domain.DeviceID
+	remoteDeviceID domain.DeviceID
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (connection *secureMeshTrackedConnection) Close() error {
+	if connection == nil {
+		return net.ErrClosed
+	}
+	connection.closeOnce.Do(func() {
+		connection.topology.untrackConnection(connection)
+		connection.closeErr = connection.Conn.Close()
+	})
+	return connection.closeErr
+}
+
 func newSecureMeshTopology() *secureMeshTopology {
 	return &secureMeshTopology{
 		targets:     make(map[netip.AddrPort]secureMeshTarget),
 		partitioned: make(map[domain.DeviceID]bool),
+		connections: make(map[*secureMeshTrackedConnection]struct{}),
 	}
 }
 
@@ -1586,17 +1953,29 @@ func (topology *secureMeshTopology) register(
 
 func (topology *secureMeshTopology) unregister(endpoint netip.AddrPort) {
 	topology.mu.Lock()
+	target, exists := topology.targets[endpoint]
 	delete(topology.targets, endpoint)
+	var connections []*secureMeshTrackedConnection
+	if exists {
+		connections = topology.connectionsForDeviceLocked(target.deviceID)
+	}
 	topology.mu.Unlock()
+	closeSecureMeshConnections(connections)
 }
 
 func (topology *secureMeshTopology) setPartition(
 	deviceID domain.DeviceID,
 	partitioned bool,
-) {
+) int {
 	topology.mu.Lock()
 	topology.partitioned[deviceID] = partitioned
+	var connections []*secureMeshTrackedConnection
+	if partitioned {
+		connections = topology.connectionsForDeviceLocked(deviceID)
+	}
 	topology.mu.Unlock()
+	closeSecureMeshConnections(connections)
+	return len(connections)
 }
 
 func (topology *secureMeshTopology) resolve(
@@ -1612,6 +1991,82 @@ func (topology *secureMeshTopology) resolve(
 		return "", false
 	}
 	return target.address, true
+}
+
+func (topology *secureMeshTopology) trackConnection(
+	localDeviceID domain.DeviceID,
+	endpoint netip.AddrPort,
+	address string,
+	connection net.Conn,
+) (net.Conn, bool) {
+	if topology == nil || connection == nil {
+		return nil, false
+	}
+	topology.mu.Lock()
+	target, exists := topology.targets[endpoint]
+	if !exists ||
+		target.address != address ||
+		topology.partitioned[localDeviceID] ||
+		topology.partitioned[target.deviceID] {
+		topology.mu.Unlock()
+		return nil, false
+	}
+	tracked := &secureMeshTrackedConnection{
+		Conn:           connection,
+		topology:       topology,
+		localDeviceID:  localDeviceID,
+		remoteDeviceID: target.deviceID,
+	}
+	topology.connections[tracked] = struct{}{}
+	topology.mu.Unlock()
+	return tracked, true
+}
+
+func (topology *secureMeshTopology) untrackConnection(
+	connection *secureMeshTrackedConnection,
+) {
+	if topology == nil || connection == nil {
+		return
+	}
+	topology.mu.Lock()
+	delete(topology.connections, connection)
+	topology.mu.Unlock()
+}
+
+func (topology *secureMeshTopology) activeConnectionCount(
+	deviceID domain.DeviceID,
+) int {
+	if topology == nil {
+		return 0
+	}
+	topology.mu.RLock()
+	defer topology.mu.RUnlock()
+	return len(topology.connectionsForDeviceLocked(deviceID))
+}
+
+func (topology *secureMeshTopology) connectionsForDeviceLocked(
+	deviceID domain.DeviceID,
+) []*secureMeshTrackedConnection {
+	connections := make([]*secureMeshTrackedConnection, 0)
+	for connection := range topology.connections {
+		if connection.localDeviceID == deviceID ||
+			connection.remoteDeviceID == deviceID {
+			connections = append(connections, connection)
+		}
+	}
+	return connections
+}
+
+func closeSecureMeshConnections(
+	connections []*secureMeshTrackedConnection,
+) {
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
+}
+
+func secureMeshRunsInProcess() bool {
+	return os.Getenv(secureMeshInProcess) == "1"
 }
 
 func secureMeshChildEnvironment(base []string) []string {

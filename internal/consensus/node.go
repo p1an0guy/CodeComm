@@ -68,6 +68,9 @@ type SingleNodeOptions struct {
 	// VoterActivationSigner is optional until voter reconciliation is enabled.
 	// When supplied, it remains owned by the caller.
 	VoterActivationSigner VoterActivationSigner
+	// CredentialEndorsementSigner is optional until credential renewal is
+	// enabled. When supplied, it remains owned by the caller.
+	CredentialEndorsementSigner CredentialEndorsementSigner
 	// CheckpointOrigin is optional until checkpoint scheduling is enabled.
 	// When supplied, it remains owned by the caller.
 	CheckpointOrigin CheckpointOrigin
@@ -114,12 +117,14 @@ type NodeOptions struct {
 	OriginBootID domain.UUIDv7
 	InitialState *store.InitialState
 
-	TransportFactory        RaftTransportFactory
-	BootstrapVoterDeviceIDs []domain.DeviceID
-	CanonicalCoverage       canonicalcoverage.ReceiptCollector
-	CheckpointSigner        CheckpointSigner
-	VoterActivationSigner   VoterActivationSigner
-	CheckpointOrigin        CheckpointOrigin
+	TransportFactory            RaftTransportFactory
+	BootstrapVoterDeviceIDs     []domain.DeviceID
+	CanonicalCoverage           canonicalcoverage.ReceiptCollector
+	CheckpointSigner            CheckpointSigner
+	VoterActivationSigner       VoterActivationSigner
+	CredentialEndorsementSigner CredentialEndorsementSigner
+	CheckpointOrigin            CheckpointOrigin
+	CheckpointOriginFactory     CheckpointOriginFactory
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -129,30 +134,34 @@ type NodeOptions struct {
 // SingleNode is the durable Raft/SQLite runtime. Its historical name remains
 // for API compatibility; OpenNode may construct a multi-voter mesh runtime.
 type SingleNode struct {
-	raft                   *raft.Raft
-	fsm                    *FSM
-	state                  *store.Store
-	stable                 *raftboltdb.BoltStore
-	snapshots              *raft.FileSnapshotStore
-	transport              RaftTransport
-	serverID               raft.ServerID
-	originBootID           domain.UUIDv7
-	clock                  ApplyClock
-	single                 bool
-	transportGate          *nodeTransportGate
-	coverageGate           *canonicalcoverage.Gate
-	readinessGate          *configurationReadinessGate
-	checkpointSigner       CheckpointSigner
-	voterActivationSigner  VoterActivationSigner
-	checkpointOrigin       CheckpointOrigin
-	checkpointRequester    consensusProofRequester
-	voterActivationOrigin  VoterActivationOrigin
-	voterReconcileGate     chan struct{}
-	voterReconcileDone     chan struct{}
-	voterReconcileStatus   voterReconciliationStatus
-	voterReconcileNow      func() time.Time
-	stagingProofAttempt    *stagingVoterProofAttempt
-	voterActivationAttempt *voterActivationAttempt
+	raft                          *raft.Raft
+	fsm                           *FSM
+	state                         *store.Store
+	stable                        *raftboltdb.BoltStore
+	snapshots                     *raft.FileSnapshotStore
+	transport                     RaftTransport
+	serverID                      raft.ServerID
+	originBootID                  domain.UUIDv7
+	clock                         ApplyClock
+	single                        bool
+	transportGate                 *nodeTransportGate
+	coverageGate                  *canonicalcoverage.Gate
+	readinessGate                 *configurationReadinessGate
+	checkpointSigner              CheckpointSigner
+	voterActivationSigner         VoterActivationSigner
+	credentialEndorsementSigner   CredentialEndorsementSigner
+	checkpointOrigin              CheckpointOrigin
+	checkpointRequester           consensusProofRequester
+	credentialRenewalRequester    credentialRenewalRequester
+	voterActivationOrigin         VoterActivationOrigin
+	credentialAuthorizationOrigin CredentialAuthorizationOrigin
+	voterReconcileGate            chan struct{}
+	voterReconcileDone            chan struct{}
+	voterReconcileStatus          voterReconciliationStatus
+	voterReconcileNow             func() time.Time
+	credentialEndorsementNow      func() time.Time
+	stagingProofAttempt           *stagingVoterProofAttempt
+	voterActivationAttempt        *voterActivationAttempt
 
 	peerAdmissionChangesClaimed atomic.Bool
 
@@ -199,18 +208,19 @@ type nodeOpenOptions struct {
 	OriginBootID domain.UUIDv7
 	InitialState *store.InitialState
 
-	Transport                  RaftTransport
-	TransportFactory           RaftTransportFactory
-	BootstrapConfiguration     raft.Configuration
-	CanonicalCoverage          canonicalcoverage.ReceiptCollector
-	ConfigurationReadiness     ConfigurationReadinessProvider
-	VoterReconciliationNow     func() time.Time
-	CheckpointSigner           CheckpointSigner
-	VoterActivationSigner      VoterActivationSigner
-	CheckpointOrigin           CheckpointOrigin
-	CheckpointOriginFactory    CheckpointOriginFactory
-	Single                     bool
-	DisableVoterReconciliation bool
+	Transport                   RaftTransport
+	TransportFactory            RaftTransportFactory
+	BootstrapConfiguration      raft.Configuration
+	CanonicalCoverage           canonicalcoverage.ReceiptCollector
+	ConfigurationReadiness      ConfigurationReadinessProvider
+	VoterReconciliationNow      func() time.Time
+	CheckpointSigner            CheckpointSigner
+	VoterActivationSigner       VoterActivationSigner
+	CredentialEndorsementSigner CredentialEndorsementSigner
+	CheckpointOrigin            CheckpointOrigin
+	CheckpointOriginFactory     CheckpointOriginFactory
+	Single                      bool
+	DisableVoterReconciliation  bool
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -227,19 +237,20 @@ func OpenSingleNode(
 		return nil, err
 	}
 	return openNode(ctx, nodeOpenOptions{
-		ServerID:                options.ServerID,
-		StatePath:               options.StatePath,
-		ConsensusDir:            options.ConsensusDir,
-		OriginBootID:            options.OriginBootID,
-		InitialState:            options.InitialState,
-		CheckpointSigner:        options.CheckpointSigner,
-		VoterActivationSigner:   options.VoterActivationSigner,
-		CheckpointOrigin:        options.CheckpointOrigin,
-		CheckpointOriginFactory: options.CheckpointOriginFactory,
-		Single:                  true,
-		Clock:                   options.Clock,
-		RaftConfig:              options.RaftConfig,
-		LogOutput:               options.LogOutput,
+		ServerID:                    options.ServerID,
+		StatePath:                   options.StatePath,
+		ConsensusDir:                options.ConsensusDir,
+		OriginBootID:                options.OriginBootID,
+		InitialState:                options.InitialState,
+		CheckpointSigner:            options.CheckpointSigner,
+		VoterActivationSigner:       options.VoterActivationSigner,
+		CredentialEndorsementSigner: options.CredentialEndorsementSigner,
+		CheckpointOrigin:            options.CheckpointOrigin,
+		CheckpointOriginFactory:     options.CheckpointOriginFactory,
+		Single:                      true,
+		Clock:                       options.Clock,
+		RaftConfig:                  options.RaftConfig,
+		LogOutput:                   options.LogOutput,
 	})
 }
 
@@ -259,20 +270,22 @@ func OpenNode(
 		return nil, err
 	}
 	return openNode(ctx, nodeOpenOptions{
-		ServerID:               options.ServerID,
-		StatePath:              options.StatePath,
-		ConsensusDir:           options.ConsensusDir,
-		OriginBootID:           options.OriginBootID,
-		InitialState:           options.InitialState,
-		TransportFactory:       options.TransportFactory,
-		BootstrapConfiguration: bootstrap,
-		CanonicalCoverage:      options.CanonicalCoverage,
-		CheckpointSigner:       options.CheckpointSigner,
-		VoterActivationSigner:  options.VoterActivationSigner,
-		CheckpointOrigin:       options.CheckpointOrigin,
-		Clock:                  options.Clock,
-		RaftConfig:             options.RaftConfig,
-		LogOutput:              options.LogOutput,
+		ServerID:                    options.ServerID,
+		StatePath:                   options.StatePath,
+		ConsensusDir:                options.ConsensusDir,
+		OriginBootID:                options.OriginBootID,
+		InitialState:                options.InitialState,
+		TransportFactory:            options.TransportFactory,
+		BootstrapConfiguration:      bootstrap,
+		CanonicalCoverage:           options.CanonicalCoverage,
+		CheckpointSigner:            options.CheckpointSigner,
+		VoterActivationSigner:       options.VoterActivationSigner,
+		CredentialEndorsementSigner: options.CredentialEndorsementSigner,
+		CheckpointOrigin:            options.CheckpointOrigin,
+		CheckpointOriginFactory:     options.CheckpointOriginFactory,
+		Clock:                       options.Clock,
+		RaftConfig:                  options.RaftConfig,
+		LogOutput:                   options.LogOutput,
 	})
 }
 
@@ -618,15 +631,19 @@ func openNode(
 		voterActivationSigner: normalizedVoterActivationSigner(
 			options.VoterActivationSigner,
 		),
-		checkpointOrigin:   checkpointOrigin,
-		monitorStop:        make(chan struct{}),
-		monitorDone:        make(chan struct{}),
-		closeStarted:       make(chan struct{}),
-		lineageGate:        make(chan struct{}, 1),
-		raftEnqueue:        make(chan struct{}, 1),
-		voterReconcileGate: make(chan struct{}, 1),
-		voterReconcileNow:  options.VoterReconciliationNow,
-		fatalSet:           make(chan struct{}),
+		credentialEndorsementSigner: normalizedCredentialEndorsementSigner(
+			options.CredentialEndorsementSigner,
+		),
+		checkpointOrigin:         checkpointOrigin,
+		monitorStop:              make(chan struct{}),
+		monitorDone:              make(chan struct{}),
+		closeStarted:             make(chan struct{}),
+		lineageGate:              make(chan struct{}, 1),
+		raftEnqueue:              make(chan struct{}, 1),
+		voterReconcileGate:       make(chan struct{}, 1),
+		voterReconcileNow:        options.VoterReconciliationNow,
+		credentialEndorsementNow: time.Now,
+		fatalSet:                 make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,
 		),
@@ -679,12 +696,6 @@ func openNode(
 		}
 	}()
 	if options.CheckpointOriginFactory != nil {
-		if !options.Single {
-			return nil, fmt.Errorf(
-				"%w: checkpoint origin factory requires a routed mesh submitter",
-				ErrInvalidNodeOptions,
-			)
-		}
 		factoryOrigin, err = options.CheckpointOriginFactory(
 			state.LocalState(),
 			node,
@@ -720,6 +731,8 @@ func openNode(
 		return nil, err
 	}
 	node.checkpointRequester = checkpointRequester
+	node.credentialRenewalRequester, _ =
+		transport.(credentialRenewalRequester)
 	node.voterActivationOrigin = voterActivationOriginForCheckpoint(
 		checkpointOrigin,
 	)
@@ -727,6 +740,15 @@ func openNode(
 		options.ServerID,
 		options.OriginBootID,
 		node.voterActivationOrigin,
+	); err != nil {
+		return nil, err
+	}
+	node.credentialAuthorizationOrigin =
+		normalizedCredentialAuthorizationOrigin(checkpointOrigin)
+	if err := validateCredentialAuthorizationOrigin(
+		options.ServerID,
+		options.OriginBootID,
+		node.credentialAuthorizationOrigin,
 	); err != nil {
 		return nil, err
 	}
@@ -807,6 +829,12 @@ func validateSingleNodeOptions(
 	); err != nil {
 		return err
 	}
+	if err := validateCredentialEndorsementSigner(
+		options.ServerID,
+		options.CredentialEndorsementSigner,
+	); err != nil {
+		return err
+	}
 	if err := validateCheckpointOrigin(
 		options.ServerID,
 		options.OriginBootID,
@@ -852,6 +880,12 @@ func validateNodeOptions(
 	); err != nil {
 		return err
 	}
+	if err := validateCredentialEndorsementSigner(
+		options.ServerID,
+		options.CredentialEndorsementSigner,
+	); err != nil {
+		return err
+	}
 	if err := validateCheckpointOrigin(
 		options.ServerID,
 		options.OriginBootID,
@@ -859,9 +893,10 @@ func validateNodeOptions(
 	); err != nil {
 		return err
 	}
-	return validateCheckpointCapabilities(
+	return validateCheckpointOriginConfiguration(
 		options.CheckpointSigner,
 		options.CheckpointOrigin,
+		options.CheckpointOriginFactory,
 	)
 }
 
@@ -2546,6 +2581,8 @@ func (node *SingleNode) PeerAdmissionSnapshot() (*peerauth.Snapshot, error) {
 	if err := node.FatalError(); err != nil {
 		return nil, err
 	}
+	node.fsm.admissionMu.Lock()
+	defer node.fsm.admissionMu.Unlock()
 	snapshot := node.fsm.admission.Load()
 	if snapshot == nil ||
 		snapshot.snapshot == nil ||

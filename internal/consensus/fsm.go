@@ -345,15 +345,18 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 	if err != nil {
 		return fsm.halt(log, err)
 	}
+	fsm.admissionMu.Lock()
 	result, err := fsm.store.Apply(context.Background(), request)
 	if err != nil {
+		fsm.admissionMu.Unlock()
 		return fsm.halt(log, fmt.Errorf("commit command: %w", err))
 	}
-	fsm.publishPeerAdmission(
+	fsm.publishPeerAdmissionLocked(
 		nextAdmission,
 		result.AdmissionRevision,
 		admissionAccessChanged(outcome.Changes),
 	)
+	fsm.admissionMu.Unlock()
 	fsm.publishAppliedCommand(log.Index)
 	return ApplyResponse{LogIndex: log.Index, Result: result}
 }
@@ -458,6 +461,14 @@ func (fsm *FSM) publishPeerAdmission(
 ) {
 	fsm.admissionMu.Lock()
 	defer fsm.admissionMu.Unlock()
+	fsm.publishPeerAdmissionLocked(snapshot, revision, notify)
+}
+
+func (fsm *FSM) publishPeerAdmissionLocked(
+	snapshot *peerauth.Snapshot,
+	revision uint64,
+	notify bool,
+) {
 	if fsm.authorizationChanges.isClosed() {
 		return
 	}

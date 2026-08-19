@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 )
 
 func TestCredentialProofGoldenVectors(t *testing.T) {
@@ -28,11 +29,10 @@ func TestCredentialProofGoldenVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("credentialBindingPreimageBytes() error = %v", err)
 	}
-	endorsementPreimage, err := credentialTimeEndorsementPreimageBytes(
-		authorization,
-	)
+	endorsementPreimage, err :=
+		credentialauthorization.CanonicalEndorsementPreimage(authorization)
 	if err != nil {
-		t.Fatalf("credentialTimeEndorsementPreimageBytes() error = %v", err)
+		t.Fatalf("CanonicalEndorsementPreimage() error = %v", err)
 	}
 
 	assertGoldenCredentialValue(

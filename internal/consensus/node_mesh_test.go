@@ -89,6 +89,55 @@ func TestOpenNodeUsesInjectedDeviceAddressedTransport(t *testing.T) {
 	}
 }
 
+func TestMeshNodeOptionsAcceptLateCheckpointOriginFactory(t *testing.T) {
+	root := t.TempDir()
+	_, _, deviceID := nodeTestInitialState(t)
+	options := NodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		TransportFactory: func(ConsensusTransportGate) (
+			RaftTransport,
+			error,
+		) {
+			return nil, errors.New("not called during validation")
+		},
+		CheckpointSigner: CheckpointSignerAdapter{
+			SignerDeviceID: deviceID,
+			Sign: func(
+				context.Context,
+				domain.Checkpoint,
+			) (store.Signature, error) {
+				return store.Signature{}, nil
+			},
+		},
+		CheckpointOriginFactory: func(
+			store.LocalState,
+			CheckpointCommandSubmitter,
+		) (CheckpointOrigin, error) {
+			return nil, errors.New("not called during validation")
+		},
+	}
+	if err := validateNodeOptions(context.Background(), options); err != nil {
+		t.Fatalf("validateNodeOptions(factory): %v", err)
+	}
+	options.CheckpointOrigin = &checkpointCommitOrigin{
+		deviceID:  deviceID,
+		bootID:    nodeTestBootID1,
+		exclusive: make(chan struct{}, 1),
+	}
+	if err := validateNodeOptions(
+		context.Background(),
+		options,
+	); !errors.Is(err, ErrInvalidNodeOptions) {
+		t.Fatalf(
+			"validateNodeOptions(origin plus factory) error = %v",
+			err,
+		)
+	}
+}
+
 func TestOpenNodeOwnsProductionConfigurationReadiness(t *testing.T) {
 	root := t.TempDir()
 	initial, _, deviceID := nodeTestInitialState(t)

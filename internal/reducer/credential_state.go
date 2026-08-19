@@ -92,7 +92,9 @@ func (state *State) loadCredentialSnapshot(
 				key.Epoch,
 			)
 		}
-		preimage, err := credentialTimeEndorsementPreimageBytes(value)
+		preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
+			value,
+		)
 		if err != nil {
 			return invalidState(
 				"credential authorization %q/%q/%d endorsement preimage: %v",

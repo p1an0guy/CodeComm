@@ -156,7 +156,9 @@ func validateCredentialEndorsements(
 		return credentialauthorization.ErrInvalidEndorsementCount
 	}
 	var previous domain.DeviceID
-	preimage, err := credentialTimeEndorsementPreimageBytes(authorization)
+	preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
+		authorization,
+	)
 	if err != nil {
 		return err
 	}

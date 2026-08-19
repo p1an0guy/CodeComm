@@ -83,9 +83,9 @@ type CheckpointCommandSubmitter interface {
 	) error
 }
 
-// CheckpointOriginFactory resolves the single-node construction cycle between
-// the node-owned LocalState capability and the durable boot-origin queue
-// owner. The factory must not start background work before returning.
+// CheckpointOriginFactory resolves the construction cycle between node-owned
+// LocalState and the durable boot-origin queue owner. The factory must not
+// start background work before returning.
 type CheckpointOriginFactory func(
 	store.LocalState,
 	CheckpointCommandSubmitter,
