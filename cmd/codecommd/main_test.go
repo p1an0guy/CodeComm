@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -29,7 +33,9 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/ui"
 )
 
@@ -201,6 +207,7 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 				newBootID: func() (domain.UUIDv7, error) {
 					return daemonTestFirstBootID, nil
 				},
+				newMeshFactory: newDaemonTestMeshFactory,
 			},
 		)
 	}()
@@ -261,6 +268,65 @@ func TestShutdownDaemonComponentsClosesConsensusBeforeWaiting(
 	}
 	if !reflect.DeepEqual(trace.events, want) {
 		t.Fatalf("shutdown order = %#v, want %#v", trace.events, want)
+	}
+}
+
+func TestDaemonServerExitAndJoinFailClosed(t *testing.T) {
+	t.Run("unexpected clean exit", func(t *testing.T) {
+		err := daemonServerExitError(
+			daemonServerResult{name: "peer ingress"},
+			nil,
+		)
+		if !errors.Is(err, errDaemonServerStopped) {
+			t.Fatalf("daemonServerExitError() = %v", err)
+		}
+	})
+	t.Run("parent cancellation", func(t *testing.T) {
+		err := daemonServerExitError(
+			daemonServerResult{
+				name: "peer ingress",
+				err:  errors.New("late failure"),
+			},
+			context.Canceled,
+		)
+		if err != nil {
+			t.Fatalf("daemonServerExitError() = %v, want nil", err)
+		}
+	})
+	t.Run("join preserves unexpected failure", func(t *testing.T) {
+		serveErr := errors.New("serve failed")
+		results := make(chan daemonServerResult, 2)
+		results <- daemonServerResult{
+			name: "local IPC",
+			err:  context.Canceled,
+		}
+		results <- daemonServerResult{
+			name: "peer ingress",
+			err:  serveErr,
+		}
+		err := joinDaemonServers(results, 0, 2, time.Second)
+		if !errors.Is(err, serveErr) {
+			t.Fatalf("joinDaemonServers() = %v", err)
+		}
+	})
+	t.Run("join is bounded", func(t *testing.T) {
+		results := make(chan daemonServerResult)
+		err := joinDaemonServers(results, 0, 1, time.Millisecond)
+		if !errors.Is(err, errDaemonServerShutdown) {
+			t.Fatalf("joinDaemonServers() = %v", err)
+		}
+	})
+}
+
+func TestNilDaemonMeshFactoryRejectsTypedNil(t *testing.T) {
+	var typedNil *daemonTestMeshFactory
+	if !nilDaemonMeshFactory(typedNil) {
+		t.Fatal("nilDaemonMeshFactory() accepted a typed nil")
+	}
+	if nilDaemonMeshFactory(&daemonTestMeshFactory{
+		deviceID: daemonMeshTestDeviceID('9'),
+	}) {
+		t.Fatal("nilDaemonMeshFactory() rejected a concrete factory")
 	}
 }
 
@@ -350,6 +416,7 @@ func TestDaemonProcessHelper(t *testing.T) {
 			newBootID: func() (domain.UUIDv7, error) {
 				return bootID, nil
 			},
+			newMeshFactory: newDaemonMeshTransportFactory,
 		},
 	)
 	if err != nil {
@@ -360,6 +427,28 @@ func TestDaemonProcessHelper(t *testing.T) {
 type testIdentityHandle struct{}
 
 func (testIdentityHandle) Close() error {
+	return nil
+}
+
+func (testIdentityHandle) Get(
+	context.Context,
+	credentialstore.Reference,
+) ([]byte, error) {
+	return nil, credentialstore.ErrNotFound
+}
+
+func (testIdentityHandle) Create(
+	context.Context,
+	credentialstore.Reference,
+	[]byte,
+) error {
+	return nil
+}
+
+func (testIdentityHandle) Delete(
+	context.Context,
+	credentialstore.Reference,
+) error {
 	return nil
 }
 
@@ -388,7 +477,7 @@ func startDaemonTestProcess(
 		"--workspace", string(daemonTestWorkspaceID),
 	)
 	command.Env = append(
-		os.Environ(),
+		daemonTestEnvironment(os.Environ()),
 		"CODECOMM_TEST_DAEMON_HELPER=1",
 		"CODECOMM_TEST_BOOT_ID="+string(bootID),
 	)
@@ -470,9 +559,16 @@ func waitForDaemonTestStatusOrExit(
 			if err == nil {
 				err = closeErr
 			}
-			if err == nil {
+			if err == nil &&
+				snapshot.Consensus.StrongWrites == "available" {
 				cancel()
 				return snapshot
+			}
+			if err == nil {
+				err = fmt.Errorf(
+					"strong writes are %s",
+					snapshot.Consensus.StrongWrites,
+				)
 			}
 		}
 		cancel()
@@ -504,6 +600,92 @@ func (consensus *recordingDaemonConsensus) Close() error {
 type recordingDaemonComponent struct {
 	name  string
 	trace *daemonShutdownTrace
+}
+
+type daemonTestMeshFactory struct {
+	deviceID domain.DeviceID
+}
+
+type daemonTestProofTransport struct {
+	consensus.RaftTransport
+}
+
+func newDaemonTestMeshFactory(
+	_ daemonOptions,
+	deviceID domain.DeviceID,
+	_ tls.Certificate,
+) (daemonConsensusTransportFactory, error) {
+	if !deviceID.Valid() {
+		return nil, errInvalidDaemonDependencies
+	}
+	return &daemonTestMeshFactory{deviceID: deviceID}, nil
+}
+
+func (factory *daemonTestMeshFactory) Build(
+	consensus.ConsensusTransportGate,
+) (consensus.RaftTransport, error) {
+	if factory == nil || !factory.deviceID.Valid() {
+		return nil, errInvalidDaemonDependencies
+	}
+	_, value := raft.NewInmemTransport(
+		raft.ServerAddress(factory.deviceID),
+	)
+	return &daemonTestProofTransport{RaftTransport: value}, nil
+}
+
+func (*daemonTestProofTransport) RequestConsensusProof(
+	context.Context,
+	domain.DeviceID,
+	[]byte,
+) (transport.ConsensusControlResponse, error) {
+	return transport.ConsensusControlResponse{},
+		transport.ErrConsensusPeerUnreachable
+}
+
+func (*daemonTestMeshFactory) NewIngress(
+	context.Context,
+	daemonOptions,
+	*consensus.Node,
+	transport.ContentCertificateProvider,
+	transport.ConnectionHandler,
+	transport.ConnectionHandler,
+	func(context.Context, netip.AddrPort) (net.Listener, error),
+) (*transport.Ingress, error) {
+	return nil, nil
+}
+
+func (*daemonTestMeshFactory) ClearIdentityCertificate() {}
+
+func (*daemonTestMeshFactory) ConsensusRoutes() *transport.ConsensusRouteTable {
+	return nil
+}
+
+func (*daemonTestMeshFactory) SetAuthenticatedDialObserver(
+	transport.ConsensusAuthenticatedDialObserver,
+) error {
+	return nil
+}
+
+func daemonTestEnvironment(base []string) []string {
+	result := make([]string, 0, len(base)+1)
+	var settings []string
+	for _, entry := range base {
+		if !strings.HasPrefix(entry, "GODEBUG=") {
+			result = append(result, entry)
+			continue
+		}
+		for _, setting := range strings.Split(
+			strings.TrimPrefix(entry, "GODEBUG="),
+			",",
+		) {
+			if setting != "" &&
+				!strings.HasPrefix(setting, "http2xconnect=") {
+				settings = append(settings, setting)
+			}
+		}
+	}
+	settings = append(settings, "http2xconnect=1")
+	return append(result, "GODEBUG="+strings.Join(settings, ","))
 }
 
 func (component *recordingDaemonComponent) BeginClose() error {

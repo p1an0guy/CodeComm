@@ -2,43 +2,55 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ijonahch/codecomm/internal/agent"
 	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/credentialservice"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/pairingservice"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/ui"
 )
 
 const fatalPollInterval = 100 * time.Millisecond
+const daemonPeerShutdownTimeout = 30 * time.Second
 
 var (
 	errInvalidDaemonOptions      = errors.New("codecommd: invalid options")
 	errDaemonLineageMismatch     = errors.New("codecommd: state lineage mismatch")
 	errInvalidDaemonDependencies = errors.New("codecommd: invalid dependencies")
+	errDaemonServerStopped       = errors.New("codecommd: server stopped unexpectedly")
+	errDaemonServerShutdown      = errors.New("codecommd: server shutdown timed out")
 )
 
 type daemonOptions struct {
-	statePath    string
-	consensusDir string
-	endpoint     ipc.Endpoint
-	sessionID    domain.UUIDv7
-	workspaceID  domain.UUIDv4
+	statePath     string
+	consensusDir  string
+	endpoint      ipc.Endpoint
+	sessionID     domain.UUIDv7
+	workspaceID   domain.UUIDv4
+	peerListeners []netip.AddrPort
+	peerRoutes    []daemonPeerRoute
 }
 
 type identityHandle interface {
@@ -54,9 +66,22 @@ type daemonConsensusCloser interface {
 	Close() error
 }
 
+type daemonServerResult struct {
+	name string
+	err  error
+}
+
 type daemonDependencies struct {
-	loadIdentity func(context.Context) (identityHandle, []byte, error)
-	newBootID    func() (domain.UUIDv7, error)
+	loadIdentity   func(context.Context) (identityHandle, []byte, error)
+	newBootID      func() (domain.UUIDv7, error)
+	newMeshFactory daemonMeshFactoryConstructor
+	listenPeer     func(
+		context.Context,
+		netip.AddrPort,
+	) (net.Listener, error)
+	openMulticast  daemonMulticastOpener
+	listInterfaces daemonInterfaceLister
+	interfaceAddrs daemonInterfaceAddressProvider
 }
 
 func main() {
@@ -104,6 +129,18 @@ func parseDaemonOptions(
 	)
 	sessionText := flags.String("session", "", "session UUIDv7")
 	workspaceText := flags.String("workspace", "", "workspace UUIDv4")
+	var peerListenerValues daemonStringList
+	var peerRouteValues daemonStringList
+	flags.Var(
+		&peerListenerValues,
+		"peer-listen",
+		"selected literal peer listener IP and port; repeat per interface",
+	)
+	flags.Var(
+		&peerRouteValues,
+		"peer-route",
+		"peer device ID, remote literal endpoint, and selected local IP",
+	)
 	if err := flags.Parse(args); err != nil {
 		return daemonOptions{}, fmt.Errorf("%w: %v", errInvalidDaemonOptions, err)
 	}
@@ -136,12 +173,21 @@ func parseDaemonOptions(
 			errInvalidDaemonOptions,
 		)
 	}
+	peerListeners, peerRoutes, err := parseDaemonMeshOptions(
+		peerListenerValues,
+		peerRouteValues,
+	)
+	if err != nil {
+		return daemonOptions{}, err
+	}
 	return daemonOptions{
-		statePath:    *statePath,
-		consensusDir: *consensusDir,
-		endpoint:     endpoint,
-		sessionID:    sessionID,
-		workspaceID:  workspaceID,
+		statePath:     *statePath,
+		consensusDir:  *consensusDir,
+		endpoint:      endpoint,
+		sessionID:     sessionID,
+		workspaceID:   workspaceID,
+		peerListeners: peerListeners,
+		peerRoutes:    peerRoutes,
 	}, nil
 }
 
@@ -172,6 +218,15 @@ func productionDaemonDependencies() daemonDependencies {
 			}
 			return result, nil
 		},
+		newMeshFactory: newDaemonMeshTransportFactory,
+		listenPeer:     listenDaemonPeer,
+		openMulticast:  openDaemonMulticast,
+		listInterfaces: net.Interfaces,
+		interfaceAddrs: func(
+			iface *net.Interface,
+		) ([]net.Addr, error) {
+			return iface.Addrs()
+		},
 	}
 }
 
@@ -182,7 +237,11 @@ func runDaemon(
 ) (resultErr error) {
 	if ctx == nil ||
 		dependencies.loadIdentity == nil ||
-		dependencies.newBootID == nil {
+		dependencies.newBootID == nil ||
+		dependencies.newMeshFactory == nil ||
+		len(options.peerListeners) != 0 &&
+			dependencies.listenPeer == nil ||
+		incompleteDaemonDiscoveryDependencies(dependencies) {
 		return errInvalidDaemonDependencies
 	}
 	if !cleanAbsolutePath(options.statePath) ||
@@ -190,6 +249,9 @@ func runDaemon(
 		!options.sessionID.Valid() ||
 		!options.workspaceID.Valid() {
 		return errInvalidDaemonOptions
+	}
+	if err := validateDaemonMeshOptions(options); err != nil {
+		return err
 	}
 	if _, err := ipc.ParseEndpoint(options.endpoint.String()); err != nil {
 		return fmt.Errorf("%w: endpoint: %v", errInvalidDaemonOptions, err)
@@ -221,6 +283,44 @@ func runDaemon(
 	if err != nil {
 		return fmt.Errorf("codecommd: derive device identity: %w", err)
 	}
+	meshPreflight, err := inspectDaemonMeshState(
+		ctx,
+		options,
+		deviceID,
+		identityPublicKey,
+	)
+	if err != nil {
+		return err
+	}
+	identityCertificate, identityBinding, err :=
+		transport.IssueIdentityCertificate(
+			options.sessionID,
+			meshPreflight.recoveryGeneration,
+			identityPrivateKey,
+		)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: issue identity certificate: %v",
+			errDaemonMeshConstruction,
+			err,
+		)
+	}
+	defer clearDaemonTLSCertificate(&identityCertificate)
+	if identityBinding.DeviceID != deviceID {
+		return errDaemonIdentityMismatch
+	}
+	meshFactory, err := dependencies.newMeshFactory(
+		options,
+		deviceID,
+		identityCertificate,
+	)
+	if err != nil {
+		return err
+	}
+	if nilDaemonMeshFactory(meshFactory) {
+		return errInvalidDaemonDependencies
+	}
+	defer meshFactory.ClearIdentityCertificate()
 	originBootID, err := dependencies.newBootID()
 	if err != nil {
 		return fmt.Errorf("codecommd: generate origin boot ID: %w", err)
@@ -238,6 +338,10 @@ func runDaemon(
 	daemonBinding, err := authority.DaemonBinding()
 	if err != nil {
 		return fmt.Errorf("codecommd: create daemon binding: %w", err)
+	}
+	operatorBinding, err := authority.OperatorBinding()
+	if err != nil {
+		return fmt.Errorf("codecommd: create operator binding: %w", err)
 	}
 	checkpointSigner := consensus.CheckpointSignerAdapter{
 		SignerDeviceID: deviceID,
@@ -258,14 +362,27 @@ func runDaemon(
 
 	processClock := consensus.NewSystemApplyClock()
 	var bootOrigin *agent.BootOrigin
-	node, err := consensus.OpenSingleNode(
+	node, err := consensus.OpenNode(
 		ctx,
-		consensus.SingleNodeOptions{
+		consensus.NodeOptions{
 			ServerID:         deviceID,
 			StatePath:        options.statePath,
 			ConsensusDir:     options.consensusDir,
 			OriginBootID:     originBootID,
+			TransportFactory: meshFactory.Build,
+			BootstrapVoterDeviceIDs: append(
+				[]domain.DeviceID(nil),
+				meshPreflight.bootstrapVoterIDs...,
+			),
 			CheckpointSigner: checkpointSigner,
+			VoterActivationSigner: newDaemonVoterActivationSigner(
+				deviceID,
+				identityPrivateKey,
+			),
+			CredentialEndorsementSigner: newDaemonCredentialEndorsementSigner(
+				deviceID,
+				identityPrivateKey,
+			),
 			CheckpointOriginFactory: func(
 				localState store.LocalState,
 				submitter consensus.CheckpointCommandSubmitter,
@@ -280,6 +397,7 @@ func runDaemon(
 						OriginBootID:       originBootID,
 						IdentityPrivateKey: identityPrivateKey,
 						DaemonOrigin:       daemonBinding,
+						OperatorOrigin:     operatorBinding,
 					},
 				)
 				if err == nil {
@@ -297,39 +415,69 @@ func runDaemon(
 		_ = node.Close()
 		return errInvalidDaemonDependencies
 	}
-	var agentService *agent.Service
+	var (
+		agentService       *agent.Service
+		credentialService  *credentialservice.Service
+		pairingService     *pairingservice.Service
+		peerIngress        *transport.Ingress
+		discoveryRuntime   *daemonDiscoveryRuntime
+		contentPeerRuntime *daemonContentPeerRuntime
+	)
+	runtimeClosed := false
 	defer func() {
-		components := []phasedDaemonComponent{bootOrigin}
-		if agentService != nil {
-			components = append(
-				[]phasedDaemonComponent{agentService},
-				components...,
-			)
+		if runtimeClosed {
+			return
 		}
+		components := make([]phasedDaemonComponent, 0, 6)
+		if agentService != nil {
+			components = append(components, agentService)
+		}
+		if contentPeerRuntime != nil {
+			components = append(components, contentPeerRuntime)
+		}
+		if discoveryRuntime != nil {
+			components = append(components, discoveryRuntime)
+		}
+		if pairingService != nil {
+			components = append(components, pairingService)
+		}
+		if credentialService != nil {
+			components = append(components, credentialService)
+		}
+		components = append(components, bootOrigin)
 		resultErr = errors.Join(
 			resultErr,
-			shutdownDaemonComponents(node, nil, components...),
+			shutdownDaemonRuntime(
+				node,
+				peerIngress,
+				nil,
+				components...,
+			),
 		)
 	}()
-	if err := node.WaitForLeader(ctx); err != nil {
-		return fmt.Errorf("codecommd: wait for local consensus: %w", err)
-	}
 	view, err := node.View(ctx)
 	if err != nil {
 		return fmt.Errorf("codecommd: read initialized state: %w", err)
 	}
 	if view.SessionID != options.sessionID ||
-		view.WorkspaceID != options.workspaceID {
+		view.WorkspaceID != options.workspaceID ||
+		view.RecoveryGeneration != meshPreflight.recoveryGeneration {
 		return fmt.Errorf(
-			"%w: got session %s and workspace %s",
+			"%w: got session %s, workspace %s, and generation %d",
 			errDaemonLineageMismatch,
 			view.SessionID,
 			view.WorkspaceID,
+			view.RecoveryGeneration,
 		)
 	}
 
 	localState, err := node.LocalState()
 	if err != nil {
+		return err
+	}
+	if err := meshFactory.SetAuthenticatedDialObserver(
+		newDaemonAuthenticatedEndpointObserver(localState, time.Now),
+	); err != nil {
 		return err
 	}
 	agentService, err = agent.New(agent.Options{
@@ -349,9 +497,99 @@ func runDaemon(
 	if err := agentService.Recover(ctx); err != nil {
 		return fmt.Errorf("codecommd: recover local agent state: %w", err)
 	}
+	credentials, ok := credentialHandle.(daemonCredentialHandle)
+	if !ok {
+		return errInvalidDaemonDependencies
+	}
+	credentialService, err = newDaemonCredentialService(
+		ctx,
+		options.sessionID,
+		deviceID,
+		ed25519.PrivateKey(identityPrivateKey),
+		credentials,
+		node,
+	)
+	if err != nil {
+		return err
+	}
+	pairingRuntime, err := newDaemonPairingRuntime(
+		ctx,
+		options,
+		deviceID,
+		ed25519.PrivateKey(identityPrivateKey),
+		ed25519.PublicKey(identityPublicKey),
+		credentials,
+		view,
+		localState,
+		node,
+		bootOrigin,
+		operatorBinding,
+		originBootID,
+	)
+	if err != nil {
+		return err
+	}
+	pairingService = pairingRuntime.service
+	discoveryRuntime, err = newDaemonDiscoveryRuntime(
+		ctx,
+		options,
+		deviceID,
+		view,
+		identityPrivateKey,
+		localState,
+		node,
+		credentialService,
+		meshFactory,
+		dependencies,
+	)
+	if err != nil {
+		return err
+	}
+	var contentHandler transport.ConnectionHandler
+	if discoveryRuntime != nil {
+		contentHandler, err = newDaemonContentServer(
+			options.sessionID,
+			options.workspaceID,
+			deviceID,
+			localState,
+			discoveryRuntime,
+		)
+		if err != nil {
+			return err
+		}
+		contentPeerRuntime, err = newDaemonContentPeerRuntime(
+			ctx,
+			options.sessionID,
+			options.workspaceID,
+			view.RecoveryGeneration,
+			deviceID,
+			localState,
+			node,
+			credentialService.ContentCertificate,
+			meshFactory.ConsensusRoutes(),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	peerIngress, err = meshFactory.NewIngress(
+		ctx,
+		options,
+		node,
+		credentialService.ContentCertificate,
+		pairingRuntime.server,
+		contentHandler,
+		dependencies.listenPeer,
+	)
+	if err != nil {
+		return err
+	}
+	meshFactory.ClearIdentityCertificate()
 
 	operatorService, err := ui.NewOperatorService(ui.OperatorServiceOptions{
 		Source:      node,
+		Submitter:   bootOrigin,
+		Pairing:     pairingRuntime.operator,
 		SessionID:   options.sessionID,
 		WorkspaceID: options.workspaceID,
 	})
@@ -371,13 +609,20 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	return serveUntilStopped(
+	serveErr := serveUntilStopped(
 		ctx,
 		localServer,
 		node,
 		agentService,
 		bootOrigin,
+		credentialService,
+		pairingService,
+		peerIngress,
+		discoveryRuntime,
+		contentPeerRuntime,
 	)
+	runtimeClosed = true
+	return serveErr
 }
 
 func serveUntilStopped(
@@ -386,51 +631,114 @@ func serveUntilStopped(
 	node *consensus.SingleNode,
 	agentService *agent.Service,
 	bootOrigin *agent.BootOrigin,
+	credentialService *credentialservice.Service,
+	pairingService *pairingservice.Service,
+	peerIngress *transport.Ingress,
+	discoveryRuntime *daemonDiscoveryRuntime,
+	contentPeerRuntime *daemonContentPeerRuntime,
 ) error {
 	serveContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	serveDone := make(chan error, 1)
+	serverResults := make(chan daemonServerResult, 2)
+	serverCount := 1
 	go func() {
-		serveDone <- server.Serve(serveContext)
+		serverResults <- daemonServerResult{
+			name: "local IPC",
+			err:  server.Serve(serveContext),
+		}
 	}()
+	if peerIngress != nil {
+		serverCount++
+		go func() {
+			serverResults <- daemonServerResult{
+				name: "peer ingress",
+				err:  peerIngress.Serve(serveContext),
+			}
+		}()
+	}
+
+	components := []phasedDaemonComponent{agentService}
+	if contentPeerRuntime != nil {
+		components = append(components, contentPeerRuntime)
+	}
+	if discoveryRuntime != nil {
+		components = append(components, discoveryRuntime)
+	}
+	if pairingService != nil {
+		components = append(components, pairingService)
+	}
+	if credentialService != nil {
+		components = append(components, credentialService)
+	}
+	if bootOrigin != nil {
+		components = append(components, bootOrigin)
+	}
 
 	ticker := time.NewTicker(fatalPollInterval)
 	defer ticker.Stop()
-	stop := func(cause error) error {
+	stop := func(cause error, completed int) error {
 		cancel()
+		joinServers := func() error {
+			return joinDaemonServers(
+				serverResults,
+				completed,
+				serverCount,
+				daemonPeerShutdownTimeout,
+			)
+		}
 		return errors.Join(
 			cause,
-			shutdownDaemonComponents(
+			shutdownDaemonRuntime(
 				node,
-				func() error { return <-serveDone },
-				agentService,
-				bootOrigin,
+				peerIngress,
+				joinServers,
+				components...,
 			),
 		)
 	}
 	for {
 		select {
-		case err := <-serveDone:
-			return err
+		case result := <-serverResults:
+			return stop(daemonServerExitError(result, ctx.Err()), 1)
 		case <-ctx.Done():
-			return stop(nil)
+			return stop(nil, 0)
 		case <-ticker.C:
 			if fatal := node.FatalError(); fatal != nil {
-				return stop(fatal)
+				return stop(fatal, 0)
 			}
 			if fatal := agentService.FatalError(); fatal != nil {
-				return stop(fatal)
+				return stop(fatal, 0)
+			}
+			if fatal := credentialService.FatalError(); fatal != nil {
+				return stop(fatal, 0)
+			}
+			if fatal := pairingService.FatalError(); fatal != nil {
+				return stop(fatal, 0)
+			}
+			if discoveryRuntime != nil {
+				if fatal := discoveryRuntime.FatalError(); fatal != nil {
+					return stop(fatal, 0)
+				}
+			}
+			if contentPeerRuntime != nil {
+				if fatal := contentPeerRuntime.FatalError(); fatal != nil {
+					return stop(fatal, 0)
+				}
 			}
 		}
 	}
 }
 
-func shutdownDaemonComponents(
+func shutdownDaemonRuntime(
 	consensus daemonConsensusCloser,
-	joinServer func() error,
+	peerIngress *transport.Ingress,
+	joinServers func() error,
 	components ...phasedDaemonComponent,
 ) error {
 	var shutdownErrors []error
+	if peerIngress != nil {
+		_ = peerIngress.BeginShutdown()
+	}
 	for _, component := range components {
 		if component == nil {
 			shutdownErrors = append(
@@ -452,8 +760,19 @@ func shutdownDaemonComponents(
 	} else {
 		shutdownErrors = append(shutdownErrors, consensus.Close())
 	}
-	if joinServer != nil {
-		shutdownErrors = append(shutdownErrors, joinServer())
+	if peerIngress != nil {
+		shutdownContext, cancel := context.WithTimeout(
+			context.Background(),
+			daemonPeerShutdownTimeout,
+		)
+		shutdownErrors = append(
+			shutdownErrors,
+			peerIngress.Shutdown(shutdownContext),
+		)
+		cancel()
+	}
+	if joinServers != nil {
+		shutdownErrors = append(shutdownErrors, joinServers())
 	}
 	for _, component := range components {
 		if component != nil {
@@ -464,4 +783,89 @@ func shutdownDaemonComponents(
 		}
 	}
 	return errors.Join(shutdownErrors...)
+}
+
+func shutdownDaemonComponents(
+	consensus daemonConsensusCloser,
+	joinServer func() error,
+	components ...phasedDaemonComponent,
+) error {
+	return shutdownDaemonRuntime(
+		consensus,
+		nil,
+		joinServer,
+		components...,
+	)
+}
+
+func nilDaemonMeshFactory(factory daemonConsensusTransportFactory) bool {
+	if factory == nil {
+		return true
+	}
+	value := reflect.ValueOf(factory)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface,
+		reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func daemonServerExitError(
+	result daemonServerResult,
+	parentErr error,
+) error {
+	if parentErr != nil {
+		return nil
+	}
+	if result.err == nil {
+		return fmt.Errorf(
+			"%w: %s",
+			errDaemonServerStopped,
+			result.name,
+		)
+	}
+	return fmt.Errorf("codecommd: %s: %w", result.name, result.err)
+}
+
+func joinDaemonServers(
+	results <-chan daemonServerResult,
+	completed int,
+	total int,
+	timeout time.Duration,
+) error {
+	if results == nil || completed < 0 || total < completed || timeout <= 0 {
+		return errInvalidDaemonDependencies
+	}
+	errs := make([]error, 0, total-completed)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for completed < total {
+		select {
+		case result, open := <-results:
+			if !open {
+				errs = append(errs, errDaemonServerShutdown)
+				return errors.Join(errs...)
+			}
+			completed++
+			if result.err == nil ||
+				errors.Is(result.err, context.Canceled) ||
+				errors.Is(result.err, net.ErrClosed) {
+				continue
+			}
+			errs = append(
+				errs,
+				fmt.Errorf(
+					"codecommd: %s: %w",
+					result.name,
+					result.err,
+				),
+			)
+		case <-timer.C:
+			errs = append(errs, errDaemonServerShutdown)
+			return errors.Join(errs...)
+		}
+	}
+	return errors.Join(errs...)
 }

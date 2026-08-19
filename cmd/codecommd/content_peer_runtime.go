@@ -1,0 +1,776 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"net/netip"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/ijonahch/codecomm/internal/contenthttp"
+	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/peerauth"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
+	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/transport"
+)
+
+const (
+	daemonContentPeerRefreshInterval = 2 * time.Second
+	daemonContentPeerDialTimeout     = 10 * time.Second
+	daemonContentPeerRequestTimeout  = 30 * time.Second
+	daemonContentPeerRetryInitial    = 250 * time.Millisecond
+	daemonContentPeerRetryMaximum    = 30 * time.Second
+)
+
+var errDaemonContentPeerConstruction = errors.New(
+	"codecommd: content peer runtime construction failed",
+)
+
+var errDaemonContentPeerState = errors.New(
+	"codecommd: content peer local state failure",
+)
+
+type daemonContentPeerState interface {
+	StatusSnapshot(
+		context.Context,
+		domain.DeviceID,
+		int,
+	) (coordstatus.DurableSnapshot, error)
+	ReplaceMemberSignedEndpointSet(
+		context.Context,
+		[]byte,
+		domain.Timestamp,
+	) (store.MemberEndpointSetUpdate, error)
+	UpsertAuthenticatedEndpoint(
+		context.Context,
+		domain.DeviceID,
+		netip.AddrPort,
+		domain.Timestamp,
+	) error
+}
+
+type daemonContentPeerAdmission interface {
+	PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+}
+
+type daemonContentPeerRoutes interface {
+	transport.ConsensusEndpointResolver
+	transport.ConsensusEndpointDialer
+}
+
+type daemonContentPeerRuntime struct {
+	sessionID     domain.UUIDv7
+	workspaceID   domain.UUIDv4
+	generation    uint64
+	localDeviceID domain.DeviceID
+	state         daemonContentPeerState
+	admission     daemonContentPeerAdmission
+	certificate   transport.ContentCertificateProvider
+	routes        daemonContentPeerRoutes
+	verifiers     *peerauth.Verifiers
+	now           func() time.Time
+	jitter        func(time.Duration) time.Duration
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	workersMu sync.Mutex
+	workers   map[domain.DeviceID]*daemonContentPeerWorker
+
+	fatalMu  sync.RWMutex
+	fatalErr error
+	closing  bool
+	close    sync.Once
+}
+
+type daemonContentPeerWorker struct {
+	deviceID domain.DeviceID
+	cancel   context.CancelFunc
+	done     chan struct{}
+}
+
+type daemonContentPeerConnection struct {
+	client      *contenthttp.Client
+	tlsConfig   *tls.Config
+	localEpoch  uint64
+	remoteEpoch uint64
+}
+
+func newDaemonContentPeerRuntime(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+	localDeviceID domain.DeviceID,
+	state daemonContentPeerState,
+	admission daemonContentPeerAdmission,
+	certificate transport.ContentCertificateProvider,
+	routes daemonContentPeerRoutes,
+) (*daemonContentPeerRuntime, error) {
+	if ctx == nil ||
+		!sessionID.Valid() ||
+		!workspaceID.Valid() ||
+		!domain.ValidUnsignedInteger(generation) ||
+		!localDeviceID.Valid() ||
+		state == nil ||
+		admission == nil ||
+		certificate == nil ||
+		routes == nil {
+		return nil, errDaemonContentPeerConstruction
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	verifiers, err := peerauth.NewVerifiers(
+		admission.PeerAdmissionSnapshot,
+		time.Now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: peer verifiers: %v",
+			errDaemonContentPeerConstruction,
+			err,
+		)
+	}
+	runtimeContext, cancel := context.WithCancel(context.Background())
+	runtime := &daemonContentPeerRuntime{
+		sessionID:     sessionID,
+		workspaceID:   workspaceID,
+		generation:    generation,
+		localDeviceID: localDeviceID,
+		state:         state,
+		admission:     admission,
+		certificate:   certificate,
+		routes:        routes,
+		verifiers:     verifiers,
+		now:           time.Now,
+		jitter:        daemonContentPeerRetryDelay,
+		ctx:           runtimeContext,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		workers:       make(map[domain.DeviceID]*daemonContentPeerWorker),
+	}
+	if err := runtime.reconcileWorkers(ctx); err != nil {
+		cancel()
+		return nil, err
+	}
+	go runtime.run()
+	return runtime, nil
+}
+
+func (runtime *daemonContentPeerRuntime) run() {
+	defer close(runtime.done)
+	defer runtime.stopWorkers()
+	ticker := time.NewTicker(daemonContentPeerRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-runtime.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := runtime.reconcileWorkers(runtime.ctx); err != nil {
+				runtime.fail(err)
+				return
+			}
+		}
+	}
+}
+
+func (runtime *daemonContentPeerRuntime) reconcileWorkers(
+	ctx context.Context,
+) error {
+	if runtime == nil || runtime.state == nil || ctx == nil {
+		return errDaemonContentPeerConstruction
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	snapshot, err := runtime.state.StatusSnapshot(
+		ctx,
+		runtime.localDeviceID,
+		1,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read applied membership: %v",
+			errDaemonContentPeerConstruction,
+			err,
+		)
+	}
+	if snapshot.SessionID != runtime.sessionID ||
+		snapshot.WorkspaceID != runtime.workspaceID ||
+		snapshot.RecoveryGeneration != runtime.generation ||
+		snapshot.Member.ID != runtime.localDeviceID ||
+		snapshot.Member.Status != device.StatusActive ||
+		snapshot.MembersTruncated ||
+		snapshot.MemberTotal != uint64(len(snapshot.Members)) {
+		return fmt.Errorf(
+			"%w: inconsistent applied membership",
+			errDaemonContentPeerConstruction,
+		)
+	}
+	desired := make(map[domain.DeviceID]struct{}, len(snapshot.Members)-1)
+	for _, member := range snapshot.Members {
+		if member.ID == runtime.localDeviceID ||
+			member.Status != device.StatusActive {
+			continue
+		}
+		desired[member.ID] = struct{}{}
+	}
+
+	var removed []*daemonContentPeerWorker
+	runtime.workersMu.Lock()
+	for id, worker := range runtime.workers {
+		if _, retained := desired[id]; retained {
+			continue
+		}
+		delete(runtime.workers, id)
+		worker.cancel()
+		removed = append(removed, worker)
+	}
+	for id := range desired {
+		if runtime.workers[id] != nil {
+			continue
+		}
+		workerContext, cancel := context.WithCancel(runtime.ctx)
+		worker := &daemonContentPeerWorker{
+			deviceID: id,
+			cancel:   cancel,
+			done:     make(chan struct{}),
+		}
+		runtime.workers[id] = worker
+		go runtime.runWorker(workerContext, worker)
+	}
+	runtime.workersMu.Unlock()
+	for _, worker := range removed {
+		select {
+		case <-worker.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (runtime *daemonContentPeerRuntime) runWorker(
+	ctx context.Context,
+	worker *daemonContentPeerWorker,
+) {
+	defer close(worker.done)
+	var connection *daemonContentPeerConnection
+	defer func() {
+		if connection != nil {
+			_ = connection.Close()
+		}
+	}()
+	retry := daemonContentPeerRetryInitial
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if connection == nil {
+			var err error
+			connection, err = runtime.dialPeer(ctx, worker.deviceID)
+			if err != nil {
+				if errors.Is(err, errDaemonContentPeerState) &&
+					ctx.Err() == nil {
+					runtime.fail(err)
+					return
+				}
+				if !runtime.waitWorker(ctx, runtime.jitter(retry)) {
+					return
+				}
+				retry = min(retry*2, daemonContentPeerRetryMaximum)
+				continue
+			}
+		}
+		if runtime.localCredentialAdvanced(connection.localEpoch) ||
+			runtime.remoteCredentialAdvanced(
+				worker.deviceID,
+				connection.remoteEpoch,
+			) {
+			replacement, err := runtime.dialPeer(ctx, worker.deviceID)
+			if err == nil {
+				_ = connection.Close()
+				connection = replacement
+			} else if errors.Is(err, errDaemonContentPeerState) &&
+				ctx.Err() == nil {
+				runtime.fail(err)
+				return
+			}
+		}
+		if err := runtime.syncPeer(ctx, worker.deviceID, connection); err != nil {
+			_ = connection.Close()
+			connection = nil
+			if errors.Is(err, errDaemonContentPeerState) &&
+				ctx.Err() == nil {
+				runtime.fail(err)
+				return
+			}
+			if !runtime.waitWorker(ctx, runtime.jitter(retry)) {
+				return
+			}
+			retry = min(retry*2, daemonContentPeerRetryMaximum)
+			continue
+		}
+		retry = daemonContentPeerRetryInitial
+		if !runtime.waitWorker(ctx, daemonContentPeerRefreshInterval) {
+			return
+		}
+	}
+}
+
+func (runtime *daemonContentPeerRuntime) dialPeer(
+	ctx context.Context,
+	peerID domain.DeviceID,
+) (*daemonContentPeerConnection, error) {
+	if runtime == nil || ctx == nil || !peerID.Valid() ||
+		peerID == runtime.localDeviceID {
+		return nil, errDaemonContentPeerConstruction
+	}
+	dialContext, cancel := context.WithTimeout(
+		ctx,
+		daemonContentPeerDialTimeout,
+	)
+	defer cancel()
+	endpoints, err := runtime.routes.ResolveConsensusEndpoints(
+		dialContext,
+		peerID,
+	)
+	if err != nil ||
+		len(endpoints) == 0 ||
+		len(endpoints) > transport.ConsensusEndpointCandidatesMax {
+		return nil, fmt.Errorf(
+			"%w: resolve content endpoints",
+			errDaemonContentPeerConstruction,
+		)
+	}
+	certificate, err := runtime.certificate()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: local content credential",
+			errDaemonContentPeerConstruction,
+		)
+	}
+	if len(certificate.Certificate) != 1 {
+		clearDaemonTLSCertificate(&certificate)
+		return nil, fmt.Errorf(
+			"%w: local content credential profile",
+			errDaemonContentPeerConstruction,
+		)
+	}
+	profile, err := transport.ParseContentCertificate(
+		certificate.Certificate[0],
+	)
+	if err != nil ||
+		profile.Binding.SessionID != runtime.sessionID ||
+		profile.Binding.DeviceID != runtime.localDeviceID {
+		clearDaemonTLSCertificate(&certificate)
+		return nil, fmt.Errorf(
+			"%w: local content credential profile",
+			errDaemonContentPeerConstruction,
+		)
+	}
+	defer clearDaemonTLSCertificate(&certificate)
+
+	endpoints = slices.Compact(endpoints)
+	var lastErr error
+	for _, endpoint := range endpoints {
+		if err := dialContext.Err(); err != nil {
+			return nil, err
+		}
+		raw, dialErr := runtime.routes.DialConsensusEndpoint(
+			dialContext,
+			endpoint,
+		)
+		if dialErr != nil || raw == nil {
+			if raw != nil {
+				_ = raw.Close()
+			}
+			lastErr = dialErr
+			continue
+		}
+		admission, configErr := transport.NewContentAdmissionRecorder(
+			func(
+				remote transport.ContentCertificate,
+			) (transport.ContentPeerAdmission, error) {
+				if remote.Binding.DeviceID != peerID {
+					return transport.ContentPeerAdmission{},
+						peerauth.ErrPeerNotAdmitted
+				}
+				return runtime.verifiers.VerifyContentPeer(remote)
+			},
+		)
+		if configErr != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf(
+				"%w: content admission recorder",
+				errDaemonContentPeerConstruction,
+			)
+		}
+		tlsConfig, configErr := transport.NewClientTLSConfig(
+			transport.ClientTLSOptions{
+				Plane:             transport.PlaneContent,
+				Certificate:       certificate,
+				VerifyContentPeer: admission.Verify,
+			},
+		)
+		if configErr != nil {
+			_ = raw.Close()
+			return nil, fmt.Errorf(
+				"%w: client TLS configuration",
+				errDaemonContentPeerConstruction,
+			)
+		}
+		tlsConnection := tls.Client(raw, tlsConfig)
+		client, openErr := contenthttp.OpenClient(
+			dialContext,
+			tlsConnection,
+			peerID,
+			admission,
+		)
+		if openErr != nil {
+			clearDaemonClientTLSConfig(tlsConfig)
+			lastErr = openErr
+			continue
+		}
+		connectionState := tlsConnection.ConnectionState()
+		remoteProfile, parseErr := transport.ParseContentCertificate(
+			connectionState.PeerCertificates[0].Raw,
+		)
+		if parseErr != nil || remoteProfile.Binding.DeviceID != peerID {
+			_ = client.Close()
+			clearDaemonClientTLSConfig(tlsConfig)
+			lastErr = contenthttp.ErrPeerMismatch
+			continue
+		}
+		if err := runtime.recordAuthenticatedEndpoint(
+			dialContext,
+			peerID,
+			endpoint,
+		); err != nil {
+			_ = client.Close()
+			clearDaemonClientTLSConfig(tlsConfig)
+			lastErr = err
+			continue
+		}
+		session, sessionErr := client.Session(dialContext)
+		if sessionErr != nil ||
+			session.SessionID() != runtime.sessionID ||
+			session.WorkspaceID() != runtime.workspaceID ||
+			session.RecoveryGeneration() != runtime.generation ||
+			session.ServerDeviceID() != peerID ||
+			len(session.RequiredCapabilities()) != 0 {
+			_ = client.Close()
+			clearDaemonClientTLSConfig(tlsConfig)
+			lastErr = sessionErr
+			if lastErr == nil {
+				lastErr = contenthttp.ErrLineageMismatch
+			}
+			continue
+		}
+		return &daemonContentPeerConnection{
+			client:      client,
+			tlsConfig:   tlsConfig,
+			localEpoch:  profile.Binding.Epoch,
+			remoteEpoch: remoteProfile.Binding.Epoch,
+		}, nil
+	}
+	if lastErr == nil {
+		lastErr = transport.ErrConsensusEndpointUnavailable
+	}
+	return nil, fmt.Errorf(
+		"%w: content dial: %v",
+		errDaemonContentPeerConstruction,
+		lastErr,
+	)
+}
+
+func (runtime *daemonContentPeerRuntime) syncPeer(
+	ctx context.Context,
+	peerID domain.DeviceID,
+	connection *daemonContentPeerConnection,
+) error {
+	if runtime == nil || ctx == nil || !peerID.Valid() ||
+		connection == nil || connection.client == nil {
+		return errDaemonContentPeerConstruction
+	}
+	requestContext, cancel := context.WithTimeout(
+		ctx,
+		daemonContentPeerRequestTimeout,
+	)
+	defer cancel()
+	response, err := connection.client.Peers(requestContext)
+	if err != nil {
+		return err
+	}
+	if response.SessionID() != runtime.sessionID ||
+		response.WorkspaceID() != runtime.workspaceID ||
+		response.RecoveryGeneration() != runtime.generation ||
+		response.ServerDeviceID() != peerID {
+		return contenthttp.ErrLineageMismatch
+	}
+	observedAt, err := runtime.timestamp()
+	if err != nil {
+		return err
+	}
+	for _, member := range response.Members() {
+		endpointSet := member.EndpointSet()
+		if member.DeviceID() == runtime.localDeviceID ||
+			len(endpointSet) == 0 {
+			continue
+		}
+		_, err := runtime.state.ReplaceMemberSignedEndpointSet(
+			requestContext,
+			endpointSet,
+			observedAt,
+		)
+		if errors.Is(err, store.ErrPeerEndpointSequenceRollback) {
+			continue
+		}
+		if err != nil {
+			if requestContext.Err() != nil {
+				return requestContext.Err()
+			}
+			if !contentPeerSetRefusal(err) {
+				return fmt.Errorf(
+					"%w: retain endpoint set for %s: %w",
+					errDaemonContentPeerState,
+					member.DeviceID(),
+					err,
+				)
+			}
+			return fmt.Errorf(
+				"%w: retain endpoint set for %s: %v",
+				errDaemonContentPeerConstruction,
+				member.DeviceID(),
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func (runtime *daemonContentPeerRuntime) recordAuthenticatedEndpoint(
+	ctx context.Context,
+	peerID domain.DeviceID,
+	endpoint netip.AddrPort,
+) error {
+	observedAt, err := runtime.timestamp()
+	if err != nil {
+		return err
+	}
+	if err := runtime.state.UpsertAuthenticatedEndpoint(
+		ctx,
+		peerID,
+		endpoint,
+		observedAt,
+	); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, store.ErrPeerEndpointCapacity) {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: retain authenticated endpoint: %w",
+			errDaemonContentPeerState,
+			err,
+		)
+	}
+	return nil
+}
+
+func contentPeerSetRefusal(err error) bool {
+	return errors.Is(err, store.ErrInvalidPeerEndpointSet) ||
+		errors.Is(err, store.ErrPeerEndpointSequenceConflict) ||
+		errors.Is(err, store.ErrPeerEndpointCapacity)
+}
+
+func (runtime *daemonContentPeerRuntime) timestamp() (domain.Timestamp, error) {
+	if runtime == nil || runtime.now == nil {
+		return "", errDaemonContentPeerConstruction
+	}
+	value := domain.Timestamp(runtime.now().UTC().Format(time.RFC3339Nano))
+	if !value.Valid() {
+		return "", errDaemonContentPeerConstruction
+	}
+	return value, nil
+}
+
+func (runtime *daemonContentPeerRuntime) localCredentialAdvanced(
+	currentEpoch uint64,
+) bool {
+	if runtime == nil || currentEpoch < 1 {
+		return false
+	}
+	certificate, err := runtime.certificate()
+	if err != nil {
+		return false
+	}
+	defer clearDaemonTLSCertificate(&certificate)
+	if len(certificate.Certificate) != 1 {
+		return false
+	}
+	profile, err := transport.ParseContentCertificate(
+		certificate.Certificate[0],
+	)
+	return err == nil &&
+		profile.Binding.SessionID == runtime.sessionID &&
+		profile.Binding.DeviceID == runtime.localDeviceID &&
+		profile.Binding.Epoch > currentEpoch
+}
+
+func (runtime *daemonContentPeerRuntime) remoteCredentialAdvanced(
+	peerID domain.DeviceID,
+	currentEpoch uint64,
+) bool {
+	if runtime == nil ||
+		runtime.admission == nil ||
+		runtime.now == nil ||
+		!peerID.Valid() ||
+		peerID == runtime.localDeviceID ||
+		currentEpoch < 1 {
+		return false
+	}
+	now := runtime.now()
+	if now.IsZero() {
+		return false
+	}
+	snapshot, err := runtime.admission.PeerAdmissionSnapshot()
+	if err != nil || snapshot == nil {
+		return false
+	}
+	authorization, active := snapshot.ActiveCredentialAuthorizationAt(
+		peerID,
+		now,
+	)
+	return active && authorization.Epoch > currentEpoch
+}
+
+func (runtime *daemonContentPeerRuntime) waitWorker(
+	ctx context.Context,
+	delay time.Duration,
+) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func daemonContentPeerRetryDelay(backoff time.Duration) time.Duration {
+	if backoff <= 0 {
+		return 0
+	}
+	floor := backoff * 3 / 4
+	ceiling := backoff * 5 / 4
+	if ceiling <= floor {
+		return backoff
+	}
+	return floor + time.Duration(
+		rand.Int64N(int64(ceiling-floor)+1),
+	)
+}
+
+func (runtime *daemonContentPeerRuntime) fail(err error) {
+	if runtime == nil || err == nil {
+		return
+	}
+	runtime.fatalMu.Lock()
+	if runtime.closing {
+		runtime.fatalMu.Unlock()
+		return
+	}
+	if runtime.fatalErr == nil {
+		runtime.fatalErr = err
+	}
+	runtime.cancel()
+	runtime.fatalMu.Unlock()
+}
+
+func (runtime *daemonContentPeerRuntime) stopWorkers() {
+	runtime.workersMu.Lock()
+	workers := make([]*daemonContentPeerWorker, 0, len(runtime.workers))
+	for id, worker := range runtime.workers {
+		delete(runtime.workers, id)
+		worker.cancel()
+		workers = append(workers, worker)
+	}
+	runtime.workersMu.Unlock()
+	for _, worker := range workers {
+		<-worker.done
+	}
+}
+
+func (runtime *daemonContentPeerRuntime) FatalError() error {
+	if runtime == nil {
+		return errDaemonContentPeerConstruction
+	}
+	runtime.fatalMu.RLock()
+	defer runtime.fatalMu.RUnlock()
+	return runtime.fatalErr
+}
+
+func (runtime *daemonContentPeerRuntime) BeginClose() error {
+	if runtime == nil || runtime.cancel == nil {
+		return errDaemonContentPeerConstruction
+	}
+	runtime.fatalMu.Lock()
+	runtime.closing = true
+	runtime.close.Do(runtime.cancel)
+	runtime.fatalMu.Unlock()
+	return nil
+}
+
+func (runtime *daemonContentPeerRuntime) Wait() error {
+	if runtime == nil || runtime.done == nil {
+		return errDaemonContentPeerConstruction
+	}
+	if err := runtime.BeginClose(); err != nil {
+		return err
+	}
+	<-runtime.done
+	return runtime.FatalError()
+}
+
+func (connection *daemonContentPeerConnection) Close() error {
+	if connection == nil {
+		return nil
+	}
+	var err error
+	if connection.client != nil {
+		err = connection.client.Close()
+		connection.client = nil
+	}
+	clearDaemonClientTLSConfig(connection.tlsConfig)
+	connection.tlsConfig = nil
+	connection.localEpoch = 0
+	connection.remoteEpoch = 0
+	return err
+}
+
+func clearDaemonClientTLSConfig(config *tls.Config) {
+	if config == nil {
+		return
+	}
+	for index := range config.Certificates {
+		clearDaemonTLSCertificate(&config.Certificates[index])
+	}
+	config.Certificates = nil
+}
+
+var _ phasedDaemonComponent = (*daemonContentPeerRuntime)(nil)
