@@ -114,6 +114,46 @@ func (transport *ConsensusNetworkTransport) RequestConsensusProof(
 	return transport.control.RequestConsensusProof(ctx, deviceID, body)
 }
 
+// RequestCredentialRenewal forwards the fixed identity-authenticated renewal
+// route without broadening Raft or proof-route authorization.
+func (transport *ConsensusNetworkTransport) RequestCredentialRenewal(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.RequestCredentialRenewal(
+		ctx,
+		deviceID,
+		body,
+	)
+}
+
+// RequestCredentialEndorsement forwards the fixed credential-time route
+// through the authenticated consensus connection pool.
+func (transport *ConsensusNetworkTransport) RequestCredentialEndorsement(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.RequestCredentialEndorsement(
+		ctx,
+		deviceID,
+		body,
+	)
+}
+
 // ProbeConsensusPeer forwards an active reachability probe through the
 // authenticated consensus connection pool.
 func (transport *ConsensusNetworkTransport) ProbeConsensusPeer(

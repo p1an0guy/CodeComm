@@ -6,6 +6,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
+	"sync"
 	"time"
 )
 
@@ -44,6 +46,8 @@ type ContentPeerVerifier func(ContentCertificate) (ContentPeerAdmission, error)
 // pairing and consensus remain available. Implementations must be concurrency safe.
 type ContentCertificateProvider func() (tls.Certificate, error)
 
+type serverContentCertificateObserver func(net.Conn, ContentCertificate)
+
 // ServerTLSOptions configures one listener with three closed ALPN planes.
 type ServerTLSOptions struct {
 	IdentityCertificate tls.Certificate
@@ -64,22 +68,38 @@ type ClientTLSOptions struct {
 // NewServerTLSConfig returns a TLS 1.3-only selector. The selected ALPN fixes
 // both the local certificate profile and the only peer verifier that can run.
 func NewServerTLSConfig(options ServerTLSOptions) (*tls.Config, error) {
+	return newServerTLSConfig(options, nil)
+}
+
+func newServerTLSConfig(
+	options ServerTLSOptions,
+	observeContent serverContentCertificateObserver,
+) (*tls.Config, error) {
+	config, _, err := newOwnedServerTLSConfig(options, observeContent)
+	return config, err
+}
+
+func newOwnedServerTLSConfig(
+	options ServerTLSOptions,
+	observeContent serverContentCertificateObserver,
+) (*tls.Config, func(), error) {
 	if options.VerifyPairingPeer == nil ||
 		options.VerifyConsensusPeer == nil ||
 		options.VerifyContentPeer == nil ||
 		options.ContentCertificate == nil {
-		return nil, ErrInvalidTLSOptions
+		return nil, nil, ErrInvalidTLSOptions
 	}
 	identityCertificate, err := validateAndCloneTLSCertificate(
 		options.IdentityCertificate,
 		PlaneConsensus,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	defer clearTLSCertificate(&identityCertificate)
 	identityProfile, err := ParseIdentityCertificate(identityCertificate.Certificate[0])
 	if err != nil {
-		return nil, ErrInvalidTLSOptions
+		return nil, nil, ErrInvalidTLSOptions
 	}
 	configs := map[Plane]*tls.Config{
 		PlanePairing: serverPlaneTLSConfig(
@@ -92,6 +112,7 @@ func NewServerTLSConfig(options ServerTLSOptions) (*tls.Config, error) {
 			identityProfile.Binding,
 			options.ContentCertificate,
 			options.VerifyContentPeer,
+			observeContent,
 		),
 	}
 	config := baseTLSConfig()
@@ -110,7 +131,22 @@ func NewServerTLSConfig(options ServerTLSOptions) (*tls.Config, error) {
 		}
 		return selected, nil
 	}
-	return config, nil
+	var clearOnce sync.Once
+	clearIdentity := func() {
+		clearOnce.Do(func() {
+			for _, plane := range []Plane{PlanePairing, PlaneConsensus} {
+				selected := configs[plane]
+				if selected == nil {
+					continue
+				}
+				for index := range selected.Certificates {
+					clearTLSCertificate(&selected.Certificates[index])
+				}
+				selected.Certificates = nil
+			}
+		})
+	}
+	return config, clearIdentity, nil
 }
 
 // NewClientTLSConfig returns a TLS 1.3-only config for one exact ALPN. Web PKI
@@ -147,14 +183,29 @@ func serverContentTLSConfig(
 	identity IdentityBinding,
 	provider ContentCertificateProvider,
 	verifyContent ContentPeerVerifier,
+	observe serverContentCertificateObserver,
 ) *tls.Config {
 	config := baseTLSConfig()
 	config.ClientAuth = tls.RequireAnyClientCert
 	config.NextProtos = []string{ALPNContent}
-	config.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	config.GetCertificate = func(
+		hello *tls.ClientHelloInfo,
+	) (*tls.Certificate, error) {
 		certificate, err := loadServerContentCertificate(identity, provider)
 		if err != nil {
 			return nil, err
+		}
+		if observe != nil {
+			if hello == nil || hello.Conn == nil {
+				return nil, ErrTLSAdmission
+			}
+			profile, err := ParseContentCertificate(
+				certificate.Certificate[0],
+			)
+			if err != nil {
+				return nil, ErrTLSAdmission
+			}
+			observe(hello.Conn, profile)
 		}
 		return &certificate, nil
 	}
@@ -317,4 +368,14 @@ func cloneTLSCertificate(certificate tls.Certificate) tls.Certificate {
 		result.PrivateKey = certificate.PrivateKey
 	}
 	return result
+}
+
+func clearTLSCertificate(certificate *tls.Certificate) {
+	if certificate == nil {
+		return
+	}
+	if privateKey, ok := certificate.PrivateKey.(ed25519.PrivateKey); ok {
+		clear(privateKey)
+	}
+	*certificate = tls.Certificate{}
 }

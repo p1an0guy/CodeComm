@@ -4,6 +4,7 @@ package peerauth
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -230,6 +231,54 @@ func (snapshot *Snapshot) Authorization(
 		return credentialauthorization.Authorization{}, false
 	}
 	return authorization.Clone(), true
+}
+
+// AuthorizationByEpochDigest resolves one retained authorization and its
+// enrolled member for bounded discovery verification.
+func (snapshot *Snapshot) AuthorizationByEpochDigest(
+	epoch uint64,
+	keyDigest [sha256.Size]byte,
+) (
+	credentialauthorization.Authorization,
+	device.Device,
+	bool,
+) {
+	if snapshot == nil ||
+		!snapshot.valid ||
+		epoch < 1 ||
+		!domain.ValidUnsignedInteger(epoch) {
+		return credentialauthorization.Authorization{},
+			device.Device{},
+			false
+	}
+	var (
+		foundAuthorization credentialauthorization.Authorization
+		foundMember        device.Device
+		found              bool
+	)
+	for key, authorization := range snapshot.authorizations {
+		if key.SessionID != snapshot.sessionID ||
+			key.Epoch != epoch ||
+			authorization.KeyDigest != keyDigest {
+			continue
+		}
+		if found {
+			return credentialauthorization.Authorization{},
+				device.Device{},
+				false
+		}
+		member, exists := snapshot.devices[key.DeviceID]
+		if !exists {
+			return credentialauthorization.Authorization{},
+				device.Device{},
+				false
+		}
+		foundAuthorization = authorization.Clone()
+		member.IdentityPublicKey = bytes.Clone(member.IdentityPublicKey)
+		foundMember = member
+		found = true
+	}
+	return foundAuthorization, foundMember, found
 }
 
 // ActiveCredentialAuthorizationAt returns an active member's greatest

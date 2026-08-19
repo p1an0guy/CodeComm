@@ -96,6 +96,15 @@ type MulticastReport struct {
 	Failures []InterfaceFailure
 }
 
+// ReceivedDatagram retains the selected receive interface needed to bind any
+// learned dial route to an allowed local source address.
+type ReceivedDatagram struct {
+	Payload        []byte
+	Source         netip.AddrPort
+	Family         AddressFamily
+	InterfaceIndex int
+}
+
 // MulticastIO owns the per-session discovery sockets for one committed port.
 // A socket is shared by all selected interfaces of its address family.
 type MulticastIO struct {
@@ -254,7 +263,7 @@ func openMulticast(
 }
 
 // AdvertisementTriggers is a coalescing signal emitted at startup and after
-// every successful interface refresh.
+// an interface refresh changes the active join set.
 func (multicast *MulticastIO) AdvertisementTriggers() <-chan struct{} {
 	if multicast == nil {
 		return nil
@@ -315,24 +324,36 @@ func (multicast *MulticastIO) Send(payload []byte) error {
 func (multicast *MulticastIO) Receive(
 	ctx context.Context,
 ) ([]byte, netip.AddrPort, error) {
+	datagram, err := multicast.ReceiveDatagram(ctx)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	return datagram.Payload, datagram.Source, nil
+}
+
+// ReceiveDatagram returns one bounded datagram with the selected interface
+// metadata required for selected-source dialing.
+func (multicast *MulticastIO) ReceiveDatagram(
+	ctx context.Context,
+) (ReceivedDatagram, error) {
 	if multicast == nil {
-		return nil, netip.AddrPort{}, ErrMulticastClosed
+		return ReceivedDatagram{}, ErrMulticastClosed
 	}
 	if ctx == nil {
-		return nil, netip.AddrPort{}, ErrInvalidMulticastConfig
+		return ReceivedDatagram{}, ErrInvalidMulticastConfig
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, netip.AddrPort{}, ctx.Err()
+			return ReceivedDatagram{}, ctx.Err()
 		case <-multicast.done:
-			return nil, netip.AddrPort{}, ErrMulticastClosed
+			return ReceivedDatagram{}, ErrMulticastClosed
 		case datagram := <-multicast.inbound:
 			multicast.mu.RLock()
 			if multicast.closed {
 				multicast.mu.RUnlock()
-				return nil, netip.AddrPort{}, ErrMulticastClosed
+				return ReceivedDatagram{}, ErrMulticastClosed
 			}
 			if datagram.interfaceIndex != 0 {
 				_, active := multicast.joins[joinKey{
@@ -346,9 +367,14 @@ func (multicast *MulticastIO) Receive(
 			}
 			multicast.mu.RUnlock()
 			if datagram.err != nil {
-				return nil, netip.AddrPort{}, datagram.err
+				return ReceivedDatagram{}, datagram.err
 			}
-			return datagram.payload, datagram.source, nil
+			return ReceivedDatagram{
+				Payload:        datagram.payload,
+				Source:         datagram.source,
+				Family:         datagram.family,
+				InterfaceIndex: datagram.interfaceIndex,
+			}, nil
 		}
 	}
 }
@@ -528,11 +554,32 @@ func (multicast *MulticastIO) Refresh(
 		multicast.sockets[family] = socket
 		multicast.startReader(family, socket)
 	}
+	changed := !sameMulticastJoinSet(multicast.joins, candidate)
 	multicast.joins = candidate
 	report := multicastReport(candidate, failures)
 	multicast.mu.Unlock()
-	multicast.signalAdvertisement()
+	if changed {
+		multicast.signalAdvertisement()
+	}
 	return report, nil
+}
+
+func sameMulticastJoinSet(
+	left map[joinKey]net.Interface,
+	right map[joinKey]net.Interface,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, leftInterface := range left {
+		rightInterface, exists := right[key]
+		if !exists ||
+			leftInterface.Index != rightInterface.Index ||
+			leftInterface.Name != rightInterface.Name {
+			return false
+		}
+	}
+	return true
 }
 
 // Close is idempotent and unblocks every current Receive and socket reader.

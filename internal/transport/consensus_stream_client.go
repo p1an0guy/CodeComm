@@ -18,10 +18,37 @@ import (
 )
 
 const (
-	consensusJSONMediaType    = "application/json"
-	consensusProblemMediaType = "application/problem+json"
-	consensusProofPath        = "/v1/consensus/prove"
+	consensusJSONMediaType             = "application/json"
+	consensusProblemMediaType          = "application/problem+json"
+	consensusProofPath                 = "/v1/consensus/prove"
+	consensusCredentialRenewalPath     = "/v1/credentials/renew"
+	consensusCredentialEndorsementPath = "/v1/credentials/endorse"
 )
+
+type consensusControlRoute uint8
+
+const (
+	consensusControlProof consensusControlRoute = iota + 1
+	consensusControlCredentialRenewal
+	consensusControlCredentialEndorsement
+)
+
+func (route consensusControlRoute) path() (string, bool) {
+	switch route {
+	case consensusControlProof:
+		return consensusProofPath, true
+	case consensusControlCredentialRenewal:
+		return consensusCredentialRenewalPath, true
+	case consensusControlCredentialEndorsement:
+		return consensusCredentialEndorsementPath, true
+	default:
+		return "", false
+	}
+}
+
+func (route consensusControlRoute) requiresLiveConfiguration() bool {
+	return route != consensusControlCredentialRenewal
+}
 
 // RequestConsensusProof sends one bounded JSON request to the fixed proof
 // route over the peer's existing authenticated consensus connection.
@@ -30,11 +57,58 @@ func (layer *ConsensusStreamLayer) RequestConsensusProof(
 	deviceID domain.DeviceID,
 	body []byte,
 ) (ConsensusControlResponse, error) {
+	return layer.requestConsensusControl(
+		ctx,
+		deviceID,
+		consensusControlProof,
+		body,
+	)
+}
+
+// RequestCredentialRenewal submits one signed binding over identity mTLS.
+// This exact route may reach an applied-active peer outside the caller's live
+// Raft configuration; every other consensus control route remains gated.
+func (layer *ConsensusStreamLayer) RequestCredentialRenewal(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	return layer.requestConsensusControl(
+		ctx,
+		deviceID,
+		consensusControlCredentialRenewal,
+		body,
+	)
+}
+
+// RequestCredentialEndorsement sends one bounded JSON request to the fixed
+// credential-endorsement route over an authenticated consensus connection.
+func (layer *ConsensusStreamLayer) RequestCredentialEndorsement(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	return layer.requestConsensusControl(
+		ctx,
+		deviceID,
+		consensusControlCredentialEndorsement,
+		body,
+	)
+}
+
+func (layer *ConsensusStreamLayer) requestConsensusControl(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	route consensusControlRoute,
+	body []byte,
+) (ConsensusControlResponse, error) {
+	path, validRoute := route.path()
 	if layer == nil ||
 		layer.ctx == nil ||
 		ctx == nil ||
 		!deviceID.Valid() ||
 		deviceID == layer.localDeviceID ||
+		!validRoute ||
 		len(body) == 0 ||
 		len(body) > ConsensusControlBodyMaxBytes {
 		return ConsensusControlResponse{},
@@ -53,8 +127,11 @@ func (layer *ConsensusStreamLayer) RequestConsensusProof(
 		cancel()
 	}()
 
-	if err := layer.authorize(deviceID); err != nil {
-		return ConsensusControlResponse{}, err
+	requireLiveConfiguration := route.requiresLiveConfiguration()
+	if requireLiveConfiguration {
+		if err := layer.authorize(deviceID); err != nil {
+			return ConsensusControlResponse{}, err
+		}
 	}
 	peer, err := layer.peer(deviceID)
 	if err != nil {
@@ -69,6 +146,7 @@ func (layer *ConsensusStreamLayer) RequestConsensusProof(
 		requestContext,
 		peer,
 		deviceID,
+		requireLiveConfiguration,
 	)
 	if err != nil {
 		return ConsensusControlResponse{}, err
@@ -78,7 +156,7 @@ func (layer *ConsensusStreamLayer) RequestConsensusProof(
 	request, err := http.NewRequestWithContext(
 		requestContext,
 		http.MethodPost,
-		"https://"+ConsensusRaftAuthority+consensusProofPath,
+		"https://"+ConsensusRaftAuthority+path,
 		bytes.NewReader(body),
 	)
 	if err != nil {
@@ -137,9 +215,11 @@ func (layer *ConsensusStreamLayer) RequestConsensusProof(
 		layer.invalidateConsensusPeer(peer, deviceID)
 		return ConsensusControlResponse{}, err
 	}
-	if err := layer.authorize(deviceID); err != nil {
-		layer.invalidateConsensusPeer(peer, deviceID)
-		return ConsensusControlResponse{}, err
+	if requireLiveConfiguration {
+		if err := layer.authorize(deviceID); err != nil {
+			layer.invalidateConsensusPeer(peer, deviceID)
+			return ConsensusControlResponse{}, err
+		}
 	}
 	return ConsensusControlResponse{
 		StatusCode: response.StatusCode,
@@ -152,6 +232,7 @@ func (layer *ConsensusStreamLayer) beginConsensusControlRequest(
 	ctx context.Context,
 	peer *consensusPeerClient,
 	deviceID domain.DeviceID,
+	requireLiveConfiguration bool,
 ) (*consensusPhysicalClient, error) {
 	if layer == nil || peer == nil || ctx == nil {
 		return nil, ErrInvalidConsensusControlRequest
@@ -171,7 +252,11 @@ func (layer *ConsensusStreamLayer) beginConsensusControlRequest(
 			physical := peer.detachPhysicalLocked()
 			_ = physical.close()
 		}
-		physical, err := layer.dialPhysical(ctx, deviceID)
+		physical, err := layer.dialPhysical(
+			ctx,
+			deviceID,
+			requireLiveConfiguration,
+		)
 		if err != nil {
 			peer.mu.Unlock()
 			return nil, err
@@ -192,12 +277,14 @@ func (layer *ConsensusStreamLayer) beginConsensusControlRequest(
 		layer.closeStreamsForDevice(deviceID)
 		return nil, err
 	}
-	if err := layer.authorize(deviceID); err != nil {
-		physical := peer.detachPhysicalLocked()
-		peer.mu.Unlock()
-		_ = physical.close()
-		layer.closeStreamsForDevice(deviceID)
-		return nil, err
+	if requireLiveConfiguration {
+		if err := layer.authorize(deviceID); err != nil {
+			physical := peer.detachPhysicalLocked()
+			peer.mu.Unlock()
+			_ = physical.close()
+			layer.closeStreamsForDevice(deviceID)
+			return nil, err
+		}
 	}
 	peer.openStreams++
 	physical := peer.physical
@@ -259,6 +346,7 @@ func consensusResponseMediaType(
 func (layer *ConsensusStreamLayer) dialPhysical(
 	ctx context.Context,
 	deviceID domain.DeviceID,
+	requireLiveConfiguration bool,
 ) (*consensusPhysicalClient, error) {
 	endpoints, err := layer.endpoints.ResolveConsensusEndpoints(
 		ctx,
@@ -343,9 +431,23 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			lastErr = ErrTLSAdmission
 			continue
 		}
-		if err := layer.authorize(deviceID); err != nil {
+		if requireLiveConfiguration {
+			if err := layer.authorize(deviceID); err != nil {
+				_ = connection.Close()
+				return nil, err
+			}
+		}
+		if observeErr := layer.notifyAuthenticatedDial(
+			ctx,
+			deviceID,
+			endpoint,
+		); observeErr != nil {
 			_ = connection.Close()
-			return nil, err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			lastErr = observeErr
+			continue
 		}
 		httpConnection, httpErr := newConsensusHTTP2ClientConn(
 			ctx,
@@ -378,6 +480,38 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 		ErrConsensusEndpointUnavailable,
 		lastErr,
 	)
+}
+
+func (layer *ConsensusStreamLayer) notifyAuthenticatedDial(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	endpoint netip.AddrPort,
+) (err error) {
+	if ctx == nil {
+		return ErrConsensusEndpointUnavailable
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	observer := layer.observeAuthenticatedDial
+	if observer == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			err = ErrConsensusEndpointUnavailable
+		}
+	}()
+	if err := observer(ctx, deviceID, endpoint); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf(
+			"transport: authenticated consensus dial observer: %w",
+			err,
+		)
+	}
+	return ctx.Err()
 }
 
 func (layer *ConsensusStreamLayer) openOutboundStream(

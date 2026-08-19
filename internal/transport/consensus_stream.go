@@ -72,8 +72,8 @@ var (
 	)
 )
 
-// ConsensusControlResponse is one bounded response from the fixed consensus
-// proof route. Body storage belongs to the caller.
+// ConsensusControlResponse is one bounded response from a closed consensus
+// control route. Body storage belongs to the caller.
 type ConsensusControlResponse struct {
 	StatusCode int
 	MediaType  string
@@ -131,33 +131,47 @@ type ExpectedConsensusPeerVerifier func(
 // admission.
 type ConsensusPeerAuthorizer func(domain.DeviceID) error
 
+// ConsensusAuthenticatedDialObserver records the exact destination of a newly
+// authenticated outbound physical connection. The layer invokes it once after
+// TLS expected-identity verification and any applicable live-configuration
+// authorization, but before constructing HTTP/2. Reusing that physical
+// connection does not invoke it again. An error fails and closes the endpoint
+// attempt. Implementations must be concurrency-safe and honor cancellation.
+type ConsensusAuthenticatedDialObserver func(
+	context.Context,
+	domain.DeviceID,
+	netip.AddrPort,
+) error
+
 // ConsensusStreamOptions configures the RFC 8441 Raft byte-stream adapter.
 // AuthorizationChanges must signal after either applied membership or live
 // Raft configuration changes; closing it makes all Raft stream authorization
 // fail closed.
 type ConsensusStreamOptions struct {
-	LocalDeviceID        domain.DeviceID
-	IdentityCertificate  tls.Certificate
-	Endpoints            ConsensusEndpointResolver
-	Dialer               ConsensusEndpointDialer
-	VerifyExpectedPeer   ExpectedConsensusPeerVerifier
-	AuthorizePeer        ConsensusPeerAuthorizer
-	AuthorizationChanges <-chan struct{}
-	ControlHandler       http.Handler
+	LocalDeviceID            domain.DeviceID
+	IdentityCertificate      tls.Certificate
+	Endpoints                ConsensusEndpointResolver
+	Dialer                   ConsensusEndpointDialer
+	VerifyExpectedPeer       ExpectedConsensusPeerVerifier
+	AuthorizePeer            ConsensusPeerAuthorizer
+	ObserveAuthenticatedDial ConsensusAuthenticatedDialObserver
+	AuthorizationChanges     <-chan struct{}
+	ControlHandler           http.Handler
 }
 
 // ConsensusStreamLayer carries HashiCorp Raft's maintained framing over
 // authenticated RFC 8441 streams.
 type ConsensusStreamLayer struct {
-	localDeviceID        domain.DeviceID
-	identityCertificate  tls.Certificate
-	endpoints            ConsensusEndpointResolver
-	dialer               ConsensusEndpointDialer
-	verifyExpectedPeer   ExpectedConsensusPeerVerifier
-	authorizePeer        ConsensusPeerAuthorizer
-	authorizationChanges <-chan struct{}
-	controlHandler       http.Handler
-	requestHeaderTimeout time.Duration
+	localDeviceID            domain.DeviceID
+	identityCertificate      tls.Certificate
+	endpoints                ConsensusEndpointResolver
+	dialer                   ConsensusEndpointDialer
+	verifyExpectedPeer       ExpectedConsensusPeerVerifier
+	authorizePeer            ConsensusPeerAuthorizer
+	observeAuthenticatedDial ConsensusAuthenticatedDialObserver
+	authorizationChanges     <-chan struct{}
+	controlHandler           http.Handler
+	requestHeaderTimeout     time.Duration
 
 	http2    *http2.Server
 	handlers chan struct{}
@@ -237,15 +251,16 @@ func NewConsensusStreamLayer(
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	layer := &ConsensusStreamLayer{
-		localDeviceID:        options.LocalDeviceID,
-		identityCertificate:  certificate,
-		endpoints:            options.Endpoints,
-		dialer:               options.Dialer,
-		verifyExpectedPeer:   options.VerifyExpectedPeer,
-		authorizePeer:        options.AuthorizePeer,
-		authorizationChanges: options.AuthorizationChanges,
-		controlHandler:       options.ControlHandler,
-		requestHeaderTimeout: consensusRequestHeader,
+		localDeviceID:            options.LocalDeviceID,
+		identityCertificate:      certificate,
+		endpoints:                options.Endpoints,
+		dialer:                   options.Dialer,
+		verifyExpectedPeer:       options.VerifyExpectedPeer,
+		authorizePeer:            options.AuthorizePeer,
+		observeAuthenticatedDial: options.ObserveAuthenticatedDial,
+		authorizationChanges:     options.AuthorizationChanges,
+		controlHandler:           options.ControlHandler,
+		requestHeaderTimeout:     consensusRequestHeader,
 		http2: &http2.Server{
 			MaxConcurrentStreams:      ConsensusStreamsPerConnectionMax,
 			MaxDecoderHeaderTableSize: 4 << 10,
@@ -344,7 +359,7 @@ func (layer *ConsensusStreamLayer) Dial(
 			physical := peer.detachPhysicalLocked()
 			_ = physical.close()
 		}
-		physical, dialErr := layer.dialPhysical(ctx, deviceID)
+		physical, dialErr := layer.dialPhysical(ctx, deviceID, true)
 		if dialErr != nil {
 			peer.mu.Unlock()
 			return nil, dialErr
@@ -441,6 +456,7 @@ func (layer *ConsensusStreamLayer) Close() error {
 				closeErrors = append(closeErrors, err)
 			}
 		}
+		clearTLSCertificate(&layer.identityCertificate)
 		layer.closeErr = errors.Join(closeErrors...)
 	})
 	return layer.closeErr

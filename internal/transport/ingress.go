@@ -70,6 +70,7 @@ type IngressOptions struct {
 type Ingress struct {
 	listener          net.Listener
 	tlsConfig         *tls.Config
+	clearTLSIdentity  func()
 	admission         *AdmissionLimiter
 	handlers          map[Plane]ConnectionHandler
 	slots             chan struct{}
@@ -86,6 +87,7 @@ type Ingress struct {
 	revalidationGeneration uint64
 	memberAccessAvailable  bool
 	active                 map[net.Conn]*ingressPeer
+	selectedContent        map[net.Conn]ContentCertificate
 
 	stopOnce sync.Once
 	stopErr  error
@@ -101,16 +103,18 @@ type Ingress struct {
 }
 
 type ingressPeer struct {
-	cancel      context.CancelFunc
-	credentials peerCredentials
-	established bool
-	closing     bool
+	cancel       context.CancelFunc
+	credentials  peerCredentials
+	localContent ContentCertificate
+	established  bool
+	closing      bool
 }
 
 type ingressPeerSnapshot struct {
-	connection  net.Conn
-	peer        *ingressPeer
-	credentials peerCredentials
+	connection   net.Conn
+	peer         *ingressPeer
+	credentials  peerCredentials
+	localContent ContentCertificate
 }
 
 // IngressStats is bounded operational state suitable for metrics and tests.
@@ -164,10 +168,6 @@ func newIngress(
 	if memberHandlers && options.PeerAccessChanges == nil {
 		return nil, ErrInvalidIngressConfig
 	}
-	tlsConfig, err := NewServerTLSConfig(options.TLS)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidIngressConfig, err)
-	}
 	admission := options.Admission
 	if admission == nil {
 		admission = NewAdmissionLimiter()
@@ -175,8 +175,8 @@ func newIngress(
 	if admission.now == nil {
 		return nil, ErrInvalidIngressConfig
 	}
-	return &Ingress{
-		listener: options.Listener, tlsConfig: tlsConfig,
+	ingress := &Ingress{
+		listener:  options.Listener,
 		admission: admission, handlers: handlers,
 		slots:                 make(chan struct{}, maxConnections),
 		peerAccessChanges:     options.PeerAccessChanges,
@@ -185,8 +185,19 @@ func newIngress(
 		verifyContent:         options.TLS.VerifyContentPeer,
 		memberAccessAvailable: !memberHandlers || options.PeerAccessChanges != nil,
 		active:                make(map[net.Conn]*ingressPeer),
+		selectedContent:       make(map[net.Conn]ContentCertificate),
 		done:                  make(chan struct{}),
-	}, nil
+	}
+	tlsConfig, clearTLSIdentity, err := newOwnedServerTLSConfig(
+		options.TLS,
+		ingress.recordSelectedContentCertificate,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidIngressConfig, err)
+	}
+	ingress.tlsConfig = tlsConfig
+	ingress.clearTLSIdentity = clearTLSIdentity
+	return ingress, nil
 }
 
 // Serve accepts peer connections until cancellation or Shutdown. Individual
@@ -344,6 +355,23 @@ func (ingress *Ingress) Shutdown(ctx context.Context) error {
 	}
 }
 
+// BeginShutdown synchronously stops admission of new connections without
+// waiting for active handlers. Shutdown completes the drain.
+func (ingress *Ingress) BeginShutdown() error {
+	if ingress == nil {
+		return ErrInvalidIngressConfig
+	}
+	ingress.initiateShutdown()
+
+	ingress.stateMu.Lock()
+	started := ingress.started
+	ingress.stateMu.Unlock()
+	if !started {
+		ingress.finish()
+	}
+	return ingress.stopErr
+}
+
 func (ingress *Ingress) runConnection(
 	ctx context.Context,
 	connection net.Conn,
@@ -404,9 +432,20 @@ func (ingress *Ingress) serveConnection(
 		ingress.dispatchErrors.Add(1)
 		return
 	}
+	var localContent ContentCertificate
+	if plane == PlaneContent {
+		var found bool
+		localContent, found =
+			ingress.takeSelectedContentCertificate(connection)
+		if !found {
+			ingress.dispatchErrors.Add(1)
+			return
+		}
+	}
 	metadata, trackedPeer, closeAt, ok := ingress.establishPeer(
 		connection,
 		credentials,
+		localContent,
 	)
 	if !ok {
 		ingress.dispatchErrors.Add(1)
@@ -494,16 +533,20 @@ func (ingress *Ingress) RevalidatePeers() RevalidationResult {
 			continue
 		}
 		peers = append(peers, ingressPeerSnapshot{
-			connection:  connection,
-			peer:        peer,
-			credentials: peer.credentials,
+			connection:   connection,
+			peer:         peer,
+			credentials:  peer.credentials,
+			localContent: peer.localContent,
 		})
 	}
 	ingress.stateMu.Unlock()
 
 	result := RevalidationResult{Checked: len(peers)}
 	for _, peer := range peers {
-		if _, authorized := ingress.verifyPeer(peer.credentials); authorized {
+		if _, authorized := ingress.verifyPeer(
+			peer.credentials,
+			peer.localContent,
+		); authorized {
 			continue
 		}
 		if ingress.closeTrackedPeer(peer.connection, peer.peer) {
@@ -562,6 +605,7 @@ func (ingress *Ingress) unregisterConnection(connection net.Conn) {
 	ingress.stateMu.Lock()
 	peer := ingress.active[connection]
 	delete(ingress.active, connection)
+	delete(ingress.selectedContent, connection)
 	ingress.stateMu.Unlock()
 	if peer != nil {
 		peer.cancel()
@@ -571,6 +615,7 @@ func (ingress *Ingress) unregisterConnection(connection net.Conn) {
 func (ingress *Ingress) establishPeer(
 	connection net.Conn,
 	credentials peerCredentials,
+	localContent ContentCertificate,
 ) (AuthenticatedPeer, *ingressPeer, time.Time, bool) {
 	for range peerEstablishmentVerifyAttempts {
 		ingress.stateMu.Lock()
@@ -587,7 +632,10 @@ func (ingress *Ingress) establishPeer(
 		generation := ingress.revalidationGeneration
 		ingress.stateMu.Unlock()
 
-		closeAt, authorized := ingress.verifyPeer(credentials)
+		closeAt, authorized := ingress.verifyPeer(
+			credentials,
+			localContent,
+		)
 		if !authorized {
 			return AuthenticatedPeer{}, nil, time.Time{}, false
 		}
@@ -605,6 +653,7 @@ func (ingress *Ingress) establishPeer(
 			return AuthenticatedPeer{}, nil, time.Time{}, false
 		case generation == ingress.revalidationGeneration:
 			peer.credentials = credentials
+			peer.localContent = localContent
 			peer.established = true
 			ingress.stateMu.Unlock()
 			return credentials.metadata, peer, closeAt, true
@@ -617,6 +666,7 @@ func (ingress *Ingress) establishPeer(
 
 func (ingress *Ingress) verifyPeer(
 	credentials peerCredentials,
+	localContent ContentCertificate,
 ) (closeAt time.Time, authorized bool) {
 	defer func() {
 		if recover() != nil {
@@ -637,11 +687,22 @@ func (ingress *Ingress) verifyPeer(
 			return time.Time{}, false
 		}
 		started := time.Now()
-		admission, err := ingress.verifyContent(credentials.content)
-		if err != nil || !admission.validFor(credentials.content) {
+		remoteAdmission, err := ingress.verifyContent(
+			credentials.content,
+		)
+		if err != nil ||
+			!remoteAdmission.validFor(credentials.content) {
 			return time.Time{}, false
 		}
-		closeAt := started.Add(admission.CloseAfter)
+		localAdmission, err := ingress.verifyContent(localContent)
+		if err != nil || !localAdmission.validFor(localContent) {
+			return time.Time{}, false
+		}
+		closeAfter := min(
+			remoteAdmission.CloseAfter,
+			localAdmission.CloseAfter,
+		)
+		closeAt := started.Add(closeAfter)
 		if !closeAt.After(time.Now()) {
 			return time.Time{}, false
 		}
@@ -671,9 +732,13 @@ func (ingress *Ingress) reauthorizePeer(
 		}
 		generation := ingress.revalidationGeneration
 		credentials := peer.credentials
+		localContent := peer.localContent
 		ingress.stateMu.Unlock()
 
-		if _, authorized := ingress.verifyPeer(credentials); !authorized {
+		if _, authorized := ingress.verifyPeer(
+			credentials,
+			localContent,
+		); !authorized {
 			ingress.closeTrackedPeer(connection, expected)
 			return ErrPeerAuthorizationDenied
 		}
@@ -700,6 +765,32 @@ func (ingress *Ingress) reauthorizePeer(
 	}
 	ingress.closeTrackedPeer(connection, expected)
 	return ErrPeerAuthorizationUnavailable
+}
+
+func (ingress *Ingress) recordSelectedContentCertificate(
+	connection net.Conn,
+	certificate ContentCertificate,
+) {
+	if connection == nil || certificate.Leaf == nil {
+		return
+	}
+	ingress.stateMu.Lock()
+	defer ingress.stateMu.Unlock()
+	peer := ingress.active[connection]
+	if ingress.stopping || peer == nil || peer.established || peer.closing {
+		return
+	}
+	ingress.selectedContent[connection] = certificate
+}
+
+func (ingress *Ingress) takeSelectedContentCertificate(
+	connection net.Conn,
+) (ContentCertificate, bool) {
+	ingress.stateMu.Lock()
+	defer ingress.stateMu.Unlock()
+	certificate, found := ingress.selectedContent[connection]
+	delete(ingress.selectedContent, connection)
+	return certificate, found
 }
 
 func (ingress *Ingress) memberAccessPermitted(plane Plane) bool {
@@ -799,6 +890,10 @@ func (ingress *Ingress) releaseConnectionSlot() {
 
 func (ingress *Ingress) finish() {
 	ingress.doneOnce.Do(func() {
+		if ingress.clearTLSIdentity != nil {
+			ingress.clearTLSIdentity()
+			ingress.clearTLSIdentity = nil
+		}
 		close(ingress.done)
 	})
 }

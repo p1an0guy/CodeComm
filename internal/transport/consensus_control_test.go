@@ -92,6 +92,167 @@ func testConsensusProofRequestReusesAuthenticatedConnection(t *testing.T) {
 	harness.assertNoActiveSocketDeadlines(t)
 }
 
+func testConsensusCredentialEndorsementUsesClosedControlRoute(t *testing.T) {
+	const (
+		requestBody  = `{"schema_version":1}`
+		responseBody = `{"schema_version":1}`
+	)
+	requestSeen := make(chan error, 1)
+	harness := newConsensusHarnessWithControlHandler(
+		t,
+		http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			request *http.Request,
+		) {
+			if request.Method != http.MethodPost ||
+				request.URL == nil ||
+				request.URL.Path !=
+					consensusCredentialEndorsementPath ||
+				request.Host != ConsensusRaftAuthority ||
+				request.Header.Get("Content-Type") !=
+					consensusJSONMediaType {
+				requestSeen <- errors.New(
+					"unexpected credential request metadata",
+				)
+				http.Error(writer, "bad request", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil || string(body) != requestBody {
+				requestSeen <- errors.New(
+					"unexpected credential request body",
+				)
+				http.Error(writer, "bad body", http.StatusBadRequest)
+				return
+			}
+			requestSeen <- nil
+			writer.Header().Set("Content-Type", consensusJSONMediaType)
+			writer.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(writer, responseBody)
+		}),
+	)
+
+	network := &ConsensusNetworkTransport{
+		delegate: &raft.NetworkTransport{},
+		control:  harness.client,
+	}
+	response, err := network.RequestCredentialEndorsement(
+		t.Context(),
+		harness.serverID,
+		[]byte(requestBody),
+	)
+	if err != nil {
+		t.Fatalf("RequestCredentialEndorsement(): %v", err)
+	}
+	if requestErr := <-requestSeen; requestErr != nil {
+		t.Fatal(requestErr)
+	}
+	if response.StatusCode != http.StatusOK ||
+		response.MediaType != consensusJSONMediaType ||
+		string(response.Body) != responseBody {
+		t.Fatalf("credential response = %#v", response)
+	}
+}
+
+func testConsensusCredentialRenewalBypassesOnlyLiveConfiguration(
+	t *testing.T,
+) {
+	const (
+		requestBody  = `{"schema_version":1}`
+		responseBody = `{"authorization_chain_index":7}`
+	)
+	requests := make(chan string, 1)
+	harness := newConsensusHarnessWithControlHandler(
+		t,
+		http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			request *http.Request,
+		) {
+			if request.Method != http.MethodPost ||
+				request.URL == nil ||
+				request.URL.Path != consensusCredentialRenewalPath ||
+				request.Header.Get("Content-Type") !=
+					consensusJSONMediaType {
+				http.Error(writer, "bad request", http.StatusBadRequest)
+				return
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil || string(body) != requestBody {
+				http.Error(writer, "bad body", http.StatusBadRequest)
+				return
+			}
+			requests <- request.URL.Path
+			writer.Header().Set("Content-Type", consensusJSONMediaType)
+			writer.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(writer, responseBody)
+		}),
+	)
+	harness.clientAllowed.Store(harness.serverID, false)
+	network := &ConsensusNetworkTransport{
+		delegate: &raft.NetworkTransport{},
+		control:  harness.client,
+	}
+	response, err := network.RequestCredentialRenewal(
+		t.Context(),
+		harness.serverID,
+		[]byte(requestBody),
+	)
+	if err != nil {
+		t.Fatalf("RequestCredentialRenewal(): %v", err)
+	}
+	if response.StatusCode != http.StatusOK ||
+		response.MediaType != consensusJSONMediaType ||
+		string(response.Body) != responseBody {
+		t.Fatalf("renewal response = %#v", response)
+	}
+	select {
+	case path := <-requests:
+		if path != consensusCredentialRenewalPath {
+			t.Fatalf("renewal path = %q", path)
+		}
+	case <-time.After(consensusTestTimeout):
+		t.Fatal("renewal route was not served")
+	}
+
+	for name, request := range map[string]func() error{
+		"proof": func() error {
+			_, err := harness.client.RequestConsensusProof(
+				t.Context(),
+				harness.serverID,
+				[]byte(`{"mode":"staging_apply"}`),
+			)
+			return err
+		},
+		"endorsement": func() error {
+			_, err := harness.client.RequestCredentialEndorsement(
+				t.Context(),
+				harness.serverID,
+				[]byte(`{"schema_version":1}`),
+			)
+			return err
+		},
+		"raft CONNECT": func() error {
+			connection, err := harness.client.Dial(
+				raft.ServerAddress(harness.serverID),
+				consensusTestTimeout,
+			)
+			if connection != nil {
+				_ = connection.Close()
+			}
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := request(); !errors.Is(err, ErrConsensusPeerDenied) {
+				t.Fatalf("outside-configuration request error = %v", err)
+			}
+		})
+	}
+	if got := harness.dialer.count.Load(); got != 1 {
+		t.Fatalf("physical connection count = %d, want 1", got)
+	}
+}
+
 func testConsensusProofRequestRejectsInvalidInputBeforeDial(t *testing.T) {
 	harness := newConsensusHarness(t)
 	tooLarge := make([]byte, ConsensusControlBodyMaxBytes+1)
@@ -264,6 +425,7 @@ func testConsensusProofDenialClosesActiveStreamsWithoutDeadlock(
 			t.Context(),
 			peer,
 			harness.serverID,
+			true,
 		)
 		result <- err
 	}()

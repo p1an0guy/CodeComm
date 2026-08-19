@@ -68,6 +68,141 @@ func TestSnapshotDefensivelyCopiesAndBoundsCredentialHistory(t *testing.T) {
 	}
 }
 
+func TestSnapshotAuthorizationByEpochDigest(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 2)
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	key := credentialauthorization.Key{
+		SessionID: snapshotTestSessionID,
+		DeviceID:  fixture.deviceID,
+		Epoch:     2,
+	}
+	want := fixture.input.CredentialAuthorizations[key]
+
+	authorization, member, found := snapshot.AuthorizationByEpochDigest(
+		want.Epoch,
+		want.KeyDigest,
+	)
+	if !found ||
+		authorization.PrimaryKey() != key ||
+		member.ID != fixture.deviceID ||
+		!bytes.Equal(member.IdentityPublicKey, fixture.identityKey.Public().(ed25519.PublicKey)) {
+		t.Fatalf(
+			"AuthorizationByEpochDigest() = (%+v, %+v, %t)",
+			authorization,
+			member,
+			found,
+		)
+	}
+	authorization.EpochPublicKey[0] ^= 0xff
+	authorization.ClockEndorsements[0].Signature[0] ^= 0xff
+	member.IdentityPublicKey[0] ^= 0xff
+
+	again, againMember, found := snapshot.AuthorizationByEpochDigest(
+		want.Epoch,
+		want.KeyDigest,
+	)
+	if !found ||
+		again.EpochPublicKey[0] != want.EpochPublicKey[0] ||
+		again.ClockEndorsements[0].Signature[0] !=
+			want.ClockEndorsements[0].Signature[0] ||
+		againMember.IdentityPublicKey[0] !=
+			fixture.identityKey.Public().(ed25519.PublicKey)[0] {
+		t.Fatal("mutating lookup results changed snapshot state")
+	}
+
+	unknown := want.KeyDigest
+	unknown[0] ^= 0xff
+	for _, test := range []struct {
+		name   string
+		epoch  uint64
+		digest [sha256.Size]byte
+	}{
+		{name: "zero epoch", epoch: 0, digest: want.KeyDigest},
+		{
+			name:   "unsafe epoch",
+			epoch:  domain.MaxSafeInteger + 1,
+			digest: want.KeyDigest,
+		},
+		{name: "unknown epoch", epoch: 3, digest: want.KeyDigest},
+		{name: "unknown digest", epoch: want.Epoch, digest: unknown},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if authorization, member, found :=
+				snapshot.AuthorizationByEpochDigest(
+					test.epoch,
+					test.digest,
+				); found {
+				t.Fatalf(
+					"AuthorizationByEpochDigest() = (%+v, %+v, true), want false",
+					authorization,
+					member,
+				)
+			}
+		})
+	}
+}
+
+func TestSnapshotAuthorizationByEpochDigestRejectsAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	first := fixture.input.CredentialAuthorizations[credentialauthorization.Key{
+		SessionID: snapshotTestSessionID,
+		DeviceID:  fixture.deviceID,
+		Epoch:     1,
+	}]
+	secondIdentity := snapshotPrivateKey(44)
+	secondID, err := device.DeriveID(
+		secondIdentity.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("device.DeriveID() error = %v", err)
+	}
+	fixture.input.Devices[secondID] = device.Device{
+		ID:                secondID,
+		Role:              device.RoleEditor,
+		IdentityPublicKey: secondIdentity.Public().(ed25519.PublicKey),
+		DaemonVersion:     "0.1.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+	fixture.input.AuditCounters[secondID] = auditcounter.Counter{
+		DeviceID:        secondID,
+		CredentialEpoch: 1,
+	}
+	second := snapshotAuthorization(
+		secondID,
+		1,
+		1,
+		snapshotPrivateKey(21),
+	)
+	fixture.input.CredentialAuthorizations[second.PrimaryKey()] = second
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+
+	if authorization, member, found :=
+		snapshot.AuthorizationByEpochDigest(
+			first.Epoch,
+			first.KeyDigest,
+		); found {
+		t.Fatalf(
+			"AuthorizationByEpochDigest(ambiguous) = (%+v, %+v, true), want false",
+			authorization,
+			member,
+		)
+	}
+}
+
 func TestSnapshotAdvanceAppliesCredentialAndMembershipChanges(t *testing.T) {
 	t.Parallel()
 

@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -247,13 +249,14 @@ func TestContentPeerDeadlineIncludesVerificationTime(t *testing.T) {
 		},
 	}
 	started := time.Now()
+	certificate := ContentCertificate{
+		NotBefore: now,
+		NotAfter:  now.Add(time.Second),
+	}
 	closeAt, authorized := ingress.verifyPeer(peerCredentials{
 		metadata: AuthenticatedPeer{Plane: PlaneContent},
-		content: ContentCertificate{
-			NotBefore: now,
-			NotAfter:  now.Add(time.Second),
-		},
-	})
+		content:  certificate,
+	}, certificate)
 	if !authorized {
 		t.Fatal("verifyPeer(content) rejected valid test admission")
 	}
@@ -274,12 +277,18 @@ func TestContentPeerDeadlineIncludesVerificationTime(t *testing.T) {
 func TestIngressContentExpiryClosesOnlyContent(t *testing.T) {
 	t.Parallel()
 
-	const closeAfter = 100 * time.Millisecond
+	const (
+		localCloseAfter  = 100 * time.Millisecond
+		remoteCloseAfter = time.Second
+	)
 	fixture := newIngressTestTLS(t)
 	fixture.server.VerifyContentPeer = func(
-		ContentCertificate,
+		certificate ContentCertificate,
 	) (ContentPeerAdmission, error) {
-		return ContentPeerAdmission{CloseAfter: closeAfter}, nil
+		if certificate.Binding.DeviceID == fixture.clientContent.DeviceID {
+			return ContentPeerAdmission{CloseAfter: remoteCloseAfter}, nil
+		}
+		return ContentPeerAdmission{CloseAfter: localCloseAfter}, nil
 	}
 	listener := newIngressTestListener(t)
 	entered := map[Plane]chan struct{}{
@@ -339,7 +348,7 @@ func TestIngressContentExpiryClosesOnlyContent(t *testing.T) {
 		select {
 		case <-canceled[plane]:
 			t.Fatalf("%s connection received a content expiry timer", plane)
-		case <-time.After(2 * closeAfter):
+		case <-time.After(2 * localCloseAfter):
 		}
 	}
 	awaitIngressCondition(
@@ -710,6 +719,74 @@ func TestIngressRevalidationClosesRevokedPeers(t *testing.T) {
 		},
 	)
 
+	stopTestIngress(t, running)
+}
+
+func TestIngressRevalidationClosesLocallyUnauthorizedContent(t *testing.T) {
+	t.Parallel()
+
+	fixture := newIngressTestTLS(t)
+	localCertificate, err := fixture.server.ContentCertificate()
+	if err != nil {
+		t.Fatalf("server content certificate: %v", err)
+	}
+	localProfile, err := ParseContentCertificate(
+		localCertificate.Certificate[0],
+	)
+	if err != nil {
+		t.Fatalf("ParseContentCertificate(server): %v", err)
+	}
+	var revokeLocal atomic.Bool
+	revoked := errors.New("local member revoked")
+	fixture.server.VerifyContentPeer = func(
+		certificate ContentCertificate,
+	) (ContentPeerAdmission, error) {
+		if revokeLocal.Load() &&
+			certificate.Binding.DeviceID == localProfile.Binding.DeviceID {
+			return ContentPeerAdmission{}, revoked
+		}
+		return admitTestContentPeer(certificate)
+	}
+
+	listener := newIngressTestListener(t)
+	entered := make(chan struct{}, 1)
+	canceled := make(chan struct{}, 1)
+	handler := ConnectionHandlerFunc(func(
+		ctx context.Context,
+		_ *tls.Conn,
+	) error {
+		entered <- struct{}{}
+		<-ctx.Done()
+		canceled <- struct{}{}
+		return ctx.Err()
+	})
+	running := startTestIngress(t, IngressOptions{
+		Listener: listener,
+		TLS:      fixture.server,
+		Content:  handler,
+	}, PeerConnectionsMax)
+	connection := dialIngressTLS(
+		t,
+		listener.Addr().String(),
+		fixture.clients[PlaneContent],
+	)
+	defer connection.Close()
+	awaitIngressValue(t, entered, ingressTestTimeout, "content handler")
+
+	revokeLocal.Store(true)
+	if result := running.ingress.RevalidatePeers(); result != (RevalidationResult{
+		Checked: 1,
+		Closed:  1,
+	}) {
+		t.Fatalf("RevalidatePeers() = %+v, want {Checked:1 Closed:1}", result)
+	}
+	awaitIngressValue(
+		t,
+		canceled,
+		ingressTestTimeout,
+		"local revocation cancellation",
+	)
+	expectIngressConnectionClosed(t, connection, ingressTestTimeout)
 	stopTestIngress(t, running)
 }
 
@@ -1506,6 +1583,66 @@ func TestIngressShutdownBeforeServeClosesListener(t *testing.T) {
 	}
 }
 
+func TestIngressBeginShutdownStopsListenerAndClearsOwnedIdentityKeys(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newIngressTestTLS(t)
+	listener := &ingressLifecycleListener{}
+	ingress, err := NewIngress(IngressOptions{
+		Listener: listener,
+		TLS:      fixture.server,
+		Pairing: ConnectionHandlerFunc(func(
+			context.Context,
+			*tls.Conn,
+		) error {
+			return nil
+		}),
+	})
+	if err != nil {
+		t.Fatalf("NewIngress(): %v", err)
+	}
+	keys := make([]ed25519.PrivateKey, 0, 2)
+	for _, protocol := range []string{ALPNPairing, ALPNConsensus} {
+		selected, err := ingress.tlsConfig.GetConfigForClient(
+			&tls.ClientHelloInfo{SupportedProtos: []string{protocol}},
+		)
+		if err != nil {
+			t.Fatalf("GetConfigForClient(%s): %v", protocol, err)
+		}
+		key, ok := selected.Certificates[0].PrivateKey.(ed25519.PrivateKey)
+		if !ok || len(key) != ed25519.PrivateKeySize {
+			t.Fatalf("selected %s key = %T", protocol, selected.Certificates[0].PrivateKey)
+		}
+		keys = append(keys, key)
+	}
+
+	if err := ingress.BeginShutdown(); err != nil {
+		t.Fatalf("BeginShutdown(): %v", err)
+	}
+	if listener.closeCalls.Load() != 1 {
+		t.Fatalf("listener close calls = %d, want 1", listener.closeCalls.Load())
+	}
+	for index, key := range keys {
+		if !bytes.Equal(key, make([]byte, ed25519.PrivateKeySize)) {
+			t.Fatalf("identity key %d was not cleared", index)
+		}
+	}
+	if err := ingress.BeginShutdown(); err != nil {
+		t.Fatalf("second BeginShutdown(): %v", err)
+	}
+	if listener.closeCalls.Load() != 1 {
+		t.Fatalf("listener close calls after retry = %d, want 1", listener.closeCalls.Load())
+	}
+	if err := ingress.Serve(context.Background()); !errors.Is(
+		err,
+		ErrIngressClosed,
+	) {
+		t.Fatalf("Serve(after BeginShutdown) = %v", err)
+	}
+}
+
 func TestIngressRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
 
@@ -2043,3 +2180,25 @@ type invalidRemoteConn struct {
 func (connection *invalidRemoteConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4zero, Port: 1}
 }
+
+type ingressLifecycleListener struct {
+	closeCalls atomic.Int32
+}
+
+func (*ingressLifecycleListener) Accept() (net.Conn, error) {
+	return nil, errors.New("unexpected Accept")
+}
+
+func (listener *ingressLifecycleListener) Close() error {
+	listener.closeCalls.Add(1)
+	return nil
+}
+
+func (*ingressLifecycleListener) Addr() net.Addr {
+	return ingressLifecycleAddress{}
+}
+
+type ingressLifecycleAddress struct{}
+
+func (ingressLifecycleAddress) Network() string { return "tcp" }
+func (ingressLifecycleAddress) String() string  { return "192.0.2.10:47831" }

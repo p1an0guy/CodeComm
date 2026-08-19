@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -248,6 +249,10 @@ func testConsensusStartupEnabled(t *testing.T) {
 	t.Run("duplex half-close and reuse", testConsensusDuplexAndReuse)
 	t.Run("expected peer binding", testConsensusExpectedPeerBinding)
 	t.Run(
+		"authenticated outbound dial observer",
+		testConsensusAuthenticatedDialObserver,
+	)
+	t.Run(
 		"outbound membership revalidation",
 		testConsensusOutboundMembershipRevalidation,
 	)
@@ -255,6 +260,7 @@ func testConsensusStartupEnabled(t *testing.T) {
 	t.Run("stream capacity", testConsensusStreamCapacity)
 	t.Run("maintained raft framing", testConsensusRaftFraming)
 	t.Run("local identity binding", testConsensusLocalIdentityBinding)
+	t.Run("identity key cleanup", testConsensusIdentityKeyCleanup)
 	t.Run("authorization revalidation", testConsensusAuthorizationRevalidation)
 	t.Run(
 		"inbound registration revalidation",
@@ -265,6 +271,14 @@ func testConsensusStartupEnabled(t *testing.T) {
 	t.Run(
 		"proof control reuse",
 		testConsensusProofRequestReusesAuthenticatedConnection,
+	)
+	t.Run(
+		"credential endorsement control route",
+		testConsensusCredentialEndorsementUsesClosedControlRoute,
+	)
+	t.Run(
+		"credential renewal configuration exception",
+		testConsensusCredentialRenewalBypassesOnlyLiveConfiguration,
 	)
 	t.Run(
 		"proof control input bounds",
@@ -559,6 +573,53 @@ func testConsensusLocalIdentityBinding(t *testing.T) {
 	}
 }
 
+func testConsensusIdentityKeyCleanup(t *testing.T) {
+	key := certificatePrivateKey(95)
+	certificate, binding, err := IssueIdentityCertificate(
+		certificateTestSessionID,
+		1,
+		key,
+	)
+	if err != nil {
+		t.Fatalf("IssueIdentityCertificate(): %v", err)
+	}
+	routes, err := NewStaticConsensusRoutes(nil)
+	if err != nil {
+		t.Fatalf("NewStaticConsensusRoutes(): %v", err)
+	}
+	layer, err := NewConsensusStreamLayer(ConsensusStreamOptions{
+		LocalDeviceID:       binding.DeviceID,
+		IdentityCertificate: certificate,
+		Endpoints:           routes,
+		Dialer:              routes,
+		VerifyExpectedPeer: func(
+			domain.DeviceID,
+			IdentityCertificate,
+		) error {
+			return nil
+		},
+		AuthorizePeer:        func(domain.DeviceID) error { return nil },
+		AuthorizationChanges: make(chan struct{}),
+		ControlHandler:       http.NotFoundHandler(),
+	})
+	if err != nil {
+		t.Fatalf("NewConsensusStreamLayer(): %v", err)
+	}
+	ownedKey, ok := layer.identityCertificate.PrivateKey.(ed25519.PrivateKey)
+	if !ok || len(ownedKey) != ed25519.PrivateKeySize {
+		t.Fatalf("owned private key = %T", layer.identityCertificate.PrivateKey)
+	}
+	if err := layer.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	if !bytes.Equal(ownedKey, make([]byte, ed25519.PrivateKeySize)) {
+		t.Fatal("owned identity key was not cleared")
+	}
+	if bytes.Equal(key, make([]byte, ed25519.PrivateKeySize)) {
+		t.Fatal("closing the layer cleared the caller-owned key")
+	}
+}
+
 func testConsensusAuthorizationRevalidation(t *testing.T) {
 	harness := newConsensusHarness(t)
 	outbound, err := harness.client.Dial(
@@ -771,6 +832,29 @@ func newConsensusHarnessWithControlHandler(
 	t *testing.T,
 	controlHandler http.Handler,
 ) *consensusHarness {
+	return newConsensusHarnessWithOptions(
+		t,
+		controlHandler,
+		nil,
+	)
+}
+
+func newConsensusHarnessWithAuthenticatedDialObserver(
+	t *testing.T,
+	observer ConsensusAuthenticatedDialObserver,
+) *consensusHarness {
+	return newConsensusHarnessWithOptions(
+		t,
+		http.NotFoundHandler(),
+		observer,
+	)
+}
+
+func newConsensusHarnessWithOptions(
+	t *testing.T,
+	controlHandler http.Handler,
+	observer ConsensusAuthenticatedDialObserver,
+) *consensusHarness {
 	t.Helper()
 	if controlHandler == nil {
 		t.Fatal("nil consensus control handler")
@@ -860,9 +944,10 @@ func newConsensusHarnessWithControlHandler(
 		VerifyExpectedPeer: verify(map[domain.DeviceID]ed25519.PublicKey{
 			harness.serverID: serverKey.Public().(ed25519.PublicKey),
 		}),
-		AuthorizePeer:        authorize(&harness.clientAllowed),
-		AuthorizationChanges: harness.clientChanges,
-		ControlHandler:       http.NotFoundHandler(),
+		AuthorizePeer:            authorize(&harness.clientAllowed),
+		ObserveAuthenticatedDial: observer,
+		AuthorizationChanges:     harness.clientChanges,
+		ControlHandler:           http.NotFoundHandler(),
 	})
 	if err != nil {
 		_ = server.Close()

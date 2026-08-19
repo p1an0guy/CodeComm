@@ -129,7 +129,7 @@ func (layer *ConsensusStreamLayer) reachabilityPhysical(
 			physical := peer.detachPhysicalLocked()
 			_ = physical.close()
 		}
-		physical, err := layer.dialPhysical(ctx, deviceID)
+		physical, err := layer.dialPhysical(ctx, deviceID, true)
 		if err != nil {
 			peer.mu.Unlock()
 			return nil, 0, err

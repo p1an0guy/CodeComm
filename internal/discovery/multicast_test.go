@@ -328,14 +328,18 @@ func TestMulticastReceiveBoundsAndIPv6Zone(t *testing.T) {
 		source:         &net.UDPAddr{IP: net.ParseIP("192.0.2.9"), Port: 60400},
 		interfaceIndex: iface.Index,
 	})
-	payload, source, err := multicast.Receive(context.Background())
+	datagram, err := multicast.ReceiveDatagram(context.Background())
 	if err != nil {
-		t.Fatalf("Receive(exact limit) error = %v", err)
+		t.Fatalf("ReceiveDatagram(exact limit) error = %v", err)
 	}
-	if !bytes.Equal(payload, exact) ||
-		source != netip.MustParseAddrPort("192.0.2.9:60400") {
-		t.Fatalf("Receive(exact limit) = %d bytes from %s", len(payload), source)
+	if !bytes.Equal(datagram.Payload, exact) ||
+		datagram.Source != netip.MustParseAddrPort("192.0.2.9:60400") ||
+		datagram.Family != AddressFamilyIPv4 ||
+		datagram.InterfaceIndex != iface.Index {
+		t.Fatalf("ReceiveDatagram(exact limit) = %+v", datagram)
 	}
+	payload := datagram.Payload
+	source := datagram.Source
 
 	ipv4Socket.inject(fakeRead{
 		payload:        bytes.Repeat([]byte{0x6b}, MaxDatagramBytes+1),
@@ -556,6 +560,35 @@ func TestMulticastRefreshReplacesJoinsAndTriggersAdvertisement(t *testing.T) {
 	}
 	if string(payload) != "active" {
 		t.Fatalf("Receive(after refresh) payload = %q, want active", payload)
+	}
+}
+
+func TestMulticastRefreshUnchangedDoesNotTriggerAdvertisement(t *testing.T) {
+	t.Parallel()
+
+	iface := testInterface(1, "ethernet0")
+	network := newFakeMulticastNetwork(map[int][]net.Addr{
+		iface.Index: testAddresses("192.0.2.1"),
+	})
+	multicast := mustOpenFakeMulticast(t, network, iface)
+	<-multicast.AdvertisementTriggers()
+
+	report, err := multicast.Refresh([]net.Interface{iface})
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	want := []InterfaceJoin{{
+		InterfaceIndex: iface.Index,
+		InterfaceName:  iface.Name,
+		Family:         AddressFamilyIPv4,
+	}}
+	if !equalJoins(report.Joins, want) {
+		t.Fatalf("Refresh() joins = %#v, want %#v", report.Joins, want)
+	}
+	select {
+	case <-multicast.AdvertisementTriggers():
+		t.Fatal("unchanged Refresh() triggered an advertisement")
+	default:
 	}
 }
 
