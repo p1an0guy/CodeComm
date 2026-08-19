@@ -13,6 +13,10 @@ import (
 const (
 	MaxOutstandingPairingInvites = 8
 	MaxPairingProofFailures      = 3
+	// MaxPairingHistoryEntries bounds invite-rooted lifecycle trees in one
+	// workspace store. Live and cleanup-critical trees consume capacity but
+	// are never evicted.
+	MaxPairingHistoryEntries = 256
 )
 
 var (
@@ -149,6 +153,7 @@ type PairingMaintenanceResult struct {
 	AbandonedPreparing uint64
 	ExpiredInvites     uint64
 	ExpiredAttempts    uint64
+	PrunedHistory      uint64
 }
 
 // PairingProofFailureInput is a structurally valid request whose HMAC failed.

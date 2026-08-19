@@ -93,6 +93,19 @@ func (state LocalState) ReservePairingInvite(
 		if active >= MaxOutstandingPairingInvites {
 			return ErrPairingInviteLimit
 		}
+		if _, err := prunePairingHistory(
+			conn,
+			MaxPairingHistoryEntries-1,
+		); err != nil {
+			return err
+		}
+		historyEntries, err := pairingHistoryCount(conn)
+		if err != nil {
+			return err
+		}
+		if historyEntries >= MaxPairingHistoryEntries {
+			return ErrPairingInviteLimit
+		}
 		if err := execute(
 			conn,
 			`INSERT INTO pairing_invites(

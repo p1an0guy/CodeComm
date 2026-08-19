@@ -292,6 +292,300 @@ func TestRecoverPairingStateAbandonsExpiresAndScrubs(t *testing.T) {
 	}
 }
 
+func TestMaintainPairingStateBoundsHistoryAndPreservesRequiredRows(t *testing.T) {
+	fixture := newPairingLifecycleFixture(t, false, "", false)
+	ctx := context.Background()
+
+	outstanding := fixture.invite(t, pairingTestUUID(9000), pairing.ModeNew, 1, 0)
+	reserveAndActivatePairingInvite(t, fixture.state, outstanding)
+
+	awaitingInvite := fixture.invite(t, pairingTestUUID(9001), pairing.ModeNew, 1, 0)
+	reserveAndActivatePairingInvite(t, fixture.state, awaitingInvite)
+	awaiting, _, err := fixture.state.ConsumePairingInvite(
+		ctx,
+		fixture.verifiedRequest(t, awaitingInvite, pairingTestUUID(9002)),
+		"2026-08-13T12:01:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completePairingSecretDeletionForTest(t, fixture.state, awaiting.InviteID)
+
+	finalizingInvite := fixture.invite(t, pairingTestUUID(9003), pairing.ModeNew, 1, 0)
+	reserveAndActivatePairingInvite(t, fixture.state, finalizingInvite)
+	finalizing, _, err := fixture.state.ConsumePairingInvite(
+		ctx,
+		fixture.verifiedRequest(t, finalizingInvite, pairingTestUUID(9004)),
+		"2026-08-13T12:01:01Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizing = confirmPairingAttempt(
+		t,
+		fixture.state,
+		fixture.ownerKey,
+		fixture.ownerID,
+		finalizing,
+		"2026-08-13T12:01:02Z",
+		"2026-08-13T12:01:03Z",
+	)
+	completePairingSecretDeletionForTest(t, fixture.state, finalizing.InviteID)
+
+	completedInvite := fixture.invite(t, pairingTestUUID(8990), pairing.ModeNew, 1, 0)
+	reserveAndActivatePairingInvite(t, fixture.state, completedInvite)
+	completed, _, err := fixture.state.ConsumePairingInvite(
+		ctx,
+		fixture.verifiedRequest(t, completedInvite, pairingTestUUID(8991)),
+		"2026-08-13T12:00:30Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed = confirmPairingAttempt(
+		t,
+		fixture.state,
+		fixture.ownerKey,
+		fixture.ownerID,
+		completed,
+		"2026-08-13T12:00:31Z",
+		"2026-08-13T12:00:32Z",
+	)
+	if _, _, err := fixture.state.CompletePairingFinalization(
+		ctx,
+		completed.AttemptID,
+		"2026-08-13T12:00:33Z",
+	); err != nil {
+		t.Fatal(err)
+	}
+	completePairingSecretDeletionForTest(t, fixture.state, completed.InviteID)
+
+	pendingDeletionInvite := fixture.invite(
+		t,
+		pairingTestUUID(9005),
+		pairing.ModeNew,
+		1,
+		0,
+	)
+	reserveAndActivatePairingInvite(t, fixture.state, pendingDeletionInvite)
+	pendingDeletionID := pendingDeletionInvite.Invite().InviteID
+	if _, _, err := fixture.state.TerminatePairingInvite(
+		ctx,
+		pendingDeletionID,
+		Digest(pendingDeletionInvite.Digest()),
+		PairingInviteRevoked,
+		"2026-08-13T12:01:04Z",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	seeded := seedTerminalPairingHistory(
+		t,
+		fixture,
+		10000,
+		MaxPairingHistoryEntries+2,
+		false,
+	)
+	wantPruned := uint64(len(seeded) + 5 - MaxPairingHistoryEntries)
+	result, err := fixture.state.MaintainPairingState(
+		ctx,
+		"2026-08-13T12:05:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != (PairingMaintenanceResult{PrunedHistory: wantPruned}) {
+		t.Fatalf("MaintainPairingState() = %+v, want %d pruned", result, wantPruned)
+	}
+
+	assertPairingInviteState(
+		t,
+		fixture.state,
+		outstanding.Invite().InviteID,
+		PairingInviteOutstanding,
+	)
+	assertPairingInviteState(
+		t,
+		fixture.state,
+		pendingDeletionID,
+		PairingInviteRevoked,
+	)
+	for name, expected := range map[string]struct {
+		id    domain.UUIDv7
+		state PairingAttemptState
+	}{
+		"awaiting":   {id: awaiting.AttemptID, state: PairingAttemptAwaitingSAS},
+		"finalizing": {id: finalizing.AttemptID, state: PairingAttemptFinalizing},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record, found, err := fixture.state.PairingAttempt(ctx, expected.id)
+			if err != nil || !found || record.State != expected.state {
+				t.Fatalf(
+					"PairingAttempt() = (%+v, %t, %v), want %q",
+					record,
+					found,
+					err,
+					expected.state,
+				)
+			}
+		})
+	}
+	pending, found, err := fixture.state.NextPairingFinalization(ctx)
+	if err != nil || !found || pending.AttemptID != finalizing.AttemptID {
+		t.Fatalf("NextPairingFinalization() = (%+v, %t, %v)", pending, found, err)
+	}
+	if _, found, err := fixture.state.PairingAttempt(
+		ctx,
+		completed.AttemptID,
+	); err != nil || found {
+		t.Fatalf("completed attempt after pruning = (found=%t, err=%v)", found, err)
+	}
+	if _, found, err := fixture.state.PairingInvite(
+		ctx,
+		completed.InviteID,
+	); err != nil || found {
+		t.Fatalf("completed invite after pruning = (found=%t, err=%v)", found, err)
+	}
+	wantSeededPruned := int(wantPruned) - 1
+	for index := range wantSeededPruned {
+		if _, found, err := fixture.state.PairingInvite(ctx, seeded[index]); err != nil || found {
+			t.Fatalf("pruned invite %d = (found=%t, err=%v)", index, found, err)
+		}
+	}
+	if _, found, err := fixture.state.PairingInvite(
+		ctx,
+		seeded[wantSeededPruned],
+	); err != nil || !found {
+		t.Fatalf("first retained history = (found=%t, err=%v)", found, err)
+	}
+	if err := fixture.state.store.withConn(ctx, func(conn *sqlite.Conn) error {
+		assertIntQuery(
+			t,
+			conn,
+			"SELECT count(*) FROM pairing_invites;",
+			MaxPairingHistoryEntries,
+		)
+		assertIntQuery(
+			t,
+			conn,
+			"SELECT count(*) FROM pairing_secret_deletions;",
+			1,
+		)
+		assertIntQuery(
+			t,
+			conn,
+			"SELECT count(*) FROM pairing_attempt_finalizations;",
+			1,
+		)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := fixture.state.MaintainPairingState(
+		ctx,
+		"2026-08-13T12:05:01Z",
+	)
+	if err != nil || second != (PairingMaintenanceResult{}) {
+		t.Fatalf("idempotent maintenance = (%+v, %v)", second, err)
+	}
+}
+
+func TestRecoverPairingStateBoundsHistoryAfterReopen(t *testing.T) {
+	fixture := newPairingLifecycleFixture(t, false, "", false)
+	seeded := seedTerminalPairingHistory(
+		t,
+		fixture,
+		11000,
+		MaxPairingHistoryEntries+1,
+		false,
+	)
+	path := fixture.state.store.path
+	if err := fixture.state.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	result, err := reopened.LocalState().RecoverPairingState(
+		context.Background(),
+		"2026-08-13T12:05:00Z",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != (PairingMaintenanceResult{PrunedHistory: 1}) {
+		t.Fatalf("RecoverPairingState() = %+v", result)
+	}
+	if _, found, err := reopened.LocalState().PairingInvite(
+		context.Background(),
+		seeded[0],
+	); err != nil || found {
+		t.Fatalf("oldest history after reopen = (found=%t, err=%v)", found, err)
+	}
+	if err := reopened.withConn(context.Background(), func(conn *sqlite.Conn) error {
+		assertIntQuery(
+			t,
+			conn,
+			"SELECT count(*) FROM pairing_invites;",
+			MaxPairingHistoryEntries,
+		)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPairingHistoryCapBackpressuresWhenEveryRowIsProtected(t *testing.T) {
+	fixture := newPairingLifecycleFixture(t, false, "", false)
+	seedTerminalPairingHistory(
+		t,
+		fixture,
+		12000,
+		MaxPairingHistoryEntries,
+		true,
+	)
+	candidate := fixture.invite(
+		t,
+		pairingTestUUID(13000),
+		pairing.ModeNew,
+		1,
+		0,
+	)
+	if _, _, err := fixture.state.ReservePairingInvite(
+		context.Background(),
+		candidate,
+	); !errors.Is(err, ErrPairingInviteLimit) {
+		t.Fatalf(
+			"ReservePairingInvite() error = %v, want %v",
+			err,
+			ErrPairingInviteLimit,
+		)
+	}
+	if err := fixture.state.store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			assertIntQuery(
+				t,
+				conn,
+				"SELECT count(*) FROM pairing_invites;",
+				MaxPairingHistoryEntries,
+			)
+			assertIntQuery(
+				t,
+				conn,
+				"SELECT count(*) FROM pairing_secret_deletions;",
+				MaxPairingHistoryEntries,
+			)
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPairingInviteConcurrentValidProofHasOneWinner(t *testing.T) {
 	fixture := newPairingLifecycleFixture(t, false, "", false)
 	invite := fixture.invite(t, pairingTestUUID(420), pairing.ModeNew, 1, 0)
@@ -1224,6 +1518,84 @@ func (fixture pairingLifecycleFixture) verifiedRequest(
 		t.Fatal(err)
 	}
 	return verified
+}
+
+func seedTerminalPairingHistory(
+	t *testing.T,
+	fixture pairingLifecycleFixture,
+	firstID int,
+	count int,
+	keepSecretDeletion bool,
+) []domain.UUIDv7 {
+	t.Helper()
+	ids := make([]domain.UUIDv7, count)
+	err := fixture.state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		for index := range count {
+			inviteID := pairingTestUUID(firstID + index)
+			ids[index] = inviteID
+			digest := sha256.Sum256([]byte(inviteID))
+			if err := execute(
+				conn,
+				`INSERT INTO pairing_invites(
+				    invite_id, session_id, workspace_id, recovery_generation,
+				    issuer_device_id, invite_digest, mode, subject_device_id,
+				    expected_entity_version, role, initial_credential_epoch,
+				    state, proof_failures, consumed_attempt_id,
+				    created_at, expires_at, terminal_at
+				) VALUES (
+				    ?1, ?2, ?3, 0, ?4, ?5, 'new', NULL, NULL,
+				    'editor', 1, 'revoked', 0, NULL,
+				    '2026-08-13T12:00:00Z', '2026-08-13T12:15:00Z',
+				    '2026-08-13T12:01:00Z'
+				);`,
+				string(inviteID),
+				testSessionID,
+				string(testWorkspaceID),
+				string(fixture.ownerID),
+				digest[:],
+			); err != nil {
+				return err
+			}
+			if keepSecretDeletion {
+				continue
+			}
+			if err := execute(
+				conn,
+				"DELETE FROM pairing_secret_deletions WHERE invite_id = ?1;",
+				string(inviteID),
+			); err != nil {
+				return err
+			}
+			if err := requireOneChangedRow(conn); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+func completePairingSecretDeletionForTest(
+	t *testing.T,
+	state LocalState,
+	inviteID domain.UUIDv7,
+) {
+	t.Helper()
+	duplicate, err := state.CompletePairingSecretDeletion(
+		context.Background(),
+		domain.UUIDv7(testSessionID),
+		inviteID,
+	)
+	if err != nil || duplicate {
+		t.Fatalf(
+			"CompletePairingSecretDeletion() = (duplicate=%t, err=%v)",
+			duplicate,
+			err,
+		)
+	}
 }
 
 func insertPairingSubject(

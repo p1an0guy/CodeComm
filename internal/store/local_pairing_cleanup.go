@@ -68,7 +68,11 @@ func (state LocalState) CompletePairingSecretDeletion(
 		}
 		if count == 0 {
 			duplicate = true
-			return nil
+			_, err := prunePairingHistory(
+				conn,
+				MaxPairingHistoryEntries,
+			)
+			return err
 		}
 		if count != 1 {
 			return ErrPairingStateIntegrity
@@ -80,7 +84,14 @@ func (state LocalState) CompletePairingSecretDeletion(
 		); err != nil {
 			return err
 		}
-		return requireOneChangedRow(conn)
+		if err := requireOneChangedRow(conn); err != nil {
+			return err
+		}
+		_, err := prunePairingHistory(
+			conn,
+			MaxPairingHistoryEntries,
+		)
+		return err
 	})
 	return duplicate, err
 }
