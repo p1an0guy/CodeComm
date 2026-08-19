@@ -9,6 +9,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -23,6 +24,12 @@ var (
 	ErrResultRangeNotCovered = errors.New(
 		"store: result range is not covered by the active generation",
 	)
+	ErrResultRangeSnapshotRequired = errors.New(
+		"store: result range requires a generation snapshot",
+	)
+	ErrResultRangeAuthorityNotCovered = errors.New(
+		"store: result range cannot end at the required authority",
+	)
 	ErrResultRangeTooLarge = errors.New(
 		"store: first result exceeds the requested range byte limit",
 	)
@@ -31,9 +38,10 @@ var (
 // ResultRangeOptions bounds one immutable result export. MaxBytes measures
 // the encoded JSON results array, including brackets and commas.
 type ResultRangeOptions struct {
-	AfterResultIndex uint64
-	MaxResults       int
-	MaxBytes         int
+	AfterResultIndex          uint64
+	MaxResults                int
+	MaxBytes                  int
+	RequiredAuthorityDeviceID domain.DeviceID
 }
 
 func (options ResultRangeOptions) validate() error {
@@ -41,7 +49,9 @@ func (options ResultRangeOptions) validate() error {
 		options.MaxResults < 1 ||
 		options.MaxResults > MaxResultRangeItems ||
 		options.MaxBytes < 2 ||
-		options.MaxBytes > MaxResultRangeBytes {
+		options.MaxBytes > MaxResultRangeBytes ||
+		options.RequiredAuthorityDeviceID != "" &&
+			!options.RequiredAuthorityDeviceID.Valid() {
 		return fmt.Errorf("%w: invalid result-range options", ErrInvalidOptions)
 	}
 	return nil
@@ -119,8 +129,15 @@ func (store *Store) ExportResultRange(
 		if err != nil {
 			return err
 		}
-		if options.AfterResultIndex < genesis.predecessorResultIndex ||
-			options.AfterResultIndex > state.resultIndex {
+		if options.AfterResultIndex < genesis.predecessorResultIndex {
+			return fmt.Errorf(
+				"%w: cursor %d precedes generation boundary %d",
+				ErrResultRangeSnapshotRequired,
+				options.AfterResultIndex,
+				genesis.predecessorResultIndex,
+			)
+		}
+		if options.AfterResultIndex > state.resultIndex {
 			return fmt.Errorf(
 				"%w: cursor %d outside [%d,%d]",
 				ErrResultRangeNotCovered,
@@ -145,7 +162,16 @@ func (store *Store) ExportResultRange(
 		if err != nil {
 			return err
 		}
-		eventIDs, err := resultRangeEventIDs(
+		authorization, err := resultRangeAuthorizationAt(
+			conn,
+			state,
+			options.AfterResultIndex,
+			options.RequiredAuthorityDeviceID,
+		)
+		if err != nil {
+			return err
+		}
+		records, err := resultRangeRecords(
 			conn,
 			state,
 			options.AfterResultIndex,
@@ -154,20 +180,31 @@ func (store *Store) ExportResultRange(
 		if err != nil {
 			return err
 		}
-		if len(eventIDs) == 0 {
+		if len(records) == 0 {
 			return historyIntegrityError(
 				"covered result range is unexpectedly empty",
 				nil,
 			)
 		}
 
-		results := make([][]byte, 0, len(eventIDs))
+		results := make([][]byte, 0, len(records))
+		heads := make([]resultRangeHead, 1, len(records)+1)
+		heads[0] = start
+		authorizations := make(
+			[]resultRangeAuthorization,
+			1,
+			len(records)+1,
+		)
+		authorizations[0] = authorization
 		resultHead := start.resultHash
 		chainIndex := start.chainIndex
 		chainHead := start.chainHash
 		encodedBytes := 2
-		for _, eventID := range eventIDs {
-			stored, exists, err := readStoredCommandResult(conn, eventID)
+		for _, record := range records {
+			stored, exists, err := readStoredCommandResult(
+				conn,
+				record.eventID,
+			)
 			if err != nil {
 				return err
 			}
@@ -259,15 +296,44 @@ func (store *Store) ExportResultRange(
 			resultHead = Digest(nextResult)
 			chainIndex = nextChainIndex
 			chainHead = nextChainHead
+			heads = append(heads, resultRangeHead{
+				resultHash: resultHead,
+				chainIndex: chainIndex,
+				chainHash:  chainHead,
+			})
+			nextAuthorization := authorizations[len(authorizations)-1]
+			if record.authorizationChange {
+				nextAuthorization, err = resultRangeAuthorizationAt(
+					conn,
+					state,
+					expectedIndex,
+					options.RequiredAuthorityDeviceID,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			authorizations = append(authorizations, nextAuthorization)
 		}
 
-		authority, err := resultRangeAuthorityAt(
-			conn,
-			state,
-			options.AfterResultIndex+uint64(len(results)),
-		)
-		if err != nil {
-			return err
+		authorization = authorizations[len(results)]
+		if required := options.RequiredAuthorityDeviceID; required != "" {
+			for !authorization.permits(required) {
+				if len(results) == 1 {
+					return fmt.Errorf(
+						"%w: device %s is not an active authority through result %d",
+						ErrResultRangeAuthorityNotCovered,
+						required,
+						options.AfterResultIndex+1,
+					)
+				}
+				results = results[:len(results)-1]
+				authorization = authorizations[len(results)]
+			}
+			selected := heads[len(results)]
+			resultHead = selected.resultHash
+			chainIndex = selected.chainIndex
+			chainHead = selected.chainHash
 		}
 		workspaceID, err := resultRangeWorkspaceID(
 			conn,
@@ -290,7 +356,7 @@ func (store *Store) ExportResultRange(
 			EndChainHash:             chainHead,
 			Results:                  results,
 			ServerAppliedResultIndex: state.resultIndex,
-			Authority:                authority,
+			Authority:                authorization.authority,
 		}
 		found = true
 		return nil
@@ -299,6 +365,18 @@ func (store *Store) ExportResultRange(
 		return ResultRange{}, false, err
 	}
 	return exported, found, nil
+}
+
+// ExportResultRange exposes verified result history through the restricted
+// local-state capability without exposing Store lifecycle or SQLite access.
+func (state LocalState) ExportResultRange(
+	ctx context.Context,
+	options ResultRangeOptions,
+) (ResultRange, bool, error) {
+	if state.store == nil {
+		return ResultRange{}, false, ErrInvalidLocalState
+	}
+	return state.store.ExportResultRange(ctx, options)
 }
 
 type resultRangeHead struct {
@@ -405,22 +483,33 @@ func resultRangeStart(
 	return start, nil
 }
 
-func resultRangeEventIDs(
+type resultRangeRecord struct {
+	eventID             domain.UUIDv7
+	authorizationChange bool
+}
+
+func resultRangeRecords(
 	conn *sqlite.Conn,
 	state consensusState,
 	afterResultIndex uint64,
 	limit int,
-) ([]domain.UUIDv7, error) {
-	result := make([]domain.UUIDv7, 0, limit)
+) ([]resultRangeRecord, error) {
+	result := make([]resultRangeRecord, 0, limit)
 	var rowErr error
 	err := queryArgs(
 		conn,
-		`SELECT event_id
-		   FROM command_results
-		  WHERE session_id = ?1
-		    AND recovery_generation = ?2
-		    AND result_index > ?3
-		  ORDER BY result_index
+		`SELECT r.event_id,
+		        EXISTS (
+		            SELECT 1
+		              FROM json_each(r.projection_mutations_json) AS mutation
+		             WHERE json_extract(mutation.value, '$.table')
+		                   IN ('devices', 'credential_authority')
+		        )
+		   FROM command_results AS r
+		  WHERE r.session_id = ?1
+		    AND r.recovery_generation = ?2
+		    AND r.result_index > ?3
+		  ORDER BY r.result_index
 		  LIMIT ?4;`,
 		[]any{
 			string(state.sessionID),
@@ -437,7 +526,10 @@ func resultRangeEventIDs(
 				rowErr = errors.New("invalid result event ID")
 				return
 			}
-			result = append(result, eventID)
+			result = append(result, resultRangeRecord{
+				eventID:             eventID,
+				authorizationChange: stmt.ColumnBool(1),
+			})
 		},
 	)
 	if err != nil {
@@ -472,59 +564,122 @@ func resultRangeWorkspaceID(
 	return workspaceID, nil
 }
 
-func resultRangeAuthorityAt(
+type resultRangeAuthorization struct {
+	authority    voterset.Set
+	signerActive bool
+}
+
+func (authorization resultRangeAuthorization) permits(
+	deviceID domain.DeviceID,
+) bool {
+	return deviceID == "" ||
+		authorization.signerActive &&
+			authorization.authority.Contains(deviceID)
+}
+
+func resultRangeAuthorizationAt(
 	conn *sqlite.Conn,
 	state consensusState,
 	resultIndex uint64,
-) (voterset.Set, error) {
+	requiredDeviceID domain.DeviceID,
+) (resultRangeAuthorization, error) {
 	rows, err := projectionRowsAtResultCut(conn, state, resultIndex)
 	if err != nil {
-		return voterset.Set{},
+		return resultRangeAuthorization{},
 			historyIntegrityError("reconstruct result-range authority", err)
 	}
 	var (
-		authority voterset.Set
-		found     bool
+		authorization  resultRangeAuthorization
+		authorityFound bool
+		deviceFound    bool
 	)
 	for _, row := range rows {
-		if row.Table != "credential_authority" {
-			continue
+		switch row.Table {
+		case "credential_authority":
+			if authorityFound {
+				return resultRangeAuthorization{},
+					historyIntegrityError(
+						"duplicate credential authority",
+						nil,
+					)
+			}
+			var wire struct {
+				SessionID       string   `json:"session_id"`
+				VoterDeviceIDs  []string `json:"voter_device_ids"`
+				VoterSetVersion uint64   `json:"voter_set_version"`
+			}
+			if err := json.Unmarshal(row.Row, &wire); err != nil {
+				return resultRangeAuthorization{},
+					historyIntegrityError(
+						"decode credential authority",
+						err,
+					)
+			}
+			if domain.UUIDv7(wire.SessionID) != state.sessionID {
+				return resultRangeAuthorization{},
+					historyIntegrityError(
+						"credential authority session differs",
+						nil,
+					)
+			}
+			voters := make(
+				[]domain.DeviceID,
+				len(wire.VoterDeviceIDs),
+			)
+			for index, encoded := range wire.VoterDeviceIDs {
+				voters[index] = domain.DeviceID(encoded)
+			}
+			authorization.authority, err = voterset.New(
+				state.sessionID,
+				voters,
+				wire.VoterSetVersion,
+			)
+			if err != nil {
+				return resultRangeAuthorization{},
+					historyIntegrityError(
+						"invalid credential authority",
+						err,
+					)
+			}
+			authorityFound = true
+		case "devices":
+			if requiredDeviceID == "" {
+				continue
+			}
+			var wire struct {
+				DeviceID string `json:"device_id"`
+				Status   string `json:"status"`
+			}
+			if err := json.Unmarshal(row.Row, &wire); err != nil {
+				return resultRangeAuthorization{},
+					historyIntegrityError("decode authority device", err)
+			}
+			deviceID := domain.DeviceID(wire.DeviceID)
+			status := device.Status(wire.Status)
+			if !deviceID.Valid() || !status.Valid() {
+				return resultRangeAuthorization{},
+					historyIntegrityError("invalid authority device", nil)
+			}
+			if deviceID != requiredDeviceID {
+				continue
+			}
+			if deviceFound {
+				return resultRangeAuthorization{},
+					historyIntegrityError("duplicate authority device", nil)
+			}
+			deviceFound = true
+			authorization.signerActive = status == device.StatusActive
 		}
-		if found {
-			return voterset.Set{},
-				historyIntegrityError("duplicate credential authority", nil)
-		}
-		var wire struct {
-			SessionID       string   `json:"session_id"`
-			VoterDeviceIDs  []string `json:"voter_device_ids"`
-			VoterSetVersion uint64   `json:"voter_set_version"`
-		}
-		if err := json.Unmarshal(row.Row, &wire); err != nil {
-			return voterset.Set{},
-				historyIntegrityError("decode credential authority", err)
-		}
-		if domain.UUIDv7(wire.SessionID) != state.sessionID {
-			return voterset.Set{},
-				historyIntegrityError("credential authority session differs", nil)
-		}
-		voters := make([]domain.DeviceID, len(wire.VoterDeviceIDs))
-		for index, encoded := range wire.VoterDeviceIDs {
-			voters[index] = domain.DeviceID(encoded)
-		}
-		authority, err = voterset.New(
-			state.sessionID,
-			voters,
-			wire.VoterSetVersion,
-		)
-		if err != nil {
-			return voterset.Set{},
-				historyIntegrityError("invalid credential authority", err)
-		}
-		found = true
 	}
-	if !found {
-		return voterset.Set{},
+	if !authorityFound {
+		return resultRangeAuthorization{},
 			historyIntegrityError("credential authority is missing", nil)
 	}
-	return authority, nil
+	if requiredDeviceID != "" &&
+		authorization.authority.Contains(requiredDeviceID) &&
+		!deviceFound {
+		return resultRangeAuthorization{},
+			historyIntegrityError("authority device is missing", nil)
+	}
+	return authorization, nil
 }

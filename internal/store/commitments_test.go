@@ -202,6 +202,19 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 		got.ProjectionAccumulator == predecessor.ProjectionAccumulator {
 		t.Fatal("successor failed to reseed every commitment head")
 	}
+	if _, _, err := store.ExportResultRange(
+		context.Background(),
+		ResultRangeOptions{
+			AfterResultIndex: predecessor.ResultIndex - 1,
+			MaxResults:       1,
+			MaxBytes:         2,
+		},
+	); !errors.Is(err, ErrResultRangeSnapshotRequired) {
+		t.Fatalf(
+			"predecessor cursor error = %v, want snapshot required",
+			err,
+		)
+	}
 	assertCounts(t, store, map[string]int64{
 		"tasks":           0,
 		"events":          1,

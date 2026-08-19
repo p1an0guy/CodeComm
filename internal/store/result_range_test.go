@@ -10,6 +10,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/replication"
 )
@@ -245,6 +246,185 @@ func TestExportResultRangeHonorsItemAndByteLimits(t *testing.T) {
 	}
 }
 
+func TestExportResultRangeEndsAtRequiredAuthority(t *testing.T) {
+	fixture := newResultRangeFixture(t)
+
+	otherPrivateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x91}, ed25519.SeedSize),
+	)
+	defer clear(otherPrivateKey)
+	otherDeviceID, err := device.DeriveID(
+		otherPrivateKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("device.DeriveID(other): %v", err)
+	}
+	thirdEventID := domain.UUIDv7(
+		"01890f47-3e72-7000-8000-000000000099",
+	)
+	thirdRequest := acceptedApplyRequest(
+		t,
+		testSignedTaskEvent(t, thirdEventID, 2),
+	)
+	thirdRequest.LogIndex = 3
+	thirdRequest.AppliedAt = domain.Timestamp("2026-08-10T12:00:02Z")
+	thirdRequest.Audit = nil
+	otherPublicKey := bytes.Clone(
+		otherPrivateKey.Public().(ed25519.PublicKey),
+	)
+	thirdRequest.Projections.Devices = []device.Device{{
+		ID:                otherDeviceID,
+		Role:              device.RoleEditor,
+		IdentityPublicKey: otherPublicKey,
+		DaemonVersion:     "1.0.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}}
+	handoff := [ed25519.SignatureSize]byte{}
+	handoff[0] = 1
+	thirdRequest.Projections.CredentialAuthority =
+		[]CredentialAuthorityRow{{
+			SessionID:                   domain.UUIDv7(testSessionID),
+			VoterDeviceIDs:              []domain.DeviceID{otherDeviceID},
+			VoterSetVersion:             2,
+			ActivationSource:            CredentialAuthorityHandoff,
+			ActivationCheckpointEventID: thirdEventID,
+			ActivationProofs: []ActivationProof{{
+				VoterDeviceID: otherDeviceID,
+				CanonicalJSON: []byte(`{"proof":1}`),
+			}},
+			PriorAuthoritySigner:  fixture.authorityDeviceID,
+			PriorAuthorityHandoff: &handoff,
+		}}
+	third, err := fixture.store.Apply(context.Background(), thirdRequest)
+	if err != nil {
+		t.Fatalf("Apply(third authority handoff): %v", err)
+	}
+
+	options := ResultRangeOptions{
+		AfterResultIndex:          fixture.initial.ResultIndex,
+		MaxResults:                MaxResultRangeItems,
+		MaxBytes:                  MaxResultRangeBytes,
+		RequiredAuthorityDeviceID: fixture.authorityDeviceID,
+	}
+	prior, found, err := fixture.store.ExportResultRange(
+		context.Background(),
+		options,
+	)
+	if err != nil || !found {
+		t.Fatalf(
+			"ExportResultRange(prior authority) = found %t, err %v",
+			found,
+			err,
+		)
+	}
+	if prior.ToResultIndex != fixture.second.Heads.ResultIndex ||
+		prior.EndResultHash != fixture.second.Heads.ResultHash ||
+		len(prior.Results) != 2 ||
+		!prior.Authority.Contains(fixture.authorityDeviceID) {
+		t.Fatalf("prior-authority range = %+v", prior)
+	}
+
+	options.RequiredAuthorityDeviceID = otherDeviceID
+	current, found, err := fixture.store.ExportResultRange(
+		context.Background(),
+		options,
+	)
+	if err != nil || !found {
+		t.Fatalf(
+			"ExportResultRange(current authority) = found %t, err %v",
+			found,
+			err,
+		)
+	}
+	if current.ToResultIndex != third.Heads.ResultIndex ||
+		current.EndResultHash != third.Heads.ResultHash ||
+		len(current.Results) != 3 ||
+		!current.Authority.Contains(otherDeviceID) {
+		t.Fatalf("current-authority range = %+v", current)
+	}
+
+	missingPrivateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x92}, ed25519.SeedSize),
+	)
+	defer clear(missingPrivateKey)
+	missingDeviceID, err := device.DeriveID(
+		missingPrivateKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("device.DeriveID(missing): %v", err)
+	}
+	options.RequiredAuthorityDeviceID = missingDeviceID
+	if _, _, err := fixture.store.ExportResultRange(
+		context.Background(),
+		options,
+	); !errors.Is(err, ErrResultRangeAuthorityNotCovered) {
+		t.Fatalf(
+			"missing-authority error = %v, want ErrResultRangeAuthorityNotCovered",
+			err,
+		)
+	}
+}
+
+func TestExportResultRangeRejectsRevokedAuthorityAtBatchEnd(
+	t *testing.T,
+) {
+	fixture := newResultRangeFixture(t)
+	member := resultRangeTestAuthorityDevice(t)
+	member.Status = device.StatusRevoked
+	member.EntityVersion++
+
+	thirdRequest := acceptedApplyRequest(
+		t,
+		testSignedTaskEvent(
+			t,
+			domain.UUIDv7("01890f47-3e72-7000-8000-000000000099"),
+			2,
+		),
+	)
+	thirdRequest.LogIndex = 3
+	thirdRequest.AppliedAt = domain.Timestamp("2026-08-10T12:00:02Z")
+	thirdRequest.Audit = nil
+	thirdRequest.Projections.Devices = []device.Device{member}
+	third, err := fixture.store.Apply(context.Background(), thirdRequest)
+	if err != nil {
+		t.Fatalf("Apply(revocation projection): %v", err)
+	}
+
+	options := ResultRangeOptions{
+		AfterResultIndex:          fixture.initial.ResultIndex,
+		MaxResults:                MaxResultRangeItems,
+		MaxBytes:                  MaxResultRangeBytes,
+		RequiredAuthorityDeviceID: fixture.authorityDeviceID,
+	}
+	got, found, err := fixture.store.ExportResultRange(
+		context.Background(),
+		options,
+	)
+	if err != nil || !found {
+		t.Fatalf("ExportResultRange() = found %t, err %v", found, err)
+	}
+	if got.ToResultIndex != fixture.second.Heads.ResultIndex ||
+		got.EndResultHash != fixture.second.Heads.ResultHash ||
+		got.ServerAppliedResultIndex != third.Heads.ResultIndex ||
+		len(got.Results) != 2 ||
+		!got.Authority.Contains(fixture.authorityDeviceID) {
+		t.Fatalf("range ending before revocation = %+v", got)
+	}
+
+	options.AfterResultIndex = fixture.second.Heads.ResultIndex
+	if _, _, err := fixture.store.ExportResultRange(
+		context.Background(),
+		options,
+	); !errors.Is(err, ErrResultRangeAuthorityNotCovered) {
+		t.Fatalf(
+			"post-revocation range error = %v, want authority not covered",
+			err,
+		)
+	}
+}
+
 func TestExportResultRangeRejectsInvalidCursorAndCorruption(t *testing.T) {
 	t.Run("cursor beyond head", func(t *testing.T) {
 		fixture := newResultRangeFixture(t)
@@ -312,6 +492,14 @@ func TestExportResultRangeValidatesOptionsContextAndClosedStore(t *testing.T) {
 				MaxBytes:   MaxResultRangeBytes + 1,
 			},
 		},
+		{
+			name: "invalid required authority",
+			options: ResultRangeOptions{
+				MaxResults:                1,
+				MaxBytes:                  2,
+				RequiredAuthorityDeviceID: "not-a-device",
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, _, err := fixture.store.ExportResultRange(
@@ -337,6 +525,12 @@ func TestExportResultRangeValidatesOptionsContextAndClosedStore(t *testing.T) {
 	); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("nil context error = %v, want ErrInvalidOptions", err)
 	}
+	if _, _, err := (LocalState{}).ExportResultRange(
+		context.Background(),
+		valid,
+	); !errors.Is(err, ErrInvalidLocalState) {
+		t.Fatalf("zero LocalState error = %v, want ErrInvalidLocalState", err)
+	}
 	if err := fixture.store.Close(); err != nil {
 		t.Fatalf("Close(): %v", err)
 	}
@@ -361,6 +555,10 @@ func newResultRangeFixture(t *testing.T) resultRangeFixture {
 
 	firstProposal := testSignedTaskEvent(t, testEventID, 1)
 	authorityDeviceID := firstProposal.Proposal().Origin.DeviceID()
+	authorityDevice := resultRangeTestAuthorityDevice(t)
+	if authorityDevice.ID != authorityDeviceID {
+		t.Fatal("result-range authority fixture identity differs")
+	}
 	target, err := voterset.New(
 		domain.UUIDv7(testSessionID),
 		[]domain.DeviceID{authorityDeviceID},
@@ -374,6 +572,7 @@ func newResultRangeFixture(t *testing.T) resultRangeFixture {
 		domain.UUIDv7(testSessionID),
 		0,
 		ProjectionWrites{
+			Devices:  []device.Device{authorityDevice},
 			VoterSet: []voterset.Set{target},
 			CredentialAuthority: []CredentialAuthorityRow{{
 				SessionID:        domain.UUIDv7(testSessionID),
@@ -413,5 +612,29 @@ func newResultRangeFixture(t *testing.T) resultRangeFixture {
 		first:             first,
 		second:            second,
 		authorityDeviceID: authorityDeviceID,
+	}
+}
+
+func resultRangeTestAuthorityDevice(t *testing.T) device.Device {
+	t.Helper()
+	seed := make([]byte, ed25519.SeedSize)
+	for index := range seed {
+		seed[index] = byte(index + 1)
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	defer clear(privateKey)
+	publicKey := bytes.Clone(privateKey.Public().(ed25519.PublicKey))
+	deviceID, err := device.DeriveID(publicKey)
+	if err != nil {
+		t.Fatalf("device.DeriveID(authority): %v", err)
+	}
+	return device.Device{
+		ID:                deviceID,
+		Role:              device.RoleOwner,
+		IdentityPublicKey: publicKey,
+		DaemonVersion:     "1.0.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
 	}
 }
