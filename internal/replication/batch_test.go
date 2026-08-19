@@ -9,6 +9,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 )
 
@@ -34,6 +35,9 @@ func TestBatchCanonicalRoundTripAndSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignBatch() error = %v", err)
 	}
+	if !batch.MatchesUnsigned(unsigned) {
+		t.Fatal("signed batch changed its unsigned preimage")
+	}
 	signature := batch.Signature()
 	if encoded := codec.EncodeBase64URL(signature[:]); len(encoded) !=
 		batchSignatureTextBytes {
@@ -46,6 +50,22 @@ func TestBatchCanonicalRoundTripAndSignature(t *testing.T) {
 	if got, want := len(batch.CanonicalBytes()),
 		completeBatchSize(len(unsigned.CanonicalBytes())); got != want {
 		t.Fatalf("complete batch size = %d, want %d", got, want)
+	}
+	var streamed bytes.Buffer
+	if err := batch.WriteCanonical(&streamed); err != nil {
+		t.Fatalf("WriteCanonical() error = %v", err)
+	}
+	if batch.EncodedLen() != streamed.Len() ||
+		!bytes.Equal(streamed.Bytes(), batch.CanonicalBytes()) {
+		t.Fatal("streamed batch differs from canonical bytes")
+	}
+	metadata := unsigned.Metadata()
+	if metadata.FromResultIndex != input.FromResultIndex ||
+		metadata.ToResultIndex != input.ToResultIndex ||
+		metadata.ServerDeviceID != input.ServerDeviceID ||
+		metadata.ServerAppliedResultIndex !=
+			input.ServerAppliedResultIndex {
+		t.Fatalf("Metadata() = %+v", metadata)
 	}
 	parsed, err := ParseBatch(batch.CanonicalBytes())
 	if err != nil {
@@ -76,6 +96,31 @@ func TestBatchCanonicalRoundTripAndSignature(t *testing.T) {
 		if bytes.Contains(unsigned.CanonicalBytes(), excluded) {
 			t.Errorf("batch command-result record contains %q", excluded)
 		}
+	}
+}
+
+func TestBatchResultPageLimitLeavesCompleteEnvelopeReserve(t *testing.T) {
+	t.Parallel()
+
+	input, _ := validBatchInput(t)
+	input.FromResultIndex = domain.MaxSafeInteger
+	input.ToResultIndex = domain.MaxSafeInteger
+	input.StartChainIndex = domain.MaxSafeInteger
+	input.EndChainIndex = domain.MaxSafeInteger
+	input.RecoveryGeneration = domain.MaxSafeInteger
+	input.ServerAppliedResultIndex = domain.MaxSafeInteger
+	input.ServerAuthorityVersion = domain.MaxSafeInteger
+	input.Results = nil
+	metadata, _ := encodeUnsignedBatch(input)
+	size := completeBatchSize(
+		len(metadata) + MaxBatchResultsBytes - len(`[]`),
+	)
+	if size > MaxBatchExpandedBytes {
+		t.Fatalf(
+			"maximum result page produces %d-byte envelope, limit %d",
+			size,
+			MaxBatchExpandedBytes,
+		)
 	}
 }
 

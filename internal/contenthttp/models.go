@@ -14,6 +14,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/replication"
 )
 
 const (
@@ -42,6 +43,7 @@ func (hop ProposalHop) valid() bool {
 type Service interface {
 	Session(context.Context) (SessionResponse, error)
 	Peers(context.Context) (PeersResponse, error)
+	Replication(context.Context, uint64) (replication.Batch, error)
 	ProposeEvent(
 		context.Context,
 		domain.DeviceID,

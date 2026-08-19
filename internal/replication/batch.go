@@ -21,6 +21,7 @@ const (
 	MaxBatchResults         = 256
 	MaxBatchCompressedBytes = 4 << 20
 	MaxBatchExpandedBytes   = 64 << 20
+	MaxBatchResultsBytes    = MaxBatchExpandedBytes - (4 << 10)
 	batchSignatureTextBytes = 86
 )
 
@@ -44,6 +45,25 @@ type BatchInput struct {
 	EndChainIndex            uint64
 	EndChainHash             chain.Digest
 	Results                  [][]byte
+	SessionID                domain.UUIDv7
+	WorkspaceID              domain.UUIDv4
+	RecoveryGeneration       uint64
+	ServerDeviceID           domain.DeviceID
+	ServerAppliedResultIndex uint64
+	ServerAuthorityVersion   uint64
+}
+
+// BatchMetadata is the signed envelope without the potentially large result
+// array.
+type BatchMetadata struct {
+	FromResultIndex          uint64
+	ToResultIndex            uint64
+	StartResultHash          chain.Digest
+	EndResultHash            chain.Digest
+	StartChainIndex          uint64
+	StartChainHash           chain.Digest
+	EndChainIndex            uint64
+	EndChainHash             chain.Digest
 	SessionID                domain.UUIDv7
 	WorkspaceID              domain.UUIDv4
 	RecoveryGeneration       uint64
@@ -242,6 +262,29 @@ func (batch UnsignedBatch) Input() BatchInput {
 	return result
 }
 
+// Metadata returns the signed envelope without copying results.
+func (batch UnsignedBatch) Metadata() BatchMetadata {
+	if !batch.valid {
+		return BatchMetadata{}
+	}
+	return BatchMetadata{
+		FromResultIndex:          batch.input.FromResultIndex,
+		ToResultIndex:            batch.input.ToResultIndex,
+		StartResultHash:          batch.input.StartResultHash,
+		EndResultHash:            batch.input.EndResultHash,
+		StartChainIndex:          batch.input.StartChainIndex,
+		StartChainHash:           batch.input.StartChainHash,
+		EndChainIndex:            batch.input.EndChainIndex,
+		EndChainHash:             batch.input.EndChainHash,
+		SessionID:                batch.input.SessionID,
+		WorkspaceID:              batch.input.WorkspaceID,
+		RecoveryGeneration:       batch.input.RecoveryGeneration,
+		ServerDeviceID:           batch.input.ServerDeviceID,
+		ServerAppliedResultIndex: batch.input.ServerAppliedResultIndex,
+		ServerAuthorityVersion:   batch.input.ServerAuthorityVersion,
+	}
+}
+
 // CanonicalBytes returns an independent copy of the signature preimage.
 func (batch UnsignedBatch) CanonicalBytes() []byte {
 	return bytes.Clone(batch.canonical)
@@ -258,6 +301,40 @@ func (batch Batch) CanonicalBytes() []byte {
 		return nil
 	}
 	return encodeCompleteBatch(batch.unsigned.canonical, batch.signature)
+}
+
+// EncodedLen returns the complete canonical batch size without encoding it.
+func (batch Batch) EncodedLen() int {
+	if err := batch.validate(); err != nil {
+		return 0
+	}
+	return completeBatchSize(len(batch.unsigned.canonical))
+}
+
+// WriteCanonical streams the complete canonical batch without allocating a
+// second result-sized buffer.
+func (batch Batch) WriteCanonical(writer io.Writer) error {
+	if writer == nil {
+		return ErrInvalidBatch
+	}
+	if err := batch.validate(); err != nil {
+		return err
+	}
+	if err := writeAll(
+		writer,
+		completeBatchPrefix(batch.signature),
+	); err != nil {
+		return err
+	}
+	return writeAll(writer, batch.unsigned.canonical[1:])
+}
+
+// MatchesUnsigned reports whether the signed batch contains the exact
+// validated preimage without copying it.
+func (batch Batch) MatchesUnsigned(unsigned UnsignedBatch) bool {
+	return batch.validate() == nil &&
+		unsigned.validate() == nil &&
+		bytes.Equal(batch.unsigned.canonical, unsigned.canonical)
 }
 
 // Signature returns the complete identity signature by value.
@@ -732,4 +809,21 @@ func appendQuoted(destination []byte, value string) []byte {
 	destination = append(destination, '"')
 	destination = append(destination, value...)
 	return append(destination, '"')
+}
+
+func writeAll(writer io.Writer, value []byte) error {
+	for len(value) != 0 {
+		written, err := writer.Write(value)
+		if written < 0 || written > len(value) {
+			return io.ErrShortWrite
+		}
+		value = value[written:]
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

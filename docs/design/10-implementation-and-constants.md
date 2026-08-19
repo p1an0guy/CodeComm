@@ -121,6 +121,7 @@ defect.
 | Snapshot signed-root / descriptor-page encoded maximum | 64 KiB / 4 MiB | Local, enforced before allocation |
 | Snapshot data-chunk compressed / expanded maximum | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Replication-batch compressed / expanded limit | 4 MiB / 64 MiB | Local, enforced before allocation |
+| Concurrent replication-batch responses | 1 per daemon | Local; bounds expanded-page memory while ordinary control requests continue |
 | Local IPC JSON body maximum | 1 MiB | Local; event payload remains subject to `max_event_bytes` |
 | Local IPC endpoint maximum | Unix socket path: 103 bytes; Windows named-pipe path: 256 ASCII characters | Local; registry-issued endpoint fails before listen/dial when exceeded |
 | Generated context cap | 256 KiB per agent/output file (§7.3) | Local |

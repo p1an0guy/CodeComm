@@ -31,14 +31,15 @@ const (
 	proposalHopHeader = "CodeComm-Proposal-Hop"
 	proposalHopOnce   = "1"
 
-	HeaderMaxBytes       = 32 << 10
-	ResponseMaxBytes     = 1 << 20
-	ControlStreamsMax    = 32
-	ActiveHandlersMax    = 128
-	RequestHeaderTimeout = 10 * time.Second
-	HandlerTimeout       = 120 * time.Second
-	ConnectionIdle       = 120 * time.Second
-	StreamNoProgress     = 30 * time.Second
+	HeaderMaxBytes         = 32 << 10
+	ResponseMaxBytes       = 1 << 20
+	ControlStreamsMax      = 32
+	ActiveHandlersMax      = 128
+	ReplicationHandlersMax = 1
+	RequestHeaderTimeout   = 10 * time.Second
+	HandlerTimeout         = 120 * time.Second
+	ConnectionIdle         = 120 * time.Second
+	StreamNoProgress       = 30 * time.Second
 )
 
 var (
@@ -61,13 +62,14 @@ var (
 
 // Server serves the fixed inbound V1 content-control routes.
 type Server struct {
-	service          Service
-	http2            *http2.Server
-	handlers         chan struct{}
-	control          *controlRegistry
-	headerTimeout    time.Duration
-	handlerTimeout   time.Duration
-	streamNoProgress time.Duration
+	service             Service
+	http2               *http2.Server
+	handlers            chan struct{}
+	replicationHandlers chan struct{}
+	control             *controlRegistry
+	headerTimeout       time.Duration
+	handlerTimeout      time.Duration
+	streamNoProgress    time.Duration
 }
 
 // New constructs the fixed V1 content-control HTTP/2 server.
@@ -99,11 +101,12 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 			MaxUploadBufferPerConnection: 1 << 16,
 			MaxUploadBufferPerStream:     event.MaxEventBytes,
 		},
-		handlers:         make(chan struct{}, activeHandlers),
-		control:          control,
-		headerTimeout:    RequestHeaderTimeout,
-		handlerTimeout:   HandlerTimeout,
-		streamNoProgress: StreamNoProgress,
+		handlers:            make(chan struct{}, activeHandlers),
+		replicationHandlers: make(chan struct{}, ReplicationHandlersMax),
+		control:             control,
+		headerTimeout:       RequestHeaderTimeout,
+		handlerTimeout:      HandlerTimeout,
+		streamNoProgress:    StreamNoProgress,
 	}, nil
 }
 
@@ -118,6 +121,7 @@ func (server *Server) ServeAuthenticatedConn(
 		server.service == nil ||
 		server.http2 == nil ||
 		server.handlers == nil ||
+		server.replicationHandlers == nil ||
 		server.control == nil ||
 		server.headerTimeout <= 0 ||
 		server.handlerTimeout <= 0 ||
@@ -310,12 +314,17 @@ func (handler *connectionHandler) ServeHTTP(
 		writeProblem(writer, http.StatusBadRequest, problemInvalidTransport)
 		return
 	}
-	if !validRequestTarget(request) {
+	if !validRequestPath(request) {
 		writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 		return
 	}
 	switch request.URL.Path {
+	case ReplicationPath:
 	case SessionPath, PeersPath, EventsPath:
+		if !validRequestTarget(request) {
+			writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
+			return
+		}
 	default:
 		writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 		return
@@ -325,6 +334,8 @@ func (handler *connectionHandler) ServeHTTP(
 		handler.serveRead(writer, request)
 	case EventsPath:
 		handler.serveEvent(writer, request)
+	case ReplicationPath:
+		handler.serveReplication(writer, request)
 	}
 }
 
@@ -565,11 +576,15 @@ func validRequestTransport(
 }
 
 func validRequestTarget(request *http.Request) bool {
+	return validRequestPath(request) &&
+		request.URL.RawQuery == "" &&
+		!request.URL.ForceQuery
+}
+
+func validRequestPath(request *http.Request) bool {
 	return request != nil &&
 		request.URL != nil &&
 		request.URL.RawPath == "" &&
-		request.URL.RawQuery == "" &&
-		!request.URL.ForceQuery &&
 		request.URL.Fragment == "" &&
 		request.URL.RawFragment == ""
 }
@@ -756,12 +771,21 @@ func writeJSON(
 	contentType string,
 	body []byte,
 ) {
+	writeJSONHeader(writer, status, contentType, len(body))
+	_, _ = writer.Write(body)
+}
+
+func writeJSONHeader(
+	writer http.ResponseWriter,
+	status int,
+	contentType string,
+	contentLength int,
+) {
 	writer.Header().Set("Cache-Control", "no-store")
-	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	writer.Header().Set("Content-Length", strconv.Itoa(contentLength))
 	writer.Header().Set("Content-Type", contentType)
 	writer.Header().Set("X-Content-Type-Options", "nosniff")
 	writer.WriteHeader(status)
-	_, _ = writer.Write(body)
 }
 
 var _ http.Handler = (*connectionHandler)(nil)

@@ -571,6 +571,7 @@ func runDaemon(
 			localState,
 			discoveryRuntime,
 			node,
+			identityPrivateKey,
 		)
 		if err != nil {
 			return err

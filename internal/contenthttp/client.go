@@ -22,6 +22,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
 )
@@ -84,6 +85,7 @@ type Client struct {
 	peerDER     []byte
 
 	lineageSet         bool
+	sessionBound       bool
 	workspaceID        domain.UUIDv4
 	recoveryGeneration uint64
 	expiryTimer        *time.Timer
@@ -127,7 +129,9 @@ func openClient(
 			_ = connection.Close()
 		}
 	}()
-	if ctx == nil || !expectedDeviceID.Valid() || admission == nil {
+	if ctx == nil ||
+		!expectedDeviceID.Valid() ||
+		admission == nil {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -250,6 +254,7 @@ func (client *Client) Session(ctx context.Context) (SessionResponse, error) {
 		response.WorkspaceID(),
 		response.RecoveryGeneration(),
 		response.ServerDeviceID(),
+		true,
 	); err != nil {
 		client.invalidate()
 		return SessionResponse{}, err
@@ -279,6 +284,7 @@ func (client *Client) Peers(ctx context.Context) (PeersResponse, error) {
 		response.WorkspaceID(),
 		response.RecoveryGeneration(),
 		response.ServerDeviceID(),
+		false,
 	); err != nil {
 		client.invalidate()
 		return PeersResponse{}, err
@@ -373,14 +379,40 @@ func (client *Client) request(
 	body []byte,
 	configure func(http.Header),
 ) ([]byte, error) {
+	return client.requestBounded(
+		ctx,
+		method,
+		path,
+		body,
+		configure,
+		ResponseMaxBytes,
+	)
+}
+
+func (client *Client) requestBounded(
+	ctx context.Context,
+	method string,
+	path string,
+	body []byte,
+	configure func(http.Header),
+	responseLimit int64,
+) ([]byte, error) {
+	replicationRequest := validClientReplicationTarget(path)
 	if client == nil ||
 		ctx == nil ||
 		(method != http.MethodGet && method != http.MethodPost) ||
-		(path != SessionPath && path != PeersPath && path != EventsPath) ||
+		(path != SessionPath &&
+			path != PeersPath &&
+			path != EventsPath &&
+			!replicationRequest) ||
 		method == http.MethodGet && len(body) != 0 ||
 		method == http.MethodPost &&
 			(path != EventsPath || len(body) == 0 ||
-				len(body) > event.MaxEventBytes) {
+				len(body) > event.MaxEventBytes) ||
+		replicationRequest &&
+			(method != http.MethodGet ||
+				responseLimit != int64(replication.MaxBatchExpandedBytes)) ||
+		!replicationRequest && responseLimit != ResponseMaxBytes {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -445,7 +477,10 @@ func (client *Client) request(
 		client.invalidate()
 		return nil, err
 	}
-	limit, problem, err := validateResponseEnvelope(response)
+	limit, problem, err := validateResponseEnvelope(
+		response,
+		responseLimit,
+	)
 	if err != nil {
 		_ = response.Body.Close()
 		client.invalidate()
@@ -537,6 +572,7 @@ func (client *Client) bindLineage(
 	workspaceID domain.UUIDv4,
 	recoveryGeneration uint64,
 	serverDeviceID domain.DeviceID,
+	sessionResponse bool,
 ) error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -553,12 +589,14 @@ func (client *Client) bindLineage(
 		client.workspaceID = workspaceID
 		client.recoveryGeneration = recoveryGeneration
 		client.lineageSet = true
+		client.sessionBound = sessionResponse
 		return nil
 	}
 	if client.workspaceID != workspaceID ||
 		client.recoveryGeneration != recoveryGeneration {
 		return ErrLineageMismatch
 	}
+	client.sessionBound = client.sessionBound || sessionResponse
 	return nil
 }
 
@@ -589,9 +627,11 @@ func validateClientResponseTLS(
 
 func validateResponseEnvelope(
 	response *http.Response,
+	successLimit int64,
 ) (limit int64, problem bool, err error) {
 	if response == nil ||
 		response.Body == nil ||
+		successLimit < 1 ||
 		response.StatusCode < http.StatusOK ||
 		response.StatusCode > 599 ||
 		response.Uncompressed ||
@@ -603,7 +643,7 @@ func validateResponseEnvelope(
 	}
 
 	expectedMediaType := contentJSONMediaType
-	limit = ResponseMaxBytes
+	limit = successLimit
 	switch {
 	case response.StatusCode == http.StatusOK:
 	case response.StatusCode >= http.StatusBadRequest:
@@ -993,6 +1033,7 @@ func (client *Client) close() error {
 	client.workspaceID = ""
 	client.recoveryGeneration = 0
 	client.lineageSet = false
+	client.sessionBound = false
 	if expiryTimer != nil {
 		expiryTimer.Stop()
 	}

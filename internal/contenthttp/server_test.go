@@ -24,6 +24,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
 )
@@ -45,6 +46,10 @@ type contentTestService struct {
 	eventHop     ProposalHop
 	eventResult  EventResult
 	eventErr     error
+	batch        replication.Batch
+	batchErr     error
+	batchCalls   int
+	batchAfter   []uint64
 
 	entered  chan struct{}
 	release  <-chan struct{}
@@ -146,6 +151,41 @@ func (service *contentTestService) ProposeEvent(
 	return service.eventResult, service.eventErr
 }
 
+func (service *contentTestService) Replication(
+	ctx context.Context,
+	afterResult uint64,
+) (replication.Batch, error) {
+	service.mu.Lock()
+	service.batchCalls++
+	service.batchAfter = append(service.batchAfter, afterResult)
+	batch := service.batch
+	batchErr := service.batchErr
+	entered := service.entered
+	release := service.release
+	canceled := service.canceled
+	service.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			if canceled != nil {
+				select {
+				case canceled <- struct{}{}:
+				default:
+				}
+			}
+			return replication.Batch{}, ctx.Err()
+		}
+	}
+	return batch, batchErr
+}
+
 func (service *contentTestService) snapshot() (int, int, []transport.AuthenticatedPeer) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -167,6 +207,7 @@ type contentTLSFixture struct {
 	clientBinding   transport.ContentBinding
 	serverBinding   transport.ContentBinding
 	serverDevice    domain.DeviceID
+	serverIdentity  ed25519.PrivateKey
 	policy          *contentPeerPolicy
 }
 
@@ -255,7 +296,9 @@ func newContentTLSFixture(t testing.TB) contentTLSFixture {
 		clientConfig: clientConfig, clientAdmission: clientAdmission,
 		clientCert:    clientContent,
 		clientBinding: clientBinding, serverBinding: serverBinding,
-		serverDevice: serverIdentityBinding.DeviceID, policy: policy,
+		serverDevice:   serverIdentityBinding.DeviceID,
+		serverIdentity: serverIdentityKey,
+		policy:         policy,
 	}
 }
 
@@ -774,6 +817,7 @@ func TestServerUsesFixedBoundsAndRejectsOversizedHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cap(server.handlers) != ActiveHandlersMax ||
+		cap(server.replicationHandlers) != ReplicationHandlersMax ||
 		server.headerTimeout != RequestHeaderTimeout ||
 		server.handlerTimeout != HandlerTimeout ||
 		server.streamNoProgress != StreamNoProgress ||
@@ -783,8 +827,15 @@ func TestServerUsesFixedBoundsAndRejectsOversizedHeaders(t *testing.T) {
 		server.http2.WriteByteTimeout != StreamNoProgress ||
 		server.http2.MaxUploadBufferPerConnection != 1<<16 ||
 		server.http2.MaxUploadBufferPerStream != event.MaxEventBytes ||
-		HeaderMaxBytes != 32<<10 || ResponseMaxBytes != 1<<20 {
-		t.Fatalf("server bounds = %+v, handlers=%d", server.http2, cap(server.handlers))
+		HeaderMaxBytes != 32<<10 ||
+		ResponseMaxBytes != 1<<20 ||
+		ReplicationHandlersMax != 1 {
+		t.Fatalf(
+			"server bounds = %+v, handlers=(%d,%d)",
+			server.http2,
+			cap(server.handlers),
+			cap(server.replicationHandlers),
+		)
 	}
 	if _, err := newServer(
 		newContentTestService(t, fixture.serverDevice),

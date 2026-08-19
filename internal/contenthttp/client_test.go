@@ -587,7 +587,14 @@ type realContentClientHarness struct {
 
 func startRealContentClient(t testing.TB) *realContentClientHarness {
 	t.Helper()
-	fixture := newContentTLSFixture(t)
+	return startRealContentClientWithFixture(t, newContentTLSFixture(t))
+}
+
+func startRealContentClientWithFixture(
+	t testing.TB,
+	fixture contentTLSFixture,
+) *realContentClientHarness {
+	t.Helper()
 	service := newContentTestService(t, fixture.serverDevice)
 	server, err := New(service)
 	if err != nil {

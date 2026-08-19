@@ -12,6 +12,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/replication"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -30,6 +31,10 @@ type daemonContentState interface {
 		context.Context,
 		domain.Timestamp,
 	) ([]store.MemberSignedEndpointSet, error)
+	ExportResultRange(
+		context.Context,
+		store.ResultRangeOptions,
+	) (store.ResultRange, bool, error)
 }
 
 type daemonEndpointSetSource interface {
@@ -49,6 +54,10 @@ type daemonEventProposalConsensus interface {
 	) (store.CommandResultLookup, error)
 }
 
+type daemonResultBatchSigner func(
+	replication.UnsignedBatch,
+) (replication.Batch, error)
+
 type daemonContentService struct {
 	sessionID          domain.UUIDv7
 	workspaceID        domain.UUIDv4
@@ -57,6 +66,7 @@ type daemonContentService struct {
 	state              daemonContentState
 	endpoints          daemonEndpointSetSource
 	proposals          daemonEventProposalConsensus
+	signResultBatch    daemonResultBatchSigner
 	now                func() time.Time
 }
 
@@ -68,6 +78,7 @@ func newDaemonContentServer(
 	state daemonContentState,
 	endpoints daemonEndpointSetSource,
 	proposals daemonEventProposalConsensus,
+	identityPrivateKey []byte,
 ) (*contenthttp.Server, error) {
 	service, err := newDaemonContentService(
 		sessionID,
@@ -77,6 +88,9 @@ func newDaemonContentServer(
 		state,
 		endpoints,
 		proposals,
+		func(unsigned replication.UnsignedBatch) (replication.Batch, error) {
+			return replication.SignBatch(unsigned, identityPrivateKey)
+		},
 		time.Now,
 	)
 	if err != nil {
@@ -101,6 +115,7 @@ func newDaemonContentService(
 	state daemonContentState,
 	endpoints daemonEndpointSetSource,
 	proposals daemonEventProposalConsensus,
+	signResultBatch daemonResultBatchSigner,
 	now func() time.Time,
 ) (*daemonContentService, error) {
 	if !sessionID.Valid() ||
@@ -110,6 +125,7 @@ func newDaemonContentService(
 		state == nil ||
 		endpoints == nil ||
 		proposals == nil ||
+		signResultBatch == nil ||
 		now == nil {
 		return nil, errDaemonContentConstruction
 	}
@@ -121,6 +137,7 @@ func newDaemonContentService(
 		state:              state,
 		endpoints:          endpoints,
 		proposals:          proposals,
+		signResultBatch:    signResultBatch,
 		now:                now,
 	}, nil
 }

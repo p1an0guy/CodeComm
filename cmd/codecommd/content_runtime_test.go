@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/replication"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -32,6 +35,11 @@ type daemonContentStateStub struct {
 	endpointSets []store.MemberSignedEndpointSet
 	endpointsErr error
 	now          domain.Timestamp
+
+	resultRange   store.ResultRange
+	resultFound   bool
+	resultErr     error
+	resultOptions store.ResultRangeOptions
 }
 
 func (state *daemonContentStateStub) StatusSnapshot(
@@ -61,6 +69,22 @@ func (state *daemonContentStateStub) ListMemberSignedEndpointSets(
 		}
 	}
 	return result, nil
+}
+
+func (state *daemonContentStateStub) ExportResultRange(
+	_ context.Context,
+	options store.ResultRangeOptions,
+) (store.ResultRange, bool, error) {
+	state.resultOptions = options
+	if state.resultErr != nil {
+		return store.ResultRange{}, false, state.resultErr
+	}
+	result := state.resultRange
+	result.Results = make([][]byte, len(state.resultRange.Results))
+	for index := range state.resultRange.Results {
+		result.Results[index] = bytes.Clone(state.resultRange.Results[index])
+	}
+	return result, state.resultFound, nil
 }
 
 type daemonEndpointSetSourceStub struct {
@@ -150,6 +174,7 @@ func TestDaemonContentServiceReturnsAppliedSessionAndExactEndpointSets(
 		state,
 		&daemonEndpointSetSourceStub{value: localSet, found: true},
 		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
 		func() time.Time { return testNow },
 	)
 	if err != nil {
@@ -235,6 +260,7 @@ func TestDaemonContentServiceSuppressesInactiveEndpointSet(t *testing.T) {
 			found: true,
 		},
 		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
 		func() time.Time { return testNow },
 	)
 	if err != nil {
@@ -272,6 +298,7 @@ func TestDaemonContentServiceProposesBoundCommittedResult(t *testing.T) {
 		&daemonContentStateStub{snapshot: snapshot},
 		&daemonEndpointSetSourceStub{},
 		proposals,
+		daemonContentTestBatchSigner(t),
 		time.Now,
 	)
 	if err != nil {
@@ -359,6 +386,176 @@ func TestDaemonContentServiceProposesBoundCommittedResult(t *testing.T) {
 	}
 }
 
+func TestDaemonContentServiceSignsAuthorityBoundResultBatch(t *testing.T) {
+	snapshot := daemonContentTestSnapshot(t)
+	exported := daemonContentTestResultRange(t, snapshot)
+	state := &daemonContentStateStub{
+		snapshot:    snapshot,
+		resultRange: exported,
+		resultFound: true,
+	}
+	service, err := newDaemonContentService(
+		snapshot.SessionID,
+		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
+		snapshot.Member.ID,
+		state,
+		&daemonEndpointSetSourceStub{},
+		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
+		time.Now,
+	)
+	if err != nil {
+		t.Fatalf("newDaemonContentService(): %v", err)
+	}
+
+	batch, err := service.Replication(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("Replication(): %v", err)
+	}
+	input := batch.Unsigned().Input()
+	if input.SessionID != snapshot.SessionID ||
+		input.WorkspaceID != snapshot.WorkspaceID ||
+		input.RecoveryGeneration != snapshot.RecoveryGeneration ||
+		input.ServerDeviceID != snapshot.Member.ID ||
+		input.ServerAuthorityVersion !=
+			snapshot.CredentialAuthority.VoterSetVersion ||
+		input.FromResultIndex != 1 ||
+		input.ToResultIndex != 1 ||
+		state.resultOptions.AfterResultIndex != 0 ||
+		state.resultOptions.MaxResults != replication.MaxBatchResults ||
+		state.resultOptions.MaxBytes != replication.MaxBatchResultsBytes ||
+		state.resultOptions.RequiredAuthorityDeviceID != snapshot.Member.ID {
+		t.Fatalf(
+			"signed batch/input options = %+v / %+v",
+			input,
+			state.resultOptions,
+		)
+	}
+	_, privateKey, _ := daemonTestInitialState(t)
+	defer clear(privateKey)
+	if err := replication.VerifyBatch(
+		batch,
+		privateKey.Public().(ed25519.PublicKey),
+	); err != nil {
+		t.Fatalf("replication.VerifyBatch(): %v", err)
+	}
+}
+
+func TestDaemonContentServiceMapsReplicationErrors(t *testing.T) {
+	snapshot := daemonContentTestSnapshot(t)
+	sentinel := errors.New("storage unavailable")
+	tests := []struct {
+		name   string
+		found  bool
+		err    error
+		mutate func(*coordstatus.DurableSnapshot)
+		want   error
+	}{
+		{
+			name: "cursor outside generation",
+			err:  store.ErrResultRangeNotCovered,
+			want: contenthttp.ErrInvalidReplicationCursor,
+		},
+		{
+			name: "cursor before generation",
+			err:  store.ErrResultRangeSnapshotRequired,
+			want: contenthttp.ErrReplicationSnapshotRequired,
+		},
+		{
+			name:  "current cursor",
+			found: false,
+			want:  contenthttp.ErrReplicationUnavailable,
+		},
+		{
+			name: "authority beyond page",
+			err:  store.ErrResultRangeAuthorityNotCovered,
+			want: contenthttp.ErrReplicationSnapshotRequired,
+		},
+		{
+			name: "non-authority server",
+			err:  store.ErrResultRangeAuthorityNotCovered,
+			mutate: func(value *coordstatus.DurableSnapshot) {
+				authority, err := voterset.New(
+					value.SessionID,
+					[]domain.DeviceID{
+						daemonContentTestDeviceID(t, 0xf1),
+					},
+					value.CredentialAuthority.VoterSetVersion,
+				)
+				if err != nil {
+					t.Fatalf("voterset.New(non-authority): %v", err)
+				}
+				value.CredentialAuthority = authority
+			},
+			want: contenthttp.ErrReplicationUnavailable,
+		},
+		{
+			name: "first result exceeds page",
+			err:  store.ErrResultRangeTooLarge,
+			want: contenthttp.ErrReplicationSnapshotRequired,
+		},
+		{
+			name: "storage",
+			err:  sentinel,
+			want: errDaemonContentConstruction,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testSnapshot := snapshot
+			if test.mutate != nil {
+				test.mutate(&testSnapshot)
+			}
+			service, err := newDaemonContentService(
+				testSnapshot.SessionID,
+				testSnapshot.WorkspaceID,
+				testSnapshot.RecoveryGeneration,
+				testSnapshot.Member.ID,
+				&daemonContentStateStub{
+					snapshot:    testSnapshot,
+					resultFound: test.found,
+					resultErr:   test.err,
+				},
+				&daemonEndpointSetSourceStub{},
+				&daemonEventProposalConsensusStub{},
+				daemonContentTestBatchSigner(t),
+				time.Now,
+			)
+			if err != nil {
+				t.Fatalf("newDaemonContentService(): %v", err)
+			}
+			if _, err := service.Replication(
+				context.Background(),
+				0,
+			); !errors.Is(err, test.want) {
+				t.Fatalf("Replication() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+
+	service, err := newDaemonContentService(
+		snapshot.SessionID,
+		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
+		snapshot.Member.ID,
+		&daemonContentStateStub{snapshot: snapshot},
+		&daemonEndpointSetSourceStub{},
+		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
+		time.Now,
+	)
+	if err != nil {
+		t.Fatalf("newDaemonContentService(): %v", err)
+	}
+	if _, err := service.Replication(
+		context.Background(),
+		domain.MaxSafeInteger+1,
+	); !errors.Is(err, contenthttp.ErrInvalidReplicationCursor) {
+		t.Fatalf("Replication(invalid cursor) error = %v", err)
+	}
+}
+
 func TestDaemonContentServiceMapsProposalErrors(t *testing.T) {
 	snapshot := daemonContentTestSnapshot(t)
 	sentinel := errors.New("unexpected proposal failure")
@@ -423,6 +620,7 @@ func TestDaemonContentServiceMapsProposalErrors(t *testing.T) {
 				&daemonContentStateStub{snapshot: snapshot},
 				&daemonEndpointSetSourceStub{},
 				&daemonEventProposalConsensusStub{err: test.err},
+				daemonContentTestBatchSigner(t),
 				time.Now,
 			)
 			if err != nil {
@@ -507,6 +705,7 @@ func TestDaemonContentServiceFailsClosed(t *testing.T) {
 					value: test.localSet, found: test.localFound,
 				},
 				&daemonEventProposalConsensusStub{},
+				daemonContentTestBatchSigner(t),
 				time.Now,
 			)
 			if err != nil {
@@ -548,6 +747,56 @@ func daemonContentTestCommandLookup(
 			ChainIndex:  &chainIndex,
 			ChainHash:   &chainHash,
 		},
+	}
+}
+
+func daemonContentTestResultRange(
+	t *testing.T,
+	snapshot coordstatus.DurableSnapshot,
+) store.ResultRange {
+	t.Helper()
+	_, privateKey, deviceID := daemonTestInitialState(t)
+	defer clear(privateKey)
+	if deviceID != snapshot.Member.ID {
+		t.Fatal("result-range fixture identity mismatch")
+	}
+	signed := daemonTestTaskEvent(t, privateKey, deviceID)
+	proposal := signed.CanonicalBytes()
+	startResult := chain.Digest{}
+	startChain := chain.Digest{}
+	endChain, err := chain.AppendEvent(startChain, proposal)
+	if err != nil {
+		t.Fatalf("chain.AppendEvent(): %v", err)
+	}
+	proposalDigest := sha256.Sum256(proposal)
+	chainIndex := uint64(1)
+	result := chain.Result{
+		ResultIndex:    1,
+		Proposal:       proposal,
+		Outcome:        []byte(`{"code":"accepted","status":"accepted"}`),
+		ProposalDigest: proposalDigest,
+		ChainIndex:     &chainIndex,
+		ChainHash:      &endChain,
+	}
+	endResult, encoded, err := chain.AppendResult(startResult, result)
+	if err != nil {
+		t.Fatalf("chain.AppendResult(): %v", err)
+	}
+	return store.ResultRange{
+		SessionID:                snapshot.SessionID,
+		WorkspaceID:              snapshot.WorkspaceID,
+		RecoveryGeneration:       snapshot.RecoveryGeneration,
+		FromResultIndex:          1,
+		ToResultIndex:            1,
+		StartResultHash:          startResult,
+		EndResultHash:            endResult,
+		StartChainIndex:          0,
+		StartChainHash:           startChain,
+		EndChainIndex:            1,
+		EndChainHash:             endChain,
+		Results:                  [][]byte{encoded},
+		ServerAppliedResultIndex: 1,
+		Authority:                snapshot.CredentialAuthority,
 	}
 }
 
@@ -644,6 +893,19 @@ func daemonContentTestDeviceID(t *testing.T, seed byte) domain.DeviceID {
 		t.Fatalf("device.DeriveID(): %v", err)
 	}
 	return value
+}
+
+func daemonContentTestBatchSigner(t *testing.T) daemonResultBatchSigner {
+	t.Helper()
+	_, privateKey, _ := daemonTestInitialState(t)
+	t.Cleanup(func() {
+		clear(privateKey)
+	})
+	return func(
+		unsigned replication.UnsignedBatch,
+	) (replication.Batch, error) {
+		return replication.SignBatch(unsigned, privateKey)
+	}
 }
 
 func daemonContentMember(

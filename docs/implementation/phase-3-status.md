@@ -58,7 +58,12 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   values bind every envelope field under `codecomm/v1/batch`, verify both dense chains and signer
   identity, and enforce the 256-record/64 MiB expanded limits. SQLite exports bounded ranges only
   after replaying the retained generation, checks both starting and ending heads in one snapshot,
-  and reconstructs the credential authority at the exact end position.
+  and reconstructs the credential authority at the exact end position. Strict
+  `GET /v1/replication?after_result=M` serving signs only pages ending where the server identity is
+  both active and authorized, returns `snapshot_required` when a bounded page cannot reach such a
+  cut, and streams under a single global large-response slot. The client preserves direct or
+  relayed signed bytes; signer-key and active-authority trust is intentionally deferred until
+  scratch replay reaches the batch end.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -81,9 +86,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
-- Result-range and signed-envelope foundations are implemented; `/v1/replication`, transactional
-  scratch replay/import, authority-handoff authorization, snapshot fallback, attestations, SSE,
-  acknowledgements, and divergence recovery remain open.
+- Result export and `/v1/replication` serving are implemented; transactional scratch replay/import,
+  receiver-side authority-handoff authorization, snapshot fallback, attestations/cursors, peer
+  catch-up, SSE, acknowledgements, and divergence recovery remain open.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
