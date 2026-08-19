@@ -16,8 +16,11 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
+	"github.com/ijonahch/codecomm/internal/store"
 )
 
 const (
@@ -34,6 +37,8 @@ func TestOperatorServiceBindsOnlyMatchingOperatorClass(t *testing.T) {
 		Source: statusSourceFunc(func(context.Context) (coordstatus.Snapshot, error) {
 			return uiTestStatusSnapshot(t), nil
 		}),
+		Submitter:   successfulOperatorSubmitter(),
+		Pairing:     testPairingOperator{},
 		SessionID:   uiTestSessionID,
 		WorkspaceID: uiTestWorkspaceID,
 	})
@@ -85,7 +90,7 @@ func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 		func(context.Context) (coordstatus.Snapshot, error) {
 			return source, nil
 		},
-	))
+	), successfulOperatorSubmitter(), testPairingOperator{}, uiTestClientID)
 	request := httptest.NewRequest(
 		http.MethodGet,
 		statusQueryPath,
@@ -108,6 +113,8 @@ func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 	if got.Session.SessionID != string(uiTestSessionID) ||
 		got.Session.LocalDeviceID != string(source.Durable.Member.ID) ||
 		got.Consensus.State != string(coordstatus.ConsensusReady) ||
+		len(got.Members) != 1 ||
+		got.Members[0].EntityVersion != source.Durable.Member.EntityVersion ||
 		len(got.Agents) != 1 ||
 		got.Agents[0].AgentSessionID != string(uiTestAgentID) ||
 		got.TaskTotal != 1 ||
@@ -124,22 +131,60 @@ func TestOperatorStatusHandlerFailsClosed(t *testing.T) {
 		func(context.Context) (coordstatus.Snapshot, error) {
 			return coordstatus.Snapshot{}, errors.New("store unavailable")
 		},
-	))
-	for _, request := range []*http.Request{
-		httptest.NewRequest(http.MethodGet, "/local/v1/query/other", nil),
-		httptest.NewRequest(http.MethodPost, statusQueryPath, strings.NewReader(`{}`)),
-		httptest.NewRequest(http.MethodGet, statusQueryPath+"?other=true", nil),
+	), successfulOperatorSubmitter(), testPairingOperator{}, uiTestClientID)
+	for _, test := range []struct {
+		name    string
+		request *http.Request
+	}{
+		{
+			name:    "other path",
+			request: httptest.NewRequest(http.MethodGet, "/local/v1/query/other", nil),
+		},
+		{
+			name: "wrong method",
+			request: httptest.NewRequest(
+				http.MethodPost,
+				statusQueryPath,
+				strings.NewReader(`{}`),
+			),
+		},
+		{
+			name: "query",
+			request: httptest.NewRequest(
+				http.MethodGet,
+				statusQueryPath+"?other=true",
+				nil,
+			),
+		},
+		{
+			name: "encoded path",
+			request: httptest.NewRequest(
+				http.MethodGet,
+				"/local/v1/query/%73tatus",
+				nil,
+			),
+		},
+		{
+			name: "forced query",
+			request: httptest.NewRequest(
+				http.MethodGet,
+				statusQueryPath+"?",
+				nil,
+			),
+		},
 	} {
-		recorder := httptest.NewRecorder()
-		handler.ServeHTTP(recorder, request)
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf(
-				"%s %s status = %d, want 404",
-				request.Method,
-				request.URL,
-				recorder.Code,
-			)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, test.request)
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf(
+					"%s %s status = %d, want 404",
+					test.request.Method,
+					test.request.URL,
+					recorder.Code,
+				)
+			}
+		})
 	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(
@@ -151,12 +196,136 @@ func TestOperatorStatusHandlerFailsClosed(t *testing.T) {
 	}
 }
 
+func TestOperatorCommandHandlerRoutesOnlyAllowlistedHumanMutations(
+	t *testing.T,
+) {
+	source := uiTestStatusSnapshot(t)
+	deviceID := source.Durable.Member.ID
+	var captured operatorcommand.Request
+	submitter := operatorSubmitterFunc(func(
+		_ context.Context,
+		request operatorcommand.Request,
+	) (operatorcommand.Result, error) {
+		captured = request
+		return operatorcommand.Result{
+			EventID: uiTestTaskID,
+			Outcome: store.CommandOutcome{
+				Status: store.OutcomeAccepted,
+				Code:   "accepted",
+				JSON:   []byte(`{"code":"accepted","status":"accepted"}`),
+			},
+		}, nil
+	})
+	handler := newOperatorHandler(
+		statusSourceFunc(func(context.Context) (coordstatus.Snapshot, error) {
+			return source, nil
+		}),
+		submitter,
+		testPairingOperator{},
+		uiTestClientID,
+	)
+	body, err := operatorCommandBody(
+		operatorcommand.OperationRevokePeer,
+		uiTestClientID,
+		event.KindMembershipDeviceRevoked,
+		string(deviceID),
+		1,
+		map[string]any{
+			"device_id":                  deviceID,
+			"expected_voter_set_version": uint64(1),
+			"reason":                     "retired device",
+			"voter_set":                  []domain.DeviceID{deviceID},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodPost, commandPath, bytes.NewReader(body)),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if captured.ClientInstanceID != uiTestClientID ||
+		captured.Command.Operation != operatorcommand.OperationRevokePeer ||
+		captured.Command.Command.Kind != event.KindMembershipDeviceRevoked ||
+		captured.Command.Command.ExpectedEntityVersion == nil ||
+		*captured.Command.Command.ExpectedEntityVersion != 1 {
+		t.Fatalf("captured request = %#v", captured)
+	}
+
+	invalid := bytes.Replace(
+		body,
+		[]byte(`"membership.device_revoked"`),
+		[]byte(`"membership.voter_set_changed"`),
+		1,
+	)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPost,
+			commandPath,
+			bytes.NewReader(invalid),
+		),
+	)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched operation status = %d", recorder.Code)
+	}
+
+	for _, target := range []string{
+		"/local/v1/%63ommands",
+		commandPath + "?",
+		commandPath + "?other=true",
+	} {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(
+			recorder,
+			httptest.NewRequest(
+				http.MethodPost,
+				target,
+				bytes.NewReader(body),
+			),
+		)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf(
+				"non-exact command route %q status = %d, want 404",
+				target,
+				recorder.Code,
+			)
+		}
+	}
+}
+
 type statusSourceFunc func(context.Context) (coordstatus.Snapshot, error)
 
 func (function statusSourceFunc) Status(
 	ctx context.Context,
 ) (coordstatus.Snapshot, error) {
 	return function(ctx)
+}
+
+type operatorSubmitterFunc func(
+	context.Context,
+	operatorcommand.Request,
+) (operatorcommand.Result, error)
+
+func (function operatorSubmitterFunc) SubmitOperatorCommand(
+	ctx context.Context,
+	request operatorcommand.Request,
+) (operatorcommand.Result, error) {
+	return function(ctx, request)
+}
+
+func successfulOperatorSubmitter() operatorcommand.Submitter {
+	return operatorSubmitterFunc(func(
+		context.Context,
+		operatorcommand.Request,
+	) (operatorcommand.Result, error) {
+		return operatorcommand.Result{}, nil
+	})
 }
 
 func uiTestStatusSnapshot(t *testing.T) coordstatus.Snapshot {
@@ -226,7 +395,14 @@ func uiTestStatusSnapshot(t *testing.T) coordstatus.Snapshot {
 				DigestVersion:           1,
 				ProjectionSchemaVersion: 1,
 			},
-			Member:              member,
+			Member: member,
+			Members: []coordstatus.MemberSummary{{
+				ID:            member.ID,
+				Role:          member.Role,
+				Status:        member.Status,
+				EntityVersion: member.EntityVersion,
+			}},
+			MemberTotal:         1,
 			VoterSet:            target,
 			CredentialAuthority: target,
 			AgentSessions:       []agentsession.Session{agent},

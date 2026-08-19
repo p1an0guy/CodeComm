@@ -17,6 +17,7 @@ import (
 const (
 	MaxTasks         = 200
 	MaxAgentSessions = int(policy.MaxActiveAgentSessions)
+	MaxMembers       = 64
 )
 
 var ErrInvalidSnapshot = errors.New("status: invalid snapshot")
@@ -140,6 +141,26 @@ type AppliedHeads struct {
 	ProjectionSchemaVersion uint64
 }
 
+// MemberSummary is the bounded operator projection of one committed device.
+// Identity public keys are intentionally excluded from local status output.
+type MemberSummary struct {
+	ID            domain.DeviceID
+	Role          device.Role
+	Status        device.Status
+	EntityVersion uint64
+}
+
+func (member MemberSummary) Validate() error {
+	if !member.ID.Valid() ||
+		!member.Role.Valid() ||
+		!member.Status.Valid() ||
+		member.EntityVersion < 1 ||
+		!domain.ValidUnsignedInteger(member.EntityVersion) {
+		return invalid("member")
+	}
+	return nil
+}
+
 // DurableSnapshot is one transactionally consistent read of the local
 // coordination projections.
 type DurableSnapshot struct {
@@ -148,6 +169,9 @@ type DurableSnapshot struct {
 	RecoveryGeneration  uint64
 	Heads               AppliedHeads
 	Member              device.Device
+	Members             []MemberSummary
+	MemberTotal         uint64
+	MembersTruncated    bool
 	VoterSet            voterset.Set
 	CredentialAuthority voterset.Set
 	AgentSessions       []agentsession.Session
@@ -294,6 +318,23 @@ func (snapshot DurableSnapshot) Validate() error {
 	}
 	if err := snapshot.Member.Validate(); err != nil {
 		return invalid("local member: %v", err)
+	}
+	if len(snapshot.Members) < 1 ||
+		len(snapshot.Members) > MaxMembers ||
+		snapshot.MemberTotal < 1 ||
+		!domain.ValidUnsignedInteger(snapshot.MemberTotal) ||
+		snapshot.MemberTotal < uint64(len(snapshot.Members)) ||
+		snapshot.MembersTruncated !=
+			(snapshot.MemberTotal > uint64(len(snapshot.Members))) {
+		return invalid("member count")
+	}
+	var priorMember domain.DeviceID
+	for index, member := range snapshot.Members {
+		if err := member.Validate(); err != nil ||
+			index > 0 && priorMember >= member.ID {
+			return invalid("member %d", index)
+		}
+		priorMember = member.ID
 	}
 	if err := snapshot.VoterSet.Validate(); err != nil ||
 		snapshot.VoterSet.SessionID != snapshot.SessionID {

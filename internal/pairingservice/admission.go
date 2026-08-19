@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/ijonahch/codecomm/internal/codec"
@@ -37,6 +38,8 @@ type AdmissionAuthorizerOptions struct {
 // AdmissionAuthorizer prepares the exact membership event reserved by the
 // second SAS approval. It performs no I/O and grants no authority by itself.
 type AdmissionAuthorizer struct {
+	mu           sync.RWMutex
+	closed       bool
 	deviceID     domain.DeviceID
 	originBootID domain.UUIDv7
 	privateKey   ed25519.PrivateKey
@@ -92,6 +95,11 @@ func (authorizer *AdmissionAuthorizer) PreparePairing(
 	if authorizer == nil || ctx == nil {
 		return nil, ErrInvalidAdmissionAuthorizer
 	}
+	authorizer.mu.RLock()
+	defer authorizer.mu.RUnlock()
+	if authorizer.closed {
+		return nil, ErrClosed
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -142,6 +150,11 @@ func (authorizer *AdmissionAuthorizer) PreparePairing(
 		eventID domain.UUIDv7,
 		originSequence uint64,
 	) (event.SignedEvent, error) {
+		authorizer.mu.RLock()
+		defer authorizer.mu.RUnlock()
+		if authorizer.closed {
+			return event.SignedEvent{}, ErrClosed
+		}
 		proposal, err := event.BuildProposal(
 			event.Command{
 				Kind:                  event.KindMembershipDeviceAdmitted,
@@ -171,6 +184,23 @@ func (authorizer *AdmissionAuthorizer) PreparePairing(
 	}
 	authorization.Admission = reservation
 	return authorization, nil
+}
+
+// Close clears the authorizer's owned identity-key clone. It is idempotent
+// and waits for an in-flight authorization or signature to finish.
+func (authorizer *AdmissionAuthorizer) Close() error {
+	if authorizer == nil {
+		return ErrInvalidAdmissionAuthorizer
+	}
+	authorizer.mu.Lock()
+	defer authorizer.mu.Unlock()
+	if authorizer.closed {
+		return nil
+	}
+	authorizer.closed = true
+	clear(authorizer.privateKey)
+	authorizer.privateKey = nil
+	return nil
 }
 
 func (authorizer *AdmissionAuthorizer) validateDetails(

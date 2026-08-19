@@ -30,6 +30,10 @@ func TestStatusSnapshotReturnsOneBoundedTransactionalView(t *testing.T) {
 		snapshot.WorkspaceID != testWorkspaceID ||
 		snapshot.RecoveryGeneration != 0 ||
 		snapshot.Member.ID != member.ID ||
+		snapshot.MemberTotal != 1 ||
+		len(snapshot.Members) != 1 ||
+		snapshot.Members[0].ID != member.ID ||
+		snapshot.Members[0].EntityVersion != member.EntityVersion ||
 		snapshot.Heads.DigestVersion != 1 ||
 		snapshot.Heads.ProjectionSchemaVersion != 1 ||
 		snapshot.TaskTotal != uint64(len(tasks)) ||

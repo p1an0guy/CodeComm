@@ -79,6 +79,7 @@ type FinalizationAuthorizer interface {
 		AttemptDetails,
 		domain.Timestamp,
 	) (*store.PairingFinalizationAuthorization, error)
+	Close() error
 }
 
 // BootReservationLane serializes the atomic SAS-confirmation reservation with
@@ -120,7 +121,8 @@ type Options struct {
 	MaintenanceInterval time.Duration
 }
 
-// Service owns one session daemon's inviter-side pairing flow.
+// Service owns one session daemon's inviter-side pairing flow, including the
+// finalization authorizer after New returns successfully.
 type Service struct {
 	state               State
 	secrets             SecretStore

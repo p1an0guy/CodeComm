@@ -475,6 +475,10 @@ func newAgentTestHarnessWithState(
 	if err != nil {
 		t.Fatalf("daemon binding: %v", err)
 	}
+	operatorOrigin, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatalf("operator binding: %v", err)
+	}
 	ids := &testIDGenerator{}
 	randomSource := &recordingRandom{}
 	bootOrigin, err := NewBootOrigin(BootOriginOptions{
@@ -486,6 +490,7 @@ func newAgentTestHarnessWithState(
 		OriginBootID:       agentTestBootID,
 		IdentityPrivateKey: privateKey,
 		DaemonOrigin:       lifecycleOrigin,
+		OperatorOrigin:     operatorOrigin,
 		Clock: func() domain.Timestamp {
 			return agentTestTimestamp
 		},

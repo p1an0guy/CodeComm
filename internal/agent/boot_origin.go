@@ -13,7 +13,10 @@ import (
 	"github.com/ijonahch/codecomm/internal/codec"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/localcommand"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"golang.org/x/sync/semaphore"
@@ -34,6 +37,7 @@ type BootOriginOptions struct {
 	OriginBootID       domain.UUIDv7
 	IdentityPrivateKey ed25519.PrivateKey
 	DaemonOrigin       event.Binding
+	OperatorOrigin     event.Binding
 
 	Clock      Clock
 	GenerateID IDGenerator
@@ -42,18 +46,19 @@ type BootOriginOptions struct {
 // BootOrigin exclusively owns forwarding and reservation for local boot
 // scopes. New work may be reserved before Recover; the worker starts lazily.
 type BootOrigin struct {
-	consensus     CheckpointConsensus
-	local         store.LocalState
-	sessionID     domain.UUIDv7
-	workspaceID   domain.UUIDv4
-	deviceID      domain.DeviceID
-	originBootID  domain.UUIDv7
-	privateKey    ed25519.PrivateKey
-	publicKey     ed25519.PublicKey
-	daemonBinding event.Binding
-	clock         Clock
-	generateID    IDGenerator
-	scope         store.OutboxScope
+	consensus       CheckpointConsensus
+	local           store.LocalState
+	sessionID       domain.UUIDv7
+	workspaceID     domain.UUIDv4
+	deviceID        domain.DeviceID
+	originBootID    domain.UUIDv7
+	privateKey      ed25519.PrivateKey
+	publicKey       ed25519.PublicKey
+	daemonBinding   event.Binding
+	operatorBinding event.Binding
+	clock           Clock
+	generateID      IDGenerator
+	scope           store.OutboxScope
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -108,6 +113,17 @@ func NewBootOrigin(options BootOriginOptions) (*BootOrigin, error) {
 			ErrInvalidOptions,
 		)
 	}
+	operatorOrigin, err := options.OperatorOrigin.Origin(1)
+	if err != nil ||
+		options.OperatorOrigin.ActorType() != event.ActorHuman ||
+		operatorOrigin.DeviceID() != options.DeviceID ||
+		operatorOrigin.OriginBootID() != options.OriginBootID ||
+		operatorOrigin.AgentSessionID() != "" {
+		return nil, fmt.Errorf(
+			"%w: invalid operator binding",
+			ErrInvalidOptions,
+		)
+	}
 	clock := options.Clock
 	if clock == nil {
 		clock = func() domain.Timestamp {
@@ -126,17 +142,18 @@ func NewBootOrigin(options BootOriginOptions) (*BootOrigin, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &BootOrigin{
-		consensus:     options.Consensus,
-		local:         options.LocalState,
-		sessionID:     options.SessionID,
-		workspaceID:   options.WorkspaceID,
-		deviceID:      options.DeviceID,
-		originBootID:  options.OriginBootID,
-		privateKey:    bytes.Clone(options.IdentityPrivateKey),
-		publicKey:     bytes.Clone(publicKey),
-		daemonBinding: options.DaemonOrigin,
-		clock:         clock,
-		generateID:    generateID,
+		consensus:       options.Consensus,
+		local:           options.LocalState,
+		sessionID:       options.SessionID,
+		workspaceID:     options.WorkspaceID,
+		deviceID:        options.DeviceID,
+		originBootID:    options.OriginBootID,
+		privateKey:      bytes.Clone(options.IdentityPrivateKey),
+		publicKey:       bytes.Clone(publicKey),
+		daemonBinding:   options.DaemonOrigin,
+		operatorBinding: options.OperatorOrigin,
+		clock:           clock,
+		generateID:      generateID,
 		scope: store.OutboxScope{
 			OriginDeviceID:  options.DeviceID,
 			OriginScopeKind: store.OriginScopeKindBoot,
@@ -147,6 +164,109 @@ func NewBootOrigin(options BootOriginOptions) (*BootOrigin, error) {
 		lane:         semaphore.NewWeighted(bootOriginLaneCapacity),
 		wake:         make(chan struct{}, 1),
 		resultSignal: make(chan struct{}),
+	}, nil
+}
+
+// SubmitOperatorCommand durably reserves and resolves one allowlisted
+// human-only owner mutation through the boot-scope outbox.
+func (origin *BootOrigin) SubmitOperatorCommand(
+	ctx context.Context,
+	request operatorcommand.Request,
+) (operatorcommand.Result, error) {
+	if err := origin.available(); err != nil {
+		return operatorcommand.Result{}, err
+	}
+	if ctx == nil {
+		return operatorcommand.Result{}, ErrInvalidOptions
+	}
+	decoded, err := localcommand.Decode(request.Command.Canonical)
+	if err != nil ||
+		decoded.Operation != request.Command.Operation ||
+		decoded.RequestID != request.Command.RequestID {
+		return operatorcommand.Result{}, operatorcommand.ErrInvalidCommand
+	}
+	request.Command = decoded
+	if err := request.Validate(); err != nil {
+		return operatorcommand.Result{}, err
+	}
+	command := request.Command.Command
+	entityID, entityPresent := command.EntityID.Value()
+	switch request.Command.Operation {
+	case operatorcommand.OperationSetVoters:
+		if !entityPresent || domain.UUIDv7(entityID) != origin.sessionID {
+			return operatorcommand.Result{}, operatorcommand.ErrInvalidCommand
+		}
+	case operatorcommand.OperationRevokePeer:
+		if !entityPresent || !domain.DeviceID(entityID).Valid() {
+			return operatorcommand.Result{}, operatorcommand.ErrInvalidCommand
+		}
+	default:
+		return operatorcommand.Result{}, operatorcommand.ErrInvalidCommand
+	}
+
+	operationContext, cancel := origin.operationContext(ctx)
+	defer cancel()
+	if err := origin.acquireShared(operationContext); err != nil {
+		return operatorcommand.Result{}, err
+	}
+	now := origin.clock()
+	if !now.Valid() {
+		origin.releaseShared()
+		return operatorcommand.Result{}, ErrInvalidOptions
+	}
+	record, duplicate, err := origin.local.ReserveCommand(
+		operationContext,
+		store.LocalCommandInput{
+			ClientInstanceID: request.ClientInstanceID,
+			RequestID:        request.Command.RequestID,
+			SessionID:        origin.sessionID,
+			WorkspaceID:      origin.workspaceID,
+			BindingClass:     store.LocalBindingOperator,
+			OriginDeviceID:   origin.deviceID,
+			OriginScopeKind:  store.OriginScopeKindBoot,
+			OriginScopeID:    origin.originBootID,
+			RequestKind:      command.Kind,
+			CanonicalRequest: request.Command.Canonical,
+			CreatedAt:        now,
+		},
+		store.UUIDv7Generator(origin.generateID),
+		func(
+			eventID domain.UUIDv7,
+			originSequence uint64,
+		) (event.SignedEvent, error) {
+			proposal, err := event.BuildProposal(
+				command,
+				origin.operatorBinding,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      origin.sessionID,
+					WorkspaceID:    origin.workspaceID,
+					CreatedAt:      now,
+					OriginSequence: originSequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, origin.privateKey)
+		},
+	)
+	origin.releaseShared()
+	if err != nil {
+		return operatorcommand.Result{}, err
+	}
+	origin.wakeWorker()
+	resolved, err := origin.waitResolved(operationContext, record)
+	if err != nil {
+		return operatorcommand.Result{}, err
+	}
+	if resolved.Outcome == nil {
+		return operatorcommand.Result{}, ErrCommandForwarding
+	}
+	return operatorcommand.Result{
+		EventID:   resolved.EventID,
+		Outcome:   *resolved.Outcome,
+		Duplicate: duplicate,
 	}, nil
 }
 
@@ -539,6 +659,169 @@ func (origin *BootOrigin) SubmitVoterSetActivation(
 		return store.CommandOutcome{}, ErrCommandForwarding
 	}
 	return *resolved.Outcome, nil
+}
+
+// SubmitCredentialAuthorization durably reserves and resolves one complete
+// leader-scheduled content-credential authorization.
+func (origin *BootOrigin) SubmitCredentialAuthorization(
+	ctx context.Context,
+	authorization credentialauthorization.Authorization,
+) (store.CommandOutcome, error) {
+	if err := origin.available(); err != nil {
+		return store.CommandOutcome{}, err
+	}
+	if ctx == nil ||
+		authorization.SessionID != origin.sessionID ||
+		authorization.AuthorizationChainIndex != 0 {
+		return store.CommandOutcome{}, ErrInvalidOptions
+	}
+	payload, err := encodeCredentialAuthorizationPayload(authorization)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+
+	operationContext, cancel := origin.operationContext(ctx)
+	defer cancel()
+	if err := origin.acquireShared(operationContext); err != nil {
+		return store.CommandOutcome{}, err
+	}
+	record, err := origin.reserveCredentialAuthorizationLocked(
+		operationContext,
+		authorization.DeviceID,
+		payload,
+	)
+	origin.releaseShared()
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	origin.wakeWorker()
+	resolved, err := origin.waitResolved(operationContext, record)
+	if err != nil {
+		return store.CommandOutcome{}, err
+	}
+	if resolved.Outcome == nil {
+		return store.CommandOutcome{}, ErrCommandForwarding
+	}
+	return *resolved.Outcome, nil
+}
+
+func (origin *BootOrigin) reserveCredentialAuthorizationLocked(
+	ctx context.Context,
+	subjectDeviceID domain.DeviceID,
+	payload []byte,
+) (store.LocalCommandRecord, error) {
+	if !subjectDeviceID.Valid() || len(payload) == 0 {
+		return store.LocalCommandRecord{}, ErrInvalidOptions
+	}
+	requestID, err := origin.generateID()
+	if err != nil {
+		return store.LocalCommandRecord{}, err
+	}
+	if !requestID.Valid() {
+		return store.LocalCommandRecord{}, ErrInvalidOptions
+	}
+	now := origin.clock()
+	if !now.Valid() {
+		return store.LocalCommandRecord{}, ErrInvalidOptions
+	}
+	canonicalRequest, err := canonicalObject(map[string]any{
+		"authorization": json.RawMessage(payload),
+		"operation":     event.KindCredentialAuthorized,
+		"request_id":    requestID,
+	})
+	if err != nil {
+		return store.LocalCommandRecord{}, err
+	}
+	record, _, err := origin.local.ReserveCommand(
+		ctx,
+		store.LocalCommandInput{
+			ClientInstanceID: origin.originBootID,
+			RequestID:        requestID,
+			SessionID:        origin.sessionID,
+			WorkspaceID:      origin.workspaceID,
+			BindingClass:     store.LocalBindingDaemon,
+			OriginDeviceID:   origin.deviceID,
+			OriginScopeKind:  store.OriginScopeKindBoot,
+			OriginScopeID:    origin.originBootID,
+			RequestKind:      event.KindCredentialAuthorized,
+			CanonicalRequest: canonicalRequest,
+			CreatedAt:        now,
+		},
+		store.UUIDv7Generator(origin.generateID),
+		func(
+			eventID domain.UUIDv7,
+			originSequence uint64,
+		) (event.SignedEvent, error) {
+			proposal, err := event.BuildProposal(
+				event.Command{
+					Kind: event.KindCredentialAuthorized,
+					EntityID: event.StringEntityID(
+						string(subjectDeviceID),
+					),
+					RationaleSummary: "",
+					Actions:          []event.Action{},
+					Payload:          payload,
+					Redaction:        defaultRedaction(),
+				},
+				origin.daemonBinding,
+				event.BuildContext{
+					EventID:        eventID,
+					SessionID:      origin.sessionID,
+					WorkspaceID:    origin.workspaceID,
+					CreatedAt:      now,
+					OriginSequence: originSequence,
+				},
+			)
+			if err != nil {
+				return event.SignedEvent{}, err
+			}
+			return event.Sign(proposal, origin.privateKey)
+		},
+	)
+	return record, err
+}
+
+func encodeCredentialAuthorizationPayload(
+	authorization credentialauthorization.Authorization,
+) ([]byte, error) {
+	candidate := authorization.Clone()
+	if candidate.AuthorizationChainIndex != 0 {
+		return nil, ErrInvalidOptions
+	}
+	candidate.AuthorizationChainIndex = 1
+	if err := candidate.Validate(); err != nil {
+		return nil, fmt.Errorf(
+			"%w: credential authorization: %v",
+			ErrInvalidOptions,
+			err,
+		)
+	}
+	endorsements := make([]map[string]any, len(authorization.ClockEndorsements))
+	for index, endorsement := range authorization.ClockEndorsements {
+		endorsements[index] = map[string]any{
+			"device_id": endorsement.DeviceID,
+			"signature": codec.EncodeBase64URL(
+				endorsement.Signature[:],
+			),
+		}
+	}
+	return canonicalObject(map[string]any{
+		"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
+		"binding_signature": codec.EncodeBase64URL(
+			authorization.BindingSignature[:],
+		),
+		"clock_endorsements": endorsements,
+		"epoch":              authorization.Epoch,
+		"epoch_public_key": codec.EncodeBase64URL(
+			authorization.EpochPublicKey[:],
+		),
+		"issued_at":         authorization.IssuedAt,
+		"key_digest":        codec.EncodeBase64URL(authorization.KeyDigest[:]),
+		"not_before":        authorization.NotBefore,
+		"role":              authorization.Role,
+		"subject_device_id": authorization.DeviceID,
+		"validity_seconds":  authorization.ValiditySeconds,
+	})
 }
 
 func (origin *BootOrigin) reserveVoterSetActivationLocked(

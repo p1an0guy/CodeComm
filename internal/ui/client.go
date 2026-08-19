@@ -8,12 +8,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
+	"github.com/ijonahch/codecomm/internal/store"
 )
 
 const localBindPath = "/local/v1/bind"
@@ -23,7 +28,10 @@ var (
 	ErrStatusClosed        = ipc.ErrClientClosed
 	ErrStatusConnection    = ipc.ErrClientConnectionLost
 	ErrStatusProtocol      = errors.New("ui: invalid status protocol response")
+	ErrCommandProtocol     = errors.New("ui: invalid command protocol response")
 )
+
+const maxOperatorReasonBytes = 1024
 
 type OperatorDialOptions struct {
 	Endpoint         ipc.Endpoint
@@ -41,6 +49,29 @@ type OperatorClient struct {
 	options   OperatorDialOptions
 	transport *ipc.Client
 	closed    bool
+}
+
+type SetVotersRequest struct {
+	RequestID               domain.UUIDv7
+	ExpectedVoterSetVersion uint64
+	VoterDeviceIDs          []domain.DeviceID
+}
+
+type RevokePeerRequest struct {
+	RequestID               domain.UUIDv7
+	DeviceID                domain.DeviceID
+	ExpectedEntityVersion   uint64
+	ExpectedVoterSetVersion uint64
+	VoterDeviceIDs          []domain.DeviceID
+	Reason                  string
+}
+
+type CommandResult struct {
+	EventID   domain.UUIDv7       `json:"event_id"`
+	Status    store.OutcomeStatus `json:"status"`
+	Code      string              `json:"code"`
+	Result    json.RawMessage     `json:"result"`
+	Duplicate bool                `json:"duplicate"`
 }
 
 func DialOperator(
@@ -129,6 +160,228 @@ func (client *OperatorClient) Status(
 		return Snapshot{}, ErrStatusProtocol
 	}
 	return decodeStatusResponse(response.Body)
+}
+
+// SetVoters commits the complete desired voter target using the caller's
+// reviewed voter-set CAS.
+func (client *OperatorClient) SetVoters(
+	ctx context.Context,
+	request SetVotersRequest,
+) (CommandResult, error) {
+	if client == nil ||
+		ctx == nil ||
+		request.ExpectedVoterSetVersion < 1 ||
+		!domain.ValidUnsignedInteger(request.ExpectedVoterSetVersion) ||
+		!validVoterIDs(request.VoterDeviceIDs) {
+		return CommandResult{}, ErrInvalidOperatorDial
+	}
+	requestID, err := operatorRequestID(request.RequestID)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	body, err := operatorCommandBody(
+		operatorcommand.OperationSetVoters,
+		requestID,
+		event.KindMembershipVoterSetChanged,
+		string(client.options.SessionID),
+		request.ExpectedVoterSetVersion,
+		map[string]any{
+			"voter_set": deviceIDStrings(request.VoterDeviceIDs),
+		},
+	)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return client.submitCommand(ctx, body)
+}
+
+// RevokePeer commits one membership revocation and its complete resulting
+// voter target using both caller-reviewed CAS values.
+func (client *OperatorClient) RevokePeer(
+	ctx context.Context,
+	request RevokePeerRequest,
+) (CommandResult, error) {
+	if client == nil ||
+		ctx == nil ||
+		!request.DeviceID.Valid() ||
+		request.ExpectedEntityVersion < 1 ||
+		!domain.ValidUnsignedInteger(request.ExpectedEntityVersion) ||
+		request.ExpectedVoterSetVersion < 1 ||
+		!domain.ValidUnsignedInteger(request.ExpectedVoterSetVersion) ||
+		len(request.Reason) < 1 ||
+		len(request.Reason) > maxOperatorReasonBytes ||
+		!utf8.ValidString(request.Reason) ||
+		!validVoterIDs(request.VoterDeviceIDs) {
+		return CommandResult{}, ErrInvalidOperatorDial
+	}
+	requestID, err := operatorRequestID(request.RequestID)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	body, err := operatorCommandBody(
+		operatorcommand.OperationRevokePeer,
+		requestID,
+		event.KindMembershipDeviceRevoked,
+		string(request.DeviceID),
+		request.ExpectedEntityVersion,
+		map[string]any{
+			"device_id":                  request.DeviceID,
+			"expected_voter_set_version": request.ExpectedVoterSetVersion,
+			"reason":                     request.Reason,
+			"voter_set":                  deviceIDStrings(request.VoterDeviceIDs),
+		},
+	)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	return client.submitCommand(ctx, body)
+}
+
+func (client *OperatorClient) submitCommand(
+	ctx context.Context,
+	body []byte,
+) (CommandResult, error) {
+	if err := ctx.Err(); err != nil {
+		return CommandResult{}, err
+	}
+	client.requestMu.Lock()
+	defer client.requestMu.Unlock()
+
+	transport, err := client.currentTransport()
+	if errors.Is(err, ErrStatusConnection) {
+		transport, err = client.reconnect(ctx, nil)
+	}
+	if err != nil {
+		return CommandResult{}, err
+	}
+	if !transport.Usable() {
+		transport, err = client.reconnect(ctx, transport)
+		if err != nil {
+			return CommandResult{}, err
+		}
+	}
+	response, err := transport.Exchange(
+		ctx,
+		http.MethodPost,
+		commandPath,
+		body,
+	)
+	if errors.Is(err, ipc.ErrClientConnectionLost) {
+		transport, reconnectErr := client.reconnect(ctx, transport)
+		if reconnectErr != nil {
+			return CommandResult{}, reconnectErr
+		}
+		response, err = transport.Exchange(
+			ctx,
+			http.MethodPost,
+			commandPath,
+			body,
+		)
+	}
+	if err != nil {
+		if errors.Is(err, ipc.ErrClientProtocol) {
+			return CommandResult{}, fmt.Errorf("%w: %v", ErrCommandProtocol, err)
+		}
+		return CommandResult{}, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return CommandResult{}, ErrCommandProtocol
+	}
+	return decodeCommandResponse(response.Body)
+}
+
+func operatorCommandBody(
+	operation string,
+	requestID domain.UUIDv7,
+	kind event.Kind,
+	entityID string,
+	expectedEntityVersion uint64,
+	payload map[string]any,
+) ([]byte, error) {
+	return canonicalOperatorJSON(map[string]any{
+		"command": map[string]any{
+			"actions":                 []any{},
+			"entity_id":               entityID,
+			"expected_entity_version": expectedEntityVersion,
+			"kind":                    kind,
+			"payload":                 payload,
+			"rationale_summary":       "",
+			"redaction": map[string]any{
+				"fields_removed": []string{},
+				"policy":         event.RedactionDefault,
+			},
+		},
+		"operation":  operation,
+		"request_id": requestID,
+	})
+}
+
+func operatorRequestID(value domain.UUIDv7) (domain.UUIDv7, error) {
+	if value.Valid() {
+		return value, nil
+	}
+	if value != "" {
+		return "", ErrInvalidOperatorDial
+	}
+	generated, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("ui: generate request ID: %w", err)
+	}
+	result := domain.UUIDv7(generated.String())
+	if !result.Valid() {
+		return "", ErrInvalidOperatorDial
+	}
+	return result, nil
+}
+
+func validVoterIDs(values []domain.DeviceID) bool {
+	if !validVoterSetSize(len(values)) {
+		return false
+	}
+	copyValues := append([]domain.DeviceID(nil), values...)
+	sort.Slice(copyValues, func(left, right int) bool {
+		return copyValues[left] < copyValues[right]
+	})
+	for index, value := range values {
+		if !value.Valid() ||
+			value != copyValues[index] ||
+			index > 0 && values[index-1] == value {
+			return false
+		}
+	}
+	return true
+}
+
+type commandResultWire struct {
+	EventID   string          `json:"event_id"`
+	Status    string          `json:"status"`
+	Code      string          `json:"code"`
+	Result    json.RawMessage `json:"result"`
+	Duplicate bool            `json:"duplicate"`
+}
+
+func decodeCommandResponse(input []byte) (CommandResult, error) {
+	var wire commandResultWire
+	if err := decodeStatusObject(input, &wire); err != nil {
+		return CommandResult{}, ErrCommandProtocol
+	}
+	result := CommandResult{
+		EventID:   domain.UUIDv7(wire.EventID),
+		Status:    store.OutcomeStatus(wire.Status),
+		Code:      wire.Code,
+		Result:    bytes.Clone(wire.Result),
+		Duplicate: wire.Duplicate,
+	}
+	canonical, err := codec.CanonicalizeSignedObject(result.Result)
+	if !result.EventID.Valid() ||
+		(result.Status != store.OutcomeAccepted &&
+			result.Status != store.OutcomeRejected) ||
+		result.Code == "" ||
+		err != nil ||
+		!bytes.Equal(canonical, result.Result) {
+		return CommandResult{}, ErrCommandProtocol
+	}
+	return result, nil
 }
 
 func (client *OperatorClient) currentTransport() (*ipc.Client, error) {

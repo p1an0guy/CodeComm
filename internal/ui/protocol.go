@@ -15,12 +15,15 @@ import (
 
 // Snapshot is the bounded status object returned over operator local IPC.
 type Snapshot struct {
-	Session   SessionStatus   `json:"session"`
-	Consensus ConsensusStatus `json:"consensus"`
-	Agents    []AgentStatus   `json:"agents"`
-	Tasks     []TaskStatus    `json:"tasks"`
-	TaskTotal uint64          `json:"task_total"`
-	Truncated bool            `json:"tasks_truncated"`
+	Session          SessionStatus   `json:"session"`
+	Consensus        ConsensusStatus `json:"consensus"`
+	Members          []MemberStatus  `json:"members"`
+	Agents           []AgentStatus   `json:"agents"`
+	Tasks            []TaskStatus    `json:"tasks"`
+	MemberTotal      uint64          `json:"member_total"`
+	MembersTruncated bool            `json:"members_truncated"`
+	TaskTotal        uint64          `json:"task_total"`
+	Truncated        bool            `json:"tasks_truncated"`
 }
 
 type SessionStatus struct {
@@ -69,6 +72,13 @@ type AgentStatus struct {
 	EntityVersion  uint64  `json:"entity_version"`
 }
 
+type MemberStatus struct {
+	DeviceID      string `json:"device_id"`
+	Role          string `json:"role"`
+	Status        string `json:"status"`
+	EntityVersion uint64 `json:"entity_version"`
+}
+
 type TaskStatus struct {
 	TaskID              string  `json:"task_id"`
 	Title               string  `json:"title"`
@@ -89,6 +99,25 @@ func (snapshot Snapshot) Validate() error {
 	}
 	if err := snapshot.Consensus.validate(snapshot.Session.LocalDeviceID); err != nil {
 		return err
+	}
+	if len(snapshot.Members) < 1 ||
+		len(snapshot.Members) > coordstatus.MaxMembers ||
+		snapshot.MemberTotal < 1 ||
+		!domain.ValidUnsignedInteger(snapshot.MemberTotal) ||
+		snapshot.MemberTotal < uint64(len(snapshot.Members)) ||
+		snapshot.MembersTruncated !=
+			(snapshot.MemberTotal > uint64(len(snapshot.Members))) {
+		return fmt.Errorf("ui: invalid member count")
+	}
+	var priorMember string
+	for index, member := range snapshot.Members {
+		if err := member.validate(); err != nil {
+			return fmt.Errorf("ui: member %d: %w", index, err)
+		}
+		if index > 0 && priorMember >= member.DeviceID {
+			return fmt.Errorf("ui: members are not ordered")
+		}
+		priorMember = member.DeviceID
 	}
 	if snapshot.Agents == nil ||
 		len(snapshot.Agents) > coordstatus.MaxAgentSessions {
@@ -128,6 +157,17 @@ func (snapshot Snapshot) Validate() error {
 		}
 		priorPriority = value.Priority
 		priorTaskID = value.TaskID
+	}
+	return nil
+}
+
+func (value MemberStatus) validate() error {
+	if !domain.DeviceID(value.DeviceID).Valid() ||
+		!device.Role(value.Role).Valid() ||
+		!device.Status(value.Status).Valid() ||
+		value.EntityVersion < 1 ||
+		!domain.ValidUnsignedInteger(value.EntityVersion) {
+		return fmt.Errorf("ui: invalid member status")
 	}
 	return nil
 }

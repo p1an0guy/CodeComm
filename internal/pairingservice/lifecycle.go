@@ -69,14 +69,12 @@ func (service *Service) BeginClose() error {
 		return ErrInvalidInput
 	}
 	service.mu.Lock()
-	if service.closed {
-		service.mu.Unlock()
-		return nil
+	if !service.closed {
+		service.closed = true
+		service.cancel()
 	}
-	service.closed = true
-	service.cancel()
 	service.mu.Unlock()
-	return nil
+	return service.authorizer.Close()
 }
 
 // Wait joins maintenance after producers and consensus have stopped.

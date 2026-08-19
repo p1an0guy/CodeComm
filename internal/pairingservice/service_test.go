@@ -31,18 +31,19 @@ const (
 )
 
 type serviceFixture struct {
-	service           *Service
-	authorizer        *AdmissionAuthorizer
-	database          *store.Store
-	databasePath      string
-	state             store.LocalState
-	secrets           *fakeSecretStore
-	clock             *testClock
-	invite            pairing.SignedInvite
-	joinerIdentityKey ed25519.PrivateKey
-	joinerEpochKey    ed25519.PrivateKey
-	peer              transport.IdentityCertificate
-	exporter          []byte
+	service            *Service
+	authorizer         *AdmissionAuthorizer
+	database           *store.Store
+	databasePath       string
+	state              store.LocalState
+	secrets            *fakeSecretStore
+	clock              *testClock
+	invite             pairing.SignedInvite
+	inviterIdentityKey ed25519.PrivateKey
+	joinerIdentityKey  ed25519.PrivateKey
+	joinerEpochKey     ed25519.PrivateKey
+	peer               transport.IdentityCertificate
+	exporter           []byte
 }
 
 func TestPairingServiceRequestConfirmationAndCleanup(t *testing.T) {
@@ -619,7 +620,7 @@ func TestPairingServiceRequiresRecoveryAndStopsCleanly(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	service, err := New(Options{
 		State: fixture.state, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Reservations: noOpBootReservationLane{},
@@ -717,7 +718,7 @@ func TestPairingServiceRestartResumesFinalization(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Reservations: noOpBootReservationLane{},
@@ -767,7 +768,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	first, err := New(Options{
 		State: failingState, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Reservations: noOpBootReservationLane{},
@@ -851,7 +852,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	reopenedState := reopened.LocalState()
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Reservations: noOpBootReservationLane{},
@@ -911,7 +912,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	defer clear(inviteValue.Secret[:])
 	first, err := New(Options{
 		State: failingState, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Reservations: noOpBootReservationLane{},
@@ -995,7 +996,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	reopenedState := reopened.LocalState()
 	restarted, err := New(Options{
 		State: reopenedState, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: finalizer,
 		Reservations: noOpBootReservationLane{},
@@ -1076,7 +1077,7 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 			defer clear(inviteValue.Secret[:])
 			service, err := New(Options{
 				State: superseding, Secrets: fixture.secrets,
-				Authorizer:        fixture.authorizer,
+				Authorizer:        fixture.newAuthorizer(t),
 				IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 				Clock:             fixture.clock.read, Finalizer: finalizer,
 				Reservations: noOpBootReservationLane{},
@@ -1200,7 +1201,7 @@ func TestPairingServiceMaintenanceRetriesSecretDeletion(t *testing.T) {
 	defer clear(inviteValue.Secret[:])
 	restarted, err := New(Options{
 		State: fixture.state, Secrets: fixture.secrets,
-		Authorizer:        fixture.authorizer,
+		Authorizer:        fixture.newAuthorizer(t),
 		IdentityPublicKey: inviteValue.InviterIdentityPublicKey[:],
 		Clock:             fixture.clock.read, Finalizer: successfulFinalizer{},
 		Reservations: noOpBootReservationLane{},
@@ -1450,9 +1451,38 @@ func newServiceFixtureWithMode(
 		service: service, authorizer: authorizer,
 		database: database, databasePath: databasePath,
 		state: localState, secrets: secrets, clock: clock, invite: invite,
-		joinerIdentityKey: joinerIdentityKey, joinerEpochKey: joinerEpochKey, peer: peer,
+		inviterIdentityKey: inviterKey,
+		joinerIdentityKey:  joinerIdentityKey, joinerEpochKey: joinerEpochKey, peer: peer,
 		exporter: bytes.Repeat([]byte{0x55}, pairing.ExporterSize),
 	}
+}
+
+func (fixture serviceFixture) newAuthorizer(
+	t testing.TB,
+) *AdmissionAuthorizer {
+	t.Helper()
+	invite := fixture.invite.Invite()
+	authority, err := event.NewLocalAuthority(
+		invite.InviterDeviceID,
+		serviceTestUUID(500),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer, err := NewAdmissionAuthorizer(AdmissionAuthorizerOptions{
+		DeviceID:           invite.InviterDeviceID,
+		OriginBootID:       serviceTestUUID(500),
+		IdentityPrivateKey: fixture.inviterIdentityKey,
+		OperatorOrigin:     operator,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return authorizer
 }
 
 func (fixture serviceFixture) request(
@@ -1853,6 +1883,7 @@ func (guard *controlledNonvoterGuard) counts() (int, int) {
 type fakeSecretStore struct {
 	mu        sync.Mutex
 	values    map[string][]byte
+	createErr error
 	deleteErr error
 }
 
@@ -1871,6 +1902,24 @@ func (secrets *fakeSecretStore) Get(
 		return nil, credentialstore.ErrNotFound
 	}
 	return bytes.Clone(value), nil
+}
+
+func (secrets *fakeSecretStore) Create(
+	_ context.Context,
+	reference credentialstore.Reference,
+	value []byte,
+) error {
+	secrets.mu.Lock()
+	defer secrets.mu.Unlock()
+	if secrets.createErr != nil {
+		return secrets.createErr
+	}
+	key := reference.String()
+	if _, exists := secrets.values[key]; exists {
+		return credentialstore.ErrAlreadyExists
+	}
+	secrets.values[key] = bytes.Clone(value)
+	return nil
 }
 
 func (secrets *fakeSecretStore) Delete(
@@ -1906,4 +1955,10 @@ func (secrets *fakeSecretStore) setDeleteError(err error) {
 	secrets.mu.Lock()
 	defer secrets.mu.Unlock()
 	secrets.deleteErr = err
+}
+
+func (secrets *fakeSecretStore) setCreateError(err error) {
+	secrets.mu.Lock()
+	defer secrets.mu.Unlock()
+	secrets.createErr = err
 }

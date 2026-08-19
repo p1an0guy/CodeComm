@@ -1,18 +1,16 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
-	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/agentsession"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/localcommand"
 	"github.com/ijonahch/codecomm/internal/store"
 )
 
@@ -26,6 +24,8 @@ const (
 type agentHandler struct {
 	client *boundClient
 }
+
+type localCommandRequest = localcommand.Request
 
 func newAgentHandler(client *boundClient) http.Handler {
 	return &agentHandler{client: client}
@@ -124,13 +124,6 @@ func (handler *agentHandler) context(
 	})
 }
 
-type localCommandRequest struct {
-	Operation string
-	RequestID domain.UUIDv7
-	Command   event.Command
-	Canonical []byte
-}
-
 func (handler *agentHandler) command(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -179,62 +172,29 @@ func (handler *agentHandler) command(
 
 func decodeLocalCommandRequest(
 	request *http.Request,
-) (localCommandRequest, error) {
+) (localcommand.Request, error) {
 	if request.Body == nil {
-		return localCommandRequest{}, ErrCommandRejected
+		return localcommand.Request{}, ErrCommandRejected
 	}
-	raw, err := readBoundedBody(request.Body, event.MaxLocalCommandBytes)
+	command, err := localcommand.DecodeReader(request.Body)
 	if err != nil {
-		return localCommandRequest{}, err
+		return localcommand.Request{}, err
 	}
-	canonical, err := codec.CanonicalizeSignedObject(raw)
-	if err != nil {
-		return localCommandRequest{}, err
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(canonical, &members); err != nil ||
-		len(members) != 3 {
-		return localCommandRequest{}, ErrCommandRejected
-	}
-	for _, field := range []string{"operation", "request_id", "command"} {
-		value, exists := members[field]
-		if !exists || bytes.Equal(value, []byte("null")) {
-			return localCommandRequest{}, ErrCommandRejected
-		}
-	}
-	var operation, requestIDText string
-	if err := json.Unmarshal(members["operation"], &operation); err != nil ||
-		json.Unmarshal(members["request_id"], &requestIDText) != nil {
-		return localCommandRequest{}, ErrCommandRejected
-	}
-	requestID := domain.UUIDv7(requestIDText)
-	if !requestID.Valid() {
-		return localCommandRequest{}, ErrCommandRejected
-	}
-	command, err := event.DecodeLocalCommand(members["command"])
-	if err != nil {
-		return localCommandRequest{}, err
-	}
-	switch operation {
+	switch command.Operation {
 	case "task.create":
-		if command.Kind != event.KindTaskCreated ||
-			command.ExpectedEntityVersion != nil {
-			return localCommandRequest{}, ErrCommandRejected
+		if command.Command.Kind != event.KindTaskCreated ||
+			command.Command.ExpectedEntityVersion != nil {
+			return localcommand.Request{}, ErrCommandRejected
 		}
 	case "task.claim":
-		if command.Kind != event.KindTaskClaimed ||
-			command.ExpectedEntityVersion == nil {
-			return localCommandRequest{}, ErrCommandRejected
+		if command.Command.Kind != event.KindTaskClaimed ||
+			command.Command.ExpectedEntityVersion == nil {
+			return localcommand.Request{}, ErrCommandRejected
 		}
 	default:
-		return localCommandRequest{}, ErrCommandRejected
+		return localcommand.Request{}, ErrCommandRejected
 	}
-	return localCommandRequest{
-		Operation: operation,
-		RequestID: requestID,
-		Command:   command,
-		Canonical: canonical,
-	}, nil
+	return command, nil
 }
 
 type submittedCommand struct {
@@ -244,7 +204,7 @@ type submittedCommand struct {
 
 func (client *boundClient) submitCommand(
 	ctx context.Context,
-	request localCommandRequest,
+	request localcommand.Request,
 ) (submittedCommand, bool, error) {
 	now := client.service.clock()
 	if !now.Valid() {
@@ -377,17 +337,6 @@ func optionalString(value string) *string {
 		return nil
 	}
 	return &value
-}
-
-func readBoundedBody(body io.Reader, limit int) ([]byte, error) {
-	result, err := io.ReadAll(io.LimitReader(body, int64(limit)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(result) > limit {
-		return nil, ErrCommandRejected
-	}
-	return result, nil
 }
 
 func writeAgentJSON(writer http.ResponseWriter, status int, value any) {

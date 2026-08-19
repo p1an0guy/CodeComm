@@ -9,11 +9,22 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/agentsession"
 	"github.com/ijonahch/codecomm/internal/domain/task"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/localcommand"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
+	"github.com/ijonahch/codecomm/internal/store"
 )
 
-const statusQueryPath = "/local/v1/query/status"
+const (
+	statusQueryPath             = "/local/v1/query/status"
+	commandPath                 = "/local/v1/commands"
+	pairingInviteCollectionPath = "/local/v1/pairing/invites"
+	pairingInviteRevokePath     = "/local/v1/pairing/invites/revoke"
+	pairingAttemptPath          = "/local/v1/pairing/attempt"
+	pairingConfirmPath          = "/local/v1/pairing/confirm"
+)
 
 var (
 	ErrInvalidOperatorOptions = errors.New("ui: invalid operator service options")
@@ -27,13 +38,17 @@ type StatusSource interface {
 
 type OperatorServiceOptions struct {
 	Source      StatusSource
+	Submitter   operatorcommand.Submitter
+	Pairing     PairingOperator
 	SessionID   domain.UUIDv7
 	WorkspaceID domain.UUIDv4
 }
 
-// OperatorService authorizes a read-only operator connection.
+// OperatorService authorizes one human operator connection.
 type OperatorService struct {
 	source      StatusSource
+	submitter   operatorcommand.Submitter
+	pairing     PairingOperator
 	sessionID   domain.UUIDv7
 	workspaceID domain.UUIDv4
 }
@@ -42,12 +57,16 @@ func NewOperatorService(
 	options OperatorServiceOptions,
 ) (*OperatorService, error) {
 	if options.Source == nil ||
+		options.Submitter == nil ||
+		options.Pairing == nil ||
 		!options.SessionID.Valid() ||
 		!options.WorkspaceID.Valid() {
 		return nil, ErrInvalidOperatorOptions
 	}
 	return &OperatorService{
 		source:      options.Source,
+		submitter:   options.Submitter,
+		pairing:     options.Pairing,
 		sessionID:   options.SessionID,
 		workspaceID: options.WorkspaceID,
 	}, nil
@@ -72,7 +91,12 @@ func (service *OperatorService) Bind(
 		return ipc.BindResult{}, err
 	}
 	return ipc.NewOperatorBindResult(&operatorBoundClient{
-		handler: newOperatorHandler(service.source),
+		handler: newOperatorHandler(
+			service.source,
+			service.submitter,
+			service.pairing,
+			request.ClientInstanceID,
+		),
 	})
 }
 
@@ -87,24 +111,73 @@ func (client *operatorBoundClient) Handler() http.Handler {
 func (*operatorBoundClient) Disconnected(context.Context) {}
 
 type operatorHandler struct {
-	source StatusSource
+	source           StatusSource
+	submitter        operatorcommand.Submitter
+	pairing          PairingOperator
+	clientInstanceID domain.UUIDv7
 }
 
-func newOperatorHandler(source StatusSource) http.Handler {
-	return &operatorHandler{source: source}
+func newOperatorHandler(
+	source StatusSource,
+	submitter operatorcommand.Submitter,
+	pairing PairingOperator,
+	clientInstanceID domain.UUIDv7,
+) http.Handler {
+	return &operatorHandler{
+		source:           source,
+		submitter:        submitter,
+		pairing:          pairing,
+		clientInstanceID: clientInstanceID,
+	}
 }
 
 func (handler *operatorHandler) ServeHTTP(
 	writer http.ResponseWriter,
 	request *http.Request,
 ) {
-	if request.Method != http.MethodGet ||
-		request.URL.Path != statusQueryPath ||
-		request.URL.RawQuery != "" ||
-		request.RequestURI != statusQueryPath {
+	switch {
+	case request.Method == http.MethodGet &&
+		exactOperatorRoute(request, statusQueryPath):
+		handler.status(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, commandPath):
+		handler.command(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, pairingInviteCollectionPath):
+		handler.createPairingInvite(writer, request)
+	case request.Method == http.MethodGet &&
+		exactOperatorRoute(request, pairingInviteCollectionPath):
+		handler.listPairingInvites(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, pairingInviteRevokePath):
+		handler.revokePairingInvite(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, pairingAttemptPath):
+		handler.pairingAttempt(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, pairingConfirmPath):
+		handler.confirmPairing(writer, request)
+	default:
 		writeOperatorError(writer, http.StatusNotFound, "operation_not_found")
-		return
 	}
+}
+
+func exactOperatorRoute(request *http.Request, path string) bool {
+	return request != nil &&
+		request.URL != nil &&
+		request.URL.Path == path &&
+		request.URL.RawPath == "" &&
+		request.URL.RawQuery == "" &&
+		request.URL.Fragment == "" &&
+		request.URL.RawFragment == "" &&
+		!request.URL.ForceQuery &&
+		request.RequestURI == path
+}
+
+func (handler *operatorHandler) status(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
 	source, err := handler.source.Status(request.Context())
 	if err != nil {
 		writeOperatorError(
@@ -133,6 +206,73 @@ func (handler *operatorHandler) ServeHTTP(
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(snapshot)
+}
+
+func (handler *operatorHandler) command(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if request.Body == nil ||
+		handler.submitter == nil ||
+		!handler.clientInstanceID.Valid() {
+		writeOperatorError(writer, http.StatusBadRequest, "invalid_command")
+		return
+	}
+	command, err := localcommand.DecodeReader(request.Body)
+	if err != nil || !validOperatorCommand(command) {
+		writeOperatorError(writer, http.StatusBadRequest, "invalid_command")
+		return
+	}
+	result, err := handler.submitter.SubmitOperatorCommand(
+		request.Context(),
+		operatorcommand.Request{
+			ClientInstanceID: handler.clientInstanceID,
+			Command:          command,
+		},
+	)
+	if err != nil {
+		status := http.StatusInternalServerError
+		code := "command_failed"
+		switch {
+		case errors.Is(err, store.ErrLocalBackpressure):
+			status = http.StatusTooManyRequests
+			code = "local_backpressure"
+		case errors.Is(err, store.ErrLocalIdempotencyConflict):
+			status = http.StatusConflict
+			code = "local_idempotency_conflict"
+		case errors.Is(err, operatorcommand.ErrInvalidCommand):
+			status = http.StatusBadRequest
+			code = "invalid_command"
+		case errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			status = http.StatusRequestTimeout
+			code = "command_wait_interrupted"
+		}
+		writeOperatorError(writer, status, code)
+		return
+	}
+	writeOperatorJSON(writer, http.StatusOK, map[string]any{
+		"code":      result.Outcome.Code,
+		"duplicate": result.Duplicate,
+		"event_id":  result.EventID,
+		"result":    json.RawMessage(result.Outcome.JSON),
+		"status":    result.Outcome.Status,
+	})
+}
+
+func validOperatorCommand(request localcommand.Request) bool {
+	command := request.Command
+	if command.ExpectedEntityVersion == nil {
+		return false
+	}
+	switch request.Operation {
+	case operatorcommand.OperationSetVoters:
+		return command.Kind == event.KindMembershipVoterSetChanged
+	case operatorcommand.OperationRevokePeer:
+		return command.Kind == event.KindMembershipDeviceRevoked
+	default:
+		return false
+	}
 }
 
 func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
@@ -169,6 +309,15 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 	tasks := make([]TaskStatus, len(durable.Tasks))
 	for index, value := range durable.Tasks {
 		tasks[index] = taskStatus(value)
+	}
+	members := make([]MemberStatus, len(durable.Members))
+	for index, member := range durable.Members {
+		members[index] = MemberStatus{
+			DeviceID:      string(member.ID),
+			Role:          string(member.Role),
+			Status:        string(member.Status),
+			EntityVersion: member.EntityVersion,
+		}
 	}
 	var reconciliationDevice *string
 	if runtime.ReconciliationDeviceID != "" {
@@ -218,10 +367,13 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 			ReconciliationBlocker:   string(runtime.ReconciliationBlocker),
 			ReconciliationDeviceID:  reconciliationDevice,
 		},
-		Agents:    agents,
-		Tasks:     tasks,
-		TaskTotal: durable.TaskTotal,
-		Truncated: durable.TasksTruncated,
+		Members:          members,
+		Agents:           agents,
+		Tasks:            tasks,
+		MemberTotal:      durable.MemberTotal,
+		MembersTruncated: durable.MembersTruncated,
+		TaskTotal:        durable.TaskTotal,
+		Truncated:        durable.TasksTruncated,
 	}
 }
 
@@ -289,4 +441,19 @@ func writeOperatorError(
 		"code":   code,
 		"status": status,
 	})
+}
+
+func writeOperatorJSON(
+	writer http.ResponseWriter,
+	status int,
+	value any,
+) {
+	body, err := canonicalOperatorJSON(value)
+	if err != nil {
+		writeOperatorError(writer, http.StatusInternalServerError, "encoding_failed")
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_, _ = writer.Write(body)
 }

@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
+	"github.com/ijonahch/codecomm/internal/store"
 )
 
 func TestOperatorClientReadsStatusAndReconnectsAfterDaemonRestart(t *testing.T) {
@@ -23,6 +26,8 @@ func TestOperatorClientReadsStatusAndReconnectsAfterDaemonRestart(t *testing.T) 
 		Source: statusSourceFunc(func(context.Context) (coordstatus.Snapshot, error) {
 			return source, nil
 		}),
+		Submitter:   successfulOperatorSubmitter(),
+		Pairing:     testPairingOperator{},
 		SessionID:   uiTestSessionID,
 		WorkspaceID: uiTestWorkspaceID,
 	})
@@ -136,6 +141,73 @@ func TestDecodeStatusResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestOperatorClientSubmitsExactVoterTarget(t *testing.T) {
+	endpoint := newUIClientTestEndpoint(t)
+	source := uiTestStatusSnapshot(t)
+	var captured operatorcommand.Request
+	service, err := NewOperatorService(OperatorServiceOptions{
+		Source: statusSourceFunc(func(context.Context) (coordstatus.Snapshot, error) {
+			return source, nil
+		}),
+		Submitter: operatorSubmitterFunc(func(
+			_ context.Context,
+			request operatorcommand.Request,
+		) (operatorcommand.Result, error) {
+			captured = request
+			return operatorcommand.Result{
+				EventID: uiTestTaskID,
+				Outcome: store.CommandOutcome{
+					Status: store.OutcomeAccepted,
+					Code:   "accepted",
+					JSON: []byte(
+						`{"code":"accepted","status":"accepted"}`,
+					),
+				},
+			}, nil
+		}),
+		Pairing:     testPairingOperator{},
+		SessionID:   uiTestSessionID,
+		WorkspaceID: uiTestWorkspaceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := startUIClientTestServer(t, endpoint, service)
+	t.Cleanup(func() { server.stop(t) })
+	client, err := DialOperator(testUIClientContext(t), OperatorDialOptions{
+		Endpoint:         endpoint,
+		ClientInstanceID: uiTestClientID,
+		SessionID:        uiTestSessionID,
+		WorkspaceID:      uiTestWorkspaceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	target := []domain.DeviceID{source.Durable.Member.ID}
+	result, err := client.SetVoters(
+		testUIClientContext(t),
+		SetVotersRequest{
+			RequestID:               uiTestAgentID,
+			ExpectedVoterSetVersion: 1,
+			VoterDeviceIDs:          target,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SetVoters(): %v", err)
+	}
+	if result.EventID != uiTestTaskID ||
+		result.Status != store.OutcomeAccepted ||
+		captured.ClientInstanceID != uiTestClientID ||
+		captured.Command.RequestID != uiTestAgentID {
+		t.Fatalf("result = %#v; request = %#v", result, captured)
+	}
+	payload := string(captured.Command.Command.Payload)
+	if payload != `{"voter_set":["`+string(target[0])+`"]}` {
+		t.Fatalf("payload = %s", payload)
 	}
 }
 

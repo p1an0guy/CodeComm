@@ -46,6 +46,10 @@ func (state LocalState) StatusSnapshot(
 		if !found {
 			return ErrLocalStateIntegrity
 		}
+		members, memberTotal, err := readStatusMembers(conn)
+		if err != nil {
+			return err
+		}
 		target, err := readStatusVoterSet(conn, lineage.sessionID)
 		if err != nil {
 			return err
@@ -80,7 +84,11 @@ func (state LocalState) StatusSnapshot(
 				DigestVersion:           heads.DigestVersion,
 				ProjectionSchemaVersion: heads.ProjectionSchemaVersion,
 			},
-			Member:              member,
+			Member:      member,
+			Members:     members,
+			MemberTotal: memberTotal,
+			MembersTruncated: memberTotal >
+				uint64(len(members)),
 			VoterSet:            target,
 			CredentialAuthority: authority,
 			AgentSessions:       sessions,
@@ -106,6 +114,61 @@ func (state LocalState) StatusSnapshot(
 		return coordstatus.DurableSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func readStatusMembers(
+	conn *sqlite.Conn,
+) ([]coordstatus.MemberSummary, uint64, error) {
+	var total int64
+	if err := queryOne(
+		conn,
+		"SELECT COUNT(*) FROM devices;",
+		func(stmt *sqlite.Stmt) {
+			total = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return nil, 0, err
+	}
+	if total < 1 || !domain.ValidUnsignedInteger(uint64(total)) {
+		return nil, 0, ErrLocalStateIntegrity
+	}
+	members := make([]coordstatus.MemberSummary, 0, min(
+		int(total),
+		coordstatus.MaxMembers,
+	))
+	var rowErr error
+	if err := queryArgs(
+		conn,
+		`SELECT device_id, role, status, entity_version
+		   FROM devices
+		  ORDER BY device_id ASC
+		  LIMIT ?1;`,
+		[]any{int64(coordstatus.MaxMembers)},
+		func(stmt *sqlite.Stmt) {
+			entityVersion := stmt.ColumnInt64(3)
+			if entityVersion < 1 {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			member := coordstatus.MemberSummary{
+				ID:            domain.DeviceID(stmt.ColumnText(0)),
+				Role:          device.Role(stmt.ColumnText(1)),
+				Status:        device.Status(stmt.ColumnText(2)),
+				EntityVersion: uint64(entityVersion),
+			}
+			if member.Validate() != nil {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			members = append(members, member)
+		},
+	); err != nil {
+		return nil, 0, err
+	}
+	if rowErr != nil || len(members) == 0 {
+		return nil, 0, ErrLocalStateIntegrity
+	}
+	return members, uint64(total), nil
 }
 
 func readStatusMember(

@@ -128,7 +128,7 @@ func TestDurableFinalizerReopensAfterCommittedAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	details, authorization := finalizerAdmissionAuthorization(
+	details, authorization, _ := finalizerAdmissionAuthorization(
 		t,
 		ownerKey,
 		ownerID,
@@ -827,7 +827,11 @@ func finalizerAdmissionAuthorization(
 	ownerKey ed25519.PrivateKey,
 	ownerID domain.DeviceID,
 	bootID domain.UUIDv7,
-) (AttemptDetails, *store.PairingFinalizationAuthorization) {
+) (
+	AttemptDetails,
+	*store.PairingFinalizationAuthorization,
+	*AdmissionAuthorizer,
+) {
 	t.Helper()
 	joinerKey := testPrivateKey(2)
 	joinerPublicKey := joinerKey.Public().(ed25519.PublicKey)
@@ -897,6 +901,7 @@ func finalizerAdmissionAuthorization(
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = authorizer.Close() })
 	decidedAt := domain.Timestamp("2026-08-13T12:01:01Z")
 	authorization, err := authorizer.PreparePairing(
 		context.Background(),
@@ -913,7 +918,7 @@ func finalizerAdmissionAuthorization(
 	return AttemptDetails{
 		Invite: invite, Attempt: attempt, Core: core,
 		SAS: preConfirmation.SAS,
-	}, authorization
+	}, authorization, authorizer
 }
 
 func finalizerApplyClock() (domain.Timestamp, int64, error) {

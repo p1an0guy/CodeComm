@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -17,15 +18,21 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/credential"
+	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/plan"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/domain/publication"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/localcommand"
+	"github.com/ijonahch/codecomm/internal/operatorcommand"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"zombiezen.com/go/sqlite"
@@ -34,7 +41,10 @@ import (
 
 var errBootOriginTestStop = errors.New("stop after reservation")
 
-var _ consensus.CheckpointOrigin = (*BootOrigin)(nil)
+var (
+	_ consensus.CheckpointOrigin              = (*BootOrigin)(nil)
+	_ consensus.CredentialAuthorizationOrigin = (*BootOrigin)(nil)
+)
 
 const (
 	bootOriginTestRequestID = domain.UUIDv7(
@@ -143,6 +153,350 @@ func TestBootOriginSubmitVoterSetActivationDurablyResolvesExactPayload(
 	}
 }
 
+func TestBootOriginSubmitCredentialAuthorizationDurablyResolvesExactPayload(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	authorization := bootOriginCredentialAuthorization(t, harness)
+	payload, err := encodeCredentialAuthorizationPayload(authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingCheckpointConsensus{
+		delegate:  harness.consensus,
+		completed: make(chan struct{}),
+	}
+	harness.boot.consensus = recorder
+
+	outcome, err := harness.boot.SubmitCredentialAuthorization(
+		bootOriginTestContext(t),
+		authorization,
+	)
+	if err != nil {
+		t.Fatalf("SubmitCredentialAuthorization(): %v", err)
+	}
+	if outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("credential outcome = %#v", outcome)
+	}
+	if authorization.AuthorizationChainIndex != 0 {
+		t.Fatalf(
+			"input authorization chain index = %d, want 0",
+			authorization.AuthorizationChainIndex,
+		)
+	}
+	proposals := recorder.proposals()
+	if len(proposals) != 1 {
+		t.Fatalf("submitted proposals = %d, want 1", len(proposals))
+	}
+	signed, err := event.ParseAndVerify(
+		proposals[0],
+		event.VerificationContext{
+			SessionID:         agentTestSessionID,
+			WorkspaceID:       agentTestWorkspaceID,
+			IdentityPublicKey: harness.private.Public().(ed25519.PublicKey),
+		},
+	)
+	if err != nil {
+		t.Fatalf("ParseAndVerify(): %v", err)
+	}
+	proposal := signed.Proposal()
+	entityID, entityPresent := proposal.EntityID.Value()
+	if proposal.Kind != event.KindCredentialAuthorized ||
+		proposal.Origin.ActorType() != event.ActorDaemon ||
+		proposal.ExpectedEntityVersion != nil ||
+		!entityPresent ||
+		entityID != string(harness.deviceID) ||
+		proposal.Origin.Sequence() != 1 ||
+		!bytes.Equal(proposal.Payload, payload) {
+		t.Fatalf("credential proposal = %#v", proposal)
+	}
+
+	record, found, err := harness.local.LookupRequest(
+		bootOriginTestContext(t),
+		agentTestBootID,
+		bootOriginTestRequestID,
+	)
+	if err != nil || !found {
+		t.Fatalf("LookupRequest() = (%#v, %t, %v)", record, found, err)
+	}
+	canonicalRequest, err := canonicalObject(map[string]any{
+		"authorization": json.RawMessage(payload),
+		"operation":     event.KindCredentialAuthorized,
+		"request_id":    bootOriginTestRequestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.EventID != bootOriginTestEventID ||
+		record.State != store.LocalRequestResolved ||
+		record.BindingClass != store.LocalBindingDaemon ||
+		record.RequestKind != event.KindCredentialAuthorized ||
+		record.RequestDigest != store.Digest(sha256.Sum256(canonicalRequest)) {
+		t.Fatalf("durable credential request = %#v", record)
+	}
+}
+
+func TestBootOriginSubmitCredentialAuthorizationRejectsInvalidCandidateBeforeReservation(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	authorization := bootOriginCredentialAuthorization(t, harness)
+	authorization.AuthorizationChainIndex = 1
+
+	_, err := harness.boot.SubmitCredentialAuthorization(
+		bootOriginTestContext(t),
+		authorization,
+	)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf(
+			"SubmitCredentialAuthorization() error = %v, want ErrInvalidOptions",
+			err,
+		)
+	}
+	records, err := harness.local.OutboxRecords(bootOriginTestContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("outbox records = %d, want 0", len(records))
+	}
+	if remaining := harness.ids.remaining(); remaining != 2 {
+		t.Fatalf("remaining generated IDs = %d, want 2", remaining)
+	}
+}
+
+func TestBootOriginSubmitOperatorCommandSignsHumanAndReplaysExactly(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	harness.ids = &fixedIDGenerator{values: []domain.UUIDv7{
+		bootOriginTestEventID,
+	}}
+	harness.boot.generateID = harness.ids.next
+	recorder := &recordingCheckpointConsensus{
+		delegate:  harness.consensus,
+		completed: make(chan struct{}),
+	}
+	harness.boot.consensus = recorder
+
+	request := bootOriginOperatorRequest(
+		t,
+		harness.deviceID,
+		bootOriginTestRequestID,
+	)
+	result, err := harness.boot.SubmitOperatorCommand(
+		bootOriginTestContext(t),
+		operatorcommand.Request{
+			ClientInstanceID: bootOriginTestPriorRequestID,
+			Command:          request,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitOperatorCommand(): %v", err)
+	}
+	if result.EventID != bootOriginTestEventID ||
+		result.Outcome.Status != store.OutcomeAccepted ||
+		result.Duplicate {
+		t.Fatalf("result = %#v", result)
+	}
+	proposals := recorder.proposals()
+	if len(proposals) != 1 {
+		t.Fatalf("proposals = %d, want 1", len(proposals))
+	}
+	signed, err := event.ParseAndVerify(
+		proposals[0],
+		event.VerificationContext{
+			SessionID:         agentTestSessionID,
+			WorkspaceID:       agentTestWorkspaceID,
+			IdentityPublicKey: harness.private.Public().(ed25519.PublicKey),
+		},
+	)
+	if err != nil {
+		t.Fatalf("ParseAndVerify(): %v", err)
+	}
+	proposal := signed.Proposal()
+	if proposal.Origin.ActorType() != event.ActorHuman ||
+		proposal.Origin.OriginBootID() != agentTestBootID ||
+		proposal.Kind != event.KindMembershipVoterSetChanged ||
+		proposal.ExpectedEntityVersion == nil ||
+		*proposal.ExpectedEntityVersion != 2 {
+		t.Fatalf("proposal = %#v", proposal)
+	}
+
+	duplicate, err := harness.boot.SubmitOperatorCommand(
+		bootOriginTestContext(t),
+		operatorcommand.Request{
+			ClientInstanceID: bootOriginTestPriorRequestID,
+			Command:          request,
+		},
+	)
+	if err != nil {
+		t.Fatalf("exact replay: %v", err)
+	}
+	if !duplicate.Duplicate ||
+		duplicate.EventID != result.EventID ||
+		len(recorder.proposals()) != 1 {
+		t.Fatalf("duplicate = %#v; proposals = %d", duplicate, len(recorder.proposals()))
+	}
+
+	changed := request
+	changed.Canonical = bytes.Replace(
+		changed.Canonical,
+		[]byte(`"expected_entity_version":2`),
+		[]byte(`"expected_entity_version":1`),
+		1,
+	)
+	if _, err := harness.boot.SubmitOperatorCommand(
+		bootOriginTestContext(t),
+		operatorcommand.Request{
+			ClientInstanceID: bootOriginTestPriorRequestID,
+			Command:          changed,
+		},
+	); !errors.Is(err, store.ErrLocalIdempotencyConflict) {
+		t.Fatalf("changed replay error = %v", err)
+	}
+}
+
+func TestBootOriginSubmitDeviceRevocationPreservesBothReviewedCASValues(
+	t *testing.T,
+) {
+	harness := newBootOriginActivationHarness(t)
+	harness.ids = &fixedIDGenerator{values: []domain.UUIDv7{
+		bootOriginTestEventID,
+	}}
+	harness.boot.generateID = harness.ids.next
+	var subject domain.DeviceID
+	for _, candidate := range harness.target {
+		if candidate != harness.deviceID {
+			subject = candidate
+			break
+		}
+	}
+	if !subject.Valid() {
+		t.Fatal("revocation fixture has no nonlocal target voter")
+	}
+	request := bootOriginRevocationRequest(
+		t,
+		harness.deviceID,
+		subject,
+		bootOriginTestRequestID,
+	)
+	result, err := harness.boot.SubmitOperatorCommand(
+		bootOriginTestContext(t),
+		operatorcommand.Request{
+			ClientInstanceID: bootOriginTestPriorRequestID,
+			Command:          request,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitOperatorCommand(revoke): %v", err)
+	}
+	if result.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("revocation result = %#v", result)
+	}
+	snapshot, err := harness.local.StatusSnapshot(
+		bootOriginTestContext(t),
+		harness.deviceID,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("StatusSnapshot(): %v", err)
+	}
+	if snapshot.VoterSet.VoterSetVersion != 3 ||
+		!reflect.DeepEqual(
+			snapshot.VoterSet.VoterDeviceIDs(),
+			[]domain.DeviceID{harness.deviceID},
+		) {
+		t.Fatalf("voter target after revocation = %#v", snapshot.VoterSet)
+	}
+	var revoked *coordstatus.MemberSummary
+	for index := range snapshot.Members {
+		if snapshot.Members[index].ID == subject {
+			revoked = &snapshot.Members[index]
+			break
+		}
+	}
+	if revoked == nil ||
+		revoked.Status != device.StatusRevoked ||
+		revoked.EntityVersion != 2 {
+		t.Fatalf("revoked member = %#v", revoked)
+	}
+}
+
+func bootOriginOperatorRequest(
+	t *testing.T,
+	deviceID domain.DeviceID,
+	requestID domain.UUIDv7,
+) localcommand.Request {
+	t.Helper()
+	canonical, err := canonicalObject(map[string]any{
+		"command": map[string]any{
+			"actions":                 []any{},
+			"entity_id":               agentTestSessionID,
+			"expected_entity_version": uint64(2),
+			"kind":                    event.KindMembershipVoterSetChanged,
+			"payload": map[string]any{
+				"voter_set": []domain.DeviceID{deviceID},
+			},
+			"rationale_summary": "",
+			"redaction": map[string]any{
+				"fields_removed": []string{},
+				"policy":         event.RedactionDefault,
+			},
+		},
+		"operation":  operatorcommand.OperationSetVoters,
+		"request_id": requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := localcommand.Decode(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func bootOriginRevocationRequest(
+	t *testing.T,
+	resultingVoter domain.DeviceID,
+	subject domain.DeviceID,
+	requestID domain.UUIDv7,
+) localcommand.Request {
+	t.Helper()
+	canonical, err := canonicalObject(map[string]any{
+		"command": map[string]any{
+			"actions":                 []any{},
+			"entity_id":               subject,
+			"expected_entity_version": uint64(1),
+			"kind":                    event.KindMembershipDeviceRevoked,
+			"payload": map[string]any{
+				"device_id":                  subject,
+				"expected_voter_set_version": uint64(2),
+				"reason":                     "retired test device",
+				"voter_set": []domain.DeviceID{
+					resultingVoter,
+				},
+			},
+			"rationale_summary": "",
+			"redaction": map[string]any{
+				"fields_removed": []string{},
+				"policy":         event.RedactionDefault,
+			},
+		},
+		"operation":  operatorcommand.OperationRevokePeer,
+		"request_id": requestID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := localcommand.Decode(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
 func TestBootOriginSubmitVoterSetActivationRejectsLineageBeforeReservation(
 	t *testing.T,
 ) {
@@ -222,6 +576,10 @@ func TestBootOriginForceCheckpointDrainsPredecessorAndSettles(
 	if err != nil {
 		t.Fatal(err)
 	}
+	operatorBinding, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var origin *BootOrigin
 	node, err := consensus.OpenSingleNode(
 		context.Background(),
@@ -260,6 +618,7 @@ func TestBootOriginForceCheckpointDrainsPredecessorAndSettles(
 					OriginBootID:       agentTestBootID,
 					IdentityPrivateKey: privateKey,
 					DaemonOrigin:       daemonBinding,
+					OperatorOrigin:     operatorBinding,
 					Clock: func() domain.Timestamp {
 						return agentTestTimestamp
 					},
@@ -506,6 +865,10 @@ func TestBootOriginReplaysExactHistoricalCheckpointAfterReopen(
 	if err != nil {
 		t.Fatal(err)
 	}
+	nextOperatorBinding, err := nextAuthority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
 	nextOrigin, err := NewBootOrigin(BootOriginOptions{
 		Consensus:          recorder,
 		LocalState:         reopened.LocalState(),
@@ -515,6 +878,7 @@ func TestBootOriginReplaysExactHistoricalCheckpointAfterReopen(
 		OriginBootID:       bootOriginTestNextBootID,
 		IdentityPrivateKey: harness.private,
 		DaemonOrigin:       nextBinding,
+		OperatorOrigin:     nextOperatorBinding,
 		Clock: func() domain.Timestamp {
 			return agentTestTimestamp
 		},
@@ -1194,6 +1558,11 @@ func newBootOriginActivationHarness(
 		_ = state.Close()
 		t.Fatal(err)
 	}
+	operatorBinding, err := authority.OperatorBinding()
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
 	ids := &fixedIDGenerator{values: []domain.UUIDv7{
 		bootOriginTestRequestID,
 		bootOriginTestEventID,
@@ -1207,6 +1576,7 @@ func newBootOriginActivationHarness(
 		OriginBootID:       agentTestBootID,
 		IdentityPrivateKey: privateKey,
 		DaemonOrigin:       binding,
+		OperatorOrigin:     operatorBinding,
 		Clock: func() domain.Timestamp {
 			return agentTestTimestamp
 		},
@@ -1328,6 +1698,59 @@ func bootOriginActivationPayload(
 		t.Fatal(err)
 	}
 	return payload
+}
+
+func bootOriginCredentialAuthorization(
+	t *testing.T,
+	harness *bootOriginActivationHarness,
+) credentialauthorization.Authorization {
+	t.Helper()
+	epochPrivateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x71}, ed25519.SeedSize),
+	)
+	defer clear(epochPrivateKey)
+	binding, err := credential.SignBinding(
+		agentTestSessionID,
+		harness.deviceID,
+		1,
+		epochPrivateKey.Public().(ed25519.PublicKey),
+		harness.private,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := credentialauthorization.Authorization{
+		SessionID:                agentTestSessionID,
+		DeviceID:                 harness.deviceID,
+		Epoch:                    binding.Epoch,
+		EpochPublicKey:           binding.EpochPublicKey,
+		KeyDigest:                binding.KeyDigest,
+		Role:                     credentialauthorization.RoleOwner,
+		IssuedAt:                 domain.WholeSecondTimestamp(agentTestTimestamp),
+		NotBefore:                domain.WholeSecondTimestamp(agentTestTimestamp),
+		ValiditySeconds:          credentialauthorization.ValiditySeconds,
+		AuthorityVoterSetVersion: 1,
+		BindingSignature:         binding.Signature,
+	}
+	preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
+		authorization,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := codecommcrypto.SignEd25519(
+		harness.private,
+		codec.SignatureCredentialTimeEndorsement,
+		preimage,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization.ClockEndorsements = []credentialauthorization.ClockEndorsement{{
+		DeviceID: harness.deviceID,
+	}}
+	copy(authorization.ClockEndorsements[0].Signature[:], signature)
+	return authorization
 }
 
 type releasingCheckpointConsensus struct {
