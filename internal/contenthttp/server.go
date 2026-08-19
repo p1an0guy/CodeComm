@@ -1,11 +1,13 @@
 package contenthttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"strconv"
@@ -15,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
 )
@@ -22,6 +26,10 @@ import (
 const (
 	SessionPath = "/v1/session"
 	PeersPath   = "/v1/peers"
+	EventsPath  = "/v1/events"
+
+	proposalHopHeader = "CodeComm-Proposal-Hop"
+	proposalHopOnce   = "1"
 
 	HeaderMaxBytes       = 32 << 10
 	ResponseMaxBytes     = 1 << 20
@@ -34,9 +42,21 @@ const (
 )
 
 var (
-	ErrInvalidOptions    = errors.New("content HTTP: invalid options")
-	ErrInvalidConnection = errors.New("content HTTP: invalid connection")
-	ErrTLSBinding        = errors.New("content HTTP: invalid TLS binding")
+	ErrInvalidOptions       = errors.New("content HTTP: invalid options")
+	ErrInvalidConnection    = errors.New("content HTTP: invalid connection")
+	ErrTLSBinding           = errors.New("content HTTP: invalid TLS binding")
+	ErrInvalidEventProposal = errors.New(
+		"content HTTP: invalid event proposal",
+	)
+	ErrEventIdempotencyConflict = errors.New(
+		"content HTTP: event idempotency conflict",
+	)
+	ErrEventProposalUnavailable = errors.New(
+		"content HTTP: event proposal unavailable",
+	)
+	ErrEventProposalRateLimited = errors.New(
+		"content HTTP: event proposal rate limited",
+	)
 )
 
 // Server serves the fixed inbound V1 content-control routes.
@@ -77,7 +97,7 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 			PingTimeout:                  RequestHeaderTimeout,
 			WriteByteTimeout:             StreamNoProgress,
 			MaxUploadBufferPerConnection: 1 << 16,
-			MaxUploadBufferPerStream:     1,
+			MaxUploadBufferPerStream:     event.MaxEventBytes,
 		},
 		handlers:         make(chan struct{}, activeHandlers),
 		control:          control,
@@ -295,11 +315,23 @@ func (handler *connectionHandler) ServeHTTP(
 		return
 	}
 	switch request.URL.Path {
-	case SessionPath, PeersPath:
+	case SessionPath, PeersPath, EventsPath:
 	default:
 		writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 		return
 	}
+	switch request.URL.Path {
+	case SessionPath, PeersPath:
+		handler.serveRead(writer, request)
+	case EventsPath:
+		handler.serveEvent(writer, request)
+	}
+}
+
+func (handler *connectionHandler) serveRead(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
 		writeProblem(writer, http.StatusMethodNotAllowed, problemMethod)
@@ -349,7 +381,170 @@ func (handler *connectionHandler) ServeHTTP(
 		writeProblem(writer, http.StatusInternalServerError, problemInternal)
 		return
 	}
-	writeJSON(writer, http.StatusOK, "application/json", body)
+	writeJSON(writer, http.StatusOK, contentJSONMediaType, body)
+}
+
+func (handler *connectionHandler) serveEvent(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if request.Method != http.MethodPost {
+		writer.Header().Set("Allow", http.MethodPost)
+		writeProblem(writer, http.StatusMethodNotAllowed, problemMethod)
+		return
+	}
+	allowed, retryAfter, err := handler.server.control.consumeProposal(
+		handler.peer.DeviceID,
+	)
+	if err != nil {
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemUnavailable,
+		)
+		return
+	}
+	if !allowed {
+		retrySeconds := max(
+			int64(1),
+			int64((retryAfter+time.Second-1)/time.Second),
+		)
+		writer.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+		writeProblem(
+			writer,
+			http.StatusTooManyRequests,
+			problemProposalRateLimited,
+		)
+		return
+	}
+	if request.ContentLength > int64(event.MaxEventBytes) {
+		writeProblem(
+			writer,
+			http.StatusRequestEntityTooLarge,
+			problemEventTooLarge,
+		)
+		return
+	}
+	idempotencyKey, hop, valid := validEventRequest(request)
+	if !valid {
+		writeProblem(writer, http.StatusBadRequest, problemEventInvalid)
+		return
+	}
+	if !validNegotiation(request.Header) {
+		writeProblem(writer, http.StatusNotAcceptable, problemNegotiation)
+		return
+	}
+
+	callContext, cancel := context.WithTimeout(
+		request.Context(),
+		handler.server.handlerTimeout,
+	)
+	defer cancel()
+	body, err := readEventRequest(callContext, request)
+	if err != nil {
+		switch {
+		case errors.Is(err, event.ErrEventTooLarge):
+			writeProblem(
+				writer,
+				http.StatusRequestEntityTooLarge,
+				problemEventTooLarge,
+			)
+		case errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			writeEventProblem(writer, err)
+		default:
+			writeProblem(writer, http.StatusBadRequest, problemEventInvalid)
+		}
+		return
+	}
+	proposal, err := event.InspectUnverifiedProposal(body)
+	if err != nil || proposal.EventID != idempotencyKey {
+		writeProblem(writer, http.StatusBadRequest, problemEventInvalid)
+		return
+	}
+	result, err := handler.server.service.ProposeEvent(
+		callContext,
+		handler.peer.DeviceID,
+		body,
+		hop,
+	)
+	if err != nil {
+		writeEventProblem(writer, err)
+		return
+	}
+	if !bytes.Equal(result.Proposal(), body) {
+		writeProblem(writer, http.StatusInternalServerError, problemInternal)
+		return
+	}
+	response, err := result.canonicalBytes()
+	if err != nil || len(response) == 0 || len(response) > ResponseMaxBytes {
+		writeProblem(writer, http.StatusInternalServerError, problemInternal)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contentJSONMediaType, response)
+}
+
+func validEventRequest(
+	request *http.Request,
+) (domain.UUIDv7, ProposalHop, bool) {
+	if request == nil ||
+		request.Body == nil ||
+		request.ContentLength < 1 ||
+		len(request.TransferEncoding) != 0 ||
+		len(request.Trailer) != 0 ||
+		len(request.Header.Values("Content-Encoding")) != 0 ||
+		len(request.Header.Values("Trailer")) != 0 ||
+		len(request.Header.Values("Expect")) != 0 ||
+		!exactMediaType(request.Header, contentJSONMediaType) {
+		return "", 0, false
+	}
+	hop := ProposalHopInitial
+	switch values := request.Header.Values(proposalHopHeader); len(values) {
+	case 0:
+	case 1:
+		if values[0] != proposalHopOnce {
+			return "", 0, false
+		}
+		hop = ProposalHopForwarded
+	default:
+		return "", 0, false
+	}
+	values := request.Header.Values("Idempotency-Key")
+	if len(values) != 1 {
+		return "", 0, false
+	}
+	eventID := domain.UUIDv7(values[0])
+	return eventID, hop, eventID.Valid() && hop.valid()
+}
+
+func readEventRequest(
+	ctx context.Context,
+	request *http.Request,
+) ([]byte, error) {
+	if ctx == nil || request == nil || request.Body == nil {
+		return nil, ErrInvalidEventProposal
+	}
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = request.Body.Close()
+	})
+	defer stopClose()
+	body, err := io.ReadAll(io.LimitReader(
+		request.Body,
+		int64(event.MaxEventBytes)+1,
+	))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, ErrInvalidEventProposal
+	}
+	if len(body) > event.MaxEventBytes {
+		return nil, event.ErrEventTooLarge
+	}
+	if int64(len(body)) != request.ContentLength {
+		return nil, ErrInvalidEventProposal
+	}
+	return body, nil
 }
 
 func validRequestTransport(
@@ -419,6 +614,32 @@ func writeServiceProblem(writer http.ResponseWriter, err error) {
 	}
 }
 
+func writeEventProblem(writer http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrInvalidEventProposal):
+		writeProblem(writer, http.StatusBadRequest, problemEventInvalid)
+	case errors.Is(err, ErrEventIdempotencyConflict):
+		writeProblem(writer, http.StatusConflict, problemEventConflict)
+	case errors.Is(err, ErrEventProposalRateLimited):
+		writer.Header().Set("Retry-After", "1")
+		writeProblem(
+			writer,
+			http.StatusTooManyRequests,
+			problemLeaderProposalRateLimited,
+		)
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, ErrEventProposalUnavailable):
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemEventUnavailable,
+		)
+	default:
+		writeProblem(writer, http.StatusInternalServerError, problemInternal)
+	}
+}
+
 type problemDefinition struct {
 	code      string
 	title     string
@@ -458,6 +679,28 @@ var (
 	}
 	problemRateLimited = problemDefinition{
 		code: "control_rate_limited", title: "Control rate limit exceeded",
+		retryable: true,
+	}
+	problemProposalRateLimited = problemDefinition{
+		code: "proposal_rate_limited", title: "Proposal rate limit exceeded",
+		retryable: true,
+	}
+	problemLeaderProposalRateLimited = problemDefinition{
+		code:      "leader_ingress_rate_limited",
+		title:     "Leader proposal rate limit exceeded",
+		retryable: true,
+	}
+	problemEventInvalid = problemDefinition{
+		code: "invalid_event", title: "Invalid event proposal",
+	}
+	problemEventTooLarge = problemDefinition{
+		code: "event_too_large", title: "Event proposal exceeds size limit",
+	}
+	problemEventConflict = problemDefinition{
+		code: "idempotency_conflict", title: "Event ID is already bound",
+	}
+	problemEventUnavailable = problemDefinition{
+		code: "event_unavailable", title: "Event proposal unavailable",
 		retryable: true,
 	}
 	problemInternal = problemDefinition{

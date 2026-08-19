@@ -21,6 +21,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
 )
@@ -37,10 +38,13 @@ const (
 )
 
 var (
-	ErrInvalidClient    = errors.New("content HTTP: invalid client")
-	ErrClientClosed     = errors.New("content HTTP: client closed")
-	ErrPeerMismatch     = errors.New("content HTTP: peer device mismatch")
-	ErrLineageMismatch  = errors.New("content HTTP: response lineage mismatch")
+	ErrInvalidClient         = errors.New("content HTTP: invalid client")
+	ErrClientClosed          = errors.New("content HTTP: client closed")
+	ErrPeerMismatch          = errors.New("content HTTP: peer device mismatch")
+	ErrLineageMismatch       = errors.New("content HTTP: response lineage mismatch")
+	ErrConnectionUnavailable = errors.New(
+		"content HTTP: connection unavailable",
+	)
 	ErrResponseProtocol = errors.New("content HTTP: invalid response protocol")
 	ErrResponseTooLarge = errors.New("content HTTP: response too large")
 )
@@ -282,9 +286,101 @@ func (client *Client) Peers(ctx context.Context) (PeersResponse, error) {
 	return response, nil
 }
 
+// Propose sends one exact signed proposal to the pinned peer and returns its
+// exact committed command-result record.
+func (client *Client) Propose(
+	ctx context.Context,
+	signed event.SignedEvent,
+) (EventResult, error) {
+	return client.propose(ctx, signed, ProposalHopInitial)
+}
+
+// ForwardProposal sends one exact signed proposal with the single-hop marker.
+// A receiving follower must not forward it again.
+func (client *Client) ForwardProposal(
+	ctx context.Context,
+	signed event.SignedEvent,
+) (EventResult, error) {
+	return client.propose(ctx, signed, ProposalHopForwarded)
+}
+
+func (client *Client) propose(
+	ctx context.Context,
+	signed event.SignedEvent,
+	hop ProposalHop,
+) (EventResult, error) {
+	if client == nil || ctx == nil || !hop.valid() {
+		return EventResult{}, ErrInvalidClient
+	}
+	canonical := signed.CanonicalBytes()
+	proposal := signed.Proposal()
+	inspected, err := event.InspectUnverifiedProposal(canonical)
+	if err != nil ||
+		!proposal.EventID.Valid() ||
+		inspected.EventID != proposal.EventID ||
+		inspected.SessionID != proposal.SessionID ||
+		inspected.WorkspaceID != proposal.WorkspaceID {
+		return EventResult{}, ErrInvalidClient
+	}
+
+	client.operationMu.Lock()
+	defer client.operationMu.Unlock()
+	recoveryGeneration, err := client.requireProposalLineage(proposal)
+	if err != nil {
+		return EventResult{}, err
+	}
+	body, err := client.request(
+		ctx,
+		http.MethodPost,
+		EventsPath,
+		canonical,
+		func(header http.Header) {
+			header.Set("Content-Type", contentJSONMediaType)
+			header.Set("Idempotency-Key", string(proposal.EventID))
+			if hop == ProposalHopForwarded {
+				header.Set(proposalHopHeader, proposalHopOnce)
+			}
+		},
+	)
+	if err != nil {
+		return EventResult{}, err
+	}
+	result, err := decodeEventResult(
+		body,
+		canonical,
+		proposal.SessionID,
+		recoveryGeneration,
+	)
+	if err != nil {
+		client.invalidate()
+		return EventResult{}, err
+	}
+	return result, nil
+}
+
 func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 	if client == nil || ctx == nil ||
 		(path != SessionPath && path != PeersPath) {
+		return nil, ErrInvalidClient
+	}
+	return client.request(ctx, http.MethodGet, path, nil, nil)
+}
+
+func (client *Client) request(
+	ctx context.Context,
+	method string,
+	path string,
+	body []byte,
+	configure func(http.Header),
+) ([]byte, error) {
+	if client == nil ||
+		ctx == nil ||
+		(method != http.MethodGet && method != http.MethodPost) ||
+		(path != SessionPath && path != PeersPath && path != EventsPath) ||
+		method == http.MethodGet && len(body) != 0 ||
+		method == http.MethodPost &&
+			(path != EventsPath || len(body) == 0 ||
+				len(body) > event.MaxEventBytes) {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -296,17 +392,24 @@ func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 	}
 	callContext, cancel := context.WithTimeout(ctx, HandlerTimeout)
 	defer cancel()
+	var requestBody io.Reader
+	if len(body) != 0 {
+		requestBody = bytes.NewReader(body)
+	}
 	request, err := http.NewRequestWithContext(
 		callContext,
-		http.MethodGet,
+		method,
 		"https://"+contentPeerAuthority+path,
-		nil,
+		requestBody,
 	)
 	if err != nil {
 		return nil, ErrInvalidClient
 	}
 	request.Header.Set("Accept", contentJSONMediaType)
 	request.Header.Set("Accept-Encoding", "identity")
+	if configure != nil {
+		configure(request.Header)
+	}
 
 	if err := connection.raw.SetReadDeadline(
 		time.Now().Add(StreamNoProgress),
@@ -314,7 +417,7 @@ func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 		client.invalidate()
 		return nil, fmt.Errorf(
 			"%w: arm response deadline",
-			ErrResponseProtocol,
+			ErrConnectionUnavailable,
 		)
 	}
 	defer func() {
@@ -333,7 +436,7 @@ func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 			return nil, ErrClientClosed
 		}
 		client.invalidate()
-		return nil, fmt.Errorf("%w: round trip", ErrResponseProtocol)
+		return nil, classifyRoundTripError(err)
 	}
 	if err := validateClientResponseTLS(response, connection); err != nil {
 		if response != nil && response.Body != nil {
@@ -348,7 +451,7 @@ func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 		client.invalidate()
 		return nil, err
 	}
-	body, err := readClientResponse(
+	responseBody, err := readClientResponse(
 		callContext,
 		response,
 		connection.raw,
@@ -363,14 +466,53 @@ func (client *Client) get(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	if !problem {
-		return body, nil
+		return responseBody, nil
 	}
-	remote, err := decodeRemoteProblem(body, response.StatusCode)
+	remote, err := decodeRemoteProblem(responseBody, response.StatusCode)
 	if err != nil {
 		client.invalidate()
 		return nil, err
 	}
 	return nil, remote
+}
+
+func classifyRoundTripError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var streamError http2.StreamError
+	if errors.As(err, &streamError) {
+		switch streamError.Code {
+		case http2.ErrCodeCancel, http2.ErrCodeRefusedStream:
+			return fmt.Errorf(
+				"%w: round trip",
+				ErrConnectionUnavailable,
+			)
+		default:
+			return fmt.Errorf("%w: round trip", ErrResponseProtocol)
+		}
+	}
+	var connectionError http2.ConnectionError
+	if errors.As(err, &connectionError) {
+		return fmt.Errorf("%w: round trip", ErrResponseProtocol)
+	}
+	return fmt.Errorf("%w: round trip", ErrConnectionUnavailable)
+}
+
+func (client *Client) requireProposalLineage(
+	proposal event.Proposal,
+) (uint64, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.closed || client.http2 == nil || client.raw == nil {
+		return 0, ErrClientClosed
+	}
+	if !client.lineageSet ||
+		proposal.SessionID != client.peerBinding.SessionID ||
+		proposal.WorkspaceID != client.workspaceID {
+		return 0, ErrLineageMismatch
+	}
+	return client.recoveryGeneration, nil
 }
 
 func (client *Client) connection() (clientConnection, error) {
@@ -546,7 +688,7 @@ func readClientResponse(
 		)
 	}
 	if err := refresh(); err != nil {
-		return nil, ErrResponseProtocol
+		return nil, ErrConnectionUnavailable
 	}
 	body, err := io.ReadAll(&clientProgressReader{
 		reader:  io.LimitReader(response.Body, limit+1),
@@ -556,7 +698,7 @@ func readClientResponse(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%w: read body", ErrResponseProtocol)
+		return nil, fmt.Errorf("%w: read body", ErrConnectionUnavailable)
 	}
 	if int64(len(body)) > limit {
 		return nil, ErrResponseTooLarge

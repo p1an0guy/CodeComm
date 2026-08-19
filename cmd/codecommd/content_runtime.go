@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -34,28 +36,47 @@ type daemonEndpointSetSource interface {
 	CurrentEndpointSet() ([]byte, time.Duration, bool)
 }
 
+type daemonEventProposalConsensus interface {
+	ApplyPeerProposal(
+		context.Context,
+		domain.DeviceID,
+		[]byte,
+	) (store.CommandResultLookup, error)
+	ApplyForwardedProposal(
+		context.Context,
+		domain.DeviceID,
+		[]byte,
+	) (store.CommandResultLookup, error)
+}
+
 type daemonContentService struct {
-	sessionID     domain.UUIDv7
-	workspaceID   domain.UUIDv4
-	localDeviceID domain.DeviceID
-	state         daemonContentState
-	endpoints     daemonEndpointSetSource
-	now           func() time.Time
+	sessionID          domain.UUIDv7
+	workspaceID        domain.UUIDv4
+	recoveryGeneration uint64
+	localDeviceID      domain.DeviceID
+	state              daemonContentState
+	endpoints          daemonEndpointSetSource
+	proposals          daemonEventProposalConsensus
+	now                func() time.Time
 }
 
 func newDaemonContentServer(
 	sessionID domain.UUIDv7,
 	workspaceID domain.UUIDv4,
+	recoveryGeneration uint64,
 	localDeviceID domain.DeviceID,
 	state daemonContentState,
 	endpoints daemonEndpointSetSource,
+	proposals daemonEventProposalConsensus,
 ) (*contenthttp.Server, error) {
 	service, err := newDaemonContentService(
 		sessionID,
 		workspaceID,
+		recoveryGeneration,
 		localDeviceID,
 		state,
 		endpoints,
+		proposals,
 		time.Now,
 	)
 	if err != nil {
@@ -75,26 +96,32 @@ func newDaemonContentServer(
 func newDaemonContentService(
 	sessionID domain.UUIDv7,
 	workspaceID domain.UUIDv4,
+	recoveryGeneration uint64,
 	localDeviceID domain.DeviceID,
 	state daemonContentState,
 	endpoints daemonEndpointSetSource,
+	proposals daemonEventProposalConsensus,
 	now func() time.Time,
 ) (*daemonContentService, error) {
 	if !sessionID.Valid() ||
 		!workspaceID.Valid() ||
+		!domain.ValidUnsignedInteger(recoveryGeneration) ||
 		!localDeviceID.Valid() ||
 		state == nil ||
 		endpoints == nil ||
+		proposals == nil ||
 		now == nil {
 		return nil, errDaemonContentConstruction
 	}
 	return &daemonContentService{
-		sessionID:     sessionID,
-		workspaceID:   workspaceID,
-		localDeviceID: localDeviceID,
-		state:         state,
-		endpoints:     endpoints,
-		now:           now,
+		sessionID:          sessionID,
+		workspaceID:        workspaceID,
+		recoveryGeneration: recoveryGeneration,
+		localDeviceID:      localDeviceID,
+		state:              state,
+		endpoints:          endpoints,
+		proposals:          proposals,
+		now:                now,
 	}, nil
 }
 
@@ -256,6 +283,82 @@ func (service *daemonContentService) Peers(
 	return response, nil
 }
 
+func (service *daemonContentService) ProposeEvent(
+	ctx context.Context,
+	senderDeviceID domain.DeviceID,
+	canonical []byte,
+	hop contenthttp.ProposalHop,
+) (contenthttp.EventResult, error) {
+	if service == nil ||
+		service.proposals == nil ||
+		ctx == nil ||
+		!senderDeviceID.Valid() ||
+		len(canonical) == 0 {
+		return contenthttp.EventResult{},
+			contenthttp.ErrInvalidEventProposal
+	}
+	var lookup store.CommandResultLookup
+	var err error
+	switch hop {
+	case contenthttp.ProposalHopForwarded:
+		lookup, err = service.proposals.ApplyForwardedProposal(
+			ctx,
+			senderDeviceID,
+			canonical,
+		)
+	case contenthttp.ProposalHopInitial:
+		lookup, err = service.proposals.ApplyPeerProposal(
+			ctx,
+			senderDeviceID,
+			canonical,
+		)
+	default:
+		return contenthttp.EventResult{},
+			contenthttp.ErrInvalidEventProposal
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, consensus.ErrInvalidPeerProposal):
+			return contenthttp.EventResult{},
+				contenthttp.ErrInvalidEventProposal
+		case errors.Is(err, store.ErrIdempotencyConflict):
+			return contenthttp.EventResult{},
+				contenthttp.ErrEventIdempotencyConflict
+		case errors.Is(err, consensus.ErrProposalIngressRateLimited):
+			return contenthttp.EventResult{},
+				contenthttp.ErrEventProposalRateLimited
+		case errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			return contenthttp.EventResult{}, err
+		case errors.Is(err, raft.ErrNotLeader),
+			errors.Is(err, raft.ErrLeadershipLost),
+			errors.Is(err, consensus.ErrProposalForwardingUnavailable),
+			errors.Is(err, consensus.ErrNodeClosed):
+			return contenthttp.EventResult{},
+				contenthttp.ErrEventProposalUnavailable
+		default:
+			return contenthttp.EventResult{}, fmt.Errorf(
+				"%w: apply forwarded event: %v",
+				errDaemonContentConstruction,
+				err,
+			)
+		}
+	}
+	result, err := contenthttp.NewEventResult(
+		lookup,
+		service.sessionID,
+		service.recoveryGeneration,
+	)
+	if err != nil {
+		return contenthttp.EventResult{}, fmt.Errorf(
+			"%w: encode committed event result: %v",
+			errDaemonContentConstruction,
+			err,
+		)
+	}
+	return result, nil
+}
+
 func (service *daemonContentService) snapshot(
 	ctx context.Context,
 ) (coordstatus.DurableSnapshot, error) {
@@ -281,6 +384,7 @@ func (service *daemonContentService) snapshot(
 	}
 	if snapshot.SessionID != service.sessionID ||
 		snapshot.WorkspaceID != service.workspaceID ||
+		snapshot.RecoveryGeneration != service.recoveryGeneration ||
 		snapshot.Member.ID != service.localDeviceID ||
 		snapshot.Member.Status != device.StatusActive ||
 		snapshot.MembersTruncated ||

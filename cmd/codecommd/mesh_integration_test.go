@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,7 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -240,11 +242,11 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 			)
 		},
 	)
+	exerciseDaemonContentMesh(t, nodes, nonvoter)
+	statuses = exerciseDaemonFollowerProposalForwarding(t, nodes)
 	leaderID := domain.DeviceID(*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
 		Consensus.LeaderDeviceID)
 	leader := daemonMeshIntegrationNodeByID(t, nodes, leaderID)
-
-	exerciseDaemonContentMesh(t, nodes, nonvoter)
 
 	client := dialDaemonMeshIntegrationOperator(t, leader.localEndpoint)
 	paired := admitDaemonMeshPairingJoiner(
@@ -390,6 +392,89 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		mutationChainIndex,
 		mutationResultIndex,
 	)
+}
+
+func exerciseDaemonFollowerProposalForwarding(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+) []ui.Snapshot {
+	t.Helper()
+	voterIDs := daemonMeshIntegrationDeviceIDs(nodes)
+	statuses := waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationMutationConverged(statuses)
+		},
+	)
+	leaderID := domain.DeviceID(
+		*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
+			Consensus.LeaderDeviceID,
+	)
+	follower := daemonMeshIntegrationFollower(t, nodes, leaderID)
+	followerNode, ready := follower.meshCapture.consensusNode()
+	if !ready || followerNode.IsLeader() {
+		t.Fatal("captured proposal source is not a follower")
+	}
+	signed := daemonTestTaskEvent(
+		t,
+		follower.privateKey,
+		follower.deviceID,
+	)
+	baselineChainIndex := statuses[0].Session.EventChainIndex
+	baselineResultIndex := statuses[0].Session.ResultIndex
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancel()
+	var result store.ApplyResult
+	for {
+		if followerNode.IsLeader() {
+			t.Fatal("proposal source became leader before forwarding")
+		}
+		var err error
+		result, err = followerNode.Apply(ctx, signed)
+		if err == nil {
+			break
+		}
+		if !errors.Is(
+			err,
+			consensus.ErrProposalForwardingUnavailable,
+		) {
+			t.Fatalf("follower Apply(): %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("follower forwarding timed out: %v", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if result.Outcome.Status != store.OutcomeAccepted ||
+		result.Outcome.Code != "accepted" {
+		t.Fatalf("follower Apply() result = %+v", result)
+	}
+
+	statuses = waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationTaskConverged(
+					statuses,
+					daemonTestTaskID,
+				) &&
+				statuses[0].Session.EventChainIndex >=
+					baselineChainIndex+1 &&
+				statuses[0].Session.ResultIndex >=
+					baselineResultIndex+1
+		},
+	)
+	if followerNode.IsLeader() {
+		t.Fatal("proposal source became leader during forwarding proof")
+	}
+	return statuses
 }
 
 func newDaemonMeshIntegrationNodes(
@@ -887,6 +972,25 @@ func daemonMeshIntegrationMutationConverged(
 		}
 	}
 	return true
+}
+
+func daemonMeshIntegrationTaskConverged(
+	statuses []ui.Snapshot,
+	taskID domain.UUIDv7,
+) bool {
+	if len(statuses) == 0 || !taskID.Valid() {
+		return false
+	}
+	for _, snapshot := range statuses {
+		if snapshot.TaskTotal != 1 ||
+			snapshot.Truncated ||
+			len(snapshot.Tasks) != 1 ||
+			snapshot.Tasks[0].TaskID != string(taskID) ||
+			snapshot.Tasks[0].EntityVersion != 1 {
+			return false
+		}
+	}
+	return daemonMeshIntegrationMutationConverged(statuses)
 }
 
 func daemonMeshIntegrationLeaderIndex(statuses []ui.Snapshot) int {

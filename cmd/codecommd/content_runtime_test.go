@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"net/netip"
 	"os"
@@ -12,10 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -64,6 +68,44 @@ type daemonEndpointSetSourceStub struct {
 	found bool
 }
 
+type daemonEventProposalConsensusStub struct {
+	lookup store.CommandResultLookup
+	err    error
+
+	calls     int
+	sender    domain.DeviceID
+	canonical []byte
+	hop       contenthttp.ProposalHop
+}
+
+func (stub *daemonEventProposalConsensusStub) apply(
+	sender domain.DeviceID,
+	canonical []byte,
+	hop contenthttp.ProposalHop,
+) (store.CommandResultLookup, error) {
+	stub.calls++
+	stub.sender = sender
+	stub.canonical = bytes.Clone(canonical)
+	stub.hop = hop
+	return stub.lookup, stub.err
+}
+
+func (stub *daemonEventProposalConsensusStub) ApplyPeerProposal(
+	_ context.Context,
+	sender domain.DeviceID,
+	canonical []byte,
+) (store.CommandResultLookup, error) {
+	return stub.apply(sender, canonical, contenthttp.ProposalHopInitial)
+}
+
+func (stub *daemonEventProposalConsensusStub) ApplyForwardedProposal(
+	_ context.Context,
+	sender domain.DeviceID,
+	canonical []byte,
+) (store.CommandResultLookup, error) {
+	return stub.apply(sender, canonical, contenthttp.ProposalHopForwarded)
+}
+
 func (source *daemonEndpointSetSourceStub) CurrentEndpointSet() (
 	[]byte,
 	time.Duration,
@@ -103,9 +145,11 @@ func TestDaemonContentServiceReturnsAppliedSessionAndExactEndpointSets(
 	service, err := newDaemonContentService(
 		snapshot.SessionID,
 		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
 		snapshot.Member.ID,
 		state,
 		&daemonEndpointSetSourceStub{value: localSet, found: true},
+		&daemonEventProposalConsensusStub{},
 		func() time.Time { return testNow },
 	)
 	if err != nil {
@@ -177,6 +221,7 @@ func TestDaemonContentServiceSuppressesInactiveEndpointSet(t *testing.T) {
 	service, err := newDaemonContentService(
 		snapshot.SessionID,
 		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
 		snapshot.Member.ID,
 		&daemonContentStateStub{
 			snapshot: snapshot,
@@ -189,6 +234,7 @@ func TestDaemonContentServiceSuppressesInactiveEndpointSet(t *testing.T) {
 			value: daemonContentTestEndpointSet(t, snapshot, testNow),
 			found: true,
 		},
+		&daemonEventProposalConsensusStub{},
 		func() time.Time { return testNow },
 	)
 	if err != nil {
@@ -204,6 +250,193 @@ func TestDaemonContentServiceSuppressesInactiveEndpointSet(t *testing.T) {
 		remoteID,
 	).EndpointSet(); endpointSet != nil {
 		t.Fatalf("revoked member endpoint set = %q", endpointSet)
+	}
+}
+
+func TestDaemonContentServiceProposesBoundCommittedResult(t *testing.T) {
+	snapshot := daemonContentTestSnapshot(t)
+	_, privateKey, deviceID := daemonTestInitialState(t)
+	defer clear(privateKey)
+	if deviceID != snapshot.Member.ID {
+		t.Fatal("event fixture identity mismatch")
+	}
+	signed := daemonTestTaskEvent(t, privateKey, deviceID)
+	proposals := &daemonEventProposalConsensusStub{
+		lookup: daemonContentTestCommandLookup(t, signed, snapshot),
+	}
+	service, err := newDaemonContentService(
+		snapshot.SessionID,
+		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
+		snapshot.Member.ID,
+		&daemonContentStateStub{snapshot: snapshot},
+		&daemonEndpointSetSourceStub{},
+		proposals,
+		time.Now,
+	)
+	if err != nil {
+		t.Fatalf("newDaemonContentService(): %v", err)
+	}
+	sender := daemonContentTestDeviceID(t, 0xd8)
+	result, err := service.ProposeEvent(
+		context.Background(),
+		sender,
+		signed.CanonicalBytes(),
+		contenthttp.ProposalHopInitial,
+	)
+	if err != nil {
+		t.Fatalf("ProposeEvent(): %v", err)
+	}
+	if proposals.calls != 1 ||
+		proposals.sender != sender ||
+		!bytes.Equal(proposals.canonical, signed.CanonicalBytes()) ||
+		proposals.hop != contenthttp.ProposalHopInitial ||
+		!bytes.Equal(result.Proposal(), signed.CanonicalBytes()) ||
+		result.Outcome().Status != store.OutcomeAccepted {
+		t.Fatalf(
+			"proposal call/result = (%d, %s, %q, %+v)",
+			proposals.calls,
+			proposals.sender,
+			proposals.canonical,
+			result.Outcome(),
+		)
+	}
+	if _, err := service.ProposeEvent(
+		context.Background(),
+		sender,
+		signed.CanonicalBytes(),
+		contenthttp.ProposalHopForwarded,
+	); err != nil {
+		t.Fatalf("ProposeEvent(forwarded): %v", err)
+	}
+	if proposals.calls != 2 ||
+		proposals.hop != contenthttp.ProposalHopForwarded {
+		t.Fatalf(
+			"forwarded proposal call = (%d, %d)",
+			proposals.calls,
+			proposals.hop,
+		)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*store.CommandResultLookup)
+	}{
+		{
+			name: "session",
+			mutate: func(lookup *store.CommandResultLookup) {
+				lookup.SessionID =
+					"01890f47-3e72-7000-8000-000000000799"
+			},
+		},
+		{
+			name: "generation",
+			mutate: func(lookup *store.CommandResultLookup) {
+				lookup.RecoveryGeneration++
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lookup := daemonContentTestCommandLookup(
+				t,
+				signed,
+				snapshot,
+			)
+			test.mutate(&lookup)
+			proposals := &daemonEventProposalConsensusStub{
+				lookup: lookup,
+			}
+			service.proposals = proposals
+			if _, err := service.ProposeEvent(
+				context.Background(),
+				sender,
+				signed.CanonicalBytes(),
+				contenthttp.ProposalHopInitial,
+			); !errors.Is(err, errDaemonContentConstruction) {
+				t.Fatalf("ProposeEvent() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestDaemonContentServiceMapsProposalErrors(t *testing.T) {
+	snapshot := daemonContentTestSnapshot(t)
+	sentinel := errors.New("unexpected proposal failure")
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{
+			name: "invalid",
+			err:  consensus.ErrInvalidPeerProposal,
+			want: contenthttp.ErrInvalidEventProposal,
+		},
+		{
+			name: "idempotency conflict",
+			err:  store.ErrIdempotencyConflict,
+			want: contenthttp.ErrEventIdempotencyConflict,
+		},
+		{
+			name: "rate limited",
+			err:  consensus.ErrProposalIngressRateLimited,
+			want: contenthttp.ErrEventProposalRateLimited,
+		},
+		{
+			name: "canceled",
+			err:  context.Canceled,
+			want: context.Canceled,
+		},
+		{
+			name: "not leader",
+			err:  raft.ErrNotLeader,
+			want: contenthttp.ErrEventProposalUnavailable,
+		},
+		{
+			name: "leadership lost",
+			err:  raft.ErrLeadershipLost,
+			want: contenthttp.ErrEventProposalUnavailable,
+		},
+		{
+			name: "forwarding unavailable",
+			err:  consensus.ErrProposalForwardingUnavailable,
+			want: contenthttp.ErrEventProposalUnavailable,
+		},
+		{
+			name: "node closed",
+			err:  consensus.ErrNodeClosed,
+			want: contenthttp.ErrEventProposalUnavailable,
+		},
+		{
+			name: "unexpected",
+			err:  sentinel,
+			want: errDaemonContentConstruction,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, err := newDaemonContentService(
+				snapshot.SessionID,
+				snapshot.WorkspaceID,
+				snapshot.RecoveryGeneration,
+				snapshot.Member.ID,
+				&daemonContentStateStub{snapshot: snapshot},
+				&daemonEndpointSetSourceStub{},
+				&daemonEventProposalConsensusStub{err: test.err},
+				time.Now,
+			)
+			if err != nil {
+				t.Fatalf("newDaemonContentService(): %v", err)
+			}
+			if _, err := service.ProposeEvent(
+				context.Background(),
+				daemonContentTestDeviceID(t, 0xd9),
+				[]byte(`{}`),
+				contenthttp.ProposalHopInitial,
+			); !errors.Is(err, test.want) {
+				t.Fatalf("ProposeEvent() error = %v, want %v", err, test.want)
+			}
+		})
 	}
 }
 
@@ -264,6 +497,7 @@ func TestDaemonContentServiceFailsClosed(t *testing.T) {
 			service, err := newDaemonContentService(
 				test.snapshot.SessionID,
 				test.snapshot.WorkspaceID,
+				test.snapshot.RecoveryGeneration,
 				test.snapshot.Member.ID,
 				&daemonContentStateStub{
 					snapshot: test.snapshot, snapshotErr: test.stateErr,
@@ -272,6 +506,7 @@ func TestDaemonContentServiceFailsClosed(t *testing.T) {
 				&daemonEndpointSetSourceStub{
 					value: test.localSet, found: test.localFound,
 				},
+				&daemonEventProposalConsensusStub{},
 				time.Now,
 			)
 			if err != nil {
@@ -284,6 +519,35 @@ func TestDaemonContentServiceFailsClosed(t *testing.T) {
 				t.Fatalf("Peers() error = %v", err)
 			}
 		})
+	}
+}
+
+func daemonContentTestCommandLookup(
+	t *testing.T,
+	signed event.SignedEvent,
+	snapshot coordstatus.DurableSnapshot,
+) store.CommandResultLookup {
+	t.Helper()
+	canonical := signed.CanonicalBytes()
+	proposalDigest := sha256.Sum256(canonical)
+	chainHash := store.Digest(sha256.Sum256([]byte("daemon-content-chain")))
+	chainIndex := uint64(1)
+	return store.CommandResultLookup{
+		EventID:            signed.Proposal().EventID,
+		SessionID:          snapshot.SessionID,
+		RecoveryGeneration: snapshot.RecoveryGeneration,
+		CanonicalProposal:  canonical,
+		ProposalDigest:     proposalDigest,
+		Outcome: store.CommandOutcome{
+			Status: store.OutcomeAccepted,
+			Code:   "accepted",
+			JSON:   []byte(`{"code":"accepted","status":"accepted"}`),
+		},
+		Tuple: store.CommandResultTuple{
+			ResultIndex: 1,
+			ChainIndex:  &chainIndex,
+			ChainHash:   &chainHash,
+		},
 	}
 }
 

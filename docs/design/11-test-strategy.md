@@ -364,10 +364,12 @@ Required unit/component subjects:
   history scan; exact local retry produces no second report, while two peers independently observing
   the same request may each commit one row with distinct reporter origins; excess,
   unauthenticated, revoked, unknown, and stale-epoch attempts only update a bounded local aggregate;
-- leader ingress limiting (§10): a member fanning proposals out to all peers concurrently is
-  first bounded independently by each receiver's control/proposal budgets and finally at the leader
-  by `leader_ingress_rate_per_device`, not by N × the per-receiver limit; ordinary authenticated
-  control requests consume the control budget while bounded bulk streams do not double-count it;
+- leader ingress limiting (§10): a member fanning proposals out to all peers concurrently is first
+  bounded independently by each receiver's control/proposal budgets and finally at the leader by one
+  signed-origin-keyed `leader_ingress_rate_per_device` budget, not N forwarding-peer budgets;
+  inactive historical origins share one bounded aggregate without churning active-origin state,
+  malformed events consume both receiver budgets, a hop-1 request never forwards again, ordinary
+  authenticated control consumes the control budget, and bounded bulk does not double-count;
 - unbounded-source resistance (§4.4, §4.6): datagrams and handshake attempts from thousands of
   forged source addresses do not grow discovery or handshake source maps past their independent
   count/byte ceilings; discovery eviction is oldest-source-first, handshake buckets expire after ten
@@ -375,9 +377,10 @@ Required unit/component subjects:
 - runtime ceilings (§5.1, §11.2): header/body/page/handler, handshake, HTTP/2 stream/connection,
   local-IPC connection/handler, pending-command, Git-transfer, ephemeral-aggregate, child deadline,
   temporary-artifact, Git-bundle-header byte/record, and supervisor-restart limits reject or
-  backpressure at the named boundary and recover after release;
-  a saturated bulk connection cannot starve control/SSE, stalled streams time out resumably, and no
-  rejection allocates beyond its ceiling;
+  backpressure at the named boundary and recover after release; the content upload stream window is
+  `max_event_bytes`, so a pre-SETTINGS default-window event cannot cause a flow-control reset while
+  the connection-wide buffer stays bounded; a saturated bulk connection cannot starve control/SSE,
+  stalled streams and request bodies time out resumably, and no rejection allocates beyond its ceiling;
 - endpoint retention (§2.3): gossip never retains more than 16 hints/member or 128/session, expires
   then evicts oldest stale hints deterministically, a current signed set replaces its predecessor
   atomically, and a seventeenth per-member or 129th session manual endpoint is refused without

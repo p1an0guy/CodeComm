@@ -23,6 +23,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
 )
@@ -37,7 +38,13 @@ type contentTestService struct {
 
 	sessionCalls int
 	peersCalls   int
+	eventCalls   int
 	peersSeen    []transport.AuthenticatedPeer
+	eventPeer    domain.DeviceID
+	eventBody    []byte
+	eventHop     ProposalHop
+	eventResult  EventResult
+	eventErr     error
 
 	entered  chan struct{}
 	release  <-chan struct{}
@@ -122,6 +129,21 @@ func (service *contentTestService) Peers(
 	service.peersCalls++
 	service.peersSeen = append(service.peersSeen, peer)
 	return service.peers, nil
+}
+
+func (service *contentTestService) ProposeEvent(
+	_ context.Context,
+	peerID domain.DeviceID,
+	body []byte,
+	hop ProposalHop,
+) (EventResult, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.eventCalls++
+	service.eventPeer = peerID
+	service.eventBody = bytes.Clone(body)
+	service.eventHop = hop
+	return service.eventResult, service.eventErr
 }
 
 func (service *contentTestService) snapshot() (int, int, []transport.AuthenticatedPeer) {
@@ -759,7 +781,8 @@ func TestServerUsesFixedBoundsAndRejectsOversizedHeaders(t *testing.T) {
 		server.http2.IdleTimeout != ConnectionIdle ||
 		server.http2.ReadIdleTimeout != StreamNoProgress ||
 		server.http2.WriteByteTimeout != StreamNoProgress ||
-		server.http2.MaxUploadBufferPerStream != 1 ||
+		server.http2.MaxUploadBufferPerConnection != 1<<16 ||
+		server.http2.MaxUploadBufferPerStream != event.MaxEventBytes ||
 		HeaderMaxBytes != 32<<10 || ResponseMaxBytes != 1<<20 {
 		t.Fatalf("server bounds = %+v, handlers=%d", server.http2, cap(server.handlers))
 	}

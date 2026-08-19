@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
@@ -363,6 +365,85 @@ func TestDaemonContentPeerRuntimeClassifiesEndpointPersistenceFailures(
 	}
 	if contentPeerSetRefusal(store.ErrPeerEndpointIntegrity) {
 		t.Fatal("local integrity failure was classified as peer refusal")
+	}
+}
+
+func TestNormalizeDaemonProposalForwardingError(t *testing.T) {
+	sentinel := errors.New("invalid peer response")
+	tests := []struct {
+		name  string
+		input error
+		want  error
+	}{
+		{
+			name:  "canceled",
+			input: context.Canceled,
+			want:  context.Canceled,
+		},
+		{
+			name:  "connection closed",
+			input: contenthttp.ErrClientClosed,
+			want:  consensus.ErrProposalForwardingUnavailable,
+		},
+		{
+			name: "connection unavailable",
+			input: errors.Join(
+				contenthttp.ErrConnectionUnavailable,
+				errors.New("GOAWAY"),
+			),
+			want: consensus.ErrProposalForwardingUnavailable,
+		},
+		{
+			name: "idempotency conflict",
+			input: &contenthttp.RemoteError{
+				Code: "idempotency_conflict",
+			},
+			want: store.ErrIdempotencyConflict,
+		},
+		{
+			name: "leader ingress rate",
+			input: &contenthttp.RemoteError{
+				Code:      "leader_ingress_rate_limited",
+				Retryable: true,
+			},
+			want: consensus.ErrProposalIngressRateLimited,
+		},
+		{
+			name: "receiver proposal rate",
+			input: &contenthttp.RemoteError{
+				Code:      "proposal_rate_limited",
+				Retryable: true,
+			},
+			want: consensus.ErrProposalForwardingUnavailable,
+		},
+		{
+			name: "connection draining",
+			input: &contenthttp.RemoteError{
+				Code:      "connection_draining",
+				Retryable: true,
+			},
+			want: consensus.ErrProposalForwardingUnavailable,
+		},
+		{
+			name:  "protocol failure",
+			input: sentinel,
+			want:  sentinel,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := normalizeDaemonProposalForwardingError(test.input)
+			if !errors.Is(got, test.want) {
+				t.Fatalf(
+					"normalizeDaemonProposalForwardingError() = %v, want %v",
+					got,
+					test.want,
+				)
+			}
+		})
+	}
+	if err := normalizeDaemonProposalForwardingError(nil); err != nil {
+		t.Fatalf("nil error normalized to %v", err)
 	}
 }
 

@@ -125,6 +125,7 @@ type NodeOptions struct {
 	CredentialEndorsementSigner CredentialEndorsementSigner
 	CheckpointOrigin            CheckpointOrigin
 	CheckpointOriginFactory     CheckpointOriginFactory
+	ProposalForwarder           ProposalForwarder
 
 	Clock      ApplyClock
 	RaftConfig *raft.Config
@@ -153,6 +154,8 @@ type SingleNode struct {
 	checkpointOrigin              CheckpointOrigin
 	checkpointRequester           consensusProofRequester
 	credentialRenewalRequester    credentialRenewalRequester
+	proposalForwarder             ProposalForwarder
+	proposalIngress               *proposalIngressLimiter
 	voterActivationOrigin         VoterActivationOrigin
 	credentialAuthorizationOrigin CredentialAuthorizationOrigin
 	voterReconcileGate            chan struct{}
@@ -219,6 +222,7 @@ type nodeOpenOptions struct {
 	CredentialEndorsementSigner CredentialEndorsementSigner
 	CheckpointOrigin            CheckpointOrigin
 	CheckpointOriginFactory     CheckpointOriginFactory
+	ProposalForwarder           ProposalForwarder
 	Single                      bool
 	DisableVoterReconciliation  bool
 
@@ -283,6 +287,7 @@ func OpenNode(
 		CredentialEndorsementSigner: options.CredentialEndorsementSigner,
 		CheckpointOrigin:            options.CheckpointOrigin,
 		CheckpointOriginFactory:     options.CheckpointOriginFactory,
+		ProposalForwarder:           options.ProposalForwarder,
 		Clock:                       options.Clock,
 		RaftConfig:                  options.RaftConfig,
 		LogOutput:                   options.LogOutput,
@@ -635,6 +640,8 @@ func openNode(
 			options.CredentialEndorsementSigner,
 		),
 		checkpointOrigin:         checkpointOrigin,
+		proposalForwarder:        options.ProposalForwarder,
+		proposalIngress:          newProposalIngressLimiter(time.Now),
 		monitorStop:              make(chan struct{}),
 		monitorDone:              make(chan struct{}),
 		closeStarted:             make(chan struct{}),
@@ -2126,7 +2133,9 @@ func (node *SingleNode) Apply(
 	if err := node.FatalError(); err != nil {
 		return store.ApplyResult{}, err
 	}
-	return node.apply(ctx, signed, false)
+	return node.apply(ctx, signed, proposalApplyOptions{
+		allowForward: true,
+	})
 }
 
 // ApplyAtGeneration proposes only while the exact expected lineage remains
@@ -2172,7 +2181,10 @@ func (node *SingleNode) ApplyAtGeneration(
 		); err != nil {
 			return err
 		}
-		result, err = node.apply(ctx, signed, true)
+		result, err = node.apply(ctx, signed, proposalApplyOptions{
+			waitForResolution: true,
+			allowForward:      true,
+		})
 		return err
 	})
 	return result, err
@@ -2286,10 +2298,18 @@ func (node *SingleNode) requireLineage(
 	return nil
 }
 
+type proposalApplyOptions struct {
+	waitForResolution           bool
+	allowForward                bool
+	leaderIngressDeviceID       domain.DeviceID
+	leaderIngressActive         bool
+	leaderIngressAlreadyCharged bool
+}
+
 func (node *SingleNode) apply(
 	ctx context.Context,
 	signed event.SignedEvent,
-	waitForResolution bool,
+	options proposalApplyOptions,
 ) (store.ApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return store.ApplyResult{}, err
@@ -2314,26 +2334,59 @@ func (node *SingleNode) apply(
 		return committed, nil
 	}
 	if owner {
-		future, enqueueErr := node.enqueueRaftApply(ctx, canonical, nil)
-		if enqueueErr != nil {
+		switch {
+		case node.IsLeader():
+			if options.leaderIngressDeviceID.Valid() &&
+				!options.leaderIngressAlreadyCharged &&
+				!node.proposalIngress.consumeOrigin(
+					options.leaderIngressDeviceID,
+					options.leaderIngressActive,
+				) {
+				node.finishProposal(
+					proposal.EventID,
+					flight,
+					store.ApplyResult{},
+					ErrProposalIngressRateLimited,
+					false,
+				)
+				break
+			}
+			future, enqueueErr := node.enqueueRaftApply(ctx, canonical, nil)
+			if enqueueErr != nil {
+				node.finishProposal(
+					proposal.EventID,
+					flight,
+					store.ApplyResult{},
+					enqueueErr,
+					false,
+				)
+			} else {
+				node.active.Add(1)
+				go node.resolveProposal(
+					proposal.EventID,
+					signed,
+					flight,
+					future,
+				)
+			}
+		case options.allowForward:
+			node.active.Add(1)
+			go node.resolveForwardedProposal(
+				proposal.EventID,
+				signed,
+				flight,
+			)
+		default:
 			node.finishProposal(
 				proposal.EventID,
 				flight,
 				store.ApplyResult{},
-				enqueueErr,
+				raft.ErrNotLeader,
 				false,
-			)
-		} else {
-			node.active.Add(1)
-			go node.resolveProposal(
-				proposal.EventID,
-				signed,
-				flight,
-				future,
 			)
 		}
 	}
-	if waitForResolution {
+	if options.waitForResolution {
 		<-flight.done
 		result := flight.result
 		if !owner && flight.err == nil {
@@ -2483,15 +2536,9 @@ func (node *SingleNode) lookupCommitted(
 	ctx context.Context,
 	signed event.SignedEvent,
 ) (store.ApplyResult, bool, error) {
-	lookup, found, err := node.state.LookupCommandResult(
-		ctx,
-		signed.Proposal().EventID,
-	)
+	lookup, found, err := node.lookupCommittedResult(ctx, signed)
 	if err != nil || !found {
 		return store.ApplyResult{}, found, err
-	}
-	if !bytes.Equal(lookup.CanonicalProposal, signed.CanonicalBytes()) {
-		return store.ApplyResult{}, false, store.ErrIdempotencyConflict
 	}
 	return store.ApplyResult{
 		Heads:             lookup.CurrentHeads,
@@ -2499,6 +2546,24 @@ func (node *SingleNode) lookupCommitted(
 		AdmissionRevision: node.state.AdmissionRevision(),
 		Duplicate:         true,
 	}, true, nil
+}
+
+func (node *SingleNode) lookupCommittedResult(
+	ctx context.Context,
+	signed event.SignedEvent,
+) (store.CommandResultLookup, bool, error) {
+	lookup, found, err := node.state.LookupCommandResult(
+		ctx,
+		signed.Proposal().EventID,
+	)
+	if err != nil || !found {
+		return store.CommandResultLookup{}, found, err
+	}
+	if !bytes.Equal(lookup.CanonicalProposal, signed.CanonicalBytes()) {
+		return store.CommandResultLookup{}, false,
+			store.ErrIdempotencyConflict
+	}
+	return lookup, true, nil
 }
 
 func (node *SingleNode) handleLookupError(err error) error {

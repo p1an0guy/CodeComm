@@ -68,7 +68,11 @@ budget, and the leader independently applies its post-forwarding ingress budget 
 committed command result is retained for the session lifetime, so replay cannot become a new
 command after a timer. A byte-identical proposal under that ID returns the original result; the same
 ID with a different proposal digest returns `idempotency_conflict` and never overwrites the first
-row. Other artifact mutations are idempotent by artifact digest and offset.
+row. An initial submission omits `CodeComm-Proposal-Hop`. A follower forwards it once with that
+header exactly `1`; a receiver of `1` applies only while leader and otherwise returns retryable
+unavailability, never forwarding again. The marker is authenticated hop metadata, not authorization;
+the signed origin and proposal remain byte-identical. Other artifact mutations are idempotent by
+artifact digest and offset.
 Unknown required capabilities fail closed. Git bundles use `application/octet-stream` plus
 digest/size/expiry.
 Every Git endpoint is bound to the selected session repository; callers cannot provide a path,

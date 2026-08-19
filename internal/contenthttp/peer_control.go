@@ -12,12 +12,15 @@ import (
 )
 
 const (
-	ControlRatePerSecond = 200
-	ControlRateBurst     = 800
-	ControlPeerStatesMax = int(policy.MaxMemberDevices)
+	ControlRatePerSecond  = 200
+	ControlRateBurst      = 800
+	ProposalRatePerSecond = 50
+	ProposalRateBurst     = 200
+	ControlPeerStatesMax  = int(policy.MaxMemberDevices)
 
-	controlTokenUnit     = int64(time.Second)
-	controlTokenCapacity = int64(ControlRateBurst) * controlTokenUnit
+	controlTokenUnit      = int64(time.Second)
+	controlTokenCapacity  = int64(ControlRateBurst) * controlTokenUnit
+	proposalTokenCapacity = int64(ProposalRateBurst) * controlTokenUnit
 )
 
 var (
@@ -39,10 +42,11 @@ type controlRegistry struct {
 }
 
 type controlPeerState struct {
-	current  *connectionHandler
-	draining *connectionHandler
-	bucket   controlTokenBucket
-	lastSeen time.Time
+	current        *connectionHandler
+	draining       *connectionHandler
+	bucket         controlTokenBucket
+	proposalBucket controlTokenBucket
+	lastSeen       time.Time
 }
 
 type controlTokenBucket struct {
@@ -157,6 +161,32 @@ func (registry *controlRegistry) consume(
 	return allowed, retryAfter, nil
 }
 
+func (registry *controlRegistry) consumeProposal(
+	deviceID domain.DeviceID,
+) (bool, time.Duration, error) {
+	if registry == nil || registry.now == nil || !deviceID.Valid() {
+		return false, 0, errControlStateUnavailable
+	}
+	now := registry.now()
+	if now.IsZero() {
+		return false, 0, errControlStateUnavailable
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	state := registry.states[deviceID]
+	if state == nil || state.current == nil && state.draining == nil {
+		return false, 0, errControlStateUnavailable
+	}
+	now = monotonicControlTime(state.lastSeen, now)
+	state.lastSeen = now
+	allowed, retryAfter := state.proposalBucket.consumeAt(
+		now,
+		ProposalRatePerSecond,
+		proposalTokenCapacity,
+	)
+	return allowed, retryAfter, nil
+}
+
 func (registry *controlRegistry) stateForRegistrationLocked(
 	deviceID domain.DeviceID,
 	now time.Time,
@@ -193,6 +223,10 @@ func (registry *controlRegistry) stateForRegistrationLocked(
 			credit: controlTokenCapacity,
 			last:   now,
 		},
+		proposalBucket: controlTokenBucket{
+			credit: proposalTokenCapacity,
+			last:   now,
+		},
 		lastSeen: now,
 	}
 	registry.states[deviceID] = state
@@ -202,6 +236,17 @@ func (registry *controlRegistry) stateForRegistrationLocked(
 func (bucket *controlTokenBucket) consume(
 	now time.Time,
 ) (bool, time.Duration) {
+	return bucket.consumeAt(now, ControlRatePerSecond, controlTokenCapacity)
+}
+
+func (bucket *controlTokenBucket) consumeAt(
+	now time.Time,
+	ratePerSecond int,
+	capacity int64,
+) (bool, time.Duration) {
+	if ratePerSecond < 1 || capacity < controlTokenUnit {
+		return false, 0
+	}
 	if bucket.last.IsZero() {
 		bucket.last = now
 	}
@@ -209,16 +254,16 @@ func (bucket *controlTokenBucket) consume(
 	elapsed := now.Sub(bucket.last)
 	bucket.last = now
 
-	missing := controlTokenCapacity - bucket.credit
+	missing := capacity - bucket.credit
 	if missing > 0 && elapsed > 0 {
 		fillAfter := time.Duration(
-			(missing + int64(ControlRatePerSecond) - 1) /
-				int64(ControlRatePerSecond),
+			(missing + int64(ratePerSecond) - 1) /
+				int64(ratePerSecond),
 		)
 		if elapsed >= fillAfter {
-			bucket.credit = controlTokenCapacity
+			bucket.credit = capacity
 		} else {
-			bucket.credit += int64(elapsed) * int64(ControlRatePerSecond)
+			bucket.credit += int64(elapsed) * int64(ratePerSecond)
 		}
 	}
 	if bucket.credit >= controlTokenUnit {
@@ -227,8 +272,8 @@ func (bucket *controlTokenBucket) consume(
 	}
 	missing = controlTokenUnit - bucket.credit
 	retryAfter := time.Duration(
-		(missing + int64(ControlRatePerSecond) - 1) /
-			int64(ControlRatePerSecond),
+		(missing + int64(ratePerSecond) - 1) /
+			int64(ratePerSecond),
 	)
 	return false, retryAfter
 }

@@ -47,6 +47,61 @@ func TestControlTokenBucketEnforcesBurstAndSustainedRate(t *testing.T) {
 	}
 }
 
+func TestProposalTokenBucketIsIndependentFromControlBudget(t *testing.T) {
+	clock := newControlTestClock()
+	server := newControlTestServer(t, clock)
+	handler, _ := newControlTestHandler(
+		server,
+		controlTestPeer(testPeerDeviceID, 1, 10),
+	)
+	if err := server.control.register(handler); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.control.unregister(handler) })
+
+	for index := range ProposalRateBurst {
+		allowed, retryAfter, err := server.control.consumeProposal(
+			testPeerDeviceID,
+		)
+		if err != nil || !allowed || retryAfter != 0 {
+			t.Fatalf(
+				"proposal %d = (%t, %s, %v)",
+				index,
+				allowed,
+				retryAfter,
+				err,
+			)
+		}
+	}
+	if allowed, retryAfter, err := server.control.consumeProposal(
+		testPeerDeviceID,
+	); err != nil || allowed || retryAfter <= 0 {
+		t.Fatalf(
+			"proposal over burst = (%t, %s, %v)",
+			allowed,
+			retryAfter,
+			err,
+		)
+	}
+	if allowed, retryAfter, err := server.control.consume(
+		testPeerDeviceID,
+	); err != nil || !allowed || retryAfter != 0 {
+		t.Fatalf(
+			"control after proposal saturation = (%t, %s, %v)",
+			allowed,
+			retryAfter,
+			err,
+		)
+	}
+	clock.Advance(time.Second)
+	for index := range ProposalRatePerSecond {
+		allowed, _, err := server.control.consumeProposal(testPeerDeviceID)
+		if err != nil || !allowed {
+			t.Fatalf("refilled proposal %d = (%t, %v)", index, allowed, err)
+		}
+	}
+}
+
 func TestControlRegistryRolloverKeepsOneCurrentAndOneDrain(t *testing.T) {
 	t.Parallel()
 

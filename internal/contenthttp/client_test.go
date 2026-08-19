@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -386,6 +387,57 @@ func TestClientReturnsBoundedProblemAndReusesConnection(t *testing.T) {
 	}
 	if _, err := harness.client.Peers(context.Background()); err != nil {
 		t.Fatalf("Peers() after problem: %v", err)
+	}
+}
+
+func TestClassifyRoundTripErrorSeparatesProtocolAndAvailability(t *testing.T) {
+	tests := []struct {
+		name  string
+		input error
+		want  error
+	}{
+		{
+			name: "stream protocol",
+			input: http2.StreamError{
+				StreamID: 1,
+				Code:     http2.ErrCodeProtocol,
+			},
+			want: ErrResponseProtocol,
+		},
+		{
+			name:  "connection protocol",
+			input: http2.ConnectionError(http2.ErrCodeCompression),
+			want:  ErrResponseProtocol,
+		},
+		{
+			name: "refused stream",
+			input: http2.StreamError{
+				StreamID: 1,
+				Code:     http2.ErrCodeRefusedStream,
+			},
+			want: ErrConnectionUnavailable,
+		},
+		{
+			name:  "EOF",
+			input: io.EOF,
+			want:  ErrConnectionUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := classifyRoundTripError(
+				test.input,
+			); !errors.Is(err, test.want) {
+				t.Fatalf(
+					"classifyRoundTripError() = %v, want %v",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+	if err := classifyRoundTripError(nil); err != nil {
+		t.Fatalf("classifyRoundTripError(nil) = %v", err)
 	}
 }
 

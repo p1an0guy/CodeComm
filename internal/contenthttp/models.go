@@ -24,11 +24,30 @@ const (
 
 var ErrInvalidResponse = errors.New("content HTTP: invalid response")
 
-// Service is the exact read-only V1 content-control surface. Implementations
-// return immutable snapshots taken at one internally consistent state cut.
+// ProposalHop identifies whether an authenticated event request entered at
+// this peer or was already relayed once.
+type ProposalHop uint8
+
+const (
+	ProposalHopInitial ProposalHop = iota + 1
+	ProposalHopForwarded
+)
+
+func (hop ProposalHop) valid() bool {
+	return hop == ProposalHopInitial || hop == ProposalHopForwarded
+}
+
+// Service is the exact V1 content-control surface. Read implementations return
+// immutable snapshots taken at one internally consistent state cut.
 type Service interface {
 	Session(context.Context) (SessionResponse, error)
 	Peers(context.Context) (PeersResponse, error)
+	ProposeEvent(
+		context.Context,
+		domain.DeviceID,
+		[]byte,
+		ProposalHop,
+	) (EventResult, error)
 }
 
 // SessionResponseInput contains the values copied into a SessionResponse.

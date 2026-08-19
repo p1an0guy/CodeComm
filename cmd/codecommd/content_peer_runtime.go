@@ -11,9 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -94,9 +96,14 @@ type daemonContentPeerWorker struct {
 	deviceID domain.DeviceID
 	cancel   context.CancelFunc
 	done     chan struct{}
+
+	connectionMu sync.RWMutex
+	connection   *daemonContentPeerConnection
 }
 
 type daemonContentPeerConnection struct {
+	mu sync.RWMutex
+
 	client      *contenthttp.Client
 	tlsConfig   *tls.Config
 	localEpoch  uint64
@@ -267,6 +274,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 	var connection *daemonContentPeerConnection
 	defer func() {
 		if connection != nil {
+			worker.clearConnection(connection)
 			_ = connection.Close()
 		}
 	}()
@@ -290,6 +298,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 				retry = min(retry*2, daemonContentPeerRetryMaximum)
 				continue
 			}
+			worker.setConnection(connection)
 		}
 		if runtime.localCredentialAdvanced(connection.localEpoch) ||
 			runtime.remoteCredentialAdvanced(
@@ -298,6 +307,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			) {
 			replacement, err := runtime.dialPeer(ctx, worker.deviceID)
 			if err == nil {
+				worker.setConnection(replacement)
 				_ = connection.Close()
 				connection = replacement
 			} else if errors.Is(err, errDaemonContentPeerState) &&
@@ -307,6 +317,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			}
 		}
 		if err := runtime.syncPeer(ctx, worker.deviceID, connection); err != nil {
+			worker.clearConnection(connection)
 			_ = connection.Close()
 			connection = nil
 			if errors.Is(err, errDaemonContentPeerState) &&
@@ -507,7 +518,7 @@ func (runtime *daemonContentPeerRuntime) syncPeer(
 		daemonContentPeerRequestTimeout,
 	)
 	defer cancel()
-	response, err := connection.client.Peers(requestContext)
+	response, err := connection.Peers(requestContext)
 	if err != nil {
 		return err
 	}
@@ -556,6 +567,80 @@ func (runtime *daemonContentPeerRuntime) syncPeer(
 		}
 	}
 	return nil
+}
+
+// ForwardProposal sends an exact signed proposal only to the caller-selected
+// active peer over its current authenticated content-control connection.
+func (runtime *daemonContentPeerRuntime) ForwardProposal(
+	ctx context.Context,
+	target domain.DeviceID,
+	signed event.SignedEvent,
+) (consensus.ForwardedProposalResult, error) {
+	if runtime == nil ||
+		ctx == nil ||
+		!target.Valid() ||
+		target == runtime.localDeviceID ||
+		!signed.Proposal().EventID.Valid() ||
+		signed.Proposal().SessionID != runtime.sessionID ||
+		signed.Proposal().WorkspaceID != runtime.workspaceID {
+		return consensus.ForwardedProposalResult{},
+			errDaemonContentPeerConstruction
+	}
+	if err := ctx.Err(); err != nil {
+		return consensus.ForwardedProposalResult{}, err
+	}
+	runtime.workersMu.Lock()
+	worker := runtime.workers[target]
+	runtime.workersMu.Unlock()
+	if worker == nil {
+		return consensus.ForwardedProposalResult{},
+			consensus.ErrProposalForwardingUnavailable
+	}
+	connection := worker.currentConnection()
+	if connection == nil {
+		return consensus.ForwardedProposalResult{},
+			consensus.ErrProposalForwardingUnavailable
+	}
+	result, err := connection.ForwardProposal(ctx, signed)
+	if err != nil {
+		return consensus.ForwardedProposalResult{},
+			normalizeDaemonProposalForwardingError(err)
+	}
+	chainIndex, chainHash, accepted := result.ChainPosition()
+	forwarded := consensus.ForwardedProposalResult{
+		Outcome:     result.Outcome(),
+		ResultIndex: result.ResultIndex(),
+	}
+	if accepted {
+		forwarded.ChainIndex = &chainIndex
+		forwarded.ChainHash = &chainHash
+	}
+	return forwarded, nil
+}
+
+func normalizeDaemonProposalForwardingError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var remote *contenthttp.RemoteError
+	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, contenthttp.ErrClientClosed),
+		errors.Is(err, contenthttp.ErrConnectionUnavailable):
+		return consensus.ErrProposalForwardingUnavailable
+	case errors.As(err, &remote) &&
+		remote.Code == "idempotency_conflict":
+		return store.ErrIdempotencyConflict
+	case errors.As(err, &remote) &&
+		remote.Code == "leader_ingress_rate_limited":
+		return consensus.ErrProposalIngressRateLimited
+	case errors.As(err, &remote) && remote.Retryable:
+		return consensus.ErrProposalForwardingUnavailable
+	default:
+		return err
+	}
 }
 
 func (runtime *daemonContentPeerRuntime) recordAuthenticatedEndpoint(
@@ -751,6 +836,8 @@ func (connection *daemonContentPeerConnection) Close() error {
 	if connection == nil {
 		return nil
 	}
+	connection.mu.Lock()
+	defer connection.mu.Unlock()
 	var err error
 	if connection.client != nil {
 		err = connection.client.Close()
@@ -761,6 +848,70 @@ func (connection *daemonContentPeerConnection) Close() error {
 	connection.localEpoch = 0
 	connection.remoteEpoch = 0
 	return err
+}
+
+func (connection *daemonContentPeerConnection) Peers(
+	ctx context.Context,
+) (contenthttp.PeersResponse, error) {
+	if connection == nil || ctx == nil {
+		return contenthttp.PeersResponse{},
+			errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	defer connection.mu.RUnlock()
+	if connection.client == nil {
+		return contenthttp.PeersResponse{}, contenthttp.ErrClientClosed
+	}
+	return connection.client.Peers(ctx)
+}
+
+func (connection *daemonContentPeerConnection) ForwardProposal(
+	ctx context.Context,
+	signed event.SignedEvent,
+) (contenthttp.EventResult, error) {
+	if connection == nil || ctx == nil {
+		return contenthttp.EventResult{},
+			errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	defer connection.mu.RUnlock()
+	if connection.client == nil {
+		return contenthttp.EventResult{}, contenthttp.ErrClientClosed
+	}
+	return connection.client.ForwardProposal(ctx, signed)
+}
+
+func (worker *daemonContentPeerWorker) setConnection(
+	connection *daemonContentPeerConnection,
+) {
+	if worker == nil || connection == nil {
+		return
+	}
+	worker.connectionMu.Lock()
+	worker.connection = connection
+	worker.connectionMu.Unlock()
+}
+
+func (worker *daemonContentPeerWorker) clearConnection(
+	connection *daemonContentPeerConnection,
+) {
+	if worker == nil || connection == nil {
+		return
+	}
+	worker.connectionMu.Lock()
+	if worker.connection == connection {
+		worker.connection = nil
+	}
+	worker.connectionMu.Unlock()
+}
+
+func (worker *daemonContentPeerWorker) currentConnection() *daemonContentPeerConnection {
+	if worker == nil {
+		return nil
+	}
+	worker.connectionMu.RLock()
+	defer worker.connectionMu.RUnlock()
+	return worker.connection
 }
 
 func clearDaemonClientTLSConfig(config *tls.Config) {
@@ -774,3 +925,4 @@ func clearDaemonClientTLSConfig(config *tls.Config) {
 }
 
 var _ phasedDaemonComponent = (*daemonContentPeerRuntime)(nil)
+var _ consensus.ProposalForwarder = (*daemonContentPeerRuntime)(nil)

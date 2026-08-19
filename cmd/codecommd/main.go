@@ -362,6 +362,7 @@ func runDaemon(
 
 	processClock := consensus.NewSystemApplyClock()
 	var bootOrigin *agent.BootOrigin
+	proposalForwarder := &daemonProposalForwarderRelay{}
 	node, err := consensus.OpenNode(
 		ctx,
 		consensus.NodeOptions{
@@ -405,7 +406,8 @@ func runDaemon(
 				}
 				return created, err
 			},
-			Clock: processClock,
+			ProposalForwarder: proposalForwarder,
+			Clock:             processClock,
 		},
 	)
 	if err != nil {
@@ -550,9 +552,11 @@ func runDaemon(
 		contentHandler, err = newDaemonContentServer(
 			options.sessionID,
 			options.workspaceID,
+			view.RecoveryGeneration,
 			deviceID,
 			localState,
 			discoveryRuntime,
+			node,
 		)
 		if err != nil {
 			return err
@@ -569,6 +573,9 @@ func runDaemon(
 			meshFactory.ConsensusRoutes(),
 		)
 		if err != nil {
+			return err
+		}
+		if err := proposalForwarder.set(contentPeerRuntime); err != nil {
 			return err
 		}
 	}

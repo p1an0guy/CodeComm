@@ -1,8 +1,8 @@
 # Phase 3 Status
 
 Status: in progress; secure daemon mesh, discovery, pairing admission, content credentials,
-endpoint relay, voter reconciliation, and revocation are production-composed; Phase 3 exit gate
-remains open
+endpoint and proposal relay, voter reconciliation, and revocation are production-composed; Phase 3
+exit gate remains open
 Last updated: 2026-08-19
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
@@ -38,16 +38,25 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   content; committed cadence changes update the running service and signed-set TTL.
 - Invite create/list/revoke, exporter-bound pairing ingress, durable proof/SAS state, local
   confirmation, admission finalization, and restart recovery are composed. CLI confirmations bind
-  the complete immutable review subject and explicit declines are durable.
+  the complete immutable review subject and explicit declines are durable. Durable invite/attempt
+  history is capped at 256 entries with deterministic oldest-first pruning that preserves active,
+  finalizing, and pending-secret-deletion rows.
 - Quorum clock endorsement, leader authorization/forwarding, protected epoch-key storage,
   make-before-break certificate selection, renewal retry, content mTLS, `/v1/session`, `/v1/peers`,
   and direct endpoint-set exchange are composed. Applied revocation closes established access,
   rejects fresh access, purges learned routes, and erases local epoch keys.
+- Content mTLS now serves strict `POST /v1/events`. Followers forward byte-identical signed
+  proposals once to their observed active leader; leader ingress is independently rate-limited per
+  signed origin, explicit hop metadata prevents recursive forwarding, delayed local Raft apply
+  cannot trigger hot re-forwarding, and each six-field response is compared with the exact local
+  result/event-chain positions after replication. Disconnect, GOAWAY, rollover, draining, and
+  capacity failures remain retryable without weakening malformed-response checks.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
-  cluster, establish and relay content state, complete two-sided SAS admission, authorize the
-  admitted member's content credential, revoke it through local operator IPC, verify both
-  established and fresh content denial without target/authority drift, restart a follower, re-open
-  every store, and verify commitment history.
+  cluster, establish and relay content state, submit a task through a captured follower over the
+  persistent content connection, complete two-sided SAS admission, authorize the admitted member's
+  content credential, revoke it through local operator IPC, verify both established and fresh
+  content denial without target/authority drift, restart a follower, re-open every store, and
+  verify commitment history.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -61,12 +70,10 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   documented end-to-end join workflow.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
-  status remain missing. Pairing history retention also needs a durable bound.
+  status remain missing.
 - Credential rotation mechanisms are composed, but production-composition tests still need on-time
   and next-workday renewal, rollover under active traffic, an unreachable transition target, and
   all-voters-asleep election/renewal recovery.
-- Followers do not yet forward `POST /v1/events` to the current leader. Local commands submitted to
-  a follower remain durable but wait for local leadership.
 - Result catch-up, authority-crossing batches, snapshots, SSE, acknowledgements, and divergence
   recovery are not implemented.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
@@ -89,6 +96,7 @@ Primary tests:
 - `TestSecureThreeVoterColdCommitRecovery`
 - `TestSecureMeshVoterReconciliationTransitions`
 - `TestSecureMeshIsolatedMinorityCannotEscalate`
+- `TestSecureMeshFollowerForwardsOnlyToObservedLeader`
 - `TestSecureMeshTopologyPartitionClosesEstablishedConnections`
 - `TestOpenNodeUsesInjectedDeviceAddressedTransport`
 - `TestInspectDaemonMeshState*`
