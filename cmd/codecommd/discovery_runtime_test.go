@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/discovery"
+	"github.com/ijonahch/codecomm/internal/transport"
 )
 
 func TestResolveDaemonDiscoverySelectionBindsListenerAddresses(
@@ -223,6 +224,83 @@ func TestDaemonDiscoveryAddressBookReplacesAtomically(t *testing.T) {
 	selected[0] = first
 	if got := book.selected(); len(got) != 1 || got[0] != second {
 		t.Fatalf("selected address snapshot was aliased: %v", got)
+	}
+}
+
+func TestDaemonDiscoverySelectionChangeNotifiesCredentialRecovery(
+	t *testing.T,
+) {
+	first := netip.MustParseAddr("192.0.2.10")
+	second := netip.MustParseAddr("192.0.2.11")
+	routes, err := transport.NewConsensusRouteTable(
+		[]netip.Addr{first},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewConsensusRouteTable(): %v", err)
+	}
+	firstKey := daemonDiscoveryAddressKey{
+		interfaceIndex: 3,
+		family:         discovery.AddressFamilyIPv4,
+	}
+	book := &daemonDiscoveryAddressBook{}
+	book.replace(
+		map[daemonDiscoveryAddressKey]netip.Addr{firstKey: first},
+		[]netip.Addr{first},
+	)
+	connectivity := &daemonConnectivityNotifierStub{}
+	runtime := &daemonDiscoveryRuntime{
+		routes:       routes,
+		addresses:    book,
+		connectivity: connectivity,
+	}
+	firstSelection := daemonDiscoverySelection{
+		addresses: map[daemonDiscoveryAddressKey]netip.Addr{
+			firstKey: first,
+		},
+		selected: []netip.Addr{first},
+	}
+	if err := runtime.replaceSelectedAddresses(firstSelection); err != nil {
+		t.Fatalf("replace unchanged selection: %v", err)
+	}
+	if connectivity.calls != 0 {
+		t.Fatalf(
+			"unchanged selection notifications = %d",
+			connectivity.calls,
+		)
+	}
+
+	secondKey := firstKey
+	secondKey.interfaceIndex = 7
+	interfaceChanged := daemonDiscoverySelection{
+		addresses: map[daemonDiscoveryAddressKey]netip.Addr{
+			secondKey: first,
+		},
+		selected: []netip.Addr{first},
+	}
+	if err := runtime.replaceSelectedAddresses(interfaceChanged); err != nil {
+		t.Fatalf("replace changed interface: %v", err)
+	}
+	if connectivity.calls != 1 {
+		t.Fatalf(
+			"interface-change notifications = %d, want 1",
+			connectivity.calls,
+		)
+	}
+	addressChanged := daemonDiscoverySelection{
+		addresses: map[daemonDiscoveryAddressKey]netip.Addr{
+			secondKey: second,
+		},
+		selected: []netip.Addr{second},
+	}
+	if err := runtime.replaceSelectedAddresses(addressChanged); err != nil {
+		t.Fatalf("replace changed address: %v", err)
+	}
+	if connectivity.calls != 2 {
+		t.Fatalf(
+			"address-change notifications = %d, want 2",
+			connectivity.calls,
+		)
 	}
 }
 

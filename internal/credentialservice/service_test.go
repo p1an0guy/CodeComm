@@ -251,6 +251,39 @@ func TestTransientRenewalReusesPersistedCandidate(t *testing.T) {
 	}
 }
 
+func TestConnectivityChangeCoalescesAndInterruptsRetryBackoff(
+	t *testing.T,
+) {
+	fixture := newServiceFixture(t, nil)
+	fixture.service.NotifyConnectivityChange()
+	fixture.service.NotifyConnectivityChange()
+	if queued := len(fixture.service.wake); queued != 1 {
+		t.Fatalf("coalesced wake signals = %d, want 1", queued)
+	}
+	if !fixture.service.wait(time.Hour) {
+		t.Fatal("queued connectivity change did not interrupt backoff")
+	}
+
+	waited := make(chan bool, 1)
+	go func() {
+		waited <- fixture.service.wait(time.Hour)
+	}()
+	select {
+	case <-waited:
+		t.Fatal("coalesced notification left a duplicate wake signal")
+	case <-time.After(25 * time.Millisecond):
+	}
+	fixture.service.NotifyConnectivityChange()
+	select {
+	case resumed := <-waited:
+		if !resumed {
+			t.Fatal("connectivity change stopped rather than resumed retry")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connectivity change did not interrupt active backoff")
+	}
+}
+
 func TestRenewalWaitsForFloorThenAllowsNextDayRecovery(t *testing.T) {
 	initialPrivate := servicePrivateKey(0x61)
 	fixture := newServiceFixture(t, initialPrivate)

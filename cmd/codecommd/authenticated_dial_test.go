@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/transport"
 )
 
 func TestDaemonAuthenticatedDialRelayFailsClosedUntilConfigured(t *testing.T) {
@@ -23,15 +24,23 @@ func TestDaemonAuthenticatedDialRelayFailsClosedUntilConfigured(t *testing.T) {
 	}
 
 	state := &daemonAuthenticatedEndpointStateStub{}
+	connectivity := &daemonConnectivityNotifierStub{
+		notify: func() {
+			if state.calls != 1 {
+				t.Fatal("connectivity notification preceded endpoint persistence")
+			}
+		},
+	}
 	now := time.Date(2026, 8, 19, 12, 0, 0, 123, time.UTC)
 	observer := newDaemonAuthenticatedEndpointObserver(
 		state,
 		func() time.Time { return now },
+		connectivity,
 	)
-	if err := relay.set(observer); err != nil {
+	if err := relay.set(observer, connectivity); err != nil {
 		t.Fatalf("set(): %v", err)
 	}
-	if err := relay.set(observer); !errors.Is(
+	if err := relay.set(observer, connectivity); !errors.Is(
 		err,
 		errDaemonAuthenticatedDialObserver,
 	) {
@@ -54,6 +63,9 @@ func TestDaemonAuthenticatedDialRelayFailsClosedUntilConfigured(t *testing.T) {
 			state.observedAt,
 		)
 	}
+	if connectivity.calls != 1 {
+		t.Fatalf("connectivity notifications = %d, want 1", connectivity.calls)
+	}
 }
 
 func TestDaemonAuthenticatedEndpointObserverPropagatesFailureAndCancellation(
@@ -61,7 +73,12 @@ func TestDaemonAuthenticatedEndpointObserverPropagatesFailureAndCancellation(
 ) {
 	persistErr := errors.New("endpoint store unavailable")
 	state := &daemonAuthenticatedEndpointStateStub{err: persistErr}
-	observer := newDaemonAuthenticatedEndpointObserver(state, time.Now)
+	connectivity := &daemonConnectivityNotifierStub{}
+	observer := newDaemonAuthenticatedEndpointObserver(
+		state,
+		time.Now,
+		connectivity,
+	)
 	if err := observer(
 		context.Background(),
 		daemonEndpointRouteTestDeviceID('7'),
@@ -84,6 +101,35 @@ func TestDaemonAuthenticatedEndpointObserverPropagatesFailureAndCancellation(
 	if state.calls != before {
 		t.Fatal("canceled observer reached endpoint storage")
 	}
+	if connectivity.calls != 0 {
+		t.Fatalf(
+			"failed observations emitted %d connectivity notifications",
+			connectivity.calls,
+		)
+	}
+}
+
+func TestDaemonAuthenticatedPeerObserverFiltersNonConsensusPlanes(
+	t *testing.T,
+) {
+	connectivity := &daemonConnectivityNotifierStub{}
+	observer := newDaemonAuthenticatedPeerObserver(connectivity)
+	for _, plane := range []transport.Plane{
+		transport.PlanePairing,
+		transport.PlaneContent,
+	} {
+		observer(transport.AuthenticatedPeer{Plane: plane})
+	}
+	if connectivity.calls != 0 {
+		t.Fatalf(
+			"non-consensus notifications = %d, want 0",
+			connectivity.calls,
+		)
+	}
+	observer(transport.AuthenticatedPeer{Plane: transport.PlaneConsensus})
+	if connectivity.calls != 1 {
+		t.Fatalf("consensus notifications = %d, want 1", connectivity.calls)
+	}
 }
 
 type daemonAuthenticatedEndpointStateStub struct {
@@ -92,6 +138,18 @@ type daemonAuthenticatedEndpointStateStub struct {
 	observedAt domain.Timestamp
 	calls      int
 	err        error
+}
+
+type daemonConnectivityNotifierStub struct {
+	calls  int
+	notify func()
+}
+
+func (notifier *daemonConnectivityNotifierStub) NotifyConnectivityChange() {
+	notifier.calls++
+	if notifier.notify != nil {
+		notifier.notify()
+	}
 }
 
 func (state *daemonAuthenticatedEndpointStateStub) UpsertAuthenticatedEndpoint(

@@ -51,6 +51,10 @@ func (function ConnectionHandlerFunc) ServeAuthenticatedConn(
 	return function(ctx, connection)
 }
 
+// AuthenticatedPeerObserver receives one peer only after TLS and current
+// admission checks succeed. It must be concurrency-safe and return promptly.
+type AuthenticatedPeerObserver func(AuthenticatedPeer)
+
 // IngressOptions configures one shared peer listener. Unregistered planes
 // complete no application dispatch and are closed after authentication.
 type IngressOptions struct {
@@ -60,6 +64,7 @@ type IngressOptions struct {
 	// PeerAccessChanges coalesces applied membership and credential changes.
 	// Each signal revalidates all established peers against current policy.
 	PeerAccessChanges <-chan struct{}
+	PeerAuthenticated AuthenticatedPeerObserver
 
 	Pairing   ConnectionHandler
 	Consensus ConnectionHandler
@@ -75,6 +80,7 @@ type Ingress struct {
 	handlers          map[Plane]ConnectionHandler
 	slots             chan struct{}
 	peerAccessChanges <-chan struct{}
+	peerAuthenticated AuthenticatedPeerObserver
 
 	verifyPairing   IdentityPeerVerifier
 	verifyConsensus IdentityPeerVerifier
@@ -180,6 +186,7 @@ func newIngress(
 		admission: admission, handlers: handlers,
 		slots:                 make(chan struct{}, maxConnections),
 		peerAccessChanges:     options.PeerAccessChanges,
+		peerAuthenticated:     options.PeerAuthenticated,
 		verifyPairing:         options.TLS.VerifyPairingPeer,
 		verifyConsensus:       options.TLS.VerifyConsensusPeer,
 		verifyContent:         options.TLS.VerifyContentPeer,
@@ -450,6 +457,9 @@ func (ingress *Ingress) serveConnection(
 	if !ok {
 		ingress.dispatchErrors.Add(1)
 		return
+	}
+	if ingress.peerAuthenticated != nil {
+		ingress.peerAuthenticated(metadata)
 	}
 	var expiryTimer *time.Timer
 	if plane == PlaneContent {

@@ -147,6 +147,99 @@ func TestIngressProvidesAuthenticatedPeerMetadata(t *testing.T) {
 	stopTestIngress(t, running)
 }
 
+func TestIngressObservesOnlySuccessfullyAuthenticatedPeers(t *testing.T) {
+	t.Parallel()
+
+	fixture := newIngressTestTLS(t)
+	var deny atomic.Bool
+	fixture.server.VerifyConsensusPeer = func(IdentityCertificate) error {
+		if deny.Load() {
+			return ErrTLSAdmission
+		}
+		return nil
+	}
+	listener := newIngressTestListener(t)
+	observed := make(chan AuthenticatedPeer, 1)
+	handled := make(chan struct{}, 1)
+	running := startTestIngress(t, IngressOptions{
+		Listener: listener,
+		TLS:      fixture.server,
+		PeerAuthenticated: func(peer AuthenticatedPeer) {
+			observed <- peer
+		},
+		Consensus: ConnectionHandlerFunc(
+			func(context.Context, *tls.Conn) error {
+				handled <- struct{}{}
+				return nil
+			},
+		),
+	}, PeerConnectionsMax)
+
+	plaintext := dialIngressTCP(t, listener.Addr().String())
+	if _, err := plaintext.Write([]byte("not TLS")); err != nil {
+		t.Fatalf("plaintext write: %v", err)
+	}
+	expectIngressConnectionClosed(t, plaintext, ingressTestTimeout)
+	_ = plaintext.Close()
+
+	deny.Store(true)
+	rejected, err := tryIngressTLS(
+		listener.Addr().String(),
+		fixture.clients[PlaneConsensus],
+		ingressTestTimeout,
+	)
+	if rejected != nil {
+		if err == nil {
+			expectIngressConnectionClosed(
+				t,
+				rejected,
+				ingressTestTimeout,
+			)
+		}
+		_ = rejected.Close()
+	}
+	select {
+	case peer := <-observed:
+		t.Fatalf("unauthenticated peer was observed: %+v", peer)
+	case <-time.After(25 * time.Millisecond):
+	}
+	select {
+	case <-handled:
+		t.Fatal("unauthenticated peer reached the handler")
+	default:
+	}
+
+	deny.Store(false)
+	connection := dialIngressTLS(
+		t,
+		listener.Addr().String(),
+		fixture.clients[PlaneConsensus],
+	)
+	defer connection.Close()
+	peer := awaitIngressValue(
+		t,
+		observed,
+		ingressTestTimeout,
+		"authenticated peer observation",
+	)
+	if peer.Plane != PlaneConsensus ||
+		peer.SessionID != fixture.clientIdentity.SessionID ||
+		peer.DeviceID != fixture.clientIdentity.DeviceID ||
+		peer.RecoveryGeneration !=
+			fixture.clientIdentity.RecoveryGeneration {
+		t.Fatalf("authenticated peer observation = %+v", peer)
+	}
+	awaitIngressValue(
+		t,
+		handled,
+		ingressTestTimeout,
+		"authenticated peer handler",
+	)
+	expectIngressConnectionClosed(t, connection, ingressTestTimeout)
+
+	stopTestIngress(t, running)
+}
+
 func TestAuthenticatedPeerReauthorizationUsesCurrentPolicy(t *testing.T) {
 	t.Parallel()
 

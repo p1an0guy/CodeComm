@@ -25,9 +25,14 @@ type daemonAuthenticatedEndpointState interface {
 	) error
 }
 
+type daemonConnectivityNotifier interface {
+	NotifyConnectivityChange()
+}
+
 type daemonAuthenticatedDialRelay struct {
 	mu       sync.RWMutex
 	observer transport.ConsensusAuthenticatedDialObserver
+	notifier daemonConnectivityNotifier
 }
 
 func (relay *daemonAuthenticatedDialRelay) observe(
@@ -52,29 +57,44 @@ func (relay *daemonAuthenticatedDialRelay) observe(
 
 func (relay *daemonAuthenticatedDialRelay) set(
 	observer transport.ConsensusAuthenticatedDialObserver,
+	notifier daemonConnectivityNotifier,
 ) error {
-	if relay == nil || observer == nil {
+	if relay == nil || observer == nil || notifier == nil {
 		return errDaemonAuthenticatedDialObserver
 	}
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
-	if relay.observer != nil {
+	if relay.observer != nil || relay.notifier != nil {
 		return errDaemonAuthenticatedDialObserver
 	}
 	relay.observer = observer
+	relay.notifier = notifier
 	return nil
+}
+
+func (relay *daemonAuthenticatedDialRelay) NotifyConnectivityChange() {
+	if relay == nil {
+		return
+	}
+	relay.mu.RLock()
+	notifier := relay.notifier
+	relay.mu.RUnlock()
+	if notifier != nil {
+		notifier.NotifyConnectivityChange()
+	}
 }
 
 func newDaemonAuthenticatedEndpointObserver(
 	state daemonAuthenticatedEndpointState,
 	now func() time.Time,
+	connectivity daemonConnectivityNotifier,
 ) transport.ConsensusAuthenticatedDialObserver {
 	return func(
 		ctx context.Context,
 		deviceID domain.DeviceID,
 		endpoint netip.AddrPort,
 	) error {
-		if state == nil || now == nil || ctx == nil {
+		if state == nil || now == nil || connectivity == nil || ctx == nil {
 			return errDaemonAuthenticatedDialObserver
 		}
 		if err := ctx.Err(); err != nil {
@@ -98,6 +118,18 @@ func newDaemonAuthenticatedEndpointObserver(
 				err,
 			)
 		}
+		connectivity.NotifyConnectivityChange()
 		return nil
+	}
+}
+
+func newDaemonAuthenticatedPeerObserver(
+	connectivity daemonConnectivityNotifier,
+) transport.AuthenticatedPeerObserver {
+	return func(peer transport.AuthenticatedPeer) {
+		if connectivity == nil || peer.Plane != transport.PlaneConsensus {
+			return
+		}
+		connectivity.NotifyConnectivityChange()
 	}
 }

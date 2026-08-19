@@ -660,8 +660,9 @@ func (*daemonTestMeshFactory) ConsensusRoutes() *transport.ConsensusRouteTable {
 	return nil
 }
 
-func (*daemonTestMeshFactory) SetAuthenticatedDialObserver(
+func (*daemonTestMeshFactory) SetAuthenticatedConnectivity(
 	transport.ConsensusAuthenticatedDialObserver,
+	daemonConnectivityNotifier,
 ) error {
 	return nil
 }

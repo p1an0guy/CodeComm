@@ -477,11 +477,6 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	if err := meshFactory.SetAuthenticatedDialObserver(
-		newDaemonAuthenticatedEndpointObserver(localState, time.Now),
-	); err != nil {
-		return err
-	}
 	agentService, err = agent.New(agent.Options{
 		Consensus:          node,
 		LocalState:         localState,
@@ -512,6 +507,16 @@ func runDaemon(
 		node,
 	)
 	if err != nil {
+		return err
+	}
+	if err := meshFactory.SetAuthenticatedConnectivity(
+		newDaemonAuthenticatedEndpointObserver(
+			localState,
+			time.Now,
+			credentialService,
+		),
+		credentialService,
+	); err != nil {
 		return err
 	}
 	pairingRuntime, err := newDaemonPairingRuntime(

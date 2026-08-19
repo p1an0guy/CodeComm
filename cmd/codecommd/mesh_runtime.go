@@ -52,8 +52,9 @@ type daemonConsensusTransportFactory interface {
 		func(context.Context, netip.AddrPort) (net.Listener, error),
 	) (*transport.Ingress, error)
 	ConsensusRoutes() *transport.ConsensusRouteTable
-	SetAuthenticatedDialObserver(
+	SetAuthenticatedConnectivity(
 		transport.ConsensusAuthenticatedDialObserver,
+		daemonConnectivityNotifier,
 	) error
 	ClearIdentityCertificate()
 }
@@ -287,9 +288,12 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 			VerifyContentPeer:   factory.verifiers.VerifyContentPeer,
 		},
 		PeerAccessChanges: node.PeerAdmissionChanges(),
-		Pairing:           pairingHandler,
-		Consensus:         factory.stream,
-		Content:           contentHandler,
+		PeerAuthenticated: newDaemonAuthenticatedPeerObserver(
+			factory.authenticatedDials,
+		),
+		Pairing:   pairingHandler,
+		Consensus: factory.stream,
+		Content:   contentHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -316,15 +320,16 @@ func (factory *daemonMeshTransportFactory) ConsensusRoutes() *transport.Consensu
 	return factory.routes
 }
 
-func (factory *daemonMeshTransportFactory) SetAuthenticatedDialObserver(
+func (factory *daemonMeshTransportFactory) SetAuthenticatedConnectivity(
 	observer transport.ConsensusAuthenticatedDialObserver,
+	notifier daemonConnectivityNotifier,
 ) error {
 	if factory == nil || factory.authenticatedDials == nil {
 		return errDaemonMeshConstruction
 	}
-	if err := factory.authenticatedDials.set(observer); err != nil {
+	if err := factory.authenticatedDials.set(observer, notifier); err != nil {
 		return fmt.Errorf(
-			"%w: authenticated dial observer: %v",
+			"%w: authenticated connectivity observer: %v",
 			errDaemonMeshConstruction,
 			err,
 		)

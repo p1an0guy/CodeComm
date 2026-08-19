@@ -76,6 +76,7 @@ type daemonDiscoveryRuntime struct {
 	localState            store.LocalState
 	listInterfaces        daemonInterfaceLister
 	interfaceAddrs        daemonInterfaceAddressProvider
+	connectivity          daemonConnectivityNotifier
 	advertisementInterval atomic.Int64
 	publicationMu         sync.RWMutex
 
@@ -270,6 +271,7 @@ func newDaemonDiscoveryRuntime(
 		localState:     localState,
 		listInterfaces: dependencies.listInterfaces,
 		interfaceAddrs: dependencies.interfaceAddrs,
+		connectivity:   credentials,
 		cancel:         cancel,
 		done:           make(chan struct{}),
 	}
@@ -457,15 +459,9 @@ func (runtime *daemonDiscoveryRuntime) refresh(
 	if err != nil {
 		return false, err
 	}
-	if err := runtime.routes.ReplaceSelectedAddresses(
-		daemonDiscoverySelectedAddresses(selection),
-	); err != nil {
-		return false, fmt.Errorf("replace selected routes: %w", err)
+	if err := runtime.replaceSelectedAddresses(selection); err != nil {
+		return false, err
 	}
-	runtime.addresses.replace(
-		selection.addresses,
-		daemonDiscoverySelectedAddresses(selection),
-	)
 	intervalChanged, err := runtime.refreshAdvertisementInterval(ctx)
 	if err != nil {
 		return false, err
@@ -474,6 +470,23 @@ func (runtime *daemonDiscoveryRuntime) refresh(
 		return intervalChanged, fmt.Errorf("refresh multicast: %w", err)
 	}
 	return intervalChanged, nil
+}
+
+func (runtime *daemonDiscoveryRuntime) replaceSelectedAddresses(
+	selection daemonDiscoverySelection,
+) error {
+	if runtime == nil || runtime.routes == nil || runtime.addresses == nil {
+		return errDaemonDiscoveryConstruction
+	}
+	selected := daemonDiscoverySelectedAddresses(selection)
+	if err := runtime.routes.ReplaceSelectedAddresses(selected); err != nil {
+		return fmt.Errorf("replace selected routes: %w", err)
+	}
+	if runtime.addresses.replace(selection.addresses, selected) &&
+		runtime.connectivity != nil {
+		runtime.connectivity.NotifyConnectivityChange()
+	}
+	return nil
 }
 
 func (runtime *daemonDiscoveryRuntime) refreshAdvertisementInterval(
@@ -717,7 +730,10 @@ func (book *daemonDiscoveryAddressBook) lookup(
 func (book *daemonDiscoveryAddressBook) replace(
 	addresses map[daemonDiscoveryAddressKey]netip.Addr,
 	selected []netip.Addr,
-) {
+) bool {
+	if book == nil {
+		return false
+	}
 	next := make(
 		map[daemonDiscoveryAddressKey]netip.Addr,
 		len(addresses),
@@ -726,9 +742,20 @@ func (book *daemonDiscoveryAddressBook) replace(
 		next[key] = address
 	}
 	book.mu.Lock()
+	changed := !slices.Equal(book.selectedAddresses, selected) ||
+		len(book.addresses) != len(next)
+	if !changed {
+		for key, address := range next {
+			if book.addresses[key] != address {
+				changed = true
+				break
+			}
+		}
+	}
 	book.addresses = next
 	book.selectedAddresses = append([]netip.Addr(nil), selected...)
 	book.mu.Unlock()
+	return changed
 }
 
 func (book *daemonDiscoveryAddressBook) selected() []netip.Addr {

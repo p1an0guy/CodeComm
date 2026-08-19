@@ -161,13 +161,14 @@ func (factory *daemonMeshIntegrationTransportFactory) ConsensusRoutes() *transpo
 	return factory.delegate.ConsensusRoutes()
 }
 
-func (factory *daemonMeshIntegrationTransportFactory) SetAuthenticatedDialObserver(
+func (factory *daemonMeshIntegrationTransportFactory) SetAuthenticatedConnectivity(
 	observer transport.ConsensusAuthenticatedDialObserver,
+	notifier daemonConnectivityNotifier,
 ) error {
 	if factory == nil || factory.delegate == nil {
 		return errDaemonMeshContentHarness
 	}
-	return factory.delegate.SetAuthenticatedDialObserver(observer)
+	return factory.delegate.SetAuthenticatedConnectivity(observer, notifier)
 }
 
 func (factory *daemonMeshIntegrationTransportFactory) ClearIdentityCertificate() {
