@@ -25,6 +25,8 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - name: Test
+        env:
+          CODECOMM_REQUIRE_DAEMON_MESH: "1"
         run: go test ./...
       - name: Vet
         run: go vet ./...
@@ -66,6 +68,32 @@ jobs:
         env:
           CODECOMM_REQUIRE_NATIVE_MULTICAST: "1"
         run: go test -count=1 -run "^TestMulticastNativeIntegration$" ./internal/discovery
+
+  phase3-mesh-coverage:
+    name: Phase 3 secure-mesh coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Exercise mesh in process
+        env:
+          GODEBUG: http2xconnect=1
+          CODECOMM_SECURE_MESH_IN_PROCESS: "1"
+        shell: bash
+        run: |
+          go test -count=1 -covermode=atomic \
+            -coverpkg=./internal/consensus,./internal/transport \
+            -coverprofile="$RUNNER_TEMP/phase3-mesh.cover" \
+            ./internal/consensus \
+            -run '^(TestSecureThreeVoterConsensusMesh|TestSecureThreeVoterColdCommitRecovery|TestSecureMeshVoterReconciliationTransitions|TestSecureMeshIsolatedMinorityCannotEscalate)$'
+          go tool cover -func="$RUNNER_TEMP/phase3-mesh.cover" \
+            | tee "$RUNNER_TEMP/phase3-mesh-coverage.txt"
+          total="$(awk '/^total:/ {gsub(/%/, "", $3); print $3}' "$RUNNER_TEMP/phase3-mesh-coverage.txt")"
+          awk -v total="$total" 'BEGIN { if (total + 0 < 45) exit 1 }'
 
   stable-store-syscall:
     name: Stable-store sync ordering

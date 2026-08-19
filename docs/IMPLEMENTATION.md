@@ -155,7 +155,8 @@ These follow §13 directly and need no elaboration here beyond build order withi
   signed canonical-coverage contract/gate with verified fixture repositories → voter-set
   reconciliation → revocation. The gate has no permissive implementation; Phase 4 supplies its
   production local-Git provider and Phase 5 adds peer repair. Must exit proving a minority commits
-  nothing, self-promotes nothing, and authorizes no credential.
+  nothing, self-promotes nothing, and authorizes no credential. Current evidence and open gates:
+  [`docs/implementation/phase-3-status.md`](implementation/phase-3-status.md).
 - **Phase 4 (bootstrap):** `gitplumbing` bundle path, no-checkout clone, isolated Git config
   (including `core.hooksPath`, `init.templateDir`, `GIT_CONFIG_*`, `core.fsmonitor`,
   `protectNTFS`/`protectHFS`), preflight.
