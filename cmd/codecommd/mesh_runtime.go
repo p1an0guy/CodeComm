@@ -63,6 +63,7 @@ type daemonMeshFactoryConstructor func(
 	daemonOptions,
 	domain.DeviceID,
 	tls.Certificate,
+	func() time.Time,
 ) (daemonConsensusTransportFactory, error)
 
 type daemonMeshTransportFactory struct {
@@ -70,6 +71,7 @@ type daemonMeshTransportFactory struct {
 	identityCertificate tls.Certificate
 	routes              *transport.ConsensusRouteTable
 	authenticatedDials  *daemonAuthenticatedDialRelay
+	credentialNow       func() time.Time
 
 	stream    *transport.ConsensusStreamLayer
 	verifiers *peerauth.Verifiers
@@ -147,7 +149,11 @@ func newDaemonMeshTransportFactory(
 	options daemonOptions,
 	deviceID domain.DeviceID,
 	identityCertificate tls.Certificate,
+	credentialNow func() time.Time,
 ) (daemonConsensusTransportFactory, error) {
+	if credentialNow == nil {
+		return nil, errDaemonMeshConstruction
+	}
 	routes := make([]transport.ConsensusRoute, len(options.peerRoutes))
 	for index, route := range options.peerRoutes {
 		if route.deviceID == deviceID {
@@ -182,6 +188,7 @@ func newDaemonMeshTransportFactory(
 		identityCertificate: cloneDaemonTLSCertificate(identityCertificate),
 		routes:              resolver,
 		authenticatedDials:  &daemonAuthenticatedDialRelay{},
+		credentialNow:       credentialNow,
 	}, nil
 }
 
@@ -199,7 +206,7 @@ func (factory *daemonMeshTransportFactory) Build(
 	}
 	verifiers, err := peerauth.NewVerifiers(
 		gate.PeerAdmissionSnapshot,
-		time.Now,
+		factory.credentialNow,
 	)
 	if err != nil {
 		return nil, err

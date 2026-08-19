@@ -79,9 +79,10 @@ type SingleNodeOptions struct {
 	// returned origin remains caller-owned after OpenSingleNode succeeds.
 	CheckpointOriginFactory CheckpointOriginFactory
 
-	Clock      ApplyClock
-	RaftConfig *raft.Config
-	LogOutput  io.Writer
+	Clock         ApplyClock
+	CredentialNow func() time.Time
+	RaftConfig    *raft.Config
+	LogOutput     io.Writer
 }
 
 // RaftTransport is the owned transport boundary required by a consensus node.
@@ -127,9 +128,10 @@ type NodeOptions struct {
 	CheckpointOriginFactory     CheckpointOriginFactory
 	ProposalForwarder           ProposalForwarder
 
-	Clock      ApplyClock
-	RaftConfig *raft.Config
-	LogOutput  io.Writer
+	Clock         ApplyClock
+	CredentialNow func() time.Time
+	RaftConfig    *raft.Config
+	LogOutput     io.Writer
 }
 
 // SingleNode is the durable Raft/SQLite runtime. Its historical name remains
@@ -226,9 +228,10 @@ type nodeOpenOptions struct {
 	Single                      bool
 	DisableVoterReconciliation  bool
 
-	Clock      ApplyClock
-	RaftConfig *raft.Config
-	LogOutput  io.Writer
+	Clock         ApplyClock
+	CredentialNow func() time.Time
+	RaftConfig    *raft.Config
+	LogOutput     io.Writer
 }
 
 // OpenSingleNode opens durable stores, completes a one-time bootstrap if
@@ -253,6 +256,7 @@ func OpenSingleNode(
 		CheckpointOriginFactory:     options.CheckpointOriginFactory,
 		Single:                      true,
 		Clock:                       options.Clock,
+		CredentialNow:               options.CredentialNow,
 		RaftConfig:                  options.RaftConfig,
 		LogOutput:                   options.LogOutput,
 	})
@@ -289,6 +293,7 @@ func OpenNode(
 		CheckpointOriginFactory:     options.CheckpointOriginFactory,
 		ProposalForwarder:           options.ProposalForwarder,
 		Clock:                       options.Clock,
+		CredentialNow:               options.CredentialNow,
 		RaftConfig:                  options.RaftConfig,
 		LogOutput:                   options.LogOutput,
 	})
@@ -618,6 +623,10 @@ func openNode(
 	checkpointOrigin := normalizedCheckpointOrigin(
 		options.CheckpointOrigin,
 	)
+	credentialNow := options.CredentialNow
+	if credentialNow == nil {
+		credentialNow = time.Now
+	}
 	node := &SingleNode{
 		fsm:           fsm,
 		state:         state,
@@ -649,7 +658,7 @@ func openNode(
 		raftEnqueue:              make(chan struct{}, 1),
 		voterReconcileGate:       make(chan struct{}, 1),
 		voterReconcileNow:        options.VoterReconciliationNow,
-		credentialEndorsementNow: time.Now,
+		credentialEndorsementNow: credentialNow,
 		fatalSet:                 make(chan struct{}),
 		proposalFlights: make(
 			map[domain.UUIDv7]*proposalFlight,

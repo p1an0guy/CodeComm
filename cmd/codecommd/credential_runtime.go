@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
@@ -23,13 +24,15 @@ func newDaemonCredentialService(
 	identityPrivateKey ed25519.PrivateKey,
 	secrets daemonCredentialHandle,
 	node *consensus.Node,
+	now func() time.Time,
 ) (*credentialservice.Service, error) {
 	if ctx == nil ||
 		!sessionID.Valid() ||
 		!deviceID.Valid() ||
 		len(identityPrivateKey) != ed25519.PrivateKeySize ||
 		secrets == nil ||
-		node == nil {
+		node == nil ||
+		now == nil {
 		return nil, errDaemonCredentialConstruction
 	}
 	service, err := credentialservice.New(credentialservice.Options{
@@ -37,6 +40,7 @@ func newDaemonCredentialService(
 		DeviceID:  deviceID,
 		Secrets:   secrets,
 		Consensus: node,
+		Now:       now,
 		Sign: func(
 			ctx context.Context,
 			epoch uint64,

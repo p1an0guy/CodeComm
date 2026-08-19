@@ -77,6 +77,7 @@ type daemonContentPeerRuntime struct {
 	routes        daemonContentPeerRoutes
 	verifiers     *peerauth.Verifiers
 	now           func() time.Time
+	credentialNow func() time.Time
 	jitter        func(time.Duration) time.Duration
 
 	ctx    context.Context
@@ -120,6 +121,7 @@ func newDaemonContentPeerRuntime(
 	admission daemonContentPeerAdmission,
 	certificate transport.ContentCertificateProvider,
 	routes daemonContentPeerRoutes,
+	now func() time.Time,
 ) (*daemonContentPeerRuntime, error) {
 	if ctx == nil ||
 		!sessionID.Valid() ||
@@ -129,7 +131,8 @@ func newDaemonContentPeerRuntime(
 		state == nil ||
 		admission == nil ||
 		certificate == nil ||
-		routes == nil {
+		routes == nil ||
+		now == nil {
 		return nil, errDaemonContentPeerConstruction
 	}
 	if err := ctx.Err(); err != nil {
@@ -137,7 +140,7 @@ func newDaemonContentPeerRuntime(
 	}
 	verifiers, err := peerauth.NewVerifiers(
 		admission.PeerAdmissionSnapshot,
-		time.Now,
+		now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -158,6 +161,7 @@ func newDaemonContentPeerRuntime(
 		routes:        routes,
 		verifiers:     verifiers,
 		now:           time.Now,
+		credentialNow: now,
 		jitter:        daemonContentPeerRetryDelay,
 		ctx:           runtimeContext,
 		cancel:        cancel,
@@ -719,13 +723,13 @@ func (runtime *daemonContentPeerRuntime) remoteCredentialAdvanced(
 ) bool {
 	if runtime == nil ||
 		runtime.admission == nil ||
-		runtime.now == nil ||
+		runtime.credentialNow == nil ||
 		!peerID.Valid() ||
 		peerID == runtime.localDeviceID ||
 		currentEpoch < 1 {
 		return false
 	}
-	now := runtime.now()
+	now := runtime.credentialNow()
 	if now.IsZero() {
 		return false
 	}

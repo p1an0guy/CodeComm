@@ -93,6 +93,7 @@ func newDaemonMeshIntegrationFactoryConstructor(
 		options daemonOptions,
 		deviceID domain.DeviceID,
 		identityCertificate tls.Certificate,
+		credentialNow func() time.Time,
 	) (daemonConsensusTransportFactory, error) {
 		if capture == nil {
 			return nil, errDaemonMeshContentHarness
@@ -101,6 +102,7 @@ func newDaemonMeshIntegrationFactoryConstructor(
 			options,
 			deviceID,
 			identityCertificate,
+			credentialNow,
 		)
 		if err != nil {
 			return nil, err
@@ -782,31 +784,40 @@ func waitForDaemonMeshContentCredentials(
 	t *testing.T,
 	nodes []*daemonMeshIntegrationNode,
 ) {
+	waitForDaemonMeshContentCredentialEpoch(t, nodes, 1)
+}
+
+func waitForDaemonMeshContentCredentialEpoch(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	want uint64,
+) {
 	t.Helper()
+	if want < 1 {
+		t.Fatal("invalid content credential epoch")
+	}
 	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		ready := true
 		for _, node := range nodes {
-			provider, _, captured := node.meshCapture.snapshot()
-			if !captured || provider == nil {
+			epoch, err := daemonMeshContentCredentialEpoch(node)
+			if err != nil || epoch != want {
 				ready = false
-				lastErr = fmt.Errorf("%s content provider not captured", node.deviceID)
-				break
-			}
-			certificate, err := provider()
-			if err != nil {
-				ready = false
-				lastErr = fmt.Errorf("%s content certificate: %w", node.deviceID, err)
-				break
-			}
-			parsed, parseErr := transport.ParseContentCertificate(
-				certificate.Certificate[0],
-			)
-			clearDaemonTLSCertificate(&certificate)
-			if parseErr != nil || parsed.Binding.DeviceID != node.deviceID {
-				ready = false
-				lastErr = fmt.Errorf("%s invalid content certificate: %v", node.deviceID, parseErr)
+				if err != nil {
+					lastErr = fmt.Errorf(
+						"%s content credential: %w",
+						node.deviceID,
+						err,
+					)
+				} else {
+					lastErr = fmt.Errorf(
+						"%s content credential epoch = %d, want %d",
+						node.deviceID,
+						epoch,
+						want,
+					)
+				}
 				break
 			}
 		}
@@ -818,11 +829,121 @@ func waitForDaemonMeshContentCredentials(
 	t.Fatalf("content credentials did not become available: %v", lastErr)
 }
 
+func daemonMeshContentCredentialEpoch(
+	node *daemonMeshIntegrationNode,
+) (uint64, error) {
+	if node == nil || node.meshCapture == nil {
+		return 0, errDaemonMeshContentHarness
+	}
+	provider, _, captured := node.meshCapture.snapshot()
+	if !captured || provider == nil {
+		return 0, errDaemonMeshContentHarness
+	}
+	certificate, err := provider()
+	if err != nil {
+		return 0, err
+	}
+	defer clearDaemonTLSCertificate(&certificate)
+	if len(certificate.Certificate) != 1 {
+		return 0, errDaemonMeshContentHarness
+	}
+	parsed, err := transport.ParseContentCertificate(
+		certificate.Certificate[0],
+	)
+	if err != nil || parsed.Binding.DeviceID != node.deviceID {
+		return 0, errors.Join(errDaemonMeshContentHarness, err)
+	}
+	return parsed.Binding.Epoch, nil
+}
+
+func exerciseDaemonContentCredentialRollover(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	clock *daemonMeshIntegrationCredentialClock,
+	renewalTime time.Time,
+) {
+	t.Helper()
+	if len(nodes) < 2 || clock == nil || renewalTime.IsZero() {
+		t.Fatal("invalid credential rollover fixture")
+	}
+	waitForDaemonMeshContentCredentialEpoch(t, nodes, 1)
+	source, target := nodes[0], nodes[1]
+	client := openDaemonMeshPeersClient(t, source, target, clock.Now)
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close rollover content client: %v", err)
+		}
+	}()
+	client.request(t, target)
+
+	clock.Set(renewalTime)
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	requests := 0
+	for time.Now().Before(deadline) {
+		_, requestErr := client.roundTrip(target)
+		requests++
+		if requestErr != nil {
+			waitForDaemonMeshContentCredentialEpoch(
+				t,
+				[]*daemonMeshIntegrationNode{target},
+				2,
+			)
+			break
+		}
+		allCurrent := true
+		for _, node := range nodes {
+			epoch, err := daemonMeshContentCredentialEpoch(node)
+			if err != nil || epoch != 2 {
+				allCurrent = false
+				break
+			}
+		}
+		if allCurrent {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	waitForDaemonMeshContentCredentialEpoch(t, nodes, 2)
+	if requests < 1 {
+		t.Fatal("rollover completed without active content traffic")
+	}
+
+	fresh := openDaemonMeshPeersClient(t, source, target, clock.Now)
+	fresh.request(t, target)
+	if err := fresh.Close(); err != nil {
+		t.Fatalf("close successor content client: %v", err)
+	}
+}
+
 func requestDaemonMeshPeers(
 	t *testing.T,
 	source, target *daemonMeshIntegrationNode,
 ) daemonMeshPeersResponse {
 	t.Helper()
+	client := openDaemonMeshPeersClient(t, source, target, time.Now)
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close content peers client: %v", err)
+		}
+	}()
+	return client.request(t, target)
+}
+
+type daemonMeshPeersClient struct {
+	client   *http2.ClientConn
+	close    sync.Once
+	closeErr error
+}
+
+func openDaemonMeshPeersClient(
+	t *testing.T,
+	source, target *daemonMeshIntegrationNode,
+	now func() time.Time,
+) *daemonMeshPeersClient {
+	t.Helper()
+	if source == nil || target == nil || now == nil {
+		t.Fatal("invalid content peers client options")
+	}
 	sourceProvider, _, sourceReady := source.meshCapture.snapshot()
 	targetProvider, _, targetReady := target.meshCapture.snapshot()
 	if !sourceReady || !targetReady || sourceProvider == nil || targetProvider == nil {
@@ -857,7 +978,7 @@ func requestDaemonMeshPeers(
 					!bytes.Equal(certificate.Leaf.Raw, expectedDER) {
 					return transport.ContentPeerAdmission{}, errDaemonMeshContentHarness
 				}
-				closeAfter, err := certificate.CloseAfter(time.Now())
+				closeAfter, err := certificate.CloseAfter(now())
 				if err != nil {
 					return transport.ContentPeerAdmission{}, err
 				}
@@ -894,7 +1015,12 @@ func requestDaemonMeshPeers(
 		_ = raw.Close()
 		t.Fatalf("content TLS handshake %s -> %s: %v", source.deviceID, target.deviceID, err)
 	}
-	defer connection.Close()
+	owned := true
+	defer func() {
+		if owned {
+			_ = connection.Close()
+		}
+	}()
 	state := connection.ConnectionState()
 	if !state.HandshakeComplete || state.Version != tls.VersionTLS13 ||
 		state.DidResume || state.NegotiatedProtocol != transport.ALPNContent ||
@@ -913,7 +1039,35 @@ func requestDaemonMeshPeers(
 	if err != nil {
 		t.Fatalf("open content HTTP/2 connection: %v", err)
 	}
-	defer client.Close()
+	owned = false
+	return &daemonMeshPeersClient{
+		client: client,
+	}
+}
+
+func (client *daemonMeshPeersClient) request(
+	t *testing.T,
+	target *daemonMeshIntegrationNode,
+) daemonMeshPeersResponse {
+	t.Helper()
+	decoded, err := client.roundTrip(target)
+	if err != nil {
+		t.Fatalf("GET %s from %s: %v", contenthttp.PeersPath, target.deviceID, err)
+	}
+	return decoded
+}
+
+func (client *daemonMeshPeersClient) roundTrip(
+	target *daemonMeshIntegrationNode,
+) (daemonMeshPeersResponse, error) {
+	if client == nil || client.client == nil || target == nil {
+		return daemonMeshPeersResponse{}, errDaemonMeshContentHarness
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancel()
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodGet,
@@ -921,13 +1075,16 @@ func requestDaemonMeshPeers(
 		nil,
 	)
 	if err != nil {
-		t.Fatalf("create peers request: %v", err)
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"create peers request: %w",
+			err,
+		)
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Accept-Encoding", "identity")
-	response, err := client.RoundTrip(request)
+	response, err := client.client.RoundTrip(request)
 	if err != nil {
-		t.Fatalf("GET %s from %s: %v", contenthttp.PeersPath, target.deviceID, err)
+		return daemonMeshPeersResponse{}, err
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(
@@ -935,7 +1092,10 @@ func requestDaemonMeshPeers(
 		contenthttp.ResponseMaxBytes+1,
 	))
 	if err != nil {
-		t.Fatalf("read peers response: %v", err)
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"read peers response: %w",
+			err,
+		)
 	}
 	if len(body) == 0 || len(body) > contenthttp.ResponseMaxBytes ||
 		response.StatusCode != http.StatusOK || response.ProtoMajor != 2 ||
@@ -944,22 +1104,53 @@ func requestDaemonMeshPeers(
 		response.Header.Get("X-Content-Type-Options") != "nosniff" ||
 		response.Header.Get("Content-Encoding") != "" ||
 		response.Header.Get("Content-Length") != strconv.Itoa(len(body)) {
-		t.Fatalf("peers response = %s headers=%v body=%s", response.Status, response.Header, body)
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"peers response = %s headers=%v body=%s",
+			response.Status,
+			response.Header,
+			body,
+		)
 	}
 	canonical, err := codec.CanonicalizeSignedObject(body)
-	if err != nil || !bytes.Equal(canonical, body) {
-		t.Fatalf("peers response is not canonical: %v", err)
+	if err != nil {
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"peers response is not canonical: %w",
+			err,
+		)
+	}
+	if !bytes.Equal(canonical, body) {
+		return daemonMeshPeersResponse{},
+			errors.New("peers response is not canonical")
 	}
 	var decoded daemonMeshPeersResponse
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
-		t.Fatalf("decode peers response: %v", err)
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"decode peers response: %w",
+			err,
+		)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		t.Fatalf("peers response has trailing JSON: %v", err)
+		return daemonMeshPeersResponse{}, fmt.Errorf(
+			"peers response has trailing JSON: %w",
+			err,
+		)
 	}
-	return decoded
+	return decoded, nil
+}
+
+func (client *daemonMeshPeersClient) Close() error {
+	if client == nil {
+		return nil
+	}
+	client.close.Do(func() {
+		client.closeErr = client.client.Close()
+		if errors.Is(client.closeErr, net.ErrClosed) {
+			client.closeErr = nil
+		}
+	})
+	return client.closeErr
 }
 
 func assertDaemonMeshPeersRoster(

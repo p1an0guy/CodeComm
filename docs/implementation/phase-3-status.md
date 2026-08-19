@@ -44,7 +44,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Quorum clock endorsement, leader authorization/forwarding, protected epoch-key storage,
   make-before-break certificate selection, renewal retry, content mTLS, `/v1/session`, `/v1/peers`,
   and direct endpoint-set exchange are composed. Applied revocation closes established access,
-  rejects fresh access, purges learned routes, and erases local epoch keys.
+  rejects fresh access, purges learned routes, and erases local epoch keys. Authenticated inbound
+  and outbound consensus connectivity plus selected-interface changes interrupt bounded renewal
+  backoff; failed or unauthenticated attempts do not.
 - Content mTLS now serves strict `POST /v1/events`. Followers forward byte-identical signed
   proposals once to their observed active leader; leader ingress is independently rate-limited per
   signed origin, explicit hop metadata prevents recursive forwarding, delayed local Raft apply
@@ -52,11 +54,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   result/event-chain positions after replication. Disconnect, GOAWAY, rollover, draining, and
   capacity failures remain retryable without weakening malformed-response checks.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
-  cluster, establish and relay content state, submit a task through a captured follower over the
-  persistent content connection, complete two-sided SAS admission, authorize the admitted member's
-  content credential, revoke it through local operator IPC, verify both established and fresh
-  content denial without target/authority drift, restart a follower, re-open every store, and
-  verify commitment history.
+  cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
+  HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
+  authorize the admitted member's content credential, revoke it through local operator IPC, verify
+  established and fresh content denial without target/authority drift, and restart a follower.
+  They then stop every voter past expiry, prove one awake voter elects and authorizes nothing, prove
+  two voters restore quorum and epoch 3, catch up the third, restore content traffic, re-open every
+  store, and verify commitment history.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -71,9 +75,6 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
-- Credential rotation mechanisms are composed, but production-composition tests still need on-time
-  and next-workday renewal, rollover under active traffic, an unreachable transition target, and
-  all-voters-asleep election/renewal recovery.
 - Result catch-up, authority-crossing batches, snapshots, SSE, acknowledgements, and divergence
   recovery are not implemented.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production

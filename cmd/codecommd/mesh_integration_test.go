@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,12 +162,39 @@ type daemonMeshIntegrationNode struct {
 	peerEndpoint  netip.AddrPort
 	credentials   *daemonTestCredentialStore
 	meshCapture   *daemonMeshIntegrationFactoryCapture
+	credentialNow func() time.Time
 
 	listener net.Listener
 	cancel   context.CancelFunc
 	exited   chan struct{}
 	exitErr  error
 	running  bool
+}
+
+type daemonMeshIntegrationCredentialClock struct {
+	unixNanos atomic.Int64
+}
+
+func newDaemonMeshIntegrationCredentialClock(
+	now time.Time,
+) *daemonMeshIntegrationCredentialClock {
+	clock := &daemonMeshIntegrationCredentialClock{}
+	clock.Set(now)
+	return clock
+}
+
+func (clock *daemonMeshIntegrationCredentialClock) Now() time.Time {
+	if clock == nil {
+		return time.Time{}
+	}
+	return time.Unix(0, clock.unixNanos.Load()).UTC()
+}
+
+func (clock *daemonMeshIntegrationCredentialClock) Set(now time.Time) {
+	if clock == nil {
+		return
+	}
+	clock.unixNanos.Store(now.UTC().UnixNano())
 }
 
 type daemonMeshIntegrationPairedMember struct {
@@ -187,11 +215,16 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 	t.Helper()
 	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 3)
 	root := t.TempDir()
+	credentialBase := time.Now().UTC().Truncate(time.Second)
+	credentialClock := newDaemonMeshIntegrationCredentialClock(
+		credentialBase.Add(-28 * time.Minute),
+	)
 	nodes := newDaemonMeshIntegrationNodes(
 		t,
 		root,
 		selectedAddress,
 		listeners,
+		credentialClock.Now,
 	)
 	t.Cleanup(func() {
 		for _, node := range nodes {
@@ -243,6 +276,12 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		},
 	)
 	exerciseDaemonContentMesh(t, nodes, nonvoter)
+	exerciseDaemonContentCredentialRollover(
+		t,
+		nodes,
+		credentialClock,
+		credentialBase,
+	)
 	statuses = exerciseDaemonFollowerProposalForwarding(t, nodes)
 	leaderID := domain.DeviceID(*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
 		Consensus.LeaderDeviceID)
@@ -380,6 +419,18 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		},
 	)
 
+	exerciseDaemonNextDayCredentialRecovery(
+		t,
+		nodes,
+		credentialClock,
+		credentialBase.Add(24*time.Hour),
+		voterIDs,
+		pairedMember.ID,
+		nonvoter.ID,
+		mutationChainIndex,
+		mutationResultIndex,
+	)
+
 	for _, node := range nodes {
 		node.stop(t)
 	}
@@ -392,6 +443,147 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		mutationChainIndex,
 		mutationResultIndex,
 	)
+}
+
+func exerciseDaemonNextDayCredentialRecovery(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	clock *daemonMeshIntegrationCredentialClock,
+	nextDay time.Time,
+	voterIDs []domain.DeviceID,
+	revokedDeviceID domain.DeviceID,
+	activeDeviceID domain.DeviceID,
+	minChainIndex, minResultIndex uint64,
+) {
+	t.Helper()
+	if len(nodes) != 3 || clock == nil || nextDay.IsZero() {
+		t.Fatal("invalid next-day credential recovery fixture")
+	}
+	for _, node := range nodes {
+		node.stop(t)
+	}
+	clock.Set(nextDay)
+
+	first := nodes[0]
+	first.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		first.peerEndpoint,
+	)
+	first.start(t, nodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{first},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 1
+		},
+	)
+	time.Sleep(3 * time.Second)
+	isolated, err := readDaemonMeshIntegrationStatus(first.localEndpoint)
+	if err != nil {
+		t.Fatalf("read isolated wake status: %v", err)
+	}
+	if isolated.Consensus.LeaderDeviceID != nil ||
+		isolated.Consensus.StrongWrites == "available" {
+		t.Fatalf("one-voter wake acquired quorum: %#v", isolated.Consensus)
+	}
+	if epoch, credentialErr := daemonMeshContentCredentialEpoch(first); credentialErr == nil {
+		t.Fatalf("expired one-voter wake exposed epoch %d", epoch)
+	}
+	firstNode, ready := first.meshCapture.consensusNode()
+	if !ready {
+		t.Fatal("one-voter wake did not expose consensus state")
+	}
+	firstAdmission, err := firstNode.PeerAdmissionSnapshot()
+	if err != nil {
+		t.Fatalf("one-voter admission snapshot: %v", err)
+	}
+	if epoch, found := firstAdmission.CurrentCredentialEpoch(first.deviceID); !found ||
+		epoch != 2 {
+		t.Fatalf(
+			"one-voter wake credential epoch = (%d, %t), want (2, true)",
+			epoch,
+			found,
+		)
+	}
+
+	second := nodes[1]
+	second.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		second.peerEndpoint,
+	)
+	second.start(t, nodes)
+	quorum := []*daemonMeshIntegrationNode{first, second}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		quorum,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(
+				statuses,
+				voterIDs,
+			) && daemonMeshIntegrationTarget(
+				statuses,
+				1,
+				voterIDs,
+			)
+		},
+	)
+	waitForDaemonMeshContentCredentialEpoch(t, quorum, 3)
+	nextDayClient := openDaemonMeshPeersClient(
+		t,
+		first,
+		second,
+		clock.Now,
+	)
+	nextDayClient.request(t, second)
+	if err := nextDayClient.Close(); err != nil {
+		t.Fatalf("close next-day quorum content client: %v", err)
+	}
+
+	third := nodes[2]
+	third.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		third.peerEndpoint,
+	)
+	third.start(t, nodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(
+				statuses,
+				voterIDs,
+			) && daemonMeshIntegrationTarget(
+				statuses,
+				1,
+				voterIDs,
+			) && daemonMeshIntegrationMemberStatus(
+				statuses,
+				revokedDeviceID,
+				device.StatusRevoked,
+				2,
+			) && daemonMeshIntegrationMemberStatus(
+				statuses,
+				activeDeviceID,
+				device.StatusActive,
+				1,
+			) && daemonMeshIntegrationMutationConverged(statuses) &&
+				statuses[0].Session.EventChainIndex >=
+					minChainIndex &&
+				statuses[0].Session.ResultIndex >=
+					minResultIndex
+		},
+	)
+	waitForDaemonMeshContentCredentialEpoch(t, nodes, 3)
+	recoveredClient := openDaemonMeshPeersClient(
+		t,
+		third,
+		first,
+		clock.Now,
+	)
+	recoveredClient.request(t, first)
+	if err := recoveredClient.Close(); err != nil {
+		t.Fatalf("close fully recovered content client: %v", err)
+	}
 }
 
 func exerciseDaemonFollowerProposalForwarding(
@@ -482,8 +674,12 @@ func newDaemonMeshIntegrationNodes(
 	root string,
 	selectedAddress netip.Addr,
 	listeners []net.Listener,
+	credentialNow func() time.Time,
 ) []*daemonMeshIntegrationNode {
 	t.Helper()
+	if credentialNow == nil {
+		t.Fatal("daemon mesh integration credential clock is nil")
+	}
 	nodes := make([]*daemonMeshIntegrationNode, len(listeners))
 	for index, listener := range listeners {
 		privateKey := ed25519.NewKeyFromSeed(
@@ -507,6 +703,7 @@ func newDaemonMeshIntegrationNodes(
 			peerEndpoint:  endpoint,
 			credentials:   newDaemonTestCredentialStore(),
 			meshCapture:   &daemonMeshIntegrationFactoryCapture{},
+			credentialNow: credentialNow,
 			listener:      listener,
 		}
 	}
@@ -754,6 +951,7 @@ func (node *daemonMeshIntegrationNode) start(
 				openMulticast:  openDaemonMeshIntegrationMulticast,
 				listInterfaces: productionDependencies.listInterfaces,
 				interfaceAddrs: productionDependencies.interfaceAddrs,
+				credentialNow:  node.credentialNow,
 			},
 		)
 		close(node.exited)
@@ -875,7 +1073,7 @@ func daemonMeshIntegrationClusterReady(
 	statuses []ui.Snapshot,
 	liveVoters []domain.DeviceID,
 ) bool {
-	if len(statuses) != len(liveVoters) {
+	if len(statuses) == 0 || len(liveVoters) == 0 {
 		return false
 	}
 	var leaderID string

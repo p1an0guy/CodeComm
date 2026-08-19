@@ -614,6 +614,7 @@ func newDaemonTestMeshFactory(
 	_ daemonOptions,
 	deviceID domain.DeviceID,
 	_ tls.Certificate,
+	_ func() time.Time,
 ) (daemonConsensusTransportFactory, error) {
 	if !deviceID.Valid() {
 		return nil, errInvalidDaemonDependencies

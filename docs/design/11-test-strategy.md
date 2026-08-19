@@ -647,6 +647,9 @@ Core scenarios:
 12. Rotate 30-minute credentials make-before-break during active control/Git transfer and election;
     old links close at original expiry with no acknowledged loss. Make one leader hours fast and
     prove it cannot collect endorsements, then complete on-time and next-workday late renewal.
+    The production-composition proof advances one shared injected credential clock used by
+    authorization, certificate selection, ingress, and outbound verification; routing timestamps
+    remain independent.
 13. Suspend a device past its epoch and change its address while asleep, then wake it:
     it re-dials on the consensus plane, renews its content credential, and converges with no
     operator action. Then
@@ -654,7 +657,9 @@ Core scenarios:
     content credential: they authenticate by device identity on the consensus plane, elect/catch up,
     authorize fresh epochs, and restore ordinary Raft. Repeat with only a minority awake:
     no credential or ordinary traffic is authorized, local reads still work, and recovery
-    occurs automatically when enough voters return.
+    occurs automatically when enough voters return. Exercise the 3-voter sequence with one voter
+    awake (no leader or credential), then two (quorum and fresh epoch), then all three (catch-up and
+    restored content traffic), followed by store reopen and commitment verification.
 14. Revoke during artifact transfer and reconnection attempts; every peer that has applied it
     closes consensus, content, and Git access; a stale peer that admits the device still sends it no entries or
     snapshot; the committed voter target excludes it and the leader reconciles the live

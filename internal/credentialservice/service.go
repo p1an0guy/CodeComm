@@ -71,6 +71,8 @@ type Options struct {
 	Secrets   SecretStore
 	Consensus Consensus
 	Sign      BindingSigner
+	// Now is the shared credential wall clock. Nil uses time.Now.
+	Now func() time.Time
 }
 
 type serviceOptions struct {
@@ -120,9 +122,13 @@ type Service struct {
 
 // New validates dependencies without performing native-store or network I/O.
 func New(options Options) (*Service, error) {
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
 	return newService(serviceOptions{
 		Options:      options,
-		now:          time.Now,
+		now:          now,
 		generateKey:  generateEpochKey,
 		retryInitial: rotationRetryInitial,
 		retryMaximum: rotationRetryMaximum,

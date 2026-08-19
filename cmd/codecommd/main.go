@@ -82,6 +82,7 @@ type daemonDependencies struct {
 	openMulticast  daemonMulticastOpener
 	listInterfaces daemonInterfaceLister
 	interfaceAddrs daemonInterfaceAddressProvider
+	credentialNow  func() time.Time
 }
 
 func main() {
@@ -222,6 +223,7 @@ func productionDaemonDependencies() daemonDependencies {
 		listenPeer:     listenDaemonPeer,
 		openMulticast:  openDaemonMulticast,
 		listInterfaces: net.Interfaces,
+		credentialNow:  time.Now,
 		interfaceAddrs: func(
 			iface *net.Interface,
 		) ([]net.Addr, error) {
@@ -258,6 +260,10 @@ func runDaemon(
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	credentialNow := dependencies.credentialNow
+	if credentialNow == nil {
+		credentialNow = time.Now
 	}
 
 	credentialHandle, identityPrivateKey, err :=
@@ -313,6 +319,7 @@ func runDaemon(
 		options,
 		deviceID,
 		identityCertificate,
+		credentialNow,
 	)
 	if err != nil {
 		return err
@@ -408,6 +415,7 @@ func runDaemon(
 			},
 			ProposalForwarder: proposalForwarder,
 			Clock:             processClock,
+			CredentialNow:     credentialNow,
 		},
 	)
 	if err != nil {
@@ -505,6 +513,7 @@ func runDaemon(
 		ed25519.PrivateKey(identityPrivateKey),
 		credentials,
 		node,
+		credentialNow,
 	)
 	if err != nil {
 		return err
@@ -576,6 +585,7 @@ func runDaemon(
 			node,
 			credentialService.ContentCertificate,
 			meshFactory.ConsensusRoutes(),
+			credentialNow,
 		)
 		if err != nil {
 			return err

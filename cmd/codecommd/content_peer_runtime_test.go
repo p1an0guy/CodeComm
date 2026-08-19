@@ -157,6 +157,7 @@ func TestDaemonContentPeerRuntimeTracksAppliedActiveMembership(t *testing.T) {
 			return tls.Certificate{}, transport.ErrContentCertificateUnavailable
 		},
 		daemonContentPeerRoutesStub{},
+		time.Now,
 	)
 	if err != nil {
 		t.Fatalf("newDaemonContentPeerRuntime(): %v", err)
@@ -270,7 +271,7 @@ func TestDaemonContentPeerRuntimeDetectsActiveRemoteSuccessor(t *testing.T) {
 		admission: daemonContentPeerAdmissionStub{
 			snapshot: snapshot,
 		},
-		now: func() time.Time { return now },
+		credentialNow: func() time.Time { return now },
 	}
 	if !runtime.remoteCredentialAdvanced(remote.ID, 1) {
 		t.Fatal("active remote successor did not request make-before-break")
@@ -294,6 +295,7 @@ func TestDaemonContentPeerRuntimeRejectsInconsistentMembership(t *testing.T) {
 		daemonContentPeerAdmissionStub{},
 		func() (tls.Certificate, error) { return tls.Certificate{}, nil },
 		daemonContentPeerRoutesStub{},
+		time.Now,
 	)
 	if !errors.Is(err, errDaemonContentPeerConstruction) {
 		t.Fatalf("newDaemonContentPeerRuntime() error = %v", err)
