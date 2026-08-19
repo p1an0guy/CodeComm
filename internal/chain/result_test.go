@@ -3,6 +3,8 @@ package chain_test
 import (
 	"bytes"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/chain"
@@ -20,6 +22,7 @@ func TestCommandResultGoldenVectors(t *testing.T) {
 	if string(encoded) != wantAccepted {
 		t.Errorf("EncodeResult(accepted) = %s, want %s", encoded, wantAccepted)
 	}
+	assertResultDecode(t, []byte(wantAccepted), accepted)
 
 	previous := filledDigest(0x55)
 	head, appended, err := chain.AppendResult(previous, accepted)
@@ -52,6 +55,7 @@ func TestCommandResultGoldenVectors(t *testing.T) {
 	if string(rejectedBytes) != wantRejected {
 		t.Errorf("EncodeResult(rejected) = %s, want %s", rejectedBytes, wantRejected)
 	}
+	assertResultDecode(t, []byte(wantRejected), rejected)
 	rejectedHead, _, err := chain.AppendResult(head, rejected)
 	if err != nil {
 		t.Fatalf("AppendResult(rejected) error = %v", err)
@@ -81,6 +85,230 @@ func TestCommandResultGoldenVectors(t *testing.T) {
 		if bytes.Contains(encoded, excluded) {
 			t.Errorf("command result contains excluded field %q", excluded)
 		}
+	}
+}
+
+func TestDecodeResultRequiresExactCanonicalEncoding(t *testing.T) {
+	t.Parallel()
+
+	acceptedBytes, err := chain.EncodeResult(validAcceptedResult())
+	if err != nil {
+		t.Fatalf("EncodeResult(accepted) error = %v", err)
+	}
+	rejectedBytes, err := chain.EncodeResult(validRejectedResult())
+	if err != nil {
+		t.Fatalf("EncodeResult(rejected) error = %v", err)
+	}
+	accepted := string(acceptedBytes)
+	rejected := string(rejectedBytes)
+
+	tests := []struct {
+		name  string
+		input string
+		also  error
+	}{
+		{name: "empty input"},
+		{name: "not an object", input: `[]`},
+		{
+			name: "unknown member",
+			input: strings.Replace(
+				accepted,
+				`"chain_index":1,`,
+				`"chain_index":1,"extra":true,`,
+				1,
+			),
+		},
+		{
+			name: "missing nullable member",
+			input: strings.Replace(
+				accepted,
+				`"chain_hash":"REREREREREREREREREREREREREREREREREREREREREQ",`,
+				"",
+				1,
+			),
+		},
+		{
+			name: "missing nonnullable member",
+			input: strings.Replace(
+				accepted,
+				`,"result_index":3`,
+				"",
+				1,
+			),
+		},
+		{
+			name: "duplicate member",
+			input: strings.Replace(
+				accepted,
+				`"chain_index":1,`,
+				`"chain_index":1,"chain_index":1,`,
+				1,
+			),
+		},
+		{name: "noncanonical whitespace", input: accepted + " "},
+		{
+			name: "noncanonical outcome",
+			input: strings.Replace(
+				accepted,
+				`{"code":"accepted","status":"accepted"}`,
+				`{"status":"accepted","code":"accepted"}`,
+				1,
+			),
+		},
+		{
+			name: "noncanonical proposal",
+			input: strings.Replace(
+				accepted,
+				`{"event_id":"018f0000-0000-7000-8000-000000000002","kind":"task.created","origin_signature":"AA","sequence":1}`,
+				`{"kind":"task.created","event_id":"018f0000-0000-7000-8000-000000000002","origin_signature":"AA","sequence":1}`,
+				1,
+			),
+		},
+		{
+			name: "fractional result index",
+			input: strings.Replace(
+				accepted,
+				`"result_index":3`,
+				`"result_index":3.0`,
+				1,
+			),
+		},
+		{
+			name: "exponent chain index",
+			input: strings.Replace(
+				accepted,
+				`"chain_index":1`,
+				`"chain_index":1e0`,
+				1,
+			),
+		},
+		{
+			name: "inexact result index",
+			input: strings.Replace(
+				accepted,
+				`"result_index":3`,
+				`"result_index":9007199254740992`,
+				1,
+			),
+			also: chain.ErrInvalidIndex,
+		},
+		{
+			name: "padded proposal digest",
+			input: strings.Replace(
+				accepted,
+				`"proposal_digest":"I8ct7tSAgwS5lJjQCyHEecuY4PLO4dEBoMI2twtIzFw"`,
+				`"proposal_digest":"I8ct7tSAgwS5lJjQCyHEecuY4PLO4dEBoMI2twtIzFw="`,
+				1,
+			),
+		},
+		{
+			name: "short chain hash",
+			input: strings.Replace(
+				accepted,
+				`"chain_hash":"REREREREREREREREREREREREREREREREREREREREREQ"`,
+				`"chain_hash":"AA"`,
+				1,
+			),
+		},
+		{
+			name: "accepted without chain tuple",
+			input: strings.NewReplacer(
+				`"chain_hash":"REREREREREREREREREREREREREREREREREREREREREQ"`,
+				`"chain_hash":null`,
+				`"chain_index":1`,
+				`"chain_index":null`,
+			).Replace(accepted),
+		},
+		{
+			name: "rejected with chain tuple",
+			input: strings.NewReplacer(
+				`"chain_hash":null`,
+				`"chain_hash":"REREREREREREREREREREREREREREREREREREREREREQ"`,
+				`"chain_index":null`,
+				`"chain_index":1`,
+			).Replace(rejected),
+		},
+		{
+			name: "partial chain tuple",
+			input: strings.Replace(
+				accepted,
+				`"chain_index":1`,
+				`"chain_index":null`,
+				1,
+			),
+		},
+		{
+			name: "proposal digest mismatch",
+			input: strings.Replace(
+				accepted,
+				`I8ct7tSAgwS5lJjQCyHEecuY4PLO4dEBoMI2twtIzFw`,
+				`Skj616_HhamVyR3sQTc5B4ym_-BROzook6B3pVK5oi8`,
+				1,
+			),
+			also: chain.ErrProposalDigest,
+		},
+		{name: "trailing JSON value", input: accepted + `{}`},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := chain.DecodeResult([]byte(test.input))
+			if !errors.Is(err, chain.ErrInvalidResult) {
+				t.Fatalf(
+					"DecodeResult() error = %v, want ErrInvalidResult",
+					err,
+				)
+			}
+			if test.also != nil && !errors.Is(err, test.also) {
+				t.Fatalf("DecodeResult() error = %v, also want %v", err, test.also)
+			}
+		})
+	}
+
+	if _, err := chain.DecodeResult(
+		make([]byte, 4<<20+1),
+	); !errors.Is(err, chain.ErrInvalidResult) {
+		t.Fatalf(
+			"DecodeResult(oversize) error = %v, want ErrInvalidResult",
+			err,
+		)
+	}
+}
+
+func TestDecodeResultDoesNotAliasCallerInput(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := chain.EncodeResult(validAcceptedResult())
+	if err != nil {
+		t.Fatalf("EncodeResult() error = %v", err)
+	}
+	original := bytes.Clone(encoded)
+	decoded, err := chain.DecodeResult(encoded)
+	if err != nil {
+		t.Fatalf("DecodeResult() error = %v", err)
+	}
+	proposal := bytes.Clone(decoded.Proposal)
+	outcome := bytes.Clone(decoded.Outcome)
+	for index := range encoded {
+		encoded[index] = 0
+	}
+	if !bytes.Equal(decoded.Proposal, proposal) ||
+		!bytes.Equal(decoded.Outcome, outcome) {
+		t.Fatal("DecodeResult() output aliases caller input")
+	}
+
+	encoded = bytes.Clone(original)
+	decoded, err = chain.DecodeResult(encoded)
+	if err != nil {
+		t.Fatalf("DecodeResult() second error = %v", err)
+	}
+	decoded.Proposal[0] ^= 0xff
+	decoded.Outcome[0] ^= 0xff
+	if !bytes.Equal(encoded, original) {
+		t.Fatal("DecodeResult() caller-mutable output aliases input")
 	}
 }
 
@@ -228,6 +456,29 @@ func TestCommandResultValidation(t *testing.T) {
 				t.Fatalf("AppendResult() error = %v, want %v", err, test.want)
 			}
 		})
+	}
+}
+
+func assertResultDecode(t *testing.T, encoded []byte, want chain.Result) {
+	t.Helper()
+
+	decoded, err := chain.DecodeResult(encoded)
+	if err != nil {
+		t.Fatalf("DecodeResult() error = %v", err)
+	}
+	if !reflect.DeepEqual(decoded, want) {
+		t.Fatalf("DecodeResult() = %#v, want %#v", decoded, want)
+	}
+	roundTrip, err := chain.EncodeResult(decoded)
+	if err != nil {
+		t.Fatalf("EncodeResult(DecodeResult()) error = %v", err)
+	}
+	if !bytes.Equal(roundTrip, encoded) {
+		t.Fatalf(
+			"EncodeResult(DecodeResult()) = %s, want %s",
+			roundTrip,
+			encoded,
+		)
 	}
 }
 

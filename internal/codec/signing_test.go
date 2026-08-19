@@ -107,4 +107,16 @@ func TestBuildSignedInputEnforcesSignedObjectBound(t *testing.T) {
 	); !errors.Is(err, ErrSignedInputTooLarge) {
 		t.Fatalf("BuildSignedInput(over limit) error = %v, want ErrSignedInputTooLarge", err)
 	}
+
+	batchOnly := make([]byte, maxSignedObjectJSONBytes+1)
+	if _, err := BuildSignedInput(SignatureBatch, batchOnly); err != nil {
+		t.Fatalf("BuildSignedInput(batch over ordinary limit) error = %v", err)
+	}
+	if maxBatchSignedInputBytes != 64<<20 {
+		t.Fatalf(
+			"maxBatchSignedInputBytes = %d, want %d",
+			maxBatchSignedInputBytes,
+			64<<20,
+		)
+	}
 }

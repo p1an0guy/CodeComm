@@ -5,6 +5,8 @@ import (
 	"fmt"
 )
 
+const maxBatchSignedInputBytes = 64 << 20
+
 // SignatureLabel is one exact V1 Ed25519 domain-separation label. Digest and
 // HMAC labels are deliberately excluded because their preimages differ.
 type SignatureLabel string
@@ -92,12 +94,16 @@ func BuildSignedInput(label SignatureLabel, signedBytes []byte) ([]byte, error) 
 	if !label.Valid() {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidSignatureLabel, label)
 	}
-	if len(signedBytes) > maxSignedObjectJSONBytes {
+	limit := maxSignedObjectJSONBytes
+	if label == SignatureBatch {
+		limit = maxBatchSignedInputBytes
+	}
+	if len(signedBytes) > limit {
 		return nil, fmt.Errorf(
 			"%w: got %d bytes, limit %d",
 			ErrSignedInputTooLarge,
 			len(signedBytes),
-			maxSignedObjectJSONBytes,
+			limit,
 		)
 	}
 	result := make([]byte, 0, len(label)+1+len(signedBytes))

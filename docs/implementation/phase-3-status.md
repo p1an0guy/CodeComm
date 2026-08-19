@@ -54,6 +54,11 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   cannot trigger hot re-forwarding, and each six-field response is compared with the exact local
   result/event-chain positions after replication. Disconnect, GOAWAY, rollover, draining, and
   capacity failures remain retryable without weakening malformed-response checks.
+- The six-field command-result record now has a strict canonical decoder. Immutable result-batch
+  values bind every envelope field under `codecomm/v1/batch`, verify both dense chains and signer
+  identity, and enforce the 256-record/64 MiB expanded limits. SQLite exports bounded ranges only
+  after replaying the retained generation, checks both starting and ending heads in one snapshot,
+  and reconstructs the credential authority at the exact end position.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -76,8 +81,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
-- Result catch-up, authority-crossing batches, snapshots, SSE, acknowledgements, and divergence
-  recovery are not implemented.
+- Result-range and signed-envelope foundations are implemented; `/v1/replication`, transactional
+  scratch replay/import, authority-handoff authorization, snapshot fallback, attestations, SSE,
+  acknowledgements, and divergence recovery remain open.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
