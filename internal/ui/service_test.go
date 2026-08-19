@@ -126,6 +126,75 @@ func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 	}
 }
 
+func TestOperatorMemberHandlerQueriesBeyondBoundedRoster(t *testing.T) {
+	snapshot := uiTestStatusSnapshot(t)
+	snapshot.Durable.MemberTotal = 2
+	snapshot.Durable.MembersTruncated = true
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("truncated snapshot: %v", err)
+	}
+	member := coordstatus.MemberSummary{
+		ID:            domain.DeviceID("cc1" + strings.Repeat("a", 64)),
+		Role:          device.RoleEditor,
+		Status:        device.StatusActive,
+		EntityVersion: 7,
+	}
+	source := &exactMemberStatusSource{
+		snapshot: snapshot,
+		member:   member,
+	}
+	handler := newOperatorHandler(
+		source,
+		successfulOperatorSubmitter(),
+		testPairingOperator{},
+		uiTestClientID,
+	)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodGet,
+			memberQueryPrefix+string(member.ID),
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf(
+			"member status = %d, body = %s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
+	}
+	var got MemberStatus
+	decoder := json.NewDecoder(bytes.NewReader(recorder.Body.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&got); err != nil {
+		t.Fatalf("decode member: %v", err)
+	}
+	if got.DeviceID != string(member.ID) ||
+		got.Role != string(member.Role) ||
+		got.Status != string(member.Status) ||
+		got.EntityVersion != member.EntityVersion ||
+		source.requested != member.ID ||
+		strings.Contains(recorder.Body.String(), "identity_public_key") {
+		t.Fatalf("member = %#v; requested = %s", got, source.requested)
+	}
+
+	missing := domain.DeviceID("cc1" + strings.Repeat("b", 64))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodGet,
+			memberQueryPrefix+string(missing),
+			nil,
+		),
+	)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing member status = %d, want 404", recorder.Code)
+	}
+}
+
 func TestOperatorStatusHandlerFailsClosed(t *testing.T) {
 	handler := newOperatorHandler(statusSourceFunc(
 		func(context.Context) (coordstatus.Snapshot, error) {
@@ -169,6 +238,25 @@ func TestOperatorStatusHandlerFailsClosed(t *testing.T) {
 			request: httptest.NewRequest(
 				http.MethodGet,
 				statusQueryPath+"?",
+				nil,
+			),
+		},
+		{
+			name: "invalid member",
+			request: httptest.NewRequest(
+				http.MethodGet,
+				memberQueryPrefix+"invalid",
+				nil,
+			),
+		},
+		{
+			name: "member query",
+			request: httptest.NewRequest(
+				http.MethodGet,
+				memberQueryPrefix+
+					"cc1"+
+					strings.Repeat("a", 64)+
+					"?other=true",
 				nil,
 			),
 		},
@@ -305,6 +393,49 @@ func (function statusSourceFunc) Status(
 	ctx context.Context,
 ) (coordstatus.Snapshot, error) {
 	return function(ctx)
+}
+
+func (function statusSourceFunc) Member(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	snapshot, err := function(ctx)
+	if err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	for _, member := range snapshot.Durable.Members {
+		if member.ID == deviceID {
+			return member, true, nil
+		}
+	}
+	return coordstatus.MemberSummary{}, false, nil
+}
+
+type exactMemberStatusSource struct {
+	snapshot  coordstatus.Snapshot
+	member    coordstatus.MemberSummary
+	requested domain.DeviceID
+	err       error
+}
+
+func (source *exactMemberStatusSource) Status(
+	context.Context,
+) (coordstatus.Snapshot, error) {
+	return source.snapshot, source.err
+}
+
+func (source *exactMemberStatusSource) Member(
+	_ context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	source.requested = deviceID
+	if source.err != nil {
+		return coordstatus.MemberSummary{}, false, source.err
+	}
+	if deviceID != source.member.ID {
+		return coordstatus.MemberSummary{}, false, nil
+	}
+	return source.member, true, nil
 }
 
 type operatorSubmitterFunc func(

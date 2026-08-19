@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/agentsession"
@@ -19,6 +20,7 @@ import (
 
 const (
 	statusQueryPath             = "/local/v1/query/status"
+	memberQueryPrefix           = "/local/v1/query/members/"
 	commandPath                 = "/local/v1/commands"
 	pairingInviteCollectionPath = "/local/v1/pairing/invites"
 	pairingInviteRevokePath     = "/local/v1/pairing/invites/revoke"
@@ -34,6 +36,10 @@ var (
 // StatusSource is the read-only daemon boundary consumed by operator views.
 type StatusSource interface {
 	Status(context.Context) (coordstatus.Snapshot, error)
+	Member(
+		context.Context,
+		domain.DeviceID,
+	) (coordstatus.MemberSummary, bool, error)
 }
 
 type OperatorServiceOptions struct {
@@ -135,6 +141,12 @@ func (handler *operatorHandler) ServeHTTP(
 	writer http.ResponseWriter,
 	request *http.Request,
 ) {
+	if request != nil && request.Method == http.MethodGet {
+		if deviceID, ok := operatorMemberRoute(request); ok {
+			handler.member(writer, request, deviceID)
+			return
+		}
+	}
 	switch {
 	case request.Method == http.MethodGet &&
 		exactOperatorRoute(request, statusQueryPath):
@@ -162,6 +174,27 @@ func (handler *operatorHandler) ServeHTTP(
 	}
 }
 
+func operatorMemberRoute(
+	request *http.Request,
+) (domain.DeviceID, bool) {
+	if request == nil ||
+		request.URL == nil ||
+		request.URL.RawPath != "" ||
+		request.URL.RawQuery != "" ||
+		request.URL.Fragment != "" ||
+		request.URL.RawFragment != "" ||
+		request.URL.ForceQuery ||
+		request.RequestURI != request.URL.Path ||
+		!strings.HasPrefix(request.URL.Path, memberQueryPrefix) {
+		return "", false
+	}
+	deviceID := domain.DeviceID(strings.TrimPrefix(
+		request.URL.Path,
+		memberQueryPrefix,
+	))
+	return deviceID, deviceID.Valid()
+}
+
 func exactOperatorRoute(request *http.Request, path string) bool {
 	return request != nil &&
 		request.URL != nil &&
@@ -172,6 +205,48 @@ func exactOperatorRoute(request *http.Request, path string) bool {
 		request.URL.RawFragment == "" &&
 		!request.URL.ForceQuery &&
 		request.RequestURI == path
+}
+
+func (handler *operatorHandler) member(
+	writer http.ResponseWriter,
+	request *http.Request,
+	deviceID domain.DeviceID,
+) {
+	member, found, err := handler.source.Member(
+		request.Context(),
+		deviceID,
+	)
+	if err != nil {
+		writeOperatorError(
+			writer,
+			http.StatusServiceUnavailable,
+			"member_unavailable",
+		)
+		return
+	}
+	if !found {
+		writeOperatorError(
+			writer,
+			http.StatusNotFound,
+			"member_not_found",
+		)
+		return
+	}
+	response := MemberStatus{
+		DeviceID:      string(member.ID),
+		Role:          string(member.Role),
+		Status:        string(member.Status),
+		EntityVersion: member.EntityVersion,
+	}
+	if member.ID != deviceID || response.validate() != nil {
+		writeOperatorError(
+			writer,
+			http.StatusServiceUnavailable,
+			"member_unavailable",
+		)
+		return
+	}
+	writeOperatorJSON(writer, http.StatusOK, response)
 }
 
 func (handler *operatorHandler) status(

@@ -69,6 +69,68 @@ func TestOperatorClientReadsStatusAndReconnectsAfterDaemonRestart(t *testing.T) 
 		string(coordstatus.StrongWritesAvailable) {
 		t.Fatalf("Status(after restart) = %#v", got)
 	}
+	member, found, err := client.Member(
+		testUIClientContext(t),
+		source.Durable.Member.ID,
+	)
+	if err != nil || !found ||
+		member.DeviceID != string(source.Durable.Member.ID) {
+		t.Fatalf("Member(after restart) = (%#v, %t, %v)", member, found, err)
+	}
+}
+
+func TestOperatorClientReadsExactMemberOutsideStatusRoster(t *testing.T) {
+	endpoint := newUIClientTestEndpoint(t)
+	snapshot := uiTestStatusSnapshot(t)
+	snapshot.Durable.MemberTotal = 2
+	snapshot.Durable.MembersTruncated = true
+	member := coordstatus.MemberSummary{
+		ID:            domain.DeviceID("cc1" + strings.Repeat("a", 64)),
+		Role:          snapshot.Durable.Member.Role,
+		Status:        snapshot.Durable.Member.Status,
+		EntityVersion: 9,
+	}
+	source := &exactMemberStatusSource{
+		snapshot: snapshot,
+		member:   member,
+	}
+	service, err := NewOperatorService(OperatorServiceOptions{
+		Source:      source,
+		Submitter:   successfulOperatorSubmitter(),
+		Pairing:     testPairingOperator{},
+		SessionID:   uiTestSessionID,
+		WorkspaceID: uiTestWorkspaceID,
+	})
+	if err != nil {
+		t.Fatalf("NewOperatorService(): %v", err)
+	}
+	server := startUIClientTestServer(t, endpoint, service)
+	t.Cleanup(func() { server.stop(t) })
+	client, err := DialOperator(testUIClientContext(t), OperatorDialOptions{
+		Endpoint:         endpoint,
+		ClientInstanceID: uiTestClientID,
+		SessionID:        uiTestSessionID,
+		WorkspaceID:      uiTestWorkspaceID,
+	})
+	if err != nil {
+		t.Fatalf("DialOperator(): %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	got, found, err := client.Member(testUIClientContext(t), member.ID)
+	if err != nil {
+		t.Fatalf("Member(found): %v", err)
+	}
+	if !found ||
+		got.DeviceID != string(member.ID) ||
+		got.EntityVersion != member.EntityVersion {
+		t.Fatalf("Member(found) = (%#v, %t)", got, found)
+	}
+	missing := domain.DeviceID("cc1" + strings.Repeat("b", 64))
+	got, found, err = client.Member(testUIClientContext(t), missing)
+	if err != nil || found || got != (MemberStatus{}) {
+		t.Fatalf("Member(absent) = (%#v, %t, %v)", got, found, err)
+	}
 }
 
 func TestDecodeStatusResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {

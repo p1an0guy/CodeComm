@@ -13,6 +13,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 )
 
 func TestStatusSnapshotReturnsOneBoundedTransactionalView(t *testing.T) {
@@ -56,6 +57,39 @@ func TestStatusSnapshotReturnsOneBoundedTransactionalView(t *testing.T) {
 	}
 	assertLocalQueryValues(t, snapshot.AgentSessions, []agentsession.Session{live})
 	assertLocalQueryValues(t, snapshot.Tasks, tasks[:1])
+}
+
+func TestMemberStatusReturnsExactProjectionAndCleanMiss(t *testing.T) {
+	value, member, _, _ := openStatusSnapshotTestStore(t)
+	state := value.LocalState()
+
+	got, found, err := state.MemberStatus(context.Background(), member.ID)
+	if err != nil {
+		t.Fatalf("MemberStatus(found): %v", err)
+	}
+	if !found ||
+		got.ID != member.ID ||
+		got.Role != member.Role ||
+		got.Status != member.Status ||
+		got.EntityVersion != member.EntityVersion {
+		t.Fatalf("MemberStatus(found) = (%#v, %t)", got, found)
+	}
+	if got, found, err = state.MemberStatus(
+		context.Background(),
+		localQueryDeviceID,
+	); err != nil || found || got != (coordstatus.MemberSummary{}) {
+		t.Fatalf("MemberStatus(absent) = (%#v, %t, %v)", got, found, err)
+	}
+	if _, _, err := state.MemberStatus(
+		context.Background(),
+		"invalid",
+	); !errors.Is(err, ErrInvalidLocalState) {
+		t.Fatalf(
+			"MemberStatus(invalid) error = %v, want %v",
+			err,
+			ErrInvalidLocalState,
+		)
+	}
 }
 
 func TestStatusSnapshotRejectsInvalidInputAndCorruptRows(t *testing.T) {

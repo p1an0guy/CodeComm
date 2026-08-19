@@ -28,7 +28,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   reconcile or self-promote, while the majority commits and both sides converge after healing.
 - Human-only durable commands and CLI surfaces implement `cluster set-voters` and `peer revoke`.
   Both retain reviewed CAS values, sign through the boot-scoped operator origin, survive restart,
-  and are reducer-authorized.
+  and are reducer-authorized. Revocation resolves its subject through an exact committed-member
+  query, including retained devices outside the bounded status roster.
 - `codecommd` now opens a device-addressed mesh node, issues its generation-bound identity
   certificate, binds selected non-loopback listeners, uses selected-source static routes, serves
   authenticated consensus ingress, and owns peer/local/worker shutdown as one lifecycle.
@@ -80,9 +81,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
-- Revocation's CLI lookup uses the bounded status roster rather than an exact-member query. The full
-  revocation transfer test, two-device degraded run, voter-placement prompt, and complete Phase 3
-  latency/security matrix remain outstanding.
+- The full revocation transfer test, two-device degraded run, voter-placement prompt, and complete
+  Phase 3 latency/security matrix remain outstanding.
 
 Phase 3 is not complete until every design §13 row is executable through production composition;
 package-level availability is not sufficient.

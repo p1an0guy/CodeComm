@@ -92,6 +92,17 @@ func TestSingleNodeStatusReportsReadyOneVoterAndDurableWork(t *testing.T) {
 	if err := snapshot.Validate(); err != nil {
 		t.Fatalf("Status().Validate(): %v", err)
 	}
+	member, found, err := node.Member(testContext(t), deviceID)
+	if err != nil {
+		t.Fatalf("Member(): %v", err)
+	}
+	if !found ||
+		member.ID != deviceID ||
+		member.Role != device.RoleOwner ||
+		member.Status != device.StatusActive ||
+		member.EntityVersion != 1 {
+		t.Fatalf("Member() = (%#v, %t)", member, found)
+	}
 }
 
 func TestApplyAtGenerationAppliesExactLineage(t *testing.T) {

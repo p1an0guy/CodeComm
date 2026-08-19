@@ -336,10 +336,13 @@ func runPeerRevoke(
 	if err != nil {
 		return err
 	}
-	member, found := findMember(snapshot.Members, subject)
+	member, found, err := client.Member(ctx, subject)
+	if err != nil {
+		return err
+	}
 	if !found {
 		return fmt.Errorf(
-			"%w: device is absent from the bounded member view",
+			"%w: device is not a committed member",
 			errInvalidCLI,
 		)
 	}
@@ -432,18 +435,6 @@ func snapshotVoterTarget(snapshot ui.Snapshot) []domain.DeviceID {
 		result[index] = domain.DeviceID(value)
 	}
 	return result
-}
-
-func findMember(
-	members []ui.MemberStatus,
-	deviceID domain.DeviceID,
-) (ui.MemberStatus, bool) {
-	for _, member := range members {
-		if member.DeviceID == string(deviceID) {
-			return member, true
-		}
-	}
-	return ui.MemberStatus{}, false
 }
 
 func containsDeviceID(

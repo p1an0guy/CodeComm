@@ -137,6 +137,22 @@ func (function cliStatusSourceFunc) Status(
 	return function(ctx)
 }
 
+func (function cliStatusSourceFunc) Member(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	snapshot, err := function(ctx)
+	if err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	for _, member := range snapshot.Durable.Members {
+		if member.ID == deviceID {
+			return member, true, nil
+		}
+	}
+	return coordstatus.MemberSummary{}, false, nil
+}
+
 type cliOperatorSubmitter struct{}
 
 func (cliOperatorSubmitter) SubmitOperatorCommand(

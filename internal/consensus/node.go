@@ -2855,6 +2855,29 @@ func (node *SingleNode) Status(
 	return snapshot, nil
 }
 
+// Member returns one exact committed member projection for local operator
+// actions whose subject may fall outside the bounded status roster.
+func (node *SingleNode) Member(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	if node == nil ||
+		node.raft == nil ||
+		node.state == nil ||
+		ctx == nil ||
+		!deviceID.Valid() {
+		return coordstatus.MemberSummary{}, false, ErrInvalidNodeOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	if err := node.beginOperation(); err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	defer node.endOperation()
+	return node.state.LocalState().MemberStatus(ctx, deviceID)
+}
+
 func raftStatusRole(state raft.RaftState) coordstatus.ConsensusRole {
 	switch state {
 	case raft.Follower:

@@ -41,7 +41,7 @@ type OperatorDialOptions struct {
 }
 
 // OperatorClient owns one operator-bound local connection and transparently
-// rebinds read-only status requests after a daemon restart.
+// rebinds read-only queries after a daemon restart.
 type OperatorClient struct {
 	requestMu sync.Mutex
 	stateMu   sync.Mutex
@@ -116,6 +116,57 @@ func (client *OperatorClient) Status(
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
+	response, err := client.query(ctx, statusQueryPath)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return Snapshot{}, ErrStatusProtocol
+	}
+	return decodeStatusResponse(response.Body)
+}
+
+// Member returns one exact committed member projection. A clean miss is
+// reported as found=false; malformed or unavailable responses fail closed.
+func (client *OperatorClient) Member(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (MemberStatus, bool, error) {
+	if client == nil || ctx == nil || !deviceID.Valid() {
+		return MemberStatus{}, false, ErrInvalidOperatorDial
+	}
+	if err := ctx.Err(); err != nil {
+		return MemberStatus{}, false, err
+	}
+	response, err := client.query(
+		ctx,
+		memberQueryPrefix+string(deviceID),
+	)
+	if err != nil {
+		var failure *ipc.ClientError
+		if errors.As(err, &failure) &&
+			failure.Status == http.StatusNotFound &&
+			failure.Code == "member_not_found" {
+			return MemberStatus{}, false, nil
+		}
+		return MemberStatus{}, false, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return MemberStatus{}, false, ErrStatusProtocol
+	}
+	var member MemberStatus
+	if err := decodeStatusObject(response.Body, &member); err != nil ||
+		member.validate() != nil ||
+		member.DeviceID != string(deviceID) {
+		return MemberStatus{}, false, ErrStatusProtocol
+	}
+	return member, true, nil
+}
+
+func (client *OperatorClient) query(
+	ctx context.Context,
+	path string,
+) (ipc.ClientResponse, error) {
 	client.requestMu.Lock()
 	defer client.requestMu.Unlock()
 
@@ -124,42 +175,40 @@ func (client *OperatorClient) Status(
 		transport, err = client.reconnect(ctx, nil)
 	}
 	if err != nil {
-		return Snapshot{}, err
+		return ipc.ClientResponse{}, err
 	}
 	if !transport.Usable() {
 		transport, err = client.reconnect(ctx, transport)
 		if err != nil {
-			return Snapshot{}, err
+			return ipc.ClientResponse{}, err
 		}
 	}
 	response, err := transport.Exchange(
 		ctx,
 		http.MethodGet,
-		statusQueryPath,
+		path,
 		nil,
 	)
 	if errors.Is(err, ipc.ErrClientConnectionLost) {
 		transport, reconnectErr := client.reconnect(ctx, transport)
 		if reconnectErr != nil {
-			return Snapshot{}, reconnectErr
+			return ipc.ClientResponse{}, reconnectErr
 		}
 		response, err = transport.Exchange(
 			ctx,
 			http.MethodGet,
-			statusQueryPath,
+			path,
 			nil,
 		)
 	}
-	if err != nil {
-		if errors.Is(err, ipc.ErrClientProtocol) {
-			return Snapshot{}, fmt.Errorf("%w: %v", ErrStatusProtocol, err)
-		}
-		return Snapshot{}, err
+	if errors.Is(err, ipc.ErrClientProtocol) {
+		return ipc.ClientResponse{}, fmt.Errorf(
+			"%w: %v",
+			ErrStatusProtocol,
+			err,
+		)
 	}
-	if response.StatusCode != http.StatusOK {
-		return Snapshot{}, ErrStatusProtocol
-	}
-	return decodeStatusResponse(response.Body)
+	return response, err
 }
 
 // SetVoters commits the complete desired voter target using the caller's

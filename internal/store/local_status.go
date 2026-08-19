@@ -116,6 +116,38 @@ func (state LocalState) StatusSnapshot(
 	return snapshot, nil
 }
 
+// MemberStatus returns one exact committed member projection. It is not
+// limited by the bounded operator roster.
+func (state LocalState) MemberStatus(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	if !deviceID.Valid() {
+		return coordstatus.MemberSummary{}, false, ErrInvalidLocalState
+	}
+	var (
+		result coordstatus.MemberSummary
+		found  bool
+	)
+	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		if _, err := readLocalLineage(conn); err != nil {
+			return err
+		}
+		member, exists, err := readStatusMemberSummary(conn, deviceID)
+		if err != nil || !exists {
+			found = exists
+			return err
+		}
+		result = member
+		found = true
+		return nil
+	})
+	if err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	return result, found, nil
+}
+
 func readStatusMembers(
 	conn *sqlite.Conn,
 ) ([]coordstatus.MemberSummary, uint64, error) {
@@ -169,6 +201,54 @@ func readStatusMembers(
 		return nil, 0, ErrLocalStateIntegrity
 	}
 	return members, uint64(total), nil
+}
+
+func readStatusMemberSummary(
+	conn *sqlite.Conn,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	var (
+		member coordstatus.MemberSummary
+		found  bool
+		rowErr error
+	)
+	count := 0
+	err := queryArgs(
+		conn,
+		`SELECT device_id, role, status, entity_version
+		   FROM devices
+		  WHERE device_id = ?1;`,
+		[]any{string(deviceID)},
+		func(stmt *sqlite.Stmt) {
+			count++
+			if count != 1 {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			found = true
+			entityVersion := stmt.ColumnInt64(3)
+			if entityVersion < 1 {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			member = coordstatus.MemberSummary{
+				ID:            domain.DeviceID(stmt.ColumnText(0)),
+				Role:          device.Role(stmt.ColumnText(1)),
+				Status:        device.Status(stmt.ColumnText(2)),
+				EntityVersion: uint64(entityVersion),
+			}
+		},
+	)
+	if err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	if rowErr != nil {
+		return coordstatus.MemberSummary{}, false, rowErr
+	}
+	if found && (member.ID != deviceID || member.Validate() != nil) {
+		return coordstatus.MemberSummary{}, false, ErrLocalStateIntegrity
+	}
+	return member, found, nil
 }
 
 func readStatusMember(
