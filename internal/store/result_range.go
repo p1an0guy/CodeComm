@@ -65,15 +65,19 @@ type ResultRange struct {
 	WorkspaceID        domain.UUIDv4
 	RecoveryGeneration uint64
 
-	FromResultIndex uint64
-	ToResultIndex   uint64
-	StartResultHash Digest
-	EndResultHash   Digest
-	StartChainIndex uint64
-	StartChainHash  Digest
-	EndChainIndex   uint64
-	EndChainHash    Digest
-	Results         [][]byte
+	FromResultIndex            uint64
+	ToResultIndex              uint64
+	StartResultHash            Digest
+	EndResultHash              Digest
+	StartChainIndex            uint64
+	StartChainHash             Digest
+	EndChainIndex              uint64
+	EndChainHash               Digest
+	StartProjectionAccumulator Digest
+	EndProjectionAccumulator   Digest
+	StartProjectionStateDigest Digest
+	EndProjectionStateDigest   Digest
+	Results                    [][]byte
 
 	ServerAppliedResultIndex uint64
 	Authority                voterset.Set
@@ -342,21 +346,43 @@ func (store *Store) ExportResultRange(
 		if err != nil {
 			return err
 		}
+		startProjection, err := resultRangeProjectionCommitmentsAt(
+			conn,
+			state,
+			genesis,
+			options.AfterResultIndex,
+		)
+		if err != nil {
+			return err
+		}
+		endProjection, err := resultRangeProjectionCommitmentsAt(
+			conn,
+			state,
+			genesis,
+			options.AfterResultIndex+uint64(len(results)),
+		)
+		if err != nil {
+			return err
+		}
 		exported = ResultRange{
-			SessionID:                state.sessionID,
-			WorkspaceID:              workspaceID,
-			RecoveryGeneration:       state.recoveryGeneration,
-			FromResultIndex:          options.AfterResultIndex + 1,
-			ToResultIndex:            options.AfterResultIndex + uint64(len(results)),
-			StartResultHash:          start.resultHash,
-			EndResultHash:            resultHead,
-			StartChainIndex:          start.chainIndex,
-			StartChainHash:           start.chainHash,
-			EndChainIndex:            chainIndex,
-			EndChainHash:             chainHead,
-			Results:                  results,
-			ServerAppliedResultIndex: state.resultIndex,
-			Authority:                authorization.authority,
+			SessionID:                  state.sessionID,
+			WorkspaceID:                workspaceID,
+			RecoveryGeneration:         state.recoveryGeneration,
+			FromResultIndex:            options.AfterResultIndex + 1,
+			ToResultIndex:              options.AfterResultIndex + uint64(len(results)),
+			StartResultHash:            start.resultHash,
+			EndResultHash:              resultHead,
+			StartChainIndex:            start.chainIndex,
+			StartChainHash:             start.chainHash,
+			EndChainIndex:              chainIndex,
+			EndChainHash:               chainHead,
+			StartProjectionAccumulator: startProjection.accumulator,
+			EndProjectionAccumulator:   endProjection.accumulator,
+			StartProjectionStateDigest: startProjection.stateDigest,
+			EndProjectionStateDigest:   endProjection.stateDigest,
+			Results:                    results,
+			ServerAppliedResultIndex:   state.resultIndex,
+			Authority:                  authorization.authority,
 		}
 		found = true
 		return nil
@@ -373,9 +399,14 @@ func (state LocalState) ExportResultRange(
 	ctx context.Context,
 	options ResultRangeOptions,
 ) (ResultRange, bool, error) {
-	if state.store == nil {
+	if err := state.validate(); err != nil {
 		return ResultRange{}, false, ErrInvalidLocalState
 	}
+	release, err := state.beginOperation()
+	if err != nil {
+		return ResultRange{}, false, err
+	}
+	defer release()
 	return state.store.ExportResultRange(ctx, options)
 }
 
@@ -383,6 +414,46 @@ type resultRangeHead struct {
 	resultHash Digest
 	chainIndex uint64
 	chainHash  Digest
+}
+
+type resultRangeProjectionCommitments struct {
+	accumulator Digest
+	stateDigest Digest
+}
+
+func resultRangeProjectionCommitmentsAt(
+	conn *sqlite.Conn,
+	state consensusState,
+	genesis storedGenesisBoundary,
+	resultIndex uint64,
+) (resultRangeProjectionCommitments, error) {
+	accumulator, err := projectionAccumulatorAtResultCut(
+		conn,
+		state,
+		genesis,
+		resultIndex,
+	)
+	if err != nil {
+		return resultRangeProjectionCommitments{},
+			historyIntegrityError("reconstruct projection accumulator", err)
+	}
+	rows, err := projectionRowsAtResultCut(conn, state, resultIndex)
+	if err != nil {
+		return resultRangeProjectionCommitments{},
+			historyIntegrityError("reconstruct projection state", err)
+	}
+	stateDigest, err := chain.StateDigest(chain.Versions{
+		Digest:           state.digestVersion,
+		ProjectionSchema: state.projectionSchemaVersion,
+	}, rows)
+	if err != nil {
+		return resultRangeProjectionCommitments{},
+			historyIntegrityError("digest projection state", err)
+	}
+	return resultRangeProjectionCommitments{
+		accumulator: accumulator,
+		stateDigest: Digest(stateDigest),
+	}, nil
 }
 
 func resultRangeStart(

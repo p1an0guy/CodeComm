@@ -41,12 +41,39 @@ var (
 // LocalState is a restricted capability for local-only durable state. It
 // intentionally exposes neither Store.Close nor the underlying SQLite pool.
 type LocalState struct {
-	store *Store
+	store          *Store
+	operationGuard *localStateOperationGuard
 }
 
 // LocalState returns the local-only state capability owned by store.
 func (store *Store) LocalState() LocalState {
 	return LocalState{store: store}
+}
+
+// LocalStateOperationGuard starts one capability operation. A successful
+// guard must return a non-nil release function that remains held until the
+// complete SQLite operation finishes.
+type LocalStateOperationGuard func() (release func(), err error)
+
+type localStateOperationGuard struct {
+	begin LocalStateOperationGuard
+}
+
+// LocalStateWithGuard returns a local-only capability whose every operation
+// is covered by guard. It lets a higher-level runtime revoke already-issued
+// capabilities before publishing terminal state or closing their store.
+func (store *Store) LocalStateWithGuard(
+	guard LocalStateOperationGuard,
+) LocalState {
+	if guard == nil {
+		return LocalState{}
+	}
+	return LocalState{
+		store: store,
+		operationGuard: &localStateOperationGuard{
+			begin: guard,
+		},
+	}
 }
 
 type LocalBindingClass string
@@ -220,6 +247,20 @@ func (state LocalState) validate() error {
 	return nil
 }
 
+func (state LocalState) beginOperation() (func(), error) {
+	if state.operationGuard == nil {
+		return func() {}, nil
+	}
+	release, err := state.operationGuard.begin()
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		return nil, ErrInvalidLocalState
+	}
+	return release, nil
+}
+
 func (state LocalState) withImmediate(
 	ctx context.Context,
 	fn func(*sqlite.Conn) error,
@@ -233,6 +274,11 @@ func (state LocalState) withImmediate(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	release, err := state.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	state.store.applyMu.Lock()
 	defer state.store.applyMu.Unlock()
 	return state.store.withConn(ctx, func(conn *sqlite.Conn) (err error) {

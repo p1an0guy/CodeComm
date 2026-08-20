@@ -501,12 +501,14 @@ The identity signature is the commitment attestation under V1's non-Byzantine-vo
 | `from_result_index`, `to_result_index` | Exactly `M+1` through the last included first-seen result; count equals `results.length` |
 | `start_result_hash`, `end_result_hash` | Receiver's expected result head at `M`, and recomputed head |
 | `start_chain_index/hash`, `end_chain_index/hash` | Accepted-event cursor before and after replay |
+| `start_projection_accumulator`, `end_projection_accumulator` | Exact projection-accumulator heads before and after replay |
+| `start_projection_state_digest`, `end_projection_state_digest` | Full covered projection-state digests at both cuts |
 | `results[]` | Contiguous canonical command-result records, each carrying its exact proposal and accepted chain tuple or nulls |
 | `session_id`, `workspace_id`, `recovery_generation` | Explicit replay/confusion binding |
 | `server_device_id`, `server_applied_result_index`, `server_authority_version` | Signer and attested progress/authority at the batch end |
 | `batch_signature` | Voter identity signature over every preceding field under `codecomm/v1/batch` |
 
-The receiver requires both starting heads to equal its durable cursor, then scratch-replays every
+The receiver requires every starting chain/projection commitment to equal its durable cursor, then scratch-replays every
 proposal, outcome, projection transition, event/result link, checkpoint, and authority handoff
 without mutating durable state. The signer must be an active member of the authority in effect at
 `to_result_index`; when that differs from the receiver's starting authority, the contiguous results
@@ -514,9 +516,9 @@ MUST contain every intervening accepted `membership.voter_set_activated`, and th
 the complete handoff chain before treating the batch signature as authorized. A batch cannot stop
 before its signer becomes authorized. If the byte bound prevents reaching such a point, the server
 returns `snapshot_required` and offers a checkpoint cut at or after that activation. Any gap, count
-mismatch, insertion, mutation, reorder, outcome mismatch, wrong end head, unauthorized signer, or
-invalid handoff rejects the whole batch with both cursors unchanged. Origin signatures alone prove
-authorship, not commitment.
+mismatch, insertion, mutation, reorder, outcome mismatch, wrong ending chain, accumulator, or state
+digest, unauthorized signer, or invalid handoff rejects the whole batch with both cursors unchanged.
+Origin signatures alone prove authorship, not commitment.
 
 An accepted batch commits its imported results/projections/heads and one local
 `replication_attestations` row atomically. That row stores every signed envelope field, signature,

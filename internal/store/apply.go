@@ -104,6 +104,9 @@ func (store *Store) Apply(
 				ErrApplyConflict,
 			)
 		}
+		if err := ensureRaftEvidenceMode(conn); err != nil {
+			return err
+		}
 
 		stored, duplicate, err := readStoredCommandResult(
 			conn,
@@ -278,41 +281,7 @@ func (store *Store) Apply(
 		if err := store.reachApplyStage(applyAfterLeaseDeadlines); err != nil {
 			return err
 		}
-		if request.Outcome.Status == OutcomeAccepted &&
-			request.Proposal.Proposal().Kind == event.KindAgentSessionEnded {
-			entityID, present := request.Proposal.Proposal().EntityID.Value()
-			if !present {
-				return fmt.Errorf(
-					"%w: accepted agent end has no session ID",
-					ErrInvalidApply,
-				)
-			}
-			if err := execute(
-				conn,
-				"DELETE FROM agent_resume_tokens WHERE agent_session_id = ?1;",
-				entityID,
-			); err != nil {
-				return err
-			}
-			if err := execute(
-				conn,
-				`UPDATE agent_launches SET state = 'cleared'
-					  WHERE agent_session_id = ?1
-					    AND state IN ('reserved', 'consumed');`,
-				entityID,
-			); err != nil {
-				return err
-			}
-		}
-		if err := compactLocalProposal(
-			conn,
-			request.RecoveryGeneration,
-			request.Proposal,
-			request.Proposal.CanonicalBytes(),
-			proposalDigest(request.Proposal),
-			request.Outcome.Status,
-			request.Outcome.Code,
-		); err != nil {
+		if err := writePostCommandLocalCleanup(conn, request); err != nil {
 			return err
 		}
 		if err := store.reachApplyStage(applyAfterOutbox); err != nil {
@@ -339,6 +308,47 @@ func (store *Store) Apply(
 		result.AdmissionRevision = store.advanceAdmissionRevision()
 	}
 	return result, nil
+}
+
+func writePostCommandLocalCleanup(
+	conn *sqlite.Conn,
+	request ApplyRequest,
+) error {
+	if request.Outcome.Status == OutcomeAccepted &&
+		request.Proposal.Proposal().Kind == event.KindAgentSessionEnded {
+		entityID, present := request.Proposal.Proposal().EntityID.Value()
+		if !present {
+			return fmt.Errorf(
+				"%w: accepted agent end has no session ID",
+				ErrInvalidApply,
+			)
+		}
+		if err := execute(
+			conn,
+			"DELETE FROM agent_resume_tokens WHERE agent_session_id = ?1;",
+			entityID,
+		); err != nil {
+			return err
+		}
+		if err := execute(
+			conn,
+			`UPDATE agent_launches SET state = 'cleared'
+				  WHERE agent_session_id = ?1
+				    AND state IN ('reserved', 'consumed');`,
+			entityID,
+		); err != nil {
+			return err
+		}
+	}
+	return compactLocalProposal(
+		conn,
+		request.RecoveryGeneration,
+		request.Proposal,
+		request.Proposal.CanonicalBytes(),
+		proposalDigest(request.Proposal),
+		request.Outcome.Status,
+		request.Outcome.Code,
+	)
 }
 
 func (store *Store) reachApplyStage(stage applyStage) error {

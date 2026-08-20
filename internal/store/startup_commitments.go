@@ -22,10 +22,36 @@ type storedGenesisBoundary struct {
 
 func verifyCurrentCommitmentTip(conn *sqlite.Conn) error {
 	state, found, err := readConsensusState(conn)
-	if err != nil || !found {
+	if err != nil {
 		return err
 	}
-	if err := verifyRaftCommandLedger(conn, state); err != nil {
+	if !found {
+		if _, settled, err := readSettledNonvoterState(conn); err != nil {
+			return err
+		} else if settled {
+			return replicationEvidenceError(
+				"settled-nonvoter marker lacks active consensus state",
+				nil,
+			)
+		}
+		return nil
+	}
+	settledState, settled, err := readSettledNonvoterState(conn)
+	if err != nil {
+		return err
+	}
+	if settled {
+		if err := verifyCommitmentHistory(conn, state); err != nil {
+			return err
+		}
+		if err := verifySettledNonvoterEvidence(
+			conn,
+			state,
+			settledState,
+		); err != nil {
+			return err
+		}
+	} else if err := verifyRaftCommandLedger(conn, state); err != nil {
 		return err
 	}
 	genesis, err := readGenesisBoundary(

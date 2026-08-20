@@ -110,6 +110,15 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err := assertRaftIndex(conn, options.RaftLog); err != nil {
 		return nil, err
 	}
+	if options.RaftLog != nil {
+		if err := ensureRaftEvidenceMode(conn); err != nil {
+			return nil, normalizeSQLiteError(
+				ctx,
+				"verify replica evidence mode",
+				err,
+			)
+		}
+	}
 	if err := verifyCommittedRaftConfiguration(conn); err != nil {
 		return nil, normalizeSQLiteError(
 			ctx,
@@ -216,9 +225,6 @@ func (store *Store) withConn(
 	defer store.pool.Put(conn)
 	if err := fn(conn); err != nil {
 		return normalizeSQLiteError(ctx, "database operation", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	return nil
 }

@@ -34,6 +34,23 @@ type StateView struct {
 // View returns the current active generation and logical projections under
 // the same apply lock and SQLite transaction. Callers own all returned memory.
 func (store *Store) View(ctx context.Context) (StateView, error) {
+	return store.stateView(ctx, false)
+}
+
+// VerifiedSettledNonvoterView returns a view only after revalidating the
+// complete Raft baseline and contiguous signed replication evidence in the
+// same transaction. It is the trusted scratch-replay starting point for a
+// settled application nonvoter.
+func (store *Store) VerifiedSettledNonvoterView(
+	ctx context.Context,
+) (StateView, error) {
+	return store.stateView(ctx, true)
+}
+
+func (store *Store) stateView(
+	ctx context.Context,
+	verifySettledEvidence bool,
+) (StateView, error) {
 	store.applyMu.Lock()
 	defer store.applyMu.Unlock()
 
@@ -54,6 +71,25 @@ func (store *Store) View(ctx context.Context) (StateView, error) {
 				"%w: store has no active generation",
 				ErrApplyConflict,
 			)
+		}
+		if verifySettledEvidence {
+			settled, found, err := readSettledNonvoterState(conn)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return ErrReplicaEvidenceMode
+			}
+			if err := verifyCommitmentHistory(conn, state); err != nil {
+				return err
+			}
+			if err := verifySettledNonvoterEvidence(
+				conn,
+				state,
+				settled,
+			); err != nil {
+				return err
+			}
 		}
 
 		var (

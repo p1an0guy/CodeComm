@@ -63,6 +63,12 @@ func TestBatchCanonicalRoundTripAndSignature(t *testing.T) {
 	if metadata.FromResultIndex != input.FromResultIndex ||
 		metadata.ToResultIndex != input.ToResultIndex ||
 		metadata.ServerDeviceID != input.ServerDeviceID ||
+		metadata.StartProjectionAccumulator !=
+			input.StartProjectionAccumulator ||
+		metadata.EndProjectionAccumulator != input.EndProjectionAccumulator ||
+		metadata.StartProjectionStateDigest !=
+			input.StartProjectionStateDigest ||
+		metadata.EndProjectionStateDigest != input.EndProjectionStateDigest ||
 		metadata.ServerAppliedResultIndex !=
 			input.ServerAppliedResultIndex {
 		t.Fatalf("Metadata() = %+v", metadata)
@@ -83,6 +89,21 @@ func TestBatchCanonicalRoundTripAndSignature(t *testing.T) {
 		privateKey.Public().(ed25519.PublicKey),
 	); err != nil {
 		t.Fatalf("VerifyBatch() error = %v", err)
+	}
+	envelope, err := codec.CanonicalizeSignedObject(
+		batch.AttestationEnvelope(),
+	)
+	if err != nil ||
+		!bytes.Equal(envelope, batch.AttestationEnvelope()) ||
+		bytes.Contains(envelope, []byte(`"results"`)) ||
+		bytes.Contains(envelope, []byte(`"batch_signature"`)) ||
+		batch.AttestationID() == "" {
+		t.Fatalf(
+			"attestation envelope = %s, id=%q, err=%v",
+			envelope,
+			batch.AttestationID(),
+			err,
+		)
 	}
 
 	const prefix = `{"batch_signature":`
@@ -403,6 +424,26 @@ func TestVerifyBatchBindsSignatureAndServerIdentity(t *testing.T) {
 			err,
 		)
 	}
+
+	projectionInput := unsigned.Input()
+	projectionInput.EndProjectionStateDigest[0] ^= 0xff
+	projectionUnsigned, err := NewUnsignedBatch(projectionInput)
+	if err != nil {
+		t.Fatalf("NewUnsignedBatch(changed projection digest): %v", err)
+	}
+	projectionBatch, err := NewBatch(projectionUnsigned, batch.Signature())
+	if err != nil {
+		t.Fatalf("NewBatch(changed projection digest): %v", err)
+	}
+	if err := VerifyBatch(
+		projectionBatch,
+		privateKey.Public().(ed25519.PublicKey),
+	); !errors.Is(err, ErrSignatureInvalid) {
+		t.Fatalf(
+			"VerifyBatch(changed projection digest) error = %v, want ErrSignatureInvalid",
+			err,
+		)
+	}
 }
 
 func validBatchInput(t *testing.T) (BatchInput, ed25519.PrivateKey) {
@@ -449,21 +490,25 @@ func validBatchInput(t *testing.T) (BatchInput, ed25519.PrivateKey) {
 		t.Fatalf("AppendResult(second): %v", err)
 	}
 	return BatchInput{
-		FromResultIndex:          5,
-		ToResultIndex:            6,
-		StartResultHash:          startResult,
-		EndResultHash:            endResult,
-		StartChainIndex:          2,
-		StartChainHash:           startChain,
-		EndChainIndex:            3,
-		EndChainHash:             firstChain,
-		Results:                  [][]byte{first, second},
-		SessionID:                "018f0000-0000-7000-8000-000000000001",
-		WorkspaceID:              "018f0000-0000-4000-8000-000000000001",
-		RecoveryGeneration:       2,
-		ServerDeviceID:           serverID,
-		ServerAppliedResultIndex: 9,
-		ServerAuthorityVersion:   4,
+		FromResultIndex:            5,
+		ToResultIndex:              6,
+		StartResultHash:            startResult,
+		EndResultHash:              endResult,
+		StartChainIndex:            2,
+		StartChainHash:             startChain,
+		EndChainIndex:              3,
+		EndChainHash:               firstChain,
+		StartProjectionAccumulator: filledDigest(0x31),
+		EndProjectionAccumulator:   filledDigest(0x32),
+		StartProjectionStateDigest: filledDigest(0x33),
+		EndProjectionStateDigest:   filledDigest(0x34),
+		Results:                    [][]byte{first, second},
+		SessionID:                  "018f0000-0000-7000-8000-000000000001",
+		WorkspaceID:                "018f0000-0000-4000-8000-000000000001",
+		RecoveryGeneration:         2,
+		ServerDeviceID:             serverID,
+		ServerAppliedResultIndex:   9,
+		ServerAuthorityVersion:     4,
 	}, privateKey
 }
 

@@ -43,10 +43,30 @@ func (store *Store) VerifyCommitmentHistory(ctx context.Context) error {
 				ErrCommandResultCorrupt,
 			)
 		}
+		if err := verifyCommitmentHistory(conn, state); err != nil {
+			return err
+		}
+		settledState, settled, err := readSettledNonvoterState(conn)
+		if err != nil {
+			return err
+		}
+		if settled {
+			if err := verifySettledNonvoterEvidence(
+				conn,
+				state,
+				settledState,
+			); err != nil {
+				return historyIntegrityError(
+					"settled-nonvoter evidence",
+					err,
+				)
+			}
+			return nil
+		}
 		if err := verifyRaftCommandLedger(conn, state); err != nil {
 			return historyIntegrityError("Raft command ledger", err)
 		}
-		return verifyCommitmentHistory(conn, state)
+		return nil
 	})
 }
 

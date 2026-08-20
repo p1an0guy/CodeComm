@@ -61,6 +61,7 @@ var requiredTables = []string{
 	"replication_cursors",
 	"schema_migrations",
 	"session_policy",
+	"settled_nonvoter_state",
 	"tasks",
 	"voter_set",
 }
@@ -139,6 +140,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"pairing_finalization",
 			"pairing_authority_fencing",
 			"committed_raft_configuration",
+			"settled_nonvoter_replication",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
@@ -182,6 +184,24 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 	}
 }
 
+func TestWithConnReturnsCommittedSuccessWhenContextCancelsAfterWork(
+	t *testing.T,
+) {
+	store := openTestStore(
+		t,
+		filepath.Join(t.TempDir(), "session", "state.db"),
+		nil,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	err := store.withConn(ctx, func(*sqlite.Conn) error {
+		cancel()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withConn() after completed work = %v, want success", err)
+	}
+}
+
 func TestOpenIsIdempotentAndChecksMigrationChecksum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
@@ -222,7 +242,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
 	broken := migrationFromText(
-		6,
+		7,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
@@ -240,7 +260,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 6;", 0)
+		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 7;", 0)
 		return nil
 	})
 	if err != nil {

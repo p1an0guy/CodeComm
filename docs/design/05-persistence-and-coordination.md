@@ -466,9 +466,11 @@ persisted wall time is display-only and never shortens it.
 
 A settled-nonvoter import scratch-replays the same deterministic transitions, then atomically writes
 the batch's results/events/projections/heads, local views/timers, cursor, and
-`replication_attestations` row. It neither advances `last_raft_applied_log_index` nor writes event
-provenance. Standalone logical-snapshot import does the equivalent replacement transaction with its
-trusted checkpoint attestation before any state becomes visible.
+`replication_attestations` row. The signed batch binds both projection-accumulator and full-state
+digests at its starting and ending cuts; startup rechecks those commitments against retained
+mutations and rows. It neither advances `last_raft_applied_log_index` nor writes event provenance.
+Standalone logical-snapshot import does the equivalent replacement transaction with its trusted
+checkpoint attestation before any state becomes visible.
 
 A Raft `InstallSnapshot` instead verifies the same logical artifact plus the adapter-supplied Raft
 metadata, then atomically replaces SQLite state, removes source-local `event_provenance` and

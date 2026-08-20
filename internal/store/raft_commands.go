@@ -103,6 +103,20 @@ func verifyRaftCommandLedger(
 	conn *sqlite.Conn,
 	state consensusState,
 ) error {
+	return verifyRaftCommandLedgerThrough(conn, state, state.resultIndex)
+}
+
+func verifyRaftCommandLedgerThrough(
+	conn *sqlite.Conn,
+	state consensusState,
+	resultCut uint64,
+) error {
+	if resultCut > state.resultIndex {
+		return raftCommandLedgerError(
+			"result cut follows the active result head",
+			nil,
+		)
+	}
 	var (
 		count    int64
 		maxIndex int64
@@ -126,6 +140,25 @@ func verifyRaftCommandLedger(
 		if count != 0 {
 			return raftCommandLedgerError(
 				"unapplied state has command bindings",
+				nil,
+			)
+		}
+		if err := queryOneArgs(
+			conn,
+			`SELECT count(*)
+			   FROM command_results
+			  WHERE recovery_generation = ?1
+			    AND result_index <= ?2;`,
+			[]any{state.recoveryGeneration, resultCut},
+			func(stmt *sqlite.Stmt) {
+				missing = stmt.ColumnInt64(0)
+			},
+		); err != nil {
+			return err
+		}
+		if missing != 0 {
+			return raftCommandLedgerError(
+				"unapplied state has unbound command results",
 				nil,
 			)
 		}
@@ -158,16 +191,17 @@ func verifyRaftCommandLedger(
 	if err := queryOneArgs(
 		conn,
 		`SELECT count(*)
-		   FROM command_results AS r
-		  WHERE r.recovery_generation = ?1
-		    AND NOT EXISTS (
+			   FROM command_results AS r
+			  WHERE r.recovery_generation = ?1
+			    AND r.result_index <= ?2
+			    AND NOT EXISTS (
 		        SELECT 1
 		          FROM raft_command_applications AS a
 		         WHERE a.recovery_generation = ?1
 		           AND a.event_id = r.event_id
 		           AND a.proposal_digest = r.proposal_digest
 		  );`,
-		[]any{state.recoveryGeneration},
+		[]any{state.recoveryGeneration, resultCut},
 		func(stmt *sqlite.Stmt) {
 			missing = stmt.ColumnInt64(0)
 		},
@@ -183,12 +217,13 @@ func verifyRaftCommandLedger(
 	if err := queryOneArgs(
 		conn,
 		`SELECT count(*)
-		   FROM raft_command_applications AS a
-		   LEFT JOIN command_results AS r
+			   FROM raft_command_applications AS a
+			   LEFT JOIN command_results AS r
 		     ON r.event_id = a.event_id
 		    AND r.proposal_digest = a.proposal_digest
-		  WHERE a.recovery_generation = ?1 AND r.event_id IS NULL;`,
-		[]any{state.recoveryGeneration},
+			  WHERE a.recovery_generation = ?1
+			    AND (r.event_id IS NULL OR r.result_index > ?2);`,
+		[]any{state.recoveryGeneration, resultCut},
 		func(stmt *sqlite.Stmt) {
 			missing = stmt.ColumnInt64(0)
 		},
@@ -240,13 +275,14 @@ func verifyRaftCommandLedger(
 		                   ON a.recovery_generation = r.recovery_generation
 		                  AND a.event_id = r.event_id
 		                  AND a.proposal_digest = r.proposal_digest
-		                WHERE r.recovery_generation = ?1
-		                GROUP BY r.event_id, r.result_index
+			                 WHERE r.recovery_generation = ?1
+			                   AND r.result_index <= ?2
+			                GROUP BY r.event_id, r.result_index
 		          )
 		   )
 		  WHERE prior_first_log_index IS NOT NULL
 		    AND first_log_index <= prior_first_log_index;`,
-		[]any{state.recoveryGeneration},
+		[]any{state.recoveryGeneration, resultCut},
 		func(stmt *sqlite.Stmt) {
 			missing = stmt.ColumnInt64(0)
 		},

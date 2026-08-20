@@ -1029,6 +1029,9 @@ func TestPairingAuthorityMigrationRevokesUnboundFinalization(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := downgradeTestReplicationEvidenceToV5(conn); err != nil {
+			return err
+		}
 		if err := execute(
 			conn,
 			`UPDATE pairing_attempts
@@ -1103,6 +1106,9 @@ func TestPairingAuthorityMigrationPreservesLegacyCompletion(t *testing.T) {
 	}
 
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := downgradeTestReplicationEvidenceToV5(conn); err != nil {
+			return err
+		}
 		if err := execute(conn, "DROP TABLE pairing_attempt_finalizations;"); err != nil {
 			return err
 		}
@@ -1298,6 +1304,9 @@ func TestPairingFinalizationMigrationRevokesPredecessorAttempts(t *testing.T) {
 	}
 	predecessorSessionID := pairingTestUUID(606)
 	if err := state.withImmediate(context.Background(), func(conn *sqlite.Conn) error {
+		if err := downgradeTestReplicationEvidenceToV5(conn); err != nil {
+			return err
+		}
 		if err := execute(
 			conn,
 			`UPDATE pairing_attempts

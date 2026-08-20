@@ -759,6 +759,7 @@ func clearGenerationLocalState(conn *sqlite.Conn) error {
 		"peer_endpoints",
 		"lease_deadlines",
 		"replication_cursors",
+		"settled_nonvoter_state",
 		"raft_committed_configuration",
 		"outbox",
 		"local_requests",

@@ -158,14 +158,26 @@ func TestExportResultRangeBuildsVerifiableSignedBatch(t *testing.T) {
 	}
 	unsigned, err := replication.NewUnsignedBatch(
 		replication.BatchInput{
-			FromResultIndex:          exported.FromResultIndex,
-			ToResultIndex:            exported.ToResultIndex,
-			StartResultHash:          chain.Digest(exported.StartResultHash),
-			EndResultHash:            chain.Digest(exported.EndResultHash),
-			StartChainIndex:          exported.StartChainIndex,
-			StartChainHash:           chain.Digest(exported.StartChainHash),
-			EndChainIndex:            exported.EndChainIndex,
-			EndChainHash:             chain.Digest(exported.EndChainHash),
+			FromResultIndex: exported.FromResultIndex,
+			ToResultIndex:   exported.ToResultIndex,
+			StartResultHash: chain.Digest(exported.StartResultHash),
+			EndResultHash:   chain.Digest(exported.EndResultHash),
+			StartChainIndex: exported.StartChainIndex,
+			StartChainHash:  chain.Digest(exported.StartChainHash),
+			EndChainIndex:   exported.EndChainIndex,
+			EndChainHash:    chain.Digest(exported.EndChainHash),
+			StartProjectionAccumulator: chain.Digest(
+				exported.StartProjectionAccumulator,
+			),
+			EndProjectionAccumulator: chain.Digest(
+				exported.EndProjectionAccumulator,
+			),
+			StartProjectionStateDigest: chain.Digest(
+				exported.StartProjectionStateDigest,
+			),
+			EndProjectionStateDigest: chain.Digest(
+				exported.EndProjectionStateDigest,
+			),
 			Results:                  exported.Results,
 			SessionID:                exported.SessionID,
 			WorkspaceID:              exported.WorkspaceID,
