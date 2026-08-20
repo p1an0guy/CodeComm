@@ -435,6 +435,21 @@ func NewState(snapshot Snapshot) (State, error) {
 	return state, nil
 }
 
+// Device returns an independent copy of one retained membership row.
+func (state State) Device(deviceID domain.DeviceID) (device.Device, bool) {
+	member, exists := state.devices[deviceID]
+	if !exists {
+		return device.Device{}, false
+	}
+	member.IdentityPublicKey = bytes.Clone(member.IdentityPublicKey)
+	return member, true
+}
+
+// CredentialAuthority returns an independent copy of the active authority.
+func (state State) CredentialAuthority() credentialauthority.Authority {
+	return state.credentialAuthority.Clone()
+}
+
 // Apply updates a validated in-memory state only after the corresponding
 // durable apply transaction commits. It validates the complete change set
 // before mutating any row.

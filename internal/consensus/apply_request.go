@@ -41,7 +41,43 @@ func BuildApplyRequest(
 ) (store.ApplyRequest, error) {
 	if context.Term < 1 ||
 		context.LogIndex < 1 ||
-		!domain.ValidUnsignedInteger(context.RecoveryGeneration) ||
+		!domain.ValidUnsignedInteger(context.Term) ||
+		!domain.ValidUnsignedInteger(context.LogIndex) {
+		return store.ApplyRequest{}, ErrInvalidApplyMapping
+	}
+	request, err := buildApplyRequest(
+		signed,
+		outcome,
+		localApplyContext{
+			RecoveryGeneration: context.RecoveryGeneration,
+			AppliedAt:          context.AppliedAt,
+			OriginBootID:       context.OriginBootID,
+			MonotonicNowNS:     context.MonotonicNowNS,
+			PriorHeads:         context.PriorHeads,
+		},
+	)
+	if err != nil {
+		return store.ApplyRequest{}, err
+	}
+	request.Term = context.Term
+	request.LogIndex = context.LogIndex
+	return request, nil
+}
+
+type localApplyContext struct {
+	RecoveryGeneration uint64
+	AppliedAt          domain.Timestamp
+	OriginBootID       domain.UUIDv7
+	MonotonicNowNS     int64
+	PriorHeads         store.ApplyHeads
+}
+
+func buildApplyRequest(
+	signed event.SignedEvent,
+	outcome reducer.Outcome,
+	context localApplyContext,
+) (store.ApplyRequest, error) {
+	if !domain.ValidUnsignedInteger(context.RecoveryGeneration) ||
 		!context.AppliedAt.Valid() ||
 		!context.OriginBootID.Valid() ||
 		context.MonotonicNowNS < 0 ||
@@ -71,8 +107,6 @@ func BuildApplyRequest(
 	}
 
 	request := store.ApplyRequest{
-		Term:               context.Term,
-		LogIndex:           context.LogIndex,
 		AppliedAt:          context.AppliedAt,
 		RecoveryGeneration: context.RecoveryGeneration,
 		Proposal:           signed,
@@ -437,7 +471,7 @@ func checkpointRecord(
 
 func leaseDeadlineChanges(
 	changes reducer.Changes,
-	context ApplyContext,
+	context localApplyContext,
 ) ([]store.LeaseDeadlineRecord, []store.LeaseDeadlineKey, error) {
 	var (
 		upserts []store.LeaseDeadlineRecord

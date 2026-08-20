@@ -318,48 +318,40 @@ func ReduceCheckpoint(
 	return reduce(state, signed, &applyContext)
 }
 
+// ReduceAttestedRejectedCheckpoint replays a voter-attested rejected
+// checkpoint without fabricating the source replica's Raft term or log index.
+// Callers must still compare the returned outcome with the signed result and
+// authorize that result's batch signer at the batch end.
+func ReduceAttestedRejectedCheckpoint(
+	state State,
+	signed event.SignedEvent,
+) (Outcome, error) {
+	if signed.Proposal().Kind != event.KindConsensusCheckpoint {
+		return Outcome{}, fmt.Errorf(
+			"%w: %q",
+			ErrCheckpointEventRequired,
+			signed.Proposal().Kind,
+		)
+	}
+	context, outcome, done, err := prepareReduction(state, signed)
+	if err != nil || done {
+		return outcome, err
+	}
+	if _, ok := decodeCheckpointProof(
+		context.state,
+		context.proposal.Payload,
+	); !ok {
+		return context.reject(CodeInvalidPayload), nil
+	}
+	return context.reject(CodeStaleCheckpoint), nil
+}
+
 func reduce(
 	state State,
 	signed event.SignedEvent,
 	checkpointContext *CheckpointApplyContext,
 ) (Outcome, error) {
-	if !domain.ValidUnsignedInteger(state.currentChainIndex) ||
-		!domain.ValidUnsignedInteger(state.currentResultIndex) ||
-		state.currentChainIndex > state.currentResultIndex {
-		return Outcome{}, invalidState(
-			"chain or result index is outside the protocol bounds",
-		)
-	}
-	if state.currentResultIndex == domain.MaxSafeInteger {
-		return Outcome{}, ErrReducerCapacityExhausted
-	}
-	proposal := signed.Proposal()
-	clusterApplyLevel := state.sessionPolicy.Values.ClusterMinApplyLevel
-	if clusterApplyLevel < 1 {
-		return Outcome{}, invalidState("cluster apply level is below one")
-	}
-	if proposal.MinApplyLevel > event.MaxSupportedApplyLevel ||
-		proposal.MinApplyLevel > uint64(clusterApplyLevel) {
-		return Outcome{}, fmt.Errorf(
-			"%w: event requires %d, binary supports %d, cluster enables %d",
-			ErrApplyLevelUnsupported,
-			proposal.MinApplyLevel,
-			event.MaxSupportedApplyLevel,
-			clusterApplyLevel,
-		)
-	}
-	if _, registered := event.LookupKind(proposal.Kind); !registered {
-		return Outcome{}, fmt.Errorf(
-			"%w: %q",
-			ErrKindNotImplemented,
-			proposal.Kind,
-		)
-	}
-	if !implementedKind(proposal.Kind) {
-		return Outcome{}, fmt.Errorf("%w: %q", ErrKindNotImplemented, proposal.Kind)
-	}
-
-	context, outcome, done, err := beginReduction(state, signed)
+	context, outcome, done, err := prepareReduction(state, signed)
 	if err != nil || done {
 		return outcome, err
 	}
@@ -368,11 +360,62 @@ func reduce(
 		return Outcome{}, err
 	}
 	if outcome.Status == StatusAccepted {
+		proposal := signed.Proposal()
 		outcome.RecordActivity = proposal.RationaleSummary != "" ||
 			len(proposal.Actions) != 0
 		outcome.Changes.AdvancesEventChain = true
 	}
 	return outcome, nil
+}
+
+func prepareReduction(
+	state State,
+	signed event.SignedEvent,
+) (reductionContext, Outcome, bool, error) {
+	if !domain.ValidUnsignedInteger(state.currentChainIndex) ||
+		!domain.ValidUnsignedInteger(state.currentResultIndex) ||
+		state.currentChainIndex > state.currentResultIndex {
+		return reductionContext{}, Outcome{}, false, invalidState(
+			"chain or result index is outside the protocol bounds",
+		)
+	}
+	if state.currentResultIndex == domain.MaxSafeInteger {
+		return reductionContext{}, Outcome{}, false,
+			ErrReducerCapacityExhausted
+	}
+	proposal := signed.Proposal()
+	clusterApplyLevel := state.sessionPolicy.Values.ClusterMinApplyLevel
+	if clusterApplyLevel < 1 {
+		return reductionContext{}, Outcome{}, false,
+			invalidState("cluster apply level is below one")
+	}
+	if proposal.MinApplyLevel > event.MaxSupportedApplyLevel ||
+		proposal.MinApplyLevel > uint64(clusterApplyLevel) {
+		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+			"%w: event requires %d, binary supports %d, cluster enables %d",
+			ErrApplyLevelUnsupported,
+			proposal.MinApplyLevel,
+			event.MaxSupportedApplyLevel,
+			clusterApplyLevel,
+		)
+	}
+	if _, registered := event.LookupKind(proposal.Kind); !registered {
+		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+			"%w: %q",
+			ErrKindNotImplemented,
+			proposal.Kind,
+		)
+	}
+	if !implementedKind(proposal.Kind) {
+		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+			"%w: %q",
+			ErrKindNotImplemented,
+			proposal.Kind,
+		)
+	}
+
+	context, outcome, done, err := beginReduction(state, signed)
+	return context, outcome, done, err
 }
 
 func implementedKind(kind event.Kind) bool {

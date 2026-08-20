@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission, content credentials,
 endpoint and proposal relay, voter reconciliation, and revocation are production-composed; Phase 3
 exit gate remains open
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -64,6 +64,19 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   cut, and streams under a single global large-response slot. The client preserves direct or
   relayed signed bytes; signer-key and active-authority trust is intentionally deferred until
   scratch replay reaches the batch end.
+- Settled nonvoters now have an explicit evidence mode and a Raft-free runtime owner. Receiver
+  scratch replay verifies origin signatures, deterministic accepted/rejected outcomes, projection
+  mutations, both chains, the accumulator, terminal authority, and the batch signature before one
+  atomic import. Imports retain contiguous signed attestations and per-relay cursors, rebuild local
+  activity/audit/checkpoint/lease rows, publish admission only after commit, survive reopen, and
+  never create event/Raft provenance or advance the frozen Raft watermark. Transaction failpoints,
+  cancellation, coherent projection-history tampering, failed replay, relayed-signer separation,
+  and race tests preserve both cursors and the complete prior cut. Signed starting/ending
+  accumulator and full-state digests bind durable projection evidence, and startup revalidates the
+  pre-transition Raft ledger. Each fetch revalidates local evidence before comparing the remote
+  lineage; coherent local rewrites latch fatal state, revoke already-issued local-state
+  capabilities, and stop admission/writes. Transient store failures remain retryable and scratch
+  replay observes cancellation between bounded records.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -86,9 +99,10 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
-- Result export and `/v1/replication` serving are implemented; transactional scratch replay/import,
-  receiver-side authority-handoff authorization, snapshot fallback, attestations/cursors, peer
-  catch-up, SSE, acknowledgements, and divergence recovery remain open.
+- Result export, serving, scratch replay/import, terminal authority authorization, and durable
+  batch evidence are implemented. Mode-aware daemon startup, peer fetch/catch-up orchestration,
+  multi-activation integration coverage, snapshot fallback, SSE, acknowledgements, completeness
+  comparison, and divergence recovery remain open.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
@@ -112,6 +126,8 @@ Primary tests:
 - `TestSecureMeshTopologyPartitionClosesEstablishedConnections`
 - `TestOpenNodeUsesInjectedDeviceAddressedTransport`
 - `TestInspectDaemonMeshState*`
+- `TestSettledReplicaImportsAndReopensAuthorityHandoff`
+- `TestSettledReplicaCoherentLocalRewriteLatchesFatalState`
 
 Run:
 

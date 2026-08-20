@@ -124,6 +124,28 @@ func TestNewStateDeepCopiesRowsUsedByDerivedIndexes(t *testing.T) {
 	}
 }
 
+func TestStateMembershipAccessorsReturnIndependentCopies(t *testing.T) {
+	t.Parallel()
+
+	fixture := newReducerFixture(t)
+	member, exists := fixture.state.Device(fixture.ownerDevice)
+	if !exists {
+		t.Fatal("Device(owner) found = false")
+	}
+	member.IdentityPublicKey[0] ^= 0xff
+	again, exists := fixture.state.Device(fixture.ownerDevice)
+	if !exists || again.IdentityPublicKey[0] == member.IdentityPublicKey[0] {
+		t.Fatal("Device() aliases reducer state")
+	}
+
+	authority := fixture.state.CredentialAuthority()
+	authority.VoterDeviceIDs[0] = fixture.editorDevice
+	pristine := fixture.state.CredentialAuthority()
+	if pristine.VoterDeviceIDs[0] == fixture.editorDevice {
+		t.Fatal("CredentialAuthority() aliases reducer state")
+	}
+}
+
 func TestStateApplyUsesExplicitAcceptedEventChainMarker(t *testing.T) {
 	t.Parallel()
 
