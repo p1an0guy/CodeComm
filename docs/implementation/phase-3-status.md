@@ -95,7 +95,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   terminal signed checkpoint. Result mutations use deterministic 2 MiB continuation records, so
   valid encodings above the 4 MiB chunk ceiling remain representable without a history-sized
   allocation. This structural pass deliberately does not replace the import layer's authority,
-  signature, or deterministic reducer-replay checks.
+  signature, or deterministic reducer-replay checks. Identity artifact construction greedily
+  streams record-aligned bounded chunks to a caller-owned sink while committing exact byte totals,
+  record/chunk counts, and artifact/chunk SHA-256 digests.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
