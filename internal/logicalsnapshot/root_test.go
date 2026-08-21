@@ -168,6 +168,32 @@ func TestRootRejectsNoncanonicalUnknownAndInvalidFields(t *testing.T) {
 			}
 		})
 	}
+	for name, mutate := range map[string]func(*RootInput){
+		"digest": func(value *RootInput) {
+			value.DigestVersion = SupportedDigestVersion + 1
+		},
+		"projection": func(value *RootInput) {
+			value.ProjectionSchemaVersion =
+				SupportedProjectionSchemaVersion + 1
+		},
+	} {
+		name, mutate := name, mutate
+		t.Run("unsupported_"+name, func(t *testing.T) {
+			t.Parallel()
+			candidate := input
+			mutate(&candidate)
+			if _, err := NewUnsignedRoot(candidate); !errors.Is(
+				err,
+				ErrUnsupportedVersion,
+			) {
+				t.Fatalf(
+					"NewUnsignedRoot(unsupported %s) = %v, want ErrUnsupportedVersion",
+					name,
+					err,
+				)
+			}
+		})
+	}
 }
 
 func TestRootOwnsCanonicalMemory(t *testing.T) {

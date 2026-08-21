@@ -10,7 +10,9 @@ import (
 	"sort"
 )
 
-const maxEncodedMutationBytes = 32 << 20
+// MaxEncodedMutationBytes is the V1 hard ceiling for one command's exact
+// canonical projection-mutation encoding.
+const MaxEncodedMutationBytes = 32 << 20
 
 type preparedMutation struct {
 	tableIndex int
@@ -117,12 +119,12 @@ func DecodeMutations(encoded []byte) ([]Mutation, error) {
 	if len(encoded) == 0 {
 		return nil, fmt.Errorf("%w: empty encoding", ErrInvalidMutation)
 	}
-	if len(encoded) > maxEncodedMutationBytes {
+	if len(encoded) > MaxEncodedMutationBytes {
 		return nil, fmt.Errorf(
 			"%w: %w: exceeds %d bytes",
 			ErrInvalidMutation,
 			ErrMutationSetTooLarge,
-			maxEncodedMutationBytes,
+			MaxEncodedMutationBytes,
 		)
 	}
 	type wireMutation struct {
@@ -192,17 +194,17 @@ func cloneNullableJSON(value json.RawMessage) []byte {
 }
 
 func encodePreparedMutations(prepared []preparedMutation) ([]byte, error) {
-	capacity := maxEncodedMutationBytes
-	if len(prepared) <= (maxEncodedMutationBytes-2)/128 {
+	capacity := MaxEncodedMutationBytes
+	if len(prepared) <= (MaxEncodedMutationBytes-2)/128 {
 		capacity = 2 + len(prepared)*128
 	}
 	encoded := make([]byte, 0, capacity)
 	appendBytes := func(value []byte) error {
-		if len(value) > maxEncodedMutationBytes-len(encoded) {
+		if len(value) > MaxEncodedMutationBytes-len(encoded) {
 			return fmt.Errorf(
 				"%w: exceeds %d bytes",
 				ErrMutationSetTooLarge,
-				maxEncodedMutationBytes,
+				MaxEncodedMutationBytes,
 			)
 		}
 		encoded = append(encoded, value...)

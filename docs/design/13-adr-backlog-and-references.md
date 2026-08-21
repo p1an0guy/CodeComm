@@ -175,9 +175,10 @@ Normative terms follow RFC 2119/8174; declarative requirements and table rows he
   the genesis-bound offline recovery key may sign one dedicated event that promotes only the
   submitting active editor; it grants no other mutation and does not bypass Raft. Permanent quorum
   loss continues to require ADR-067's successor recovery.
-- ADR-072: Logical snapshots use a bounded signed root, hash-chained bounded descriptor pages, and
-  independently verified resumable data chunks; session-lifetime history is never one body or
-  allocation.
+- ADR-072: Logical snapshots use a bounded signed root, hash-chained bounded descriptor pages,
+  independently verified resumable data chunks, and deterministic result-mutation continuations;
+  session-lifetime history is never one body or allocation, and a legal 32 MiB mutation set never
+  requires an oversized transport chunk.
 - ADR-073: Control-file proposals explicitly distinguish upsert from delete, and initial bootstrap
   withholds control paths until local review so cloning cannot activate unapproved agent guidance.
 - ADR-074: An active device that retained its identity but lost session state reuses the pairing

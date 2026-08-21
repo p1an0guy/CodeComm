@@ -89,6 +89,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   live topology and reconciliation unknown rather than presenting the frozen pre-transition Raft
   configuration as current; replica currency remains unknown without direct live exact-cut
   observations from the complete current authority.
+- Logical-snapshot roots, descriptor-page chains, record framing, semantic payload codecs, and the
+  streaming record-order validator are implemented. The validator checks complete successor
+  genesis lineage, both chains, accepted-event identity, projection accumulator/state, and the
+  terminal signed checkpoint. Result mutations use deterministic 2 MiB continuation records, so
+  valid encodings above the 4 MiB chunk ceiling remain representable without a history-sized
+  allocation. This structural pass deliberately does not replace the import layer's authority,
+  signature, or deterministic reducer-replay checks.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,

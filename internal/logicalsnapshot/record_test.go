@@ -80,6 +80,28 @@ func TestRecordReaderRejectsTruncationAndBoundsBeforeAllocation(t *testing.T) {
 	) {
 		t.Fatalf("Next(oversized declaration) = %v, want ErrRecordTooLarge", err)
 	}
+
+	for _, payloadLength := range []uint64{0, 1} {
+		var undersized bytes.Buffer
+		binary.BigEndian.PutUint16(
+			header[:2],
+			uint16(len(RecordResult)),
+		)
+		binary.BigEndian.PutUint64(header[2:], payloadLength)
+		undersized.Write(header[:2])
+		undersized.WriteString(string(RecordResult))
+		undersized.Write(header[2:])
+		if _, err := NewRecordReader(&undersized).Next(); !errors.Is(
+			err,
+			ErrInvalidRecord,
+		) {
+			t.Fatalf(
+				"Next(payload length %d) = %v, want ErrInvalidRecord",
+				payloadLength,
+				err,
+			)
+		}
+	}
 }
 
 func TestRecordRejectsUnknownAndNoncanonicalPayload(t *testing.T) {

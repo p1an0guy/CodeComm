@@ -18,16 +18,21 @@ import (
 )
 
 const (
-	RootSchemaVersion = 1
-	MaxRootBytes      = 64 << 10
+	RootSchemaVersion                = 1
+	SupportedDigestVersion           = 1
+	SupportedProjectionSchemaVersion = 1
+	MaxRootBytes                     = 64 << 10
 )
 
 var (
-	ErrInvalidRoot      = errors.New("logicalsnapshot: invalid signed root")
-	ErrRootTooLarge     = errors.New("logicalsnapshot: signed root exceeds size limit")
-	ErrRootSigner       = errors.New("logicalsnapshot: root signer mismatch")
-	ErrRootSignature    = errors.New("logicalsnapshot: invalid root signature")
-	ErrUnsupportedCodec = errors.New("logicalsnapshot: unsupported content encoding")
+	ErrInvalidRoot        = errors.New("logicalsnapshot: invalid signed root")
+	ErrRootTooLarge       = errors.New("logicalsnapshot: signed root exceeds size limit")
+	ErrRootSigner         = errors.New("logicalsnapshot: root signer mismatch")
+	ErrRootSignature      = errors.New("logicalsnapshot: invalid root signature")
+	ErrUnsupportedCodec   = errors.New("logicalsnapshot: unsupported content encoding")
+	ErrUnsupportedVersion = errors.New(
+		"logicalsnapshot: unsupported projection commitment version",
+	)
 )
 
 // ContentEncoding names the exact encoding used for every transmitted chunk.
@@ -321,6 +326,11 @@ func (root Root) validate() error {
 }
 
 func validateRootInput(input RootInput) error {
+	if input.DigestVersion != SupportedDigestVersion ||
+		input.ProjectionSchemaVersion !=
+			SupportedProjectionSchemaVersion {
+		return ErrUnsupportedVersion
+	}
 	if !validArtifactID(input.ArtifactID) ||
 		!input.SessionID.Valid() ||
 		!input.WorkspaceID.Valid() ||
@@ -333,10 +343,6 @@ func validateRootInput(input RootInput) error {
 		input.ChainIndex > input.ResultIndex ||
 		input.AuthorityVersion < 1 ||
 		!domain.ValidUnsignedInteger(input.AuthorityVersion) ||
-		input.DigestVersion < 1 ||
-		!domain.ValidUnsignedInteger(input.DigestVersion) ||
-		input.ProjectionSchemaVersion < 1 ||
-		!domain.ValidUnsignedInteger(input.ProjectionSchemaVersion) ||
 		!input.ContentEncoding.valid() ||
 		input.ExpandedBytes < 1 ||
 		!domain.ValidUnsignedInteger(input.ExpandedBytes) ||

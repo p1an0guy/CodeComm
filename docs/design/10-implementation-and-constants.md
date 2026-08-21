@@ -119,6 +119,7 @@ defect.
 | `control_file_diff_max_bytes` | 64 KiB | Committed, immutable in V1; review aid only (§8.4) |
 | `control_path_policy_version` | 1 | Committed, immutable in V1; exact classifier in §8.4 |
 | Snapshot signed-root / descriptor-page encoded maximum | 64 KiB / 4 MiB | Local, enforced before allocation |
+| Snapshot record payload / raw result-mutation slice maximum | 3 MiB / 2 MiB | Local; leaves framing and compression overhead below the 4 MiB transmitted-chunk bound |
 | Snapshot data-chunk compressed / expanded maximum | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Replication-batch compressed / expanded limit | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Concurrent replication-batch responses | 1 per daemon | Local; bounds expanded-page memory while ordinary control requests continue |

@@ -182,6 +182,8 @@ Required unit/component subjects:
   a session-sized snapshot uses the exact typed length-framed record order, bounded signed root,
   hash-chained JCS descriptor pages, and bounded chunks; root encoding and expanded/compressed
   totals are binding, page/chunk indices are contiguous, chunk hashes cover transmitted bytes,
+  a valid mutation encoding above 4 MiB round-trips under identity encoding through deterministic
+  bounded continuation records up to the 32 MiB command ceiling,
   artifact/state digests cover expanded records/rows, and resume rejects empty, duplicate, missing,
   reordered, oversized, wrong-encoding/length/digest pages or chunks without history-sized allocation;
 - proof that no signed proposal contains ordering metadata, and that a replica never

@@ -12,7 +12,7 @@ import (
 
 const (
 	MaxRecordTypeBytes    = 64
-	MaxRecordPayloadBytes = 4 << 20
+	MaxRecordPayloadBytes = 3 << 20
 )
 
 var (
@@ -27,6 +27,7 @@ type RecordType string
 const (
 	RecordGenesis    RecordType = "genesis"
 	RecordResult     RecordType = "result"
+	RecordMutation   RecordType = "result_mutation_chunk"
 	RecordEvent      RecordType = "event"
 	RecordProjection RecordType = "projection"
 	RecordCheckpoint RecordType = "checkpoint"
@@ -36,6 +37,7 @@ func (recordType RecordType) valid() bool {
 	switch recordType {
 	case RecordGenesis,
 		RecordResult,
+		RecordMutation,
 		RecordEvent,
 		RecordProjection,
 		RecordCheckpoint:
@@ -116,7 +118,10 @@ func (reader *RecordReader) Next() (Record, error) {
 		return Record{}, fmt.Errorf("%w: payload length", ErrTruncatedRecord)
 	}
 	payloadLength := binary.BigEndian.Uint64(payloadLengthBytes[:])
-	if payloadLength < 2 || payloadLength > MaxRecordPayloadBytes {
+	if payloadLength < 2 {
+		return Record{}, ErrInvalidRecord
+	}
+	if payloadLength > MaxRecordPayloadBytes {
 		return Record{}, ErrRecordTooLarge
 	}
 	payload := make([]byte, int(payloadLength))

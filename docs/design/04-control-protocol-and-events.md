@@ -581,12 +581,28 @@ establish a Raft command watermark without per-command apply bindings for the co
 
 Snapshot history is potentially session-sized and MUST NOT be allocated as one request or in-memory
 object. The expanded artifact is a fixed record stream: each record is
-`u16be(type_len) || ASCII(type) || u64be(payload_len) || JCS(payload)`, ordered by generation for
-genesis records, then `result_index`, `chain_index`, and finally §5.6 table/primary-key order plus the
-checkpoint record. Chunks end only between records. `artifact_digest` hashes that exact expanded
-stream; each descriptor's `sha256` hashes the exact transmitted compressed chunk bytes. The signed
-root names one encoding from `identity`, `gzip`, or `zstd`; encoding changes therefore produce a
-different manifest even when expanded state is equal.
+`u16be(type_len) || ASCII(type) || u64be(payload_len) || JCS(payload)`. Order is all genesis records
+by generation; then, for each `result_index`, one `result` followed by one or more
+`result_mutation_chunk` records; all accepted events by `chain_index`; §5.6 rows by
+table/primary-key; and the checkpoint. A result binds its exact mutation-encoding byte length,
+SHA-256, and chunk count. Continuations carry deterministic consecutive slices of at most 2 MiB,
+base64url-wrapped in JCS; every nonfinal slice is exactly 2 MiB. This represents the full 32 MiB
+legal mutation ceiling without exceeding the record or compressed-chunk bound, including
+incompressible identity encoding. Chunks end only between records. `artifact_digest` hashes the
+exact expanded stream; each descriptor's `sha256` hashes the exact transmitted compressed chunk
+bytes. The signed root names one encoding from `identity`, `gzip`, or `zstd`; encoding changes
+therefore produce a different manifest even when expanded state is equal.
+
+V1 record payloads are closed JCS objects:
+
+| Type | Exact payload members |
+|---|---|
+| `genesis` | `boundary_transform_digest` (base64url SHA-256), `genesis` (exact canonical signed object), `recovery_authorization` (exact object or null) |
+| `result` | `mutation_bytes`, `mutation_chunk_count`, `mutation_sha256` (base64url SHA-256), `result` (exact six-field §5.2.1 object) |
+| `result_mutation_chunk` | `chunk_index` (zero-based within the result), `data` (base64url raw mutation-encoding slice), `result_index` |
+| `event` | `chain_hash` (base64url SHA-256), `chain_index`, `proposal` (exact canonical signed proposal) |
+| `projection` | `primary_key` (canonical key array), `row` (canonical logical row), `table` |
+| `checkpoint` | `checkpoint_event_id`, `payload` (exact §5.2.1 checkpoint object plus authority signature) |
 
 Descriptor pages are JCS objects containing `artifact_id`, zero-based `page_index`,
 `previous_page_hash`, and a nonempty ordered descriptor slice
