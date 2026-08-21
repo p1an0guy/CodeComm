@@ -537,6 +537,116 @@ func TestProjectionStateGoldenVectorsAndOrderInvariance(t *testing.T) {
 	}
 }
 
+func TestStateDigesterMatchesBatchDigestAndRejectsOrderingErrors(t *testing.T) {
+	t.Parallel()
+
+	versions := chain.Versions{Digest: 1, ProjectionSchema: 1}
+	rows := goldenRows()
+	tables := chain.CoveredTables()
+	tableIndex := make(map[string]int, len(tables))
+	counts := make([]chain.TableRowCount, len(tables))
+	for index, table := range tables {
+		tableIndex[table] = index
+		counts[index].Table = table
+	}
+	for _, row := range rows {
+		counts[tableIndex[row.Table]].Count++
+	}
+	slices.SortFunc(rows, func(left, right chain.LogicalRow) int {
+		if compared := tableIndex[left.Table] - tableIndex[right.Table]; compared != 0 {
+			return compared
+		}
+		return bytes.Compare(left.PrimaryKey, right.PrimaryKey)
+	})
+
+	want, err := chain.StateDigest(versions, rows)
+	if err != nil {
+		t.Fatalf("StateDigest(): %v", err)
+	}
+	streamed, err := chain.NewStateDigester(versions, counts)
+	if err != nil {
+		t.Fatalf("NewStateDigester(): %v", err)
+	}
+	for _, row := range rows {
+		if err := streamed.Append(row); err != nil {
+			t.Fatalf("Append(%s %s): %v", row.Table, row.PrimaryKey, err)
+		}
+	}
+	got, err := streamed.Sum()
+	if err != nil {
+		t.Fatalf("Sum(): %v", err)
+	}
+	if got != want {
+		t.Fatalf("streamed digest = %x, want %x", got, want)
+	}
+	again, err := streamed.Sum()
+	if err != nil || again != got {
+		t.Fatalf("Sum(repeated) = (%x, %v), want (%x, nil)", again, err, got)
+	}
+	if err := streamed.Append(rows[0]); !errors.Is(
+		err,
+		chain.ErrLogicalRowOrder,
+	) {
+		t.Fatalf("Append(after Sum) = %v, want ErrLogicalRowOrder", err)
+	}
+
+	badCounts := slices.Clone(counts)
+	badCounts[0].Table = "tasks"
+	if _, err := chain.NewStateDigester(
+		versions,
+		badCounts,
+	); !errors.Is(err, chain.ErrLogicalRowOrder) {
+		t.Fatalf("NewStateDigester(wrong table) = %v, want ErrLogicalRowOrder", err)
+	}
+	if _, err := chain.NewStateDigester(
+		versions,
+		counts[:len(counts)-1],
+	); !errors.Is(err, chain.ErrLogicalRowOrder) {
+		t.Fatalf("NewStateDigester(short counts) = %v, want ErrLogicalRowOrder", err)
+	}
+
+	tooMany := slices.Clone(counts)
+	tooMany[tableIndex["tasks"]].Count++
+	incomplete, err := chain.NewStateDigester(versions, tooMany)
+	if err != nil {
+		t.Fatalf("NewStateDigester(incomplete): %v", err)
+	}
+	for _, row := range rows {
+		if err := incomplete.Append(row); err != nil {
+			t.Fatalf("Append(incomplete): %v", err)
+		}
+	}
+	if _, err := incomplete.Sum(); !errors.Is(
+		err,
+		chain.ErrLogicalRowOrder,
+	) {
+		t.Fatalf("Sum(incomplete) = %v, want ErrLogicalRowOrder", err)
+	}
+
+	reversedKeys := slices.Clone(rows)
+	for index := 1; index < len(reversedKeys); index++ {
+		if reversedKeys[index-1].Table == "tasks" &&
+			reversedKeys[index].Table == "tasks" {
+			reversedKeys[index-1], reversedKeys[index] =
+				reversedKeys[index], reversedKeys[index-1]
+			break
+		}
+	}
+	outOfOrder, err := chain.NewStateDigester(versions, counts)
+	if err != nil {
+		t.Fatalf("NewStateDigester(out of order): %v", err)
+	}
+	var orderErr error
+	for _, row := range reversedKeys {
+		if orderErr = outOfOrder.Append(row); orderErr != nil {
+			break
+		}
+	}
+	if !errors.Is(orderErr, chain.ErrLogicalRowOrder) {
+		t.Fatalf("Append(out of order) = %v, want ErrLogicalRowOrder", orderErr)
+	}
+}
+
 func TestProjectionStateValidation(t *testing.T) {
 	t.Parallel()
 

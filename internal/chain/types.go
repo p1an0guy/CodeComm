@@ -56,6 +56,13 @@ type LogicalRow struct {
 	Row        []byte
 }
 
+// TableRowCount declares one covered table's row cardinality in registry
+// order. It lets StateDigester frame table counts before rows are streamed.
+type TableRowCount struct {
+	Table string
+	Count uint64
+}
+
 var (
 	// ErrInvalidBoundary reports an inconsistent generation boundary.
 	ErrInvalidBoundary = errors.New("chain: invalid generation boundary")
@@ -87,6 +94,9 @@ var (
 	ErrInvalidLogicalRow = errors.New("chain: invalid logical row")
 	// ErrDuplicateLogicalRow reports two current rows with the same table/key.
 	ErrDuplicateLogicalRow = errors.New("chain: duplicate logical row")
+	// ErrLogicalRowOrder reports a streaming state-digest input that differs
+	// from covered-table and primary-key order.
+	ErrLogicalRowOrder = errors.New("chain: logical rows are not canonically ordered")
 )
 
 type primaryKeyKind uint8

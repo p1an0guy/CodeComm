@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 )
@@ -286,21 +287,182 @@ type preparedRow struct {
 	row        []byte
 }
 
+// StateDigester computes the existing projection-state digest from rows
+// streamed in covered-table and primary-key order. Counts are supplied first
+// because each table digest frames its cardinality before its row hashes.
+type StateDigester struct {
+	state              hash.Hash
+	table              hash.Hash
+	counts             []uint64
+	tableIndex         int
+	rowsInTable        uint64
+	previousPrimaryKey []byte
+	digest             Digest
+	finished           bool
+}
+
+// NewStateDigester validates the exact covered-table cardinality vector and
+// prepares an ordered streaming projection-state digest.
+func NewStateDigester(
+	versions Versions,
+	counts []TableRowCount,
+) (*StateDigester, error) {
+	if err := validateStateDigestVersions(versions); err != nil {
+		return nil, err
+	}
+	if len(counts) != len(coveredTableRegistry) {
+		return nil, fmt.Errorf(
+			"%w: got %d table counts, want %d",
+			ErrLogicalRowOrder,
+			len(counts),
+			len(coveredTableRegistry),
+		)
+	}
+	rowCounts := make([]uint64, len(counts))
+	for index, count := range counts {
+		if count.Table != coveredTableRegistry[index].name ||
+			count.Count > maxSafeInteger {
+			return nil, fmt.Errorf(
+				"%w: invalid table count %d for %q",
+				ErrLogicalRowOrder,
+				count.Count,
+				count.Table,
+			)
+		}
+		rowCounts[index] = count.Count
+	}
+
+	state := sha256.New()
+	writeBytes(state, []byte(projectionStateLabel))
+	writeBytes(state, []byte{0})
+	writeUint64(state, versions.Digest)
+	writeUint64(state, versions.ProjectionSchema)
+	digester := &StateDigester{
+		state:  state,
+		counts: rowCounts,
+	}
+	digester.startTable()
+	return digester, nil
+}
+
+// Append validates and hashes one logical row. Rows must be strictly ordered
+// by covered-table registry position and then canonical primary-key bytes.
+func (digester *StateDigester) Append(row LogicalRow) error {
+	if digester == nil || digester.finished ||
+		digester.tableIndex >= len(coveredTableRegistry) {
+		return ErrLogicalRowOrder
+	}
+	spec, tableIndex, exists := lookupTable(row.Table)
+	if !exists {
+		return fmt.Errorf("%w: table %q", ErrUnknownTable, row.Table)
+	}
+	for digester.tableIndex < tableIndex {
+		if err := digester.finishTable(); err != nil {
+			return err
+		}
+		digester.tableIndex++
+		digester.startTable()
+	}
+	if tableIndex != digester.tableIndex ||
+		digester.rowsInTable >= digester.counts[tableIndex] {
+		return fmt.Errorf(
+			"%w: unexpected row for table %q",
+			ErrLogicalRowOrder,
+			row.Table,
+		)
+	}
+	components, err := validatePrimaryKey(spec, row.PrimaryKey)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidLogicalRow, err)
+	}
+	if err := validateLogicalRow(
+		spec,
+		components,
+		row.Row,
+		ErrInvalidLogicalRow,
+	); err != nil {
+		return err
+	}
+	if digester.rowsInTable != 0 &&
+		bytes.Compare(digester.previousPrimaryKey, row.PrimaryKey) >= 0 {
+		return fmt.Errorf(
+			"%w: table %s",
+			ErrLogicalRowOrder,
+			row.Table,
+		)
+	}
+	digest := rowDigest(row.Table, preparedRow{
+		tableIndex: tableIndex,
+		primaryKey: row.PrimaryKey,
+		row:        row.Row,
+	})
+	writeBytes(digester.table, digest[:])
+	digester.rowsInTable++
+	digester.previousPrimaryKey = bytes.Clone(row.PrimaryKey)
+	return nil
+}
+
+// Sum finishes every table, requiring the declared row counts to match, and
+// returns the projection-state digest. Repeated calls return the same value.
+func (digester *StateDigester) Sum() (Digest, error) {
+	if digester == nil || digester.state == nil {
+		return Digest{}, ErrLogicalRowOrder
+	}
+	if digester.finished {
+		return digester.digest, nil
+	}
+	for digester.tableIndex < len(coveredTableRegistry) {
+		if err := digester.finishTable(); err != nil {
+			return Digest{}, err
+		}
+		digester.tableIndex++
+		if digester.tableIndex < len(coveredTableRegistry) {
+			digester.startTable()
+		}
+	}
+	copy(digester.digest[:], digester.state.Sum(nil))
+	digester.finished = true
+	digester.previousPrimaryKey = nil
+	return digester.digest, nil
+}
+
+func (digester *StateDigester) startTable() {
+	if digester == nil ||
+		digester.tableIndex >= len(coveredTableRegistry) {
+		return
+	}
+	table := coveredTableRegistry[digester.tableIndex].name
+	digester.table = sha256.New()
+	writeBytes(digester.table, []byte(projectionTableLabel))
+	writeBytes(digester.table, []byte{0})
+	writeUint64(digester.table, uint64(len(table)))
+	writeBytes(digester.table, []byte(table))
+	writeUint64(digester.table, digester.counts[digester.tableIndex])
+	digester.rowsInTable = 0
+	digester.previousPrimaryKey = nil
+}
+
+func (digester *StateDigester) finishTable() error {
+	if digester == nil ||
+		digester.tableIndex >= len(coveredTableRegistry) ||
+		digester.table == nil ||
+		digester.rowsInTable != digester.counts[digester.tableIndex] {
+		return fmt.Errorf(
+			"%w: table %d row count differs",
+			ErrLogicalRowOrder,
+			digester.tableIndex,
+		)
+	}
+	writeBytes(digester.state, digester.table.Sum(nil))
+	return nil
+}
+
 // StateDigest computes the full logical projection-state digest. All covered
 // tables contribute in registry order, including tables with no rows.
 func StateDigest(versions Versions, rows []LogicalRow) (Digest, error) {
-	if versions.Digest == 0 ||
-		versions.Digest > maxSafeInteger ||
-		versions.ProjectionSchema == 0 ||
-		versions.ProjectionSchema > maxSafeInteger {
-		return Digest{}, fmt.Errorf(
-			"%w: digest=%d projection_schema=%d",
-			ErrInvalidVersions,
-			versions.Digest,
-			versions.ProjectionSchema,
-		)
+	if err := validateStateDigestVersions(versions); err != nil {
+		return Digest{}, err
 	}
-
 	prepared := make([]preparedRow, 0, len(rows))
 	for index, row := range rows {
 		spec, tableIndex, exists := lookupTable(row.Table)
@@ -356,26 +518,42 @@ func StateDigest(versions Versions, rows []LogicalRow) (Digest, error) {
 		}
 	}
 
-	state := sha256.New()
-	writeBytes(state, []byte(projectionStateLabel))
-	writeBytes(state, []byte{0})
-	writeUint64(state, versions.Digest)
-	writeUint64(state, versions.ProjectionSchema)
-
-	rowIndex := 0
-	for tableIndex, spec := range coveredTableRegistry {
-		start := rowIndex
-		for rowIndex < len(prepared) &&
-			prepared[rowIndex].tableIndex == tableIndex {
-			rowIndex++
-		}
-		digest := tableDigest(spec.name, prepared[start:rowIndex])
-		writeBytes(state, digest[:])
+	counts := make([]TableRowCount, len(coveredTableRegistry))
+	for index := range coveredTableRegistry {
+		counts[index].Table = coveredTableRegistry[index].name
 	}
+	for _, row := range prepared {
+		counts[row.tableIndex].Count++
+	}
+	digester, err := NewStateDigester(versions, counts)
+	if err != nil {
+		return Digest{}, err
+	}
+	for _, row := range prepared {
+		if err := digester.Append(LogicalRow{
+			Table:      coveredTableRegistry[row.tableIndex].name,
+			PrimaryKey: row.primaryKey,
+			Row:        row.row,
+		}); err != nil {
+			return Digest{}, err
+		}
+	}
+	return digester.Sum()
+}
 
-	var digest Digest
-	copy(digest[:], state.Sum(nil))
-	return digest, nil
+func validateStateDigestVersions(versions Versions) error {
+	if versions.Digest == 0 ||
+		versions.Digest > maxSafeInteger ||
+		versions.ProjectionSchema == 0 ||
+		versions.ProjectionSchema > maxSafeInteger {
+		return fmt.Errorf(
+			"%w: digest=%d projection_schema=%d",
+			ErrInvalidVersions,
+			versions.Digest,
+			versions.ProjectionSchema,
+		)
+	}
+	return nil
 }
 
 func rowDigest(table string, row preparedRow) Digest {
@@ -388,22 +566,6 @@ func rowDigest(table string, row preparedRow) Digest {
 	writeBytes(digester, row.primaryKey)
 	writeUint64(digester, uint64(len(row.row)))
 	writeBytes(digester, row.row)
-	var digest Digest
-	copy(digest[:], digester.Sum(nil))
-	return digest
-}
-
-func tableDigest(table string, rows []preparedRow) Digest {
-	digester := sha256.New()
-	writeBytes(digester, []byte(projectionTableLabel))
-	writeBytes(digester, []byte{0})
-	writeUint64(digester, uint64(len(table)))
-	writeBytes(digester, []byte(table))
-	writeUint64(digester, uint64(len(rows)))
-	for _, row := range rows {
-		digest := rowDigest(table, row)
-		writeBytes(digester, digest[:])
-	}
 	var digest Digest
 	copy(digest[:], digester.Sum(nil))
 	return digest

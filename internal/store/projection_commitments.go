@@ -11,6 +11,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/domain"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
@@ -782,9 +783,62 @@ func projectionKeyPredicate(columns []projectionColumn) string {
 
 func projectionLogicalRows(conn *sqlite.Conn) ([]chain.LogicalRow, error) {
 	var rows []chain.LogicalRow
+	err := streamProjectionLogicalRows(
+		conn,
+		func(row chain.LogicalRow) error {
+			rows = append(rows, row)
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func projectionTableRowCounts(
+	conn *sqlite.Conn,
+) ([]chain.TableRowCount, error) {
+	counts := make([]chain.TableRowCount, len(projectionTables))
+	for index, table := range projectionTables {
+		counts[index].Table = table.name
+		if err := queryOne(
+			conn,
+			"SELECT count(*) FROM "+table.name+";",
+			func(stmt *sqlite.Stmt) {
+				value := stmt.ColumnInt64(0)
+				if value < 0 {
+					counts[index].Count = domain.MaxSafeInteger + 1
+					return
+				}
+				counts[index].Count = uint64(value)
+			},
+		); err != nil {
+			return nil, fmt.Errorf("count %s: %w", table.name, err)
+		}
+		if !domain.ValidUnsignedInteger(counts[index].Count) {
+			return nil, fmt.Errorf(
+				"%w: %s row count exceeds exact range",
+				ErrIntegrityCheck,
+				table.name,
+			)
+		}
+	}
+	return counts, nil
+}
+
+func streamProjectionLogicalRows(
+	conn *sqlite.Conn,
+	visit func(chain.LogicalRow) error,
+) error {
+	if conn == nil || visit == nil {
+		return ErrInvalidOptions
+	}
 	for _, table := range projectionTables {
-		statement := "SELECT " + projectionColumnList(table) +
-			" FROM " + table.name + ";"
+		primaryKeyExpression := projectionPrimaryKeyJSONExpression(table)
+		statement := "SELECT " + projectionColumnList(table) + ", " +
+			primaryKeyExpression + " FROM " + table.name +
+			" ORDER BY CAST(" + primaryKeyExpression + " AS BLOB);"
 		var rowErr error
 		err := query(conn, statement, func(stmt *sqlite.Stmt) {
 			if rowErr != nil {
@@ -792,29 +846,61 @@ func projectionLogicalRows(conn *sqlite.Conn) ([]chain.LogicalRow, error) {
 			}
 			var row chain.LogicalRow
 			row, rowErr = logicalProjectionRowFromStatement(table, stmt)
-			if rowErr == nil {
-				rows = append(rows, row)
+			if rowErr != nil {
+				return
 			}
+			orderedKey := []byte(stmt.ColumnText(len(table.columns)))
+			if !bytes.Equal(orderedKey, row.PrimaryKey) {
+				rowErr = fmt.Errorf(
+					"SQLite primary-key encoding %q differs from logical key %q",
+					orderedKey,
+					row.PrimaryKey,
+				)
+				return
+			}
+			rowErr = visit(row)
 		})
 		if err != nil {
-			return nil, fmt.Errorf("scan %s: %w", table.name, err)
+			return fmt.Errorf("scan %s: %w", table.name, err)
 		}
 		if rowErr != nil {
-			return nil, fmt.Errorf("encode %s: %w", table.name, rowErr)
+			return fmt.Errorf("encode %s: %w", table.name, rowErr)
 		}
 	}
-	return rows, nil
+	return nil
+}
+
+func projectionPrimaryKeyJSONExpression(table projectionTable) string {
+	primary := projectionPrimaryColumns(table)
+	names := make([]string, len(primary))
+	for index, column := range primary {
+		names[index] = column.storageName
+	}
+	return "json_array(" + strings.Join(names, ", ") + ")"
 }
 
 func projectionStateDigest(
 	conn *sqlite.Conn,
 	versions chain.Versions,
 ) (Digest, error) {
-	rows, err := projectionLogicalRows(conn)
+	counts, err := projectionTableRowCounts(conn)
 	if err != nil {
 		return Digest{}, err
 	}
-	digest, err := chain.StateDigest(versions, rows)
+	digester, err := chain.NewStateDigester(versions, counts)
+	if err != nil {
+		return Digest{}, fmt.Errorf("store: prepare projection state digest: %w", err)
+	}
+	err = streamProjectionLogicalRows(
+		conn,
+		func(row chain.LogicalRow) error {
+			return digester.Append(row)
+		},
+	)
+	if err != nil {
+		return Digest{}, fmt.Errorf("store: stream projection state digest: %w", err)
+	}
+	digest, err := digester.Sum()
 	if err != nil {
 		return Digest{}, fmt.Errorf("store: projection state digest: %w", err)
 	}
