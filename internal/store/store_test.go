@@ -59,6 +59,7 @@ var requiredTables = []string{
 	"raft_snapshot_installs",
 	"replication_attestations",
 	"replication_cursors",
+	"replication_watermark_observations",
 	"schema_migrations",
 	"session_policy",
 	"settled_nonvoter_state",
@@ -141,6 +142,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"pairing_authority_fencing",
 			"committed_raft_configuration",
 			"settled_nonvoter_replication",
+			"replication_watermark_observations",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
@@ -242,7 +244,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
 	broken := migrationFromText(
-		7,
+		8,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
@@ -260,7 +262,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 7;", 0)
+		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 8;", 0)
 		return nil
 	})
 	if err != nil {

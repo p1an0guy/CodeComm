@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -59,6 +60,193 @@ func TestReplicationRoundTripUsesExpandedBatchBound(t *testing.T) {
 			"Replication service calls = %d, cursors = %v",
 			harness.service.batchCalls,
 			harness.service.batchAfter,
+		)
+	}
+}
+
+func TestReplicationAcknowledgementRoundTripIsSignedAndBound(t *testing.T) {
+	fixture := newContentTLSFixture(t)
+	harness := startRealContentClientWithFixture(t, fixture)
+	acknowledgement := contentReplicationAcknowledgement(
+		t,
+		fixture.serverIdentity,
+		testSessionID,
+		testWorkspaceID,
+		0,
+		0,
+	)
+	harness.service.mu.Lock()
+	harness.service.acknowledgement = acknowledgement
+	harness.service.mu.Unlock()
+
+	if _, err := harness.client.Session(context.Background()); err != nil {
+		t.Fatalf("Session() error = %v", err)
+	}
+	got, err := harness.client.ReplicationAcknowledgement(
+		context.Background(),
+		0,
+	)
+	if err != nil {
+		t.Fatalf("ReplicationAcknowledgement() error = %v", err)
+	}
+	if !bytes.Equal(
+		got.CanonicalBytes(),
+		acknowledgement.CanonicalBytes(),
+	) {
+		t.Fatal("acknowledgement bytes changed in transit")
+	}
+	if err := replication.VerifyAcknowledgement(
+		got,
+		fixture.serverIdentity.Public().(ed25519.PublicKey),
+	); err != nil {
+		t.Fatalf("VerifyAcknowledgement(): %v", err)
+	}
+	harness.service.mu.Lock()
+	defer harness.service.mu.Unlock()
+	if harness.service.acknowledgementCalls != 1 ||
+		!slices.Equal(harness.service.acknowledgementAt, []uint64{0}) {
+		t.Fatalf(
+			"acknowledgement calls/cursors = %d/%v",
+			harness.service.acknowledgementCalls,
+			harness.service.acknowledgementAt,
+		)
+	}
+}
+
+func TestReplicationAcknowledgementRequiresSessionAndExactCursor(
+	t *testing.T,
+) {
+	fixture := newContentTLSFixture(t)
+	harness := startRealContentClientWithFixture(t, fixture)
+	harness.service.mu.Lock()
+	harness.service.acknowledgement = contentReplicationAcknowledgement(
+		t,
+		fixture.serverIdentity,
+		testSessionID,
+		testWorkspaceID,
+		0,
+		1,
+	)
+	harness.service.mu.Unlock()
+
+	if _, err := harness.client.ReplicationAcknowledgement(
+		context.Background(),
+		1,
+	); !errors.Is(err, ErrLineageMismatch) {
+		t.Fatalf("acknowledgement before Session error = %v", err)
+	}
+	if _, err := harness.client.Session(context.Background()); err != nil {
+		t.Fatalf("Session() error = %v", err)
+	}
+	if _, err := harness.client.ReplicationAcknowledgement(
+		context.Background(),
+		0,
+	); err == nil {
+		t.Fatalf("mismatched acknowledgement cursor error = %v", err)
+	}
+}
+
+func TestClientReplicationTargetsHaveDistinctResponseBounds(t *testing.T) {
+	batchTarget := ReplicationPath + "?after_result=0"
+	acknowledgementTarget := ReplicationAcknowledgementPath +
+		"?at_result=0"
+	if !validClientReplicationBatchTarget(batchTarget) ||
+		validClientReplicationBatchTarget(acknowledgementTarget) ||
+		!validClientReplicationAcknowledgementTarget(
+			acknowledgementTarget,
+		) ||
+		validClientReplicationAcknowledgementTarget(batchTarget) {
+		t.Fatal("replication target classifiers overlap or reject valid paths")
+	}
+	for _, test := range []struct {
+		name  string
+		path  string
+		limit int64
+		want  error
+	}{
+		{
+			name:  "batch with acknowledgement limit",
+			path:  batchTarget,
+			limit: int64(replication.MaxAcknowledgementBytes),
+			want:  ErrInvalidClient,
+		},
+		{
+			name:  "acknowledgement with batch limit",
+			path:  acknowledgementTarget,
+			limit: int64(replication.MaxBatchExpandedBytes),
+			want:  ErrInvalidClient,
+		},
+		{
+			name:  "batch with batch limit",
+			path:  batchTarget,
+			limit: int64(replication.MaxBatchExpandedBytes),
+			want:  ErrClientClosed,
+		},
+		{
+			name:  "acknowledgement with acknowledgement limit",
+			path:  acknowledgementTarget,
+			limit: int64(replication.MaxAcknowledgementBytes),
+			want:  ErrClientClosed,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{}
+			if _, err := client.requestBounded(
+				context.Background(),
+				http.MethodGet,
+				test.path,
+				nil,
+				nil,
+				test.limit,
+			); !errors.Is(err, test.want) {
+				t.Fatalf(
+					"requestBounded() error = %v, want %v",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func TestServerReplicationAcknowledgementRejectsNoncanonicalCursor(
+	t *testing.T,
+) {
+	harness := startContentHarness(t, ActiveHandlersMax)
+	for _, target := range []string{
+		ReplicationAcknowledgementPath,
+		ReplicationAcknowledgementPath + "?",
+		ReplicationAcknowledgementPath + "?at_result=",
+		ReplicationAcknowledgementPath + "?at_result=00",
+		ReplicationAcknowledgementPath + "?at_result=01",
+		ReplicationAcknowledgementPath + "?at_result=+1",
+		ReplicationAcknowledgementPath + "?at_result=1&extra=2",
+		ReplicationAcknowledgementPath + "?at_result=9007199254740992",
+	} {
+		response := harness.request(t, http.MethodGet, target, nil)
+		body := assertContentResponse(
+			t,
+			response,
+			http.StatusBadRequest,
+			contentProblemMediaType,
+		)
+		var problem problemResponse
+		if err := json.Unmarshal(body, &problem); err != nil ||
+			problem.Code != "invalid_replication_cursor" {
+			t.Fatalf(
+				"cursor %q problem = %+v, error = %v",
+				target,
+				problem,
+				err,
+			)
+		}
+	}
+	harness.service.mu.Lock()
+	defer harness.service.mu.Unlock()
+	if harness.service.acknowledgementCalls != 0 {
+		t.Fatalf(
+			"invalid cursors reached service %d times",
+			harness.service.acknowledgementCalls,
 		)
 	}
 }
@@ -839,4 +1027,48 @@ func contentReplicationBatch(
 		t.Fatalf("replication.SignBatch() error = %v", err)
 	}
 	return batch
+}
+
+func contentReplicationAcknowledgement(
+	t testing.TB,
+	privateKey ed25519.PrivateKey,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+	resultIndex uint64,
+) replication.Acknowledgement {
+	t.Helper()
+	deviceID, err := device.DeriveID(
+		privateKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsigned, err := replication.NewUnsignedAcknowledgement(
+		replication.AcknowledgementInput{
+			SessionID:                sessionID,
+			WorkspaceID:              workspaceID,
+			RecoveryGeneration:       generation,
+			ServerDeviceID:           deviceID,
+			ServerAuthorityVersion:   1,
+			ResultIndex:              resultIndex,
+			ResultHash:               chain.Digest{0x11},
+			ChainIndex:               resultIndex,
+			ChainHash:                chain.Digest{0x22},
+			ProjectionAccumulator:    chain.Digest{0x33},
+			ProjectionStateDigest:    chain.Digest{0x44},
+			ServerAppliedResultIndex: resultIndex,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledgement, err := replication.SignAcknowledgement(
+		unsigned,
+		privateKey,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return acknowledgement
 }

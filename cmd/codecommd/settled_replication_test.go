@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/replication"
@@ -19,6 +20,9 @@ type daemonSettledReplicaStub struct {
 	fatal     error
 	importErr error
 	imports   int
+	ackErr    error
+	acks      int
+	forgotten []domain.DeviceID
 }
 
 func (stub *daemonSettledReplicaStub) ReplicationHeads(
@@ -57,12 +61,61 @@ func (stub *daemonSettledReplicaStub) FatalError() error {
 	return stub.fatal
 }
 
+func (stub *daemonSettledReplicaStub) ObserveReplicationAcknowledgement(
+	_ context.Context,
+	_ domain.DeviceID,
+	acknowledgement replication.Acknowledgement,
+) error {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.acks++
+	if stub.ackErr != nil {
+		return stub.ackErr
+	}
+	metadata := acknowledgement.Unsigned().Metadata()
+	stub.heads.ResultIndex = metadata.ResultIndex
+	stub.heads.ResultHash = store.Digest(metadata.ResultHash)
+	return nil
+}
+
+func (stub *daemonSettledReplicaStub) ForgetReplicationPeer(
+	peerID domain.DeviceID,
+) {
+	stub.mu.Lock()
+	stub.forgotten = append(stub.forgotten, peerID)
+	stub.mu.Unlock()
+}
+
 type daemonReplicationClientStub struct {
-	mu      sync.Mutex
-	batches []replication.Batch
-	errs    []error
-	after   []uint64
-	wait    bool
+	mu               sync.Mutex
+	batches          []replication.Batch
+	acknowledgements []replication.Acknowledgement
+	errs             []error
+	ackErrs          []error
+	after            []uint64
+	ackAt            []uint64
+	wait             bool
+}
+
+func (stub *daemonReplicationClientStub) ReplicationAcknowledgement(
+	_ context.Context,
+	atResult uint64,
+) (replication.Acknowledgement, error) {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.ackAt = append(stub.ackAt, atResult)
+	if len(stub.ackErrs) != 0 {
+		err := stub.ackErrs[0]
+		stub.ackErrs = stub.ackErrs[1:]
+		return replication.Acknowledgement{}, err
+	}
+	if len(stub.acknowledgements) == 0 {
+		return replication.Acknowledgement{},
+			contenthttp.ErrReplicationUnavailable
+	}
+	acknowledgement := stub.acknowledgements[0]
+	stub.acknowledgements = stub.acknowledgements[1:]
+	return acknowledgement, nil
 }
 
 func (stub *daemonReplicationClientStub) Replication(
@@ -165,7 +218,7 @@ func TestDaemonSettledReplicationDoesNotExcuseInvalidConcurrentPage(
 	}
 }
 
-func TestDaemonSettledReplicationKeepsLinkAtUnavailableCursor(
+func TestDaemonSettledReplicationKeepsCurrencyUnknownWithoutAcknowledgement(
 	t *testing.T,
 ) {
 	replica := &daemonSettledReplicaStub{}
@@ -186,11 +239,93 @@ func TestDaemonSettledReplicationKeepsLinkAtUnavailableCursor(
 	}
 	if replica.imports != 0 ||
 		len(client.after) != 1 ||
-		client.after[0] != 0 {
+		client.after[0] != 0 ||
+		len(client.ackAt) != 1 ||
+		client.ackAt[0] != 0 ||
+		replica.acks != 0 {
 		t.Fatalf(
-			"unavailable cursor = imports %d, requests %v",
+			"unavailable cursor = imports %d, requests %v, acknowledgements %v/%d",
 			replica.imports,
 			client.after,
+			client.ackAt,
+			replica.acks,
+		)
+	}
+}
+
+func TestDaemonSettledReplicationRecordsEqualCursorAcknowledgement(
+	t *testing.T,
+) {
+	replica := &daemonSettledReplicaStub{}
+	runtime, err := newDaemonSettledReplication(
+		context.Background(),
+		replica,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := daemonContentTestDeviceID(t, 0xd6)
+	client := &daemonReplicationClientStub{
+		acknowledgements: []replication.Acknowledgement{
+			daemonSettledReplicationTestAcknowledgement(t),
+		},
+	}
+	if err := runtime.Sync(
+		context.Background(),
+		relay,
+		client,
+	); err != nil {
+		t.Fatalf("Sync(equal cursor): %v", err)
+	}
+	if replica.imports != 0 ||
+		replica.acks != 1 ||
+		len(replica.forgotten) != 1 ||
+		replica.forgotten[0] != relay ||
+		len(client.after) != 1 ||
+		client.after[0] != 0 ||
+		len(client.ackAt) != 1 ||
+		client.ackAt[0] != 0 {
+		t.Fatalf(
+			"equal-cursor sync = imports %d, acks %d, forgotten %v, requests %v/%v",
+			replica.imports,
+			replica.acks,
+			replica.forgotten,
+			client.after,
+			client.ackAt,
+		)
+	}
+}
+
+func TestDaemonSettledReplicationRejectsInvalidAcknowledgement(
+	t *testing.T,
+) {
+	replica := &daemonSettledReplicaStub{
+		ackErr: consensus.ErrInvalidReplicationReplay,
+	}
+	runtime, err := newDaemonSettledReplication(
+		context.Background(),
+		replica,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &daemonReplicationClientStub{
+		acknowledgements: []replication.Acknowledgement{
+			daemonSettledReplicationTestAcknowledgement(t),
+		},
+	}
+	err = runtime.Sync(
+		context.Background(),
+		daemonContentTestDeviceID(t, 0xd7),
+		client,
+	)
+	if !errors.Is(err, errDaemonSettledReplication) ||
+		!errors.Is(err, consensus.ErrInvalidReplicationReplay) ||
+		replica.acks != 1 {
+		t.Fatalf(
+			"Sync(invalid acknowledgement) = %v, acknowledgements %d",
+			err,
+			replica.acks,
 		)
 	}
 }
@@ -280,4 +415,39 @@ func daemonSettledReplicationTestBatch(
 		t.Fatal(err)
 	}
 	return batch
+}
+
+func daemonSettledReplicationTestAcknowledgement(
+	t *testing.T,
+) replication.Acknowledgement {
+	t.Helper()
+	snapshot := daemonContentTestSnapshot(t)
+	_, privateKey, deviceID := daemonTestInitialState(t)
+	defer clear(privateKey)
+	if deviceID != snapshot.Member.ID {
+		t.Fatal("acknowledgement fixture identity mismatch")
+	}
+	unsigned, err := replication.NewUnsignedAcknowledgement(
+		replication.AcknowledgementInput{
+			SessionID:                snapshot.SessionID,
+			WorkspaceID:              snapshot.WorkspaceID,
+			RecoveryGeneration:       snapshot.RecoveryGeneration,
+			ServerDeviceID:           deviceID,
+			ServerAuthorityVersion:   snapshot.CredentialAuthority.VoterSetVersion,
+			ResultIndex:              0,
+			ChainIndex:               0,
+			ServerAppliedResultIndex: 0,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledgement, err := replication.SignAcknowledgement(
+		unsigned,
+		privateKey,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return acknowledgement
 }

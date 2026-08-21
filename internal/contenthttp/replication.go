@@ -100,19 +100,30 @@ func (handler *connectionHandler) serveReplication(
 }
 
 func replicationCursor(request *http.Request) (uint64, bool) {
+	return exactReplicationCursor(
+		request,
+		ReplicationPath,
+		"after_result=",
+	)
+}
+
+func exactReplicationCursor(
+	request *http.Request,
+	path string,
+	queryPrefix string,
+) (uint64, bool) {
 	if request == nil ||
 		request.URL == nil ||
-		request.URL.Path != ReplicationPath ||
+		request.URL.Path != path ||
 		!validRequestPath(request) ||
 		request.URL.ForceQuery {
 		return 0, false
 	}
-	const prefix = "after_result="
 	raw := request.URL.RawQuery
-	if !strings.HasPrefix(raw, prefix) {
+	if !strings.HasPrefix(raw, queryPrefix) {
 		return 0, false
 	}
-	encoded := strings.TrimPrefix(raw, prefix)
+	encoded := strings.TrimPrefix(raw, queryPrefix)
 	if encoded == "" || len(encoded) > 1 && encoded[0] == '0' {
 		return 0, false
 	}
@@ -124,7 +135,7 @@ func replicationCursor(request *http.Request) (uint64, bool) {
 	value, err := strconv.ParseUint(encoded, 10, 64)
 	return value, err == nil &&
 		domain.ValidUnsignedInteger(value) &&
-		raw == prefix+strconv.FormatUint(value, 10)
+		raw == queryPrefix+strconv.FormatUint(value, 10)
 }
 
 func writeReplicationProblem(writer http.ResponseWriter, err error) {
@@ -274,22 +285,7 @@ func (client *Client) replicationLineage() (
 	}, nil
 }
 
-func validClientReplicationTarget(target string) bool {
+func validClientReplicationBatchTarget(target string) bool {
 	const prefix = ReplicationPath + "?after_result="
-	if !strings.HasPrefix(target, prefix) {
-		return false
-	}
-	value := strings.TrimPrefix(target, prefix)
-	if value == "" || len(value) > 1 && value[0] == '0' {
-		return false
-	}
-	for _, character := range value {
-		if character < '0' || character > '9' {
-			return false
-		}
-	}
-	parsed, err := strconv.ParseUint(value, 10, 64)
-	return err == nil &&
-		domain.ValidUnsignedInteger(parsed) &&
-		target == prefix+strconv.FormatUint(parsed, 10)
+	return validCanonicalUnsignedTarget(target, prefix)
 }

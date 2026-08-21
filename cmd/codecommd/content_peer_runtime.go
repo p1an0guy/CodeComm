@@ -69,6 +69,15 @@ type daemonContentPeerRoutes interface {
 	transport.ConsensusEndpointDialer
 }
 
+type daemonContentPeerReplication interface {
+	Sync(
+		context.Context,
+		domain.DeviceID,
+		daemonReplicationClient,
+	) error
+	ForgetPeer(domain.DeviceID)
+}
+
 type daemonContentPeerRuntime struct {
 	sessionID     domain.UUIDv7
 	workspaceID   domain.UUIDv4
@@ -82,7 +91,7 @@ type daemonContentPeerRuntime struct {
 	now           func() time.Time
 	credentialNow func() time.Time
 	jitter        func(time.Duration) time.Duration
-	replication   *daemonSettledReplication
+	replication   daemonContentPeerReplication
 	status        consensus.ConsensusStatusRequester
 
 	ctx    context.Context
@@ -194,7 +203,7 @@ func newDaemonContentPeerRuntimeWithReplication(
 	certificate transport.ContentCertificateProvider,
 	routes daemonContentPeerRoutes,
 	now func() time.Time,
-	replicationRuntime *daemonSettledReplication,
+	replicationRuntime daemonContentPeerReplication,
 	contentVerifiers *peerauth.Verifiers,
 	statusRequester consensus.ConsensusStatusRequester,
 ) (*daemonContentPeerRuntime, error) {
@@ -361,6 +370,9 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 	defer close(worker.done)
 	var connection *daemonContentPeerConnection
 	defer func() {
+		if runtime.replication != nil {
+			runtime.replication.ForgetPeer(worker.deviceID)
+		}
 		if connection != nil {
 			worker.clearConnection(connection)
 			_ = connection.Close()
@@ -405,6 +417,9 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			}
 		}
 		if err := runtime.syncPeer(ctx, worker.deviceID, connection); err != nil {
+			if runtime.replication != nil {
+				runtime.replication.ForgetPeer(worker.deviceID)
+			}
 			worker.clearConnection(connection)
 			_ = connection.Close()
 			connection = nil
@@ -1143,6 +1158,23 @@ func (connection *daemonContentPeerConnection) Replication(
 		return replication.Batch{}, contenthttp.ErrClientClosed
 	}
 	return connection.client.Replication(ctx, afterResult)
+}
+
+func (connection *daemonContentPeerConnection) ReplicationAcknowledgement(
+	ctx context.Context,
+	atResult uint64,
+) (replication.Acknowledgement, error) {
+	if connection == nil || ctx == nil {
+		return replication.Acknowledgement{},
+			errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	defer connection.mu.RUnlock()
+	if connection.client == nil {
+		return replication.Acknowledgement{},
+			contenthttp.ErrClientClosed
+	}
+	return connection.client.ReplicationAcknowledgement(ctx, atResult)
 }
 
 func (worker *daemonContentPeerWorker) setConnection(

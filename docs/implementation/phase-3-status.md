@@ -76,14 +76,19 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   pre-transition Raft ledger. Each fetch revalidates local evidence before comparing the remote
   lineage; coherent local rewrites latch fatal state, revoke already-issued local-state
   capabilities, and stop admission/writes. Transient store failures remain retryable and scratch
-  replay observes cancellation between bounded records.
+  replay observes cancellation between bounded records. Identity-signed equal-cursor
+  acknowledgements bind the complete verified cut, persist separately from contiguous batch
+  attestations, and are reverified on reopen. Durable observations can prove `behind`, but only
+  exact-cut observations received directly from their authenticated signer establish `current`;
+  relayed signatures are historical evidence only, and disconnect or restart returns currency to
+  `unknown`.
 - Daemon startup now selects Raft or settled mode from verified durable evidence. A settled daemon
   opens no Raft state, renews credentials over identity mTLS, keeps content links alive at equal
   cursors, forwards local and initial-hop proposals to current authority peers, imports bounded
   signed tails through one serialized gate, and exposes read-only operator status. Status labels
   live topology and reconciliation unknown rather than presenting the frozen pre-transition Raft
-  configuration as current; replica currency remains unknown unless retained signed observations
-  prove it.
+  configuration as current; replica currency remains unknown without direct live exact-cut
+  observations from the complete current authority.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -108,8 +113,7 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   status remain missing.
 - Result export, serving, scratch replay/import, terminal authority authorization, durable batch
   evidence, mode-aware startup, and peer fetch/catch-up orchestration are implemented.
-  Multi-activation integration coverage, snapshot fallback, SSE, signed equal-cursor
-  acknowledgements, complete authority-watermark comparison, and divergence recovery remain open.
+  Multi-activation integration coverage, snapshot fallback, SSE, and divergence recovery remain open.
   Promotion also remains blocked on the designed logical snapshot plus metadata-bound Raft
   `InstallSnapshot` path; removal needs the reciprocal verified freeze before restarting in settled
   mode. Neither transition may relabel imported results as local Raft provenance.

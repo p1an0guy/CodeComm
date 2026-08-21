@@ -113,6 +113,24 @@ type daemonContentPeerResolvedRoutesStub struct {
 	dialed bool
 }
 
+type daemonContentPeerReplicationStub struct {
+	forgotten chan domain.DeviceID
+}
+
+func (*daemonContentPeerReplicationStub) Sync(
+	context.Context,
+	domain.DeviceID,
+	daemonReplicationClient,
+) error {
+	return nil
+}
+
+func (stub *daemonContentPeerReplicationStub) ForgetPeer(
+	peerID domain.DeviceID,
+) {
+	stub.forgotten <- peerID
+}
+
 type daemonConsensusStatusRequesterStub struct {
 	mu       sync.Mutex
 	response transport.ConsensusControlResponse
@@ -145,6 +163,37 @@ func (routes *daemonContentPeerResolvedRoutesStub) DialConsensusEndpoint(
 ) (net.Conn, error) {
 	routes.dialed = true
 	return nil, transport.ErrConsensusEndpointUnavailable
+}
+
+func TestDaemonContentPeerWorkerForgetsReplicationPeerOnExit(t *testing.T) {
+	replicationRuntime := &daemonContentPeerReplicationStub{
+		forgotten: make(chan domain.DeviceID, 1),
+	}
+	runtime := &daemonContentPeerRuntime{
+		replication: replicationRuntime,
+	}
+	peerID := daemonContentTestDeviceID(t, 0xe0)
+	worker := &daemonContentPeerWorker{
+		deviceID: peerID,
+		done:     make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runtime.runWorker(ctx, worker)
+
+	select {
+	case got := <-replicationRuntime.forgotten:
+		if got != peerID {
+			t.Fatalf("forgotten peer = %s, want %s", got, peerID)
+		}
+	default:
+		t.Fatal("worker exit retained replication freshness")
+	}
+	select {
+	case <-worker.done:
+	default:
+		t.Fatal("worker exit did not close done")
+	}
 }
 
 func TestDaemonContentPeerRuntimeTracksAppliedActiveMembership(t *testing.T) {

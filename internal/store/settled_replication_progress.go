@@ -144,6 +144,34 @@ func (store *Store) SettledReplicationProgress(
 			}
 			cursor = attestation.toResultIndex
 		}
+		watermarks, err := readStoredWatermarkObservations(conn)
+		if err != nil {
+			return err
+		}
+		for _, watermark := range watermarks {
+			key := observationKey{
+				signer:    watermark.signerDeviceID,
+				authority: watermark.authorityVersion,
+			}
+			candidate := SettledReplicationObservation{
+				SignerDeviceID:      watermark.signerDeviceID,
+				AuthorityVersion:    watermark.authorityVersion,
+				VerifiedResultIndex: watermark.resultIndex,
+				ServerAppliedResultIndex: watermark.
+					serverAppliedResultIndex,
+				VerifiedAt: watermark.verifiedAt,
+			}
+			current, exists := observations[key]
+			if !exists ||
+				candidate.ServerAppliedResultIndex >
+					current.ServerAppliedResultIndex ||
+				candidate.ServerAppliedResultIndex ==
+					current.ServerAppliedResultIndex &&
+					candidate.VerifiedResultIndex >
+						current.VerifiedResultIndex {
+				observations[key] = candidate
+			}
+		}
 
 		progress.Heads = headsFromConsensus(state)
 		progress.Observations = make(

@@ -38,6 +38,7 @@ and rejection of missing/wrong pseudo-headers.
 | `POST /v1/events` | Propose idempotent event |
 | `GET /v1/events?after=N` | Paginated accepted-event history/export; `N` is a `chain_index` |
 | `GET /v1/replication?after_result=M` | Authoritative catch-up; `M` is a `result_index` and the response is the §5.3 result batch |
+| `GET /v1/replication/acknowledgement?at_result=M` | Authority-signed proof that the server's current verified result head is exactly `M` |
 | `GET /v1/events/stream` | SSE result/event high-watermark notification |
 | `GET /v1/snapshots/latest`, `/v1/snapshots/{id}/manifest-pages/{n}`, and `/v1/snapshots/{id}/chunks/{n}` | Signed logical-snapshot root, bounded descriptor pages, and resumable chunks |
 | `POST /v1/agent-sessions/presence` | Ephemeral device-bound presence plus a compact local control-manifest summary |
@@ -527,6 +528,18 @@ reconstructed by `result_index` from immutable `command_results` when the signed
 reverified. Missing, changed, overlapping-inconsistent, or noncontiguous coverage is an integrity
 failure. Batch import never advances `last_raft_applied_log_index` and creates no
 `event_provenance`.
+
+A server returns a replication acknowledgement only when `at_result` exactly equals its current
+verified head and it is active in the authority at that cut. The canonical signed object binds its
+kind, lineage, signer and authority version, complete result/event/projection heads, full
+projection-state digest, and server result watermark; peers may relay the bytes unchanged. A
+receiver verifies the signer at the exact cut and requires every head to equal its local verified
+state before retaining the observation. Retention is historical evidence, not reachability: only a
+response received directly from an authenticated peer whose identity equals the signer is live
+freshness evidence. Relayed responses, process restart, or connection loss cannot establish
+`current`, while a retained higher watermark still proves the receiver is `behind`. `current`
+requires direct live observations at the exact local cut from every member of the current
+authority; otherwise currency is `unknown` unless signed evidence proves `behind`.
 
 A short batch is allowed but not proof of completeness. `server_applied_result_index` is signed;
 receivers compare it with peer acknowledgement watermarks and other authority members, continue

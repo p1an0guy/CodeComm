@@ -133,10 +133,17 @@ func verifySettledNonvoterEvidence(
 				nil,
 			)
 		}
-		return verifyImportedRowsLackRaftProvenance(
+		if err := verifyImportedRowsLackRaftProvenance(
 			conn,
 			state,
 			baseline.ResultIndex,
+		); err != nil {
+			return err
+		}
+		return verifyReplicationWatermarkObservations(
+			conn,
+			state,
+			settled,
 		)
 	}
 	authority, err := newReplicationEvidenceAuthority(
@@ -354,7 +361,7 @@ func verifySettledNonvoterEvidence(
 	); err != nil {
 		return err
 	}
-	return nil
+	return verifyReplicationWatermarkObservations(conn, state, settled)
 }
 
 func projectionAccumulatorAtResultCut(

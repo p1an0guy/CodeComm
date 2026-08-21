@@ -102,13 +102,9 @@ func TestSettledReplicaImportsRelayedBatchWithoutRaftProvenance(
 		t.Fatalf("Status(): %v", err)
 	}
 	if status.Runtime.ReplicaCurrency !=
-		coordstatus.ReplicaCurrencyCurrent ||
-		!slices.Equal(
-			status.Runtime.ObservedAuthorityIDs,
-			[]domain.DeviceID{fixture.signerDeviceID},
-		) ||
-		status.Runtime.ObservedResultIndex !=
-			sourceView.Heads.ResultIndex {
+		coordstatus.ReplicaCurrencyUnknown ||
+		len(status.Runtime.ObservedAuthorityIDs) != 0 ||
+		status.Runtime.ObservedResultIndex != 0 {
 		t.Fatalf("settled replica currency = %+v", status.Runtime)
 	}
 
@@ -135,6 +131,350 @@ func TestSettledReplicaImportsRelayedBatchWithoutRaftProvenance(
 	if reopenedView.Heads != targetView.Heads ||
 		reopenedView.ProjectionStateDigest != targetView.ProjectionStateDigest {
 		t.Fatalf("reopened view = %+v, want %+v", reopenedView, targetView)
+	}
+	reopenedStatus, err := reopened.Status(testContext(t))
+	if err != nil {
+		t.Fatalf("Status(reopened): %v", err)
+	}
+	if reopenedStatus.Runtime.ReplicaCurrency !=
+		coordstatus.ReplicaCurrencyUnknown ||
+		len(reopenedStatus.Runtime.ObservedAuthorityIDs) != 0 ||
+		reopenedStatus.Runtime.ObservedResultIndex != 0 {
+		t.Fatalf(
+			"reopened replica retained live currency = %+v",
+			reopenedStatus.Runtime,
+		)
+	}
+}
+
+func TestSettledReplicaAcknowledgementRequiresLiveRelayObservation(
+	t *testing.T,
+) {
+	fixture := newSettledReplicaImportFixture(t)
+	if _, err := fixture.replica.ImportResultBatch(
+		testContext(t),
+		fixture.relayDeviceID,
+		fixture.batch,
+	); err != nil {
+		t.Fatalf("ImportResultBatch(): %v", err)
+	}
+	fixture.replica.ForgetReplicationPeer(fixture.relayDeviceID)
+	assertSettledReplicaCurrency(
+		t,
+		fixture.replica,
+		coordstatus.ReplicaCurrencyUnknown,
+		nil,
+		0,
+	)
+
+	acknowledgement := settledReplicaTestAcknowledgement(t, fixture)
+	if err := fixture.replica.ObserveReplicationAcknowledgement(
+		testContext(t),
+		fixture.relayDeviceID,
+		acknowledgement,
+	); err != nil {
+		t.Fatalf("ObserveReplicationAcknowledgement(relayed): %v", err)
+	}
+	assertSettledReplicaCurrency(
+		t,
+		fixture.replica,
+		coordstatus.ReplicaCurrencyUnknown,
+		nil,
+		0,
+	)
+	if err := fixture.replica.ObserveReplicationAcknowledgement(
+		testContext(t),
+		fixture.signerDeviceID,
+		acknowledgement,
+	); err != nil {
+		t.Fatalf("ObserveReplicationAcknowledgement(direct): %v", err)
+	}
+	assertSettledReplicaCurrency(
+		t,
+		fixture.replica,
+		coordstatus.ReplicaCurrencyCurrent,
+		[]domain.DeviceID{fixture.signerDeviceID},
+		fixture.finalApplyHeads.ResultIndex,
+	)
+	progress, err := fixture.replica.ReplicationProgress(testContext(t))
+	if err != nil {
+		t.Fatalf("ReplicationProgress(): %v", err)
+	}
+	if len(progress.Observations) != 1 ||
+		progress.Observations[0].SignerDeviceID !=
+			fixture.signerDeviceID ||
+		progress.Observations[0].VerifiedResultIndex !=
+			fixture.finalApplyHeads.ResultIndex {
+		t.Fatalf("durable acknowledgement progress = %+v", progress)
+	}
+
+	fixture.replica.ForgetReplicationPeer(fixture.signerDeviceID)
+	assertSettledReplicaCurrency(
+		t,
+		fixture.replica,
+		coordstatus.ReplicaCurrencyUnknown,
+		nil,
+		0,
+	)
+}
+
+func TestSettledReplicaRejectsInvalidAcknowledgementWithoutCurrency(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		mutate func(
+			*testing.T,
+			settledReplicaImportFixture,
+			replication.Acknowledgement,
+		) replication.Acknowledgement
+	}{
+		{
+			name: "wrong commitment cut",
+			mutate: func(
+				t *testing.T,
+				fixture settledReplicaImportFixture,
+				valid replication.Acknowledgement,
+			) replication.Acknowledgement {
+				input := valid.Unsigned().Input()
+				input.ResultHash[0] ^= 0xff
+				unsigned, err := replication.NewUnsignedAcknowledgement(
+					input,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed, err := replication.SignAcknowledgement(
+					unsigned,
+					fixture.signerPrivateKey,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return changed
+			},
+		},
+		{
+			name: "invalid identity signature",
+			mutate: func(
+				t *testing.T,
+				_ settledReplicaImportFixture,
+				valid replication.Acknowledgement,
+			) replication.Acknowledgement {
+				signature := valid.Signature()
+				signature[0] ^= 0xff
+				changed, err := replication.NewAcknowledgement(
+					valid.Unsigned(),
+					signature,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return changed
+			},
+		},
+		{
+			name: "unauthorized signer",
+			mutate: func(
+				t *testing.T,
+				_ settledReplicaImportFixture,
+				valid replication.Acknowledgement,
+			) replication.Acknowledgement {
+				privateKey := ed25519.NewKeyFromSeed(
+					bytes.Repeat([]byte{0xe7}, ed25519.SeedSize),
+				)
+				defer clear(privateKey)
+				serverID, err := device.DeriveID(
+					privateKey.Public().(ed25519.PublicKey),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				input := valid.Unsigned().Input()
+				input.ServerDeviceID = serverID
+				unsigned, err := replication.NewUnsignedAcknowledgement(
+					input,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed, err := replication.SignAcknowledgement(
+					unsigned,
+					privateKey,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return changed
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSettledReplicaImportFixture(t)
+			if _, err := fixture.replica.ImportResultBatch(
+				testContext(t),
+				fixture.relayDeviceID,
+				fixture.batch,
+			); err != nil {
+				t.Fatalf("ImportResultBatch(): %v", err)
+			}
+			fixture.replica.ForgetReplicationPeer(
+				fixture.relayDeviceID,
+			)
+			acknowledgement := test.mutate(
+				t,
+				fixture,
+				settledReplicaTestAcknowledgement(t, fixture),
+			)
+			if err := fixture.replica.
+				ObserveReplicationAcknowledgement(
+					testContext(t),
+					fixture.relayDeviceID,
+					acknowledgement,
+				); !errors.Is(err, ErrInvalidReplicationReplay) {
+				t.Fatalf(
+					"ObserveReplicationAcknowledgement() error = %v, want %v",
+					err,
+					ErrInvalidReplicationReplay,
+				)
+			}
+			if err := fixture.replica.FatalError(); err != nil {
+				t.Fatalf("invalid peer input latched fatal state: %v", err)
+			}
+			assertSettledReplicaCurrency(
+				t,
+				fixture.replica,
+				coordstatus.ReplicaCurrencyUnknown,
+				nil,
+				0,
+			)
+		})
+	}
+}
+
+func TestSettledReplicaRejectsRelayedSignaturesAsLiveEvidence(t *testing.T) {
+	relayID := settledReplicaTestMemberWithSeed(t, 0xd4).ID
+	signerID := settledReplicaTestMemberWithSeed(t, 0xd5).ID
+	replica := &SettledReplica{
+		replicationObservations: make(
+			map[domain.DeviceID]liveReplicationObservation,
+		),
+	}
+	replica.recordLiveReplicationObservation(
+		relayID,
+		signerID,
+		2,
+		7,
+		9,
+	)
+	if got := replica.liveReplicationObservationSnapshot(); len(got) != 0 {
+		t.Fatalf("relayed signature became live evidence = %+v", got)
+	}
+	replica.recordLiveReplicationObservation(
+		signerID,
+		signerID,
+		2,
+		7,
+		9,
+	)
+	replica.recordLiveReplicationObservation(
+		signerID,
+		signerID,
+		1,
+		6,
+		8,
+	)
+	got := replica.liveReplicationObservationSnapshot()
+	if len(got) != 1 ||
+		got[0].RelayPeerID != signerID ||
+		got[0].SignerDeviceID != signerID ||
+		got[0].AuthorityVersion != 2 ||
+		got[0].VerifiedResultIndex != 7 {
+		t.Fatalf("direct signer observations = %+v", got)
+	}
+	replica.ForgetReplicationPeer(signerID)
+	if got := replica.liveReplicationObservationSnapshot(); len(got) != 0 {
+		t.Fatalf("forgotten direct observation = %+v", got)
+	}
+}
+
+func TestSettledReplicaCurrencyRequiresEveryAuthorityAtExactCut(
+	t *testing.T,
+) {
+	firstID := settledReplicaTestMemberWithSeed(t, 0xd5).ID
+	secondID := settledReplicaTestMemberWithSeed(t, 0xd6).ID
+	authorityIDs := []domain.DeviceID{firstID, secondID}
+	slices.Sort(authorityIDs)
+	progress := store.SettledReplicationProgress{
+		Heads: store.ApplyHeads{ResultIndex: 10},
+	}
+	live := []liveReplicationObservation{
+		{
+			SignerDeviceID:           firstID,
+			AuthorityVersion:         2,
+			VerifiedResultIndex:      10,
+			ServerAppliedResultIndex: 10,
+		},
+		{
+			SignerDeviceID:           secondID,
+			AuthorityVersion:         2,
+			VerifiedResultIndex:      9,
+			ServerAppliedResultIndex: 9,
+		},
+	}
+	currency, observed, resultIndex := settledReplicaCurrency(
+		progress,
+		live,
+		authorityIDs,
+		2,
+	)
+	if currency != coordstatus.ReplicaCurrencyUnknown ||
+		!slices.Equal(observed, authorityIDs) ||
+		resultIndex != 10 {
+		t.Fatalf(
+			"stale authority currency = %s/%v/%d",
+			currency,
+			observed,
+			resultIndex,
+		)
+	}
+
+	live[1].VerifiedResultIndex = 10
+	live[1].ServerAppliedResultIndex = 10
+	currency, observed, resultIndex = settledReplicaCurrency(
+		progress,
+		live,
+		authorityIDs,
+		2,
+	)
+	if currency != coordstatus.ReplicaCurrencyCurrent ||
+		!slices.Equal(observed, authorityIDs) ||
+		resultIndex != 10 {
+		t.Fatalf(
+			"exact authority currency = %s/%v/%d",
+			currency,
+			observed,
+			resultIndex,
+		)
+	}
+
+	live[1].ServerAppliedResultIndex = 11
+	currency, observed, resultIndex = settledReplicaCurrency(
+		progress,
+		live,
+		authorityIDs,
+		2,
+	)
+	if currency != coordstatus.ReplicaCurrencyBehind ||
+		!slices.Equal(observed, authorityIDs) ||
+		resultIndex != 11 {
+		t.Fatalf(
+			"ahead authority currency = %s/%v/%d",
+			currency,
+			observed,
+			resultIndex,
+		)
 	}
 }
 
@@ -979,10 +1319,92 @@ func newSettledReplicaImportFixture(
 	}
 }
 
+func settledReplicaTestAcknowledgement(
+	t *testing.T,
+	fixture settledReplicaImportFixture,
+) replication.Acknowledgement {
+	t.Helper()
+	view, err := fixture.replica.View(testContext(t))
+	if err != nil {
+		t.Fatalf("View(acknowledgement cut): %v", err)
+	}
+	batchMetadata := fixture.batch.Unsigned().Metadata()
+	unsigned, err := replication.NewUnsignedAcknowledgement(
+		replication.AcknowledgementInput{
+			SessionID:          view.SessionID,
+			WorkspaceID:        view.WorkspaceID,
+			RecoveryGeneration: view.RecoveryGeneration,
+			ServerDeviceID:     fixture.signerDeviceID,
+			ServerAuthorityVersion: batchMetadata.
+				ServerAuthorityVersion,
+			ResultIndex: view.Heads.ResultIndex,
+			ResultHash:  chain.Digest(view.Heads.ResultHash),
+			ChainIndex:  view.Heads.ChainIndex,
+			ChainHash:   chain.Digest(view.Heads.ChainHash),
+			ProjectionAccumulator: chain.Digest(
+				view.Heads.ProjectionAccumulator,
+			),
+			ProjectionStateDigest: chain.Digest(
+				view.ProjectionStateDigest,
+			),
+			ServerAppliedResultIndex: view.Heads.ResultIndex,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewUnsignedAcknowledgement(): %v", err)
+	}
+	acknowledgement, err := replication.SignAcknowledgement(
+		unsigned,
+		fixture.signerPrivateKey,
+	)
+	if err != nil {
+		t.Fatalf("SignAcknowledgement(): %v", err)
+	}
+	return acknowledgement
+}
+
+func assertSettledReplicaCurrency(
+	t *testing.T,
+	replica *SettledReplica,
+	want coordstatus.ReplicaCurrencyState,
+	wantAuthority []domain.DeviceID,
+	wantResult uint64,
+) {
+	t.Helper()
+	status, err := replica.Status(testContext(t))
+	if err != nil {
+		t.Fatalf("Status(): %v", err)
+	}
+	if status.Runtime.ReplicaCurrency != want ||
+		!slices.Equal(
+			status.Runtime.ObservedAuthorityIDs,
+			wantAuthority,
+		) ||
+		status.Runtime.ObservedResultIndex != wantResult {
+		t.Fatalf(
+			"replica currency = %s/%v/%d, want %s/%v/%d",
+			status.Runtime.ReplicaCurrency,
+			status.Runtime.ObservedAuthorityIDs,
+			status.Runtime.ObservedResultIndex,
+			want,
+			wantAuthority,
+			wantResult,
+		)
+	}
+}
+
 func settledReplicaTestMember(t *testing.T) device.Device {
 	t.Helper()
+	return settledReplicaTestMemberWithSeed(t, 0xd4)
+}
+
+func settledReplicaTestMemberWithSeed(
+	t *testing.T,
+	seed byte,
+) device.Device {
+	t.Helper()
 	privateKey := ed25519.NewKeyFromSeed(
-		bytes.Repeat([]byte{0xd4}, ed25519.SeedSize),
+		bytes.Repeat([]byte{seed}, ed25519.SeedSize),
 	)
 	defer clear(privateKey)
 	publicKey := bytes.Clone(

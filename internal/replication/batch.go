@@ -1,4 +1,5 @@
-// Package replication implements CodeComm's signed result-batch protocol.
+// Package replication implements CodeComm's signed result replication
+// protocol.
 package replication
 
 import (

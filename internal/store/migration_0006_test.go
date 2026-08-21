@@ -14,7 +14,7 @@ func TestMigration0006SchemaParityAndRejectsLedgerLoss(t *testing.T) {
 	fresh := openMigrationTestConnection(t)
 	if err := applyMigrations(
 		fresh,
-		embeddedMigrations,
+		embeddedMigrations[:6],
 		fixedMigrationTestClock,
 	); err != nil {
 		t.Fatalf("apply fresh migrations: %v", err)
@@ -31,7 +31,7 @@ func TestMigration0006SchemaParityAndRejectsLedgerLoss(t *testing.T) {
 	}
 	if err := applyMigrations(
 		upgraded,
-		embeddedMigrations,
+		embeddedMigrations[:6],
 		fixedMigrationTestClock,
 	); err != nil {
 		t.Fatalf("upgrade v5 to v6: %v", err)
@@ -48,7 +48,7 @@ func TestMigration0006SchemaParityAndRejectsLedgerLoss(t *testing.T) {
 	}
 	err := applyMigrations(
 		upgraded,
-		embeddedMigrations,
+		embeddedMigrations[:6],
 		fixedMigrationTestClock,
 	)
 	if err == nil || !strings.Contains(err.Error(), "already_v6 = 0") {
@@ -108,7 +108,11 @@ func TestMigration0006RejectsNonemptyLegacyAttestations(t *testing.T) {
 		t.Fatalf("insert legacy attestation: %v", err)
 	}
 
-	err := applyMigrations(conn, embeddedMigrations, fixedMigrationTestClock)
+	err := applyMigrations(
+		conn,
+		embeddedMigrations[:6],
+		fixedMigrationTestClock,
+	)
 	if err == nil ||
 		!strings.Contains(err.Error(), "legacy_row_count = 0") {
 		t.Fatalf("upgrade with legacy evidence error = %v, want guard failure", err)
@@ -297,7 +301,7 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 			return err
 		}
 	}
-	var attestationCount, settledCount int64
+	var attestationCount, settledCount, watermarkCount int64
 	if err := queryOne(
 		conn,
 		"SELECT count(*) FROM replication_attestations;",
@@ -316,10 +320,22 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 	); err != nil {
 		return err
 	}
-	if attestationCount != 0 || settledCount != 0 {
+	if err := queryOne(
+		conn,
+		"SELECT count(*) FROM replication_watermark_observations;",
+		func(stmt *sqlite.Stmt) {
+			watermarkCount = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return err
+	}
+	if attestationCount != 0 ||
+		settledCount != 0 ||
+		watermarkCount != 0 {
 		return errors.New("test downgrade would discard replication evidence")
 	}
 	for _, statement := range []string{
+		"DROP TABLE replication_watermark_observations;",
 		"DROP TABLE settled_nonvoter_state;",
 		"DROP INDEX replication_attestations_coverage;",
 		"DROP TABLE replication_attestations;",

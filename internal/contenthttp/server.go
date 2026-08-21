@@ -319,7 +319,7 @@ func (handler *connectionHandler) ServeHTTP(
 		return
 	}
 	switch request.URL.Path {
-	case ReplicationPath:
+	case ReplicationPath, ReplicationAcknowledgementPath:
 	case SessionPath, PeersPath, EventsPath:
 		if !validRequestTarget(request) {
 			writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
@@ -336,6 +336,8 @@ func (handler *connectionHandler) ServeHTTP(
 		handler.serveEvent(writer, request)
 	case ReplicationPath:
 		handler.serveReplication(writer, request)
+	case ReplicationAcknowledgementPath:
+		handler.serveReplicationAcknowledgement(writer, request)
 	}
 }
 

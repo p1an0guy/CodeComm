@@ -48,6 +48,9 @@ type SettledReplica struct {
 	transitionRequired      atomic.Bool
 	importGate              chan struct{}
 
+	replicationObservationsMu sync.RWMutex
+	replicationObservations   map[domain.DeviceID]liveReplicationObservation
+
 	localStateMu     sync.RWMutex
 	localStateClosed atomic.Bool
 
@@ -123,8 +126,11 @@ func OpenSettledReplica(
 		clock:         clock,
 		changes:       newChangeFeed(),
 		importGate:    make(chan struct{}, 1),
-		closeStarted:  make(chan struct{}),
-		fatalSet:      make(chan struct{}),
+		replicationObservations: make(
+			map[domain.DeviceID]liveReplicationObservation,
+		),
+		closeStarted: make(chan struct{}),
+		fatalSet:     make(chan struct{}),
 	}
 	replica.localState = database.LocalStateWithGuard(
 		replica.beginLocalStateOperation,
@@ -256,6 +262,14 @@ func (replica *SettledReplica) ImportResultBatch(
 		}
 		return store.ResultBatchImportResult{}, err
 	}
+	metadata := batch.Unsigned().Metadata()
+	replica.recordLiveReplicationObservation(
+		relayPeerID,
+		metadata.ServerDeviceID,
+		metadata.ServerAuthorityVersion,
+		metadata.ToResultIndex,
+		metadata.ServerAppliedResultIndex,
+	)
 	return result, nil
 }
 
@@ -429,6 +443,7 @@ func (replica *SettledReplica) Status(
 	currency, observedAuthorityIDs, observedResultIndex :=
 		settledReplicaCurrency(
 			progress,
+			replica.liveReplicationObservationSnapshot(),
 			durable.CredentialAuthority.VoterDeviceIDs(),
 			durable.CredentialAuthority.VoterSetVersion,
 		)
@@ -464,6 +479,7 @@ func (replica *SettledReplica) Status(
 
 func settledReplicaCurrency(
 	progress store.SettledReplicationProgress,
+	live []liveReplicationObservation,
 	authorityIDs []domain.DeviceID,
 	authorityVersion uint64,
 ) (coordstatus.ReplicaCurrencyState, []domain.DeviceID, uint64) {
@@ -472,8 +488,9 @@ func settledReplicaCurrency(
 		authority[deviceID] = struct{}{}
 	}
 	observedSet := make(map[domain.DeviceID]struct{}, len(authorityIDs))
+	currentSet := make(map[domain.DeviceID]struct{}, len(authorityIDs))
 	observedResultIndex := uint64(0)
-	for _, observation := range progress.Observations {
+	for _, observation := range live {
 		if observation.ServerAppliedResultIndex > observedResultIndex {
 			observedResultIndex = observation.ServerAppliedResultIndex
 		}
@@ -482,6 +499,12 @@ func settledReplicaCurrency(
 		}
 		if _, current := authority[observation.SignerDeviceID]; current {
 			observedSet[observation.SignerDeviceID] = struct{}{}
+			if observation.VerifiedResultIndex ==
+				progress.Heads.ResultIndex &&
+				observation.ServerAppliedResultIndex ==
+					progress.Heads.ResultIndex {
+				currentSet[observation.SignerDeviceID] = struct{}{}
+			}
 		}
 	}
 	observed := make([]domain.DeviceID, 0, len(observedSet))
@@ -497,13 +520,15 @@ func settledReplicaCurrency(
 			observed,
 			progress.Blocker.ResultIndex
 	}
-	if len(observed) == len(authorityIDs) && len(authorityIDs) != 0 {
+	if observedResultIndex > progress.Heads.ResultIndex {
+		return coordstatus.ReplicaCurrencyBehind,
+			observed,
+			observedResultIndex
+	}
+	if len(currentSet) == len(authorityIDs) && len(authorityIDs) != 0 {
 		return coordstatus.ReplicaCurrencyCurrent,
 			observed,
 			progress.Heads.ResultIndex
-	}
-	if observedResultIndex > progress.Heads.ResultIndex {
-		observedResultIndex = progress.Heads.ResultIndex
 	}
 	return coordstatus.ReplicaCurrencyUnknown,
 		observed,
@@ -828,6 +853,10 @@ func fatalSettledImportError(err error) bool {
 		errors.Is(err, store.ErrAppliedCheckpointIntegrity) ||
 		errors.Is(err, store.ErrRaftCommandBinding) ||
 		errors.Is(err, store.ErrReplicaEvidenceMode) ||
+		errors.Is(
+			err,
+			store.ErrInvalidReplicationWatermarkObservation,
+		) ||
 		errors.Is(err, ErrInvalidStateView) ||
 		errors.Is(err, reducer.ErrInvalidCommittedState)
 }

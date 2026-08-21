@@ -30,11 +30,21 @@ type daemonSettledReplica interface {
 		domain.DeviceID,
 		replication.Batch,
 	) (store.ResultBatchImportResult, error)
+	ObserveReplicationAcknowledgement(
+		context.Context,
+		domain.DeviceID,
+		replication.Acknowledgement,
+	) error
+	ForgetReplicationPeer(domain.DeviceID)
 	FatalError() error
 }
 
 type daemonReplicationClient interface {
 	Replication(context.Context, uint64) (replication.Batch, error)
+	ReplicationAcknowledgement(
+		context.Context,
+		uint64,
+	) (replication.Acknowledgement, error)
 }
 
 // daemonSettledReplication serializes authenticated peer fetch/import passes.
@@ -101,6 +111,7 @@ func (runtime *daemonSettledReplication) Sync(
 		return err
 	}
 	defer runtime.release()
+	runtime.replica.ForgetReplicationPeer(relayPeerID)
 
 	for page := 0; page < daemonSettledReplicationPagesPerPass; page++ {
 		before, err := runtime.replica.ReplicationHeads(ctx)
@@ -132,9 +143,39 @@ func (runtime *daemonSettledReplication) Sync(
 					err,
 				)
 			case errors.Is(err, contenthttp.ErrReplicationUnavailable):
-				// The peer may be exactly at this cursor or temporarily unable
-				// to sign a page. Neither condition invalidates the authenticated
-				// connection or establishes replica currency.
+				acknowledgement, acknowledgementErr :=
+					client.ReplicationAcknowledgement(
+						ctx,
+						before.ResultIndex,
+					)
+				if acknowledgementErr != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					if errors.Is(
+						acknowledgementErr,
+						contenthttp.ErrReplicationUnavailable,
+					) {
+						return nil
+					}
+					return fmt.Errorf(
+						"%w: fetch acknowledgement from %s: %w",
+						errDaemonSettledReplication,
+						relayPeerID,
+						acknowledgementErr,
+					)
+				}
+				if err := runtime.replica.
+					ObserveReplicationAcknowledgement(
+						ctx,
+						relayPeerID,
+						acknowledgement,
+					); err != nil {
+					return runtime.replicaError(
+						"record acknowledgement",
+						err,
+					)
+				}
 				return nil
 			case errors.Is(err, contenthttp.ErrReplicationSnapshotRequired):
 				return fmt.Errorf(
@@ -198,6 +239,15 @@ func (runtime *daemonSettledReplication) Sync(
 		}
 	}
 	return nil
+}
+
+func (runtime *daemonSettledReplication) ForgetPeer(
+	peerID domain.DeviceID,
+) {
+	if runtime == nil || runtime.replica == nil || !peerID.Valid() {
+		return
+	}
+	runtime.replica.ForgetReplicationPeer(peerID)
 }
 
 func (runtime *daemonSettledReplication) replicaError(

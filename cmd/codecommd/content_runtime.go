@@ -35,6 +35,10 @@ type daemonContentState interface {
 		context.Context,
 		store.ResultRangeOptions,
 	) (store.ResultRange, bool, error)
+	ExportReplicationWatermark(
+		context.Context,
+		domain.DeviceID,
+	) (store.ReplicationWatermark, error)
 }
 
 type daemonEndpointSetSource interface {
@@ -58,16 +62,21 @@ type daemonResultBatchSigner func(
 	replication.UnsignedBatch,
 ) (replication.Batch, error)
 
+type daemonReplicationAcknowledgementSigner func(
+	replication.UnsignedAcknowledgement,
+) (replication.Acknowledgement, error)
+
 type daemonContentService struct {
-	sessionID          domain.UUIDv7
-	workspaceID        domain.UUIDv4
-	recoveryGeneration uint64
-	localDeviceID      domain.DeviceID
-	state              daemonContentState
-	endpoints          daemonEndpointSetSource
-	proposals          daemonEventProposalConsensus
-	signResultBatch    daemonResultBatchSigner
-	now                func() time.Time
+	sessionID           domain.UUIDv7
+	workspaceID         domain.UUIDv4
+	recoveryGeneration  uint64
+	localDeviceID       domain.DeviceID
+	state               daemonContentState
+	endpoints           daemonEndpointSetSource
+	proposals           daemonEventProposalConsensus
+	signResultBatch     daemonResultBatchSigner
+	signAcknowledgement daemonReplicationAcknowledgementSigner
+	now                 func() time.Time
 }
 
 func newDaemonContentServer(
@@ -95,6 +104,14 @@ func newDaemonContentServer(
 	)
 	if err != nil {
 		return nil, err
+	}
+	service.signAcknowledgement = func(
+		unsigned replication.UnsignedAcknowledgement,
+	) (replication.Acknowledgement, error) {
+		return replication.SignAcknowledgement(
+			unsigned,
+			identityPrivateKey,
+		)
 	}
 	server, err := contenthttp.New(service)
 	if err != nil {

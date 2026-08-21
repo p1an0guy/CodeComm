@@ -397,7 +397,11 @@ func (client *Client) requestBounded(
 	configure func(http.Header),
 	responseLimit int64,
 ) ([]byte, error) {
-	replicationRequest := validClientReplicationTarget(path)
+	batchReplicationRequest := validClientReplicationBatchTarget(path)
+	acknowledgementRequest :=
+		validClientReplicationAcknowledgementTarget(path)
+	replicationRequest := batchReplicationRequest ||
+		acknowledgementRequest
 	if client == nil ||
 		ctx == nil ||
 		(method != http.MethodGet && method != http.MethodPost) ||
@@ -409,9 +413,12 @@ func (client *Client) requestBounded(
 		method == http.MethodPost &&
 			(path != EventsPath || len(body) == 0 ||
 				len(body) > event.MaxEventBytes) ||
-		replicationRequest &&
+		batchReplicationRequest &&
 			(method != http.MethodGet ||
 				responseLimit != int64(replication.MaxBatchExpandedBytes)) ||
+		acknowledgementRequest &&
+			(method != http.MethodGet ||
+				responseLimit != int64(replication.MaxAcknowledgementBytes)) ||
 		!replicationRequest && responseLimit != ResponseMaxBytes {
 		return nil, ErrInvalidClient
 	}

@@ -40,6 +40,10 @@ type daemonContentStateStub struct {
 	resultFound   bool
 	resultErr     error
 	resultOptions store.ResultRangeOptions
+
+	replicationWatermark store.ReplicationWatermark
+	watermarkErr         error
+	watermarkSigner      domain.DeviceID
 }
 
 func (state *daemonContentStateStub) StatusSnapshot(
@@ -85,6 +89,17 @@ func (state *daemonContentStateStub) ExportResultRange(
 		result.Results[index] = bytes.Clone(state.resultRange.Results[index])
 	}
 	return result, state.resultFound, nil
+}
+
+func (state *daemonContentStateStub) ExportReplicationWatermark(
+	_ context.Context,
+	requiredSigner domain.DeviceID,
+) (store.ReplicationWatermark, error) {
+	state.watermarkSigner = requiredSigner
+	if state.watermarkErr != nil {
+		return store.ReplicationWatermark{}, state.watermarkErr
+	}
+	return state.replicationWatermark, nil
 }
 
 type daemonEndpointSetSourceStub struct {
@@ -439,6 +454,170 @@ func TestDaemonContentServiceSignsAuthorityBoundResultBatch(t *testing.T) {
 		privateKey.Public().(ed25519.PublicKey),
 	); err != nil {
 		t.Fatalf("replication.VerifyBatch(): %v", err)
+	}
+}
+
+func TestDaemonContentServiceSignsCurrentReplicationAcknowledgement(
+	t *testing.T,
+) {
+	snapshot := daemonContentTestSnapshot(t)
+	watermark := store.ReplicationWatermark{
+		SessionID:             snapshot.SessionID,
+		WorkspaceID:           snapshot.WorkspaceID,
+		RecoveryGeneration:    snapshot.RecoveryGeneration,
+		ResultIndex:           0,
+		ResultHash:            store.Digest{0x11},
+		ChainIndex:            0,
+		ChainHash:             store.Digest{0x22},
+		ProjectionAccumulator: store.Digest{0x33},
+		ProjectionStateDigest: store.Digest{0x44},
+		Authority:             snapshot.CredentialAuthority,
+	}
+	state := &daemonContentStateStub{
+		snapshot:             snapshot,
+		replicationWatermark: watermark,
+	}
+	service, err := newDaemonContentService(
+		snapshot.SessionID,
+		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
+		snapshot.Member.ID,
+		state,
+		&daemonEndpointSetSourceStub{},
+		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
+		time.Now,
+	)
+	if err != nil {
+		t.Fatalf("newDaemonContentService(): %v", err)
+	}
+	_, privateKey, deviceID := daemonTestInitialState(t)
+	defer clear(privateKey)
+	service.signAcknowledgement = func(
+		unsigned replication.UnsignedAcknowledgement,
+	) (replication.Acknowledgement, error) {
+		return replication.SignAcknowledgement(unsigned, privateKey)
+	}
+
+	acknowledgement, err := service.ReplicationAcknowledgement(
+		context.Background(),
+		0,
+	)
+	if err != nil {
+		t.Fatalf("ReplicationAcknowledgement(): %v", err)
+	}
+	metadata := acknowledgement.Unsigned().Metadata()
+	if state.watermarkSigner != deviceID ||
+		metadata.SessionID != watermark.SessionID ||
+		metadata.WorkspaceID != watermark.WorkspaceID ||
+		metadata.RecoveryGeneration != watermark.RecoveryGeneration ||
+		metadata.ServerDeviceID != deviceID ||
+		metadata.ServerAuthorityVersion !=
+			watermark.Authority.VoterSetVersion ||
+		metadata.ResultIndex != watermark.ResultIndex ||
+		metadata.ResultHash != chain.Digest(watermark.ResultHash) ||
+		metadata.ChainIndex != watermark.ChainIndex ||
+		metadata.ChainHash != chain.Digest(watermark.ChainHash) ||
+		metadata.ProjectionAccumulator !=
+			chain.Digest(watermark.ProjectionAccumulator) ||
+		metadata.ProjectionStateDigest !=
+			chain.Digest(watermark.ProjectionStateDigest) ||
+		metadata.ServerAppliedResultIndex != watermark.ResultIndex {
+		t.Fatalf("signed acknowledgement metadata = %+v", metadata)
+	}
+	if err := replication.VerifyAcknowledgement(
+		acknowledgement,
+		privateKey.Public().(ed25519.PublicKey),
+	); err != nil {
+		t.Fatalf("VerifyAcknowledgement(): %v", err)
+	}
+}
+
+func TestDaemonContentServiceMapsReplicationAcknowledgementErrors(
+	t *testing.T,
+) {
+	snapshot := daemonContentTestSnapshot(t)
+	validWatermark := store.ReplicationWatermark{
+		SessionID:          snapshot.SessionID,
+		WorkspaceID:        snapshot.WorkspaceID,
+		RecoveryGeneration: snapshot.RecoveryGeneration,
+		ResultIndex:        0,
+		Authority:          snapshot.CredentialAuthority,
+	}
+	sentinel := errors.New("watermark unavailable")
+	for _, test := range []struct {
+		name      string
+		atResult  uint64
+		watermark store.ReplicationWatermark
+		storeErr  error
+		want      error
+	}{
+		{
+			name:      "cursor differs",
+			atResult:  1,
+			watermark: validWatermark,
+			want:      contenthttp.ErrReplicationUnavailable,
+		},
+		{
+			name:      "signer is not authority",
+			watermark: validWatermark,
+			storeErr:  store.ErrResultRangeAuthorityNotCovered,
+			want:      contenthttp.ErrReplicationUnavailable,
+		},
+		{
+			name:      "storage failure",
+			watermark: validWatermark,
+			storeErr:  sentinel,
+			want:      errDaemonContentConstruction,
+		},
+		{
+			name:      "invalid cursor",
+			atResult:  domain.MaxSafeInteger + 1,
+			watermark: validWatermark,
+			want:      contenthttp.ErrInvalidReplicationCursor,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &daemonContentStateStub{
+				snapshot:             snapshot,
+				replicationWatermark: test.watermark,
+				watermarkErr:         test.storeErr,
+			}
+			service, err := newDaemonContentService(
+				snapshot.SessionID,
+				snapshot.WorkspaceID,
+				snapshot.RecoveryGeneration,
+				snapshot.Member.ID,
+				state,
+				&daemonEndpointSetSourceStub{},
+				&daemonEventProposalConsensusStub{},
+				daemonContentTestBatchSigner(t),
+				time.Now,
+			)
+			if err != nil {
+				t.Fatalf("newDaemonContentService(): %v", err)
+			}
+			_, privateKey, _ := daemonTestInitialState(t)
+			defer clear(privateKey)
+			service.signAcknowledgement = func(
+				unsigned replication.UnsignedAcknowledgement,
+			) (replication.Acknowledgement, error) {
+				return replication.SignAcknowledgement(
+					unsigned,
+					privateKey,
+				)
+			}
+			if _, err := service.ReplicationAcknowledgement(
+				context.Background(),
+				test.atResult,
+			); !errors.Is(err, test.want) {
+				t.Fatalf(
+					"ReplicationAcknowledgement() error = %v, want %v",
+					err,
+					test.want,
+				)
+			}
+		})
 	}
 }
 

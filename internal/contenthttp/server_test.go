@@ -37,19 +37,23 @@ type contentTestService struct {
 	session SessionResponse
 	peers   PeersResponse
 
-	sessionCalls int
-	peersCalls   int
-	eventCalls   int
-	peersSeen    []transport.AuthenticatedPeer
-	eventPeer    domain.DeviceID
-	eventBody    []byte
-	eventHop     ProposalHop
-	eventResult  EventResult
-	eventErr     error
-	batch        replication.Batch
-	batchErr     error
-	batchCalls   int
-	batchAfter   []uint64
+	sessionCalls         int
+	peersCalls           int
+	eventCalls           int
+	peersSeen            []transport.AuthenticatedPeer
+	eventPeer            domain.DeviceID
+	eventBody            []byte
+	eventHop             ProposalHop
+	eventResult          EventResult
+	eventErr             error
+	batch                replication.Batch
+	batchErr             error
+	batchCalls           int
+	batchAfter           []uint64
+	acknowledgement      replication.Acknowledgement
+	acknowledgementErr   error
+	acknowledgementCalls int
+	acknowledgementAt    []uint64
 
 	entered  chan struct{}
 	release  <-chan struct{}
@@ -184,6 +188,20 @@ func (service *contentTestService) Replication(
 		}
 	}
 	return batch, batchErr
+}
+
+func (service *contentTestService) ReplicationAcknowledgement(
+	_ context.Context,
+	atResult uint64,
+) (replication.Acknowledgement, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.acknowledgementCalls++
+	service.acknowledgementAt = append(
+		service.acknowledgementAt,
+		atResult,
+	)
+	return service.acknowledgement, service.acknowledgementErr
 }
 
 func (service *contentTestService) snapshot() (int, int, []transport.AuthenticatedPeer) {

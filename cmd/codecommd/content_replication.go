@@ -142,3 +142,80 @@ func (service *daemonContentService) Replication(
 	}
 	return signed, nil
 }
+
+func (service *daemonContentService) ReplicationAcknowledgement(
+	ctx context.Context,
+	atResultIndex uint64,
+) (replication.Acknowledgement, error) {
+	if service == nil ||
+		service.state == nil ||
+		service.signAcknowledgement == nil ||
+		ctx == nil ||
+		!domain.ValidUnsignedInteger(atResultIndex) {
+		return replication.Acknowledgement{},
+			contenthttp.ErrInvalidReplicationCursor
+	}
+	if err := ctx.Err(); err != nil {
+		return replication.Acknowledgement{}, err
+	}
+	watermark, err := service.state.ExportReplicationWatermark(
+		ctx,
+		service.localDeviceID,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrResultRangeAuthorityNotCovered):
+			return replication.Acknowledgement{},
+				contenthttp.ErrReplicationUnavailable
+		case errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded):
+			return replication.Acknowledgement{}, err
+		default:
+			return replication.Acknowledgement{}, fmt.Errorf(
+				"%w: export replication watermark: %v",
+				errDaemonContentConstruction,
+				err,
+			)
+		}
+	}
+	if watermark.SessionID != service.sessionID ||
+		watermark.WorkspaceID != service.workspaceID ||
+		watermark.RecoveryGeneration != service.recoveryGeneration ||
+		watermark.ResultIndex != atResultIndex ||
+		!watermark.Authority.Contains(service.localDeviceID) {
+		return replication.Acknowledgement{},
+			contenthttp.ErrReplicationUnavailable
+	}
+	unsigned, err := replication.NewUnsignedAcknowledgement(
+		replication.AcknowledgementInput{
+			SessionID:                watermark.SessionID,
+			WorkspaceID:              watermark.WorkspaceID,
+			RecoveryGeneration:       watermark.RecoveryGeneration,
+			ServerDeviceID:           service.localDeviceID,
+			ServerAuthorityVersion:   watermark.Authority.VoterSetVersion,
+			ResultIndex:              watermark.ResultIndex,
+			ResultHash:               chain.Digest(watermark.ResultHash),
+			ChainIndex:               watermark.ChainIndex,
+			ChainHash:                chain.Digest(watermark.ChainHash),
+			ProjectionAccumulator:    chain.Digest(watermark.ProjectionAccumulator),
+			ProjectionStateDigest:    chain.Digest(watermark.ProjectionStateDigest),
+			ServerAppliedResultIndex: watermark.ResultIndex,
+		},
+	)
+	if err != nil {
+		return replication.Acknowledgement{}, fmt.Errorf(
+			"%w: build replication acknowledgement: %v",
+			errDaemonContentConstruction,
+			err,
+		)
+	}
+	signed, err := service.signAcknowledgement(unsigned)
+	if err != nil || !signed.MatchesUnsigned(unsigned) ||
+		len(signed.CanonicalBytes()) == 0 {
+		return replication.Acknowledgement{}, fmt.Errorf(
+			"%w: sign replication acknowledgement",
+			errDaemonContentConstruction,
+		)
+	}
+	return signed, nil
+}

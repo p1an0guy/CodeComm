@@ -44,6 +44,10 @@ type Service interface {
 	Session(context.Context) (SessionResponse, error)
 	Peers(context.Context) (PeersResponse, error)
 	Replication(context.Context, uint64) (replication.Batch, error)
+	ReplicationAcknowledgement(
+		context.Context,
+		uint64,
+	) (replication.Acknowledgement, error)
 	ProposeEvent(
 		context.Context,
 		domain.DeviceID,
