@@ -104,23 +104,18 @@ func verifySettledNonvoterEvidence(
 			nil,
 		)
 	}
-	baselineRows, err := projectionRowsAtResultCut(
+	baselineStateDigest, err := projectionStateDigestAtResultCut(
 		conn,
 		state,
+		genesis,
 		baseline.ResultIndex,
+		nil,
 	)
 	if err != nil {
 		return replicationEvidenceError(
 			"reconstruct baseline projections",
 			err,
 		)
-	}
-	baselineStateDigest, err := chain.StateDigest(chain.Versions{
-		Digest:           state.digestVersion,
-		ProjectionSchema: state.projectionSchemaVersion,
-	}, baselineRows)
-	if err != nil {
-		return replicationEvidenceError("digest baseline projections", err)
 	}
 	attestationCount, err := activeAttestationCount(conn, state)
 	if err != nil {
@@ -146,16 +141,37 @@ func verifySettledNonvoterEvidence(
 			settled,
 		)
 	}
+	baselineAuthorityRows, verifiedStateDigest, err :=
+		projectionAuthorityRowsAtResultCut(
+			conn,
+			state,
+			genesis,
+			baseline.ResultIndex,
+		)
+	if err != nil {
+		return replicationEvidenceError(
+			"reconstruct baseline authority",
+			err,
+		)
+	}
+	if verifiedStateDigest != baselineStateDigest {
+		return replicationEvidenceError(
+			"baseline projection digest changed",
+			nil,
+		)
+	}
 	authority, err := newReplicationEvidenceAuthority(
 		state.sessionID,
-		baselineRows,
+		baselineAuthorityRows,
 	)
 	if err != nil {
-		return replicationEvidenceError("decode baseline authority", err)
+		return replicationEvidenceError(
+			"decode baseline authority",
+			err,
+		)
 	}
-
 	cursor := baseline
-	cursorStateDigest := baselineStateDigest
+	cursorStateDigest := chain.Digest(verifiedStateDigest)
 	verifiedCount := int64(0)
 	for cursor.ResultIndex < state.resultIndex {
 		if cursor.ResultIndex == domain.MaxSafeInteger {
@@ -277,10 +293,12 @@ func verifySettledNonvoterEvidence(
 				nil,
 			)
 		}
-		endRows, err := projectionRowsAtResultCut(
+		endStateDigest, err := projectionStateDigestAtResultCut(
 			conn,
 			state,
+			genesis,
 			metadata.ToResultIndex,
+			nil,
 		)
 		if err != nil {
 			return replicationEvidenceError(
@@ -288,15 +306,11 @@ func verifySettledNonvoterEvidence(
 				err,
 			)
 		}
-		endStateDigest, err := chain.StateDigest(chain.Versions{
-			Digest:           state.digestVersion,
-			ProjectionSchema: state.projectionSchemaVersion,
-		}, endRows)
-		if err != nil ||
-			endStateDigest != metadata.EndProjectionStateDigest {
+		if chain.Digest(endStateDigest) !=
+			metadata.EndProjectionStateDigest {
 			return replicationEvidenceError(
 				"attested projection state differs from signed end",
-				err,
+				nil,
 			)
 		}
 		if authority.authority.SessionID != state.sessionID {

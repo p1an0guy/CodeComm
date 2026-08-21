@@ -49,6 +49,7 @@ func configurePooledConnection(conn *sqlite.Conn) error {
 		"PRAGMA synchronous = FULL;",
 		"PRAGMA foreign_keys = ON;",
 		"PRAGMA trusted_schema = OFF;",
+		"PRAGMA temp_store = FILE;",
 	} {
 		if err := execute(conn, statement); err != nil {
 			return err
@@ -62,6 +63,7 @@ func configurePooledConnection(conn *sqlite.Conn) error {
 		{"PRAGMA foreign_keys;", 1},
 		{"PRAGMA busy_timeout;", 5000},
 		{"PRAGMA trusted_schema;", 0},
+		{"PRAGMA temp_store;", 1},
 	}
 	for _, check := range checks {
 		var got int64

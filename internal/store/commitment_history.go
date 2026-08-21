@@ -363,30 +363,20 @@ func verifyCommitmentHistory(
 	return nil
 }
 
-type projectionHistoryKey struct {
-	table      string
-	primaryKey string
-}
-
 func verifyProjectionMutationHistory(
 	conn *sqlite.Conn,
 	state consensusState,
 	genesis storedGenesisBoundary,
 ) error {
-	boundaryRows, err := projectionRowsAtResultCut(
+	digest, err := projectionStateDigestAtResultCut(
 		conn,
 		state,
+		genesis,
 		genesis.predecessorResultIndex,
+		nil,
 	)
 	if err != nil {
 		return historyIntegrityError("projection mutation history", err)
-	}
-	digest, err := chain.StateDigest(chain.Versions{
-		Digest:           state.digestVersion,
-		ProjectionSchema: state.projectionSchemaVersion,
-	}, boundaryRows)
-	if err != nil {
-		return historyIntegrityError("boundary projection state", err)
 	}
 	if digest != chain.Digest(genesis.stateDigest) {
 		return historyIntegrityError(
@@ -395,96 +385,6 @@ func verifyProjectionMutationHistory(
 		)
 	}
 	return nil
-}
-
-func projectionRowsAtResultCut(
-	conn *sqlite.Conn,
-	state consensusState,
-	resultCut uint64,
-) ([]chain.LogicalRow, error) {
-	if resultCut > state.resultIndex {
-		return nil, errors.New("projection cut follows current result")
-	}
-	currentRows, err := projectionLogicalRows(conn)
-	if err != nil {
-		return nil, fmt.Errorf("current projection state: %w", err)
-	}
-	rows := make(map[projectionHistoryKey]chain.LogicalRow, len(currentRows))
-	for _, row := range currentRows {
-		key := projectionHistoryKey{
-			table:      row.Table,
-			primaryKey: string(row.PrimaryKey),
-		}
-		if _, exists := rows[key]; exists {
-			return nil, errors.New("duplicate current projection row")
-		}
-		rows[key] = row
-	}
-
-	var rowErr error
-	err = queryArgs(
-		conn,
-		`SELECT projection_mutations_json
-		   FROM command_results
-		  WHERE session_id = ?1 AND recovery_generation = ?2
-		    AND result_index > ?3
-		  ORDER BY result_index DESC;`,
-		[]any{string(state.sessionID), state.recoveryGeneration, resultCut},
-		func(stmt *sqlite.Stmt) {
-			if rowErr != nil {
-				return
-			}
-			mutations, err := chain.DecodeMutations(
-				[]byte(stmt.ColumnText(0)),
-			)
-			if err != nil {
-				rowErr = err
-				return
-			}
-			for _, mutation := range mutations {
-				key := projectionHistoryKey{
-					table:      mutation.Table,
-					primaryKey: string(mutation.PrimaryKey),
-				}
-				current, exists := rows[key]
-				switch {
-				case mutation.After == nil && exists:
-					rowErr = errors.New(
-						"deleted mutation has a current after-image",
-					)
-				case mutation.After != nil &&
-					(!exists || !bytes.Equal(current.Row, mutation.After)):
-					rowErr = errors.New(
-						"mutation after-image does not match later state",
-					)
-				}
-				if rowErr != nil {
-					return
-				}
-				if mutation.Before == nil {
-					delete(rows, key)
-					continue
-				}
-				rows[key] = chain.LogicalRow{
-					Table:      mutation.Table,
-					PrimaryKey: bytes.Clone(mutation.PrimaryKey),
-					Row:        bytes.Clone(mutation.Before),
-				}
-			}
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if rowErr != nil {
-		return nil, rowErr
-	}
-
-	result := make([]chain.LogicalRow, 0, len(rows))
-	for _, row := range rows {
-		result = append(result, row)
-	}
-	return result, nil
 }
 
 func historyIntegrityError(detail string, cause error) error {

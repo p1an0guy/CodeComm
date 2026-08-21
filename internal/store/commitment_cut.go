@@ -135,7 +135,7 @@ func (store *Store) VerifyCommitmentCut(
 		); err != nil {
 			return err
 		}
-		return verifyProjectionStateCut(conn, state, cut)
+		return verifyProjectionStateCut(conn, state, genesis, cut)
 	})
 }
 
@@ -218,18 +218,18 @@ func verifyAccumulatorCut(
 func verifyProjectionStateCut(
 	conn *sqlite.Conn,
 	state consensusState,
+	genesis storedGenesisBoundary,
 	cut CommitmentCut,
 ) error {
-	rows, err := projectionRowsAtResultCut(conn, state, cut.ResultIndex)
+	digest, err := projectionStateDigestAtResultCut(
+		conn,
+		state,
+		genesis,
+		cut.ResultIndex,
+		nil,
+	)
 	if err != nil {
 		return commitmentCutError("rewind projection state cut", err)
-	}
-	digest, err := chain.StateDigest(chain.Versions{
-		Digest:           cut.DigestVersion,
-		ProjectionSchema: cut.ProjectionSchemaVersion,
-	}, rows)
-	if err != nil {
-		return commitmentCutError("digest projection state cut", err)
 	}
 	if digest != chain.Digest(cut.ProjectionStateDigest) {
 		return commitmentCutError("projection state cut differs", nil)

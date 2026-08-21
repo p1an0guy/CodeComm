@@ -860,11 +860,11 @@ func streamProjectionLogicalRows(
 			}
 			rowErr = visit(row)
 		})
-		if err != nil {
-			return fmt.Errorf("scan %s: %w", table.name, err)
-		}
 		if rowErr != nil {
 			return fmt.Errorf("encode %s: %w", table.name, rowErr)
+		}
+		if err != nil {
+			return fmt.Errorf("scan %s: %w", table.name, err)
 		}
 	}
 	return nil

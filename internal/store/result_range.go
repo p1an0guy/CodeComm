@@ -437,22 +437,20 @@ func resultRangeProjectionCommitmentsAt(
 		return resultRangeProjectionCommitments{},
 			historyIntegrityError("reconstruct projection accumulator", err)
 	}
-	rows, err := projectionRowsAtResultCut(conn, state, resultIndex)
+	stateDigest, err := projectionStateDigestAtResultCut(
+		conn,
+		state,
+		genesis,
+		resultIndex,
+		nil,
+	)
 	if err != nil {
 		return resultRangeProjectionCommitments{},
 			historyIntegrityError("reconstruct projection state", err)
 	}
-	stateDigest, err := chain.StateDigest(chain.Versions{
-		Digest:           state.digestVersion,
-		ProjectionSchema: state.projectionSchemaVersion,
-	}, rows)
-	if err != nil {
-		return resultRangeProjectionCommitments{},
-			historyIntegrityError("digest projection state", err)
-	}
 	return resultRangeProjectionCommitments{
 		accumulator: accumulator,
-		stateDigest: Digest(stateDigest),
+		stateDigest: stateDigest,
 	}, nil
 }
 
@@ -654,7 +652,21 @@ func resultRangeAuthorizationAt(
 	resultIndex uint64,
 	requiredDeviceID domain.DeviceID,
 ) (resultRangeAuthorization, error) {
-	rows, err := projectionRowsAtResultCut(conn, state, resultIndex)
+	genesis, err := readGenesisBoundary(
+		conn,
+		state.recoveryGeneration,
+		state.sessionID,
+	)
+	if err != nil {
+		return resultRangeAuthorization{},
+			historyIntegrityError("read result-range boundary", err)
+	}
+	rows, _, err := projectionAuthorityRowsAtResultCut(
+		conn,
+		state,
+		genesis,
+		resultIndex,
+	)
 	if err != nil {
 		return resultRangeAuthorization{},
 			historyIntegrityError("reconstruct result-range authority", err)
