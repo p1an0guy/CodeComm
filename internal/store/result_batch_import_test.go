@@ -594,10 +594,11 @@ func newResultBatchImportFixtureFromSource(
 			len(exported.Results),
 		)
 	}
-	commands := make([]ResultBatchCommand, len(sourceCommands))
+	commands := make([]VerifiedCommandImport, len(sourceCommands))
 	for index, sourceCommand := range sourceCommands {
 		commands[index] = resultBatchCommand(
 			sourceCommand.request,
+			exported.Results[index],
 			mutations[index],
 			sourceCommand.heads,
 		)
@@ -710,15 +711,17 @@ func resultBatchInitialState(
 
 func resultBatchCommand(
 	request ApplyRequest,
+	encodedResult []byte,
 	mutations []chain.Mutation,
 	heads ApplyHeads,
-) ResultBatchCommand {
-	return ResultBatchCommand{
-		Proposal:    request.Proposal,
-		Outcome:     request.Outcome,
-		Projections: request.Projections,
-		Mutations:   mutations,
-		Heads:       heads,
+) VerifiedCommandImport {
+	return VerifiedCommandImport{
+		Proposal:      request.Proposal,
+		Outcome:       request.Outcome,
+		EncodedResult: bytes.Clone(encodedResult),
+		Projections:   request.Projections,
+		Mutations:     mutations,
+		Heads:         heads,
 		Local: ResultBatchLocalWrites{
 			AppliedAt:            request.AppliedAt,
 			RecordActivity:       request.RecordActivity,

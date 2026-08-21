@@ -74,6 +74,26 @@ func verifyCommitmentHistory(
 	conn *sqlite.Conn,
 	state consensusState,
 ) error {
+	return verifyCommitmentHistoryWithProjectionRewind(conn, state, true)
+}
+
+// verifyHistoricalGenerationCommitments verifies immutable event/result
+// links and the projection accumulator for a predecessor generation. Its
+// terminal projection rows were deliberately replaced by the next recovery
+// transform, so only the active generation can additionally rewind mutations
+// from the current covered rows.
+func verifyHistoricalGenerationCommitments(
+	conn *sqlite.Conn,
+	state consensusState,
+) error {
+	return verifyCommitmentHistoryWithProjectionRewind(conn, state, false)
+}
+
+func verifyCommitmentHistoryWithProjectionRewind(
+	conn *sqlite.Conn,
+	state consensusState,
+	verifyProjectionRewind bool,
+) error {
 	genesis, err := readGenesisBoundary(
 		conn,
 		state.recoveryGeneration,
@@ -357,8 +377,14 @@ func verifyCommitmentHistory(
 			nil,
 		)
 	}
-	if err := verifyProjectionMutationHistory(conn, state, genesis); err != nil {
-		return err
+	if verifyProjectionRewind {
+		if err := verifyProjectionMutationHistory(
+			conn,
+			state,
+			genesis,
+		); err != nil {
+			return err
+		}
 	}
 	return nil
 }

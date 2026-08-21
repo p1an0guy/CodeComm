@@ -33,15 +33,18 @@ type ResultBatchLocalWrites struct {
 	DeleteLeaseDeadlines []LeaseDeadlineKey
 }
 
-// ResultBatchCommand is one fully scratch-verified command and its exact
-// deterministic persistence artifacts.
-type ResultBatchCommand struct {
-	Proposal    event.SignedEvent
-	Outcome     CommandOutcome
-	Projections ProjectionWrites
-	Mutations   []chain.Mutation
-	Heads       ApplyHeads
-	Local       ResultBatchLocalWrites
+// VerifiedCommandImport is one fully scratch-verified command and its exact
+// deterministic persistence artifacts. EncodedResult is the immutable
+// result-chain preimage. Batch and snapshot importers share this bounded
+// representation.
+type VerifiedCommandImport struct {
+	Proposal      event.SignedEvent
+	Outcome       CommandOutcome
+	EncodedResult []byte
+	Projections   ProjectionWrites
+	Mutations     []chain.Mutation
+	Heads         ApplyHeads
+	Local         ResultBatchLocalWrites
 }
 
 // VerifiedResultBatchImport is the complete input to one atomic
@@ -50,7 +53,7 @@ type ResultBatchCommand struct {
 type VerifiedResultBatchImport struct {
 	RelayPeerID           domain.DeviceID
 	Batch                 replication.Batch
-	Commands              []ResultBatchCommand
+	Commands              []VerifiedCommandImport
 	VerifiedAt            domain.Timestamp
 	FinalProjectionDigest Digest
 }
@@ -157,119 +160,21 @@ func (store *Store) ImportSettledNonvoterResultBatch(
 		var finalHeads ApplyHeads
 		for index := range request.Commands {
 			command := request.Commands[index]
-			encodedResult := input.Results[index]
-			decoded, err := chain.DecodeResult(encodedResult)
-			if err != nil {
-				return resultBatchCommandError(index, "decode result", err)
+			if !bytes.Equal(command.EncodedResult, input.Results[index]) {
+				return resultBatchCommandError(
+					index,
+					"result binding",
+					errors.New("command result differs from signed batch"),
+				)
 			}
-			applyRequest, err := validateResultBatchCommand(
+			heads, err := store.importVerifiedCommand(
+				conn,
 				prior,
 				input.WorkspaceID,
 				command,
-				decoded,
 			)
 			if err != nil {
-				return resultBatchCommandError(index, "validate", err)
-			}
-			prepared, err := prepareProjectionWrites(command.Projections)
-			if err != nil {
-				return resultBatchCommandError(index, "prepare projections", err)
-			}
-			mutations, err := projectionMutations(conn, prepared)
-			if err != nil {
-				return resultBatchCommandError(index, "apply projections", err)
-			}
-			if !equalResultBatchMutations(mutations, command.Mutations) {
-				return resultBatchCommandError(
-					index,
-					"projection mutations",
-					errors.New("SQLite before/after images differ from scratch replay"),
-				)
-			}
-			if err := store.reachApplyStage(
-				applyAfterProjections,
-			); err != nil {
-				return err
-			}
-			heads, mutationJSON, err := deriveResultBatchCommitments(
-				prior,
-				decoded,
-				encodedResult,
-				mutations,
-			)
-			if err != nil {
-				return resultBatchCommandError(index, "derive commitments", err)
-			}
-			if heads != command.Heads {
-				return resultBatchCommandError(
-					index,
-					"compare heads",
-					errors.New("scratch-replayed heads differ from SQLite derivation"),
-				)
-			}
-			if err := validateResultBatchLocalWrites(
-				prior,
-				applyRequest,
-				heads,
-				prepared,
-			); err != nil {
-				return resultBatchCommandError(index, "validate local rows", err)
-			}
-
-			if applyRequest.Outcome.Status == OutcomeAccepted {
-				if err := writeAcceptedEvent(conn, applyRequest); err != nil {
-					return resultBatchCommandError(index, "write event", err)
-				}
-			}
-			if err := store.reachApplyStage(applyAfterEvent); err != nil {
-				return err
-			}
-			if err := store.reachApplyStage(
-				applyAfterProvenance,
-			); err != nil {
-				return err
-			}
-			if err := ensurePendingControlFileApprovals(
-				conn,
-				prior.sessionID,
-				prepared.controlFileProposalRows,
-			); err != nil {
-				return resultBatchCommandError(
-					index,
-					"write control-file approvals",
-					err,
-				)
-			}
-			if err := writeCommandResult(
-				conn,
-				applyRequest,
-				heads,
-				encodedResult,
-				mutationJSON,
-			); err != nil {
-				return resultBatchCommandError(index, "write result", err)
-			}
-			if err := store.reachApplyStage(applyAfterResult); err != nil {
-				return err
-			}
-			if err := store.writeResultBatchLocalRows(
-				conn,
-				applyRequest,
-			); err != nil {
-				return resultBatchCommandError(index, "write local rows", err)
-			}
-			if err := writePostCommandLocalCleanup(
-				conn,
-				applyRequest,
-			); err != nil {
-				return resultBatchCommandError(
-					index,
-					"clean local command state",
-					err,
-				)
-			}
-			if err := store.reachApplyStage(applyAfterOutbox); err != nil {
-				return err
+				return resultBatchCommandError(index, "import", err)
 			}
 			finalHeads = heads
 			prior = consensusStateFromImportedHeads(prior, heads)
@@ -382,10 +287,121 @@ func validateResultBatchStart(
 	return nil
 }
 
-func validateResultBatchCommand(
+// importVerifiedCommand persists one command whose origin signature, reducer
+// outcome, and mutation list were already independently scratch-verified. It
+// re-derives SQLite before/after images and every commitment before writing
+// history. The caller owns the surrounding transaction and advances
+// consensus_state only after this function succeeds.
+func (store *Store) importVerifiedCommand(
+	conn *sqlite.Conn,
 	prior consensusState,
 	workspaceID domain.UUIDv4,
-	command ResultBatchCommand,
+	command VerifiedCommandImport,
+) (ApplyHeads, error) {
+	decoded, err := chain.DecodeResult(command.EncodedResult)
+	if err != nil {
+		return ApplyHeads{}, fmt.Errorf("decode result: %w", err)
+	}
+	applyRequest, err := validateVerifiedCommandImport(
+		prior,
+		workspaceID,
+		command,
+		decoded,
+	)
+	if err != nil {
+		return ApplyHeads{}, fmt.Errorf("validate: %w", err)
+	}
+	prepared, err := prepareProjectionWrites(command.Projections)
+	if err != nil {
+		return ApplyHeads{}, fmt.Errorf("prepare projections: %w", err)
+	}
+	mutations, err := projectionMutations(conn, prepared)
+	if err != nil {
+		return ApplyHeads{}, fmt.Errorf("apply projections: %w", err)
+	}
+	if !equalImportedCommandMutations(mutations, command.Mutations) {
+		return ApplyHeads{}, errors.New(
+			"projection mutations: SQLite before/after images differ from scratch replay",
+		)
+	}
+	if err := store.reachApplyStage(applyAfterProjections); err != nil {
+		return ApplyHeads{}, err
+	}
+	heads, mutationJSON, err := deriveImportedCommandCommitments(
+		prior,
+		decoded,
+		command.EncodedResult,
+		mutations,
+	)
+	if err != nil {
+		return ApplyHeads{}, fmt.Errorf("derive commitments: %w", err)
+	}
+	if heads != command.Heads {
+		return ApplyHeads{}, errors.New(
+			"compare heads: scratch-replayed heads differ from SQLite derivation",
+		)
+	}
+	if err := validateImportedCommandLocalWrites(
+		prior,
+		applyRequest,
+		heads,
+		prepared,
+	); err != nil {
+		return ApplyHeads{}, fmt.Errorf("validate local rows: %w", err)
+	}
+
+	if applyRequest.Outcome.Status == OutcomeAccepted {
+		if err := writeAcceptedEvent(conn, applyRequest); err != nil {
+			return ApplyHeads{}, fmt.Errorf("write event: %w", err)
+		}
+	}
+	if err := store.reachApplyStage(applyAfterEvent); err != nil {
+		return ApplyHeads{}, err
+	}
+	if err := store.reachApplyStage(applyAfterProvenance); err != nil {
+		return ApplyHeads{}, err
+	}
+	if err := ensurePendingControlFileApprovals(
+		conn,
+		prior.sessionID,
+		prepared.controlFileProposalRows,
+	); err != nil {
+		return ApplyHeads{}, fmt.Errorf(
+			"write control-file approvals: %w",
+			err,
+		)
+	}
+	if err := writeCommandResult(
+		conn,
+		applyRequest,
+		heads,
+		command.EncodedResult,
+		mutationJSON,
+	); err != nil {
+		return ApplyHeads{}, fmt.Errorf("write result: %w", err)
+	}
+	if err := store.reachApplyStage(applyAfterResult); err != nil {
+		return ApplyHeads{}, err
+	}
+	if err := store.writeImportedCommandLocalRows(conn, applyRequest); err != nil {
+		return ApplyHeads{}, fmt.Errorf("write local rows: %w", err)
+	}
+	if err := writePostCommandLocalCleanup(conn, applyRequest); err != nil {
+		return ApplyHeads{}, fmt.Errorf(
+			"clean local command state: %w",
+			err,
+		)
+	}
+	if err := store.reachApplyStage(applyAfterOutbox); err != nil {
+		return ApplyHeads{}, err
+	}
+	return heads, nil
+}
+
+func validateVerifiedCommandImport(
+	prior consensusState,
+	workspaceID domain.UUIDv4,
+	command VerifiedCommandImport,
 	result chain.Result,
 ) (ApplyRequest, error) {
 	local := command.Local
@@ -493,7 +509,7 @@ func validateResultBatchCommand(
 	return request, nil
 }
 
-func deriveResultBatchCommitments(
+func deriveImportedCommandCommitments(
 	prior consensusState,
 	result chain.Result,
 	encodedResult []byte,
@@ -555,7 +571,7 @@ func deriveResultBatchCommitments(
 	return heads, mutationJSON, nil
 }
 
-func validateResultBatchLocalWrites(
+func validateImportedCommandLocalWrites(
 	prior consensusState,
 	request ApplyRequest,
 	heads ApplyHeads,
@@ -615,7 +631,7 @@ func validateResultBatchLocalWrites(
 	return nil
 }
 
-func (store *Store) writeResultBatchLocalRows(
+func (store *Store) writeImportedCommandLocalRows(
 	conn *sqlite.Conn,
 	request ApplyRequest,
 ) error {
@@ -882,7 +898,7 @@ func writeReplicationCursor(
 	)
 }
 
-func equalResultBatchMutations(
+func equalImportedCommandMutations(
 	left []chain.Mutation,
 	right []chain.Mutation,
 ) bool {

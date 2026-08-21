@@ -28,6 +28,7 @@ var (
 	ErrRaftIndexAhead     = errors.New("store: applied SQLite index exceeds Raft log")
 	ErrIntegrityCheck     = errors.New("store: integrity check failed")
 	ErrUnexpectedRowCount = errors.New("store: unexpected query row count")
+	ErrDatabaseExists     = errors.New("store: database already exists")
 )
 
 // RaftLog provides the durable last log index used for the startup consistency
@@ -39,8 +40,9 @@ type RaftLog interface {
 
 // Options configures one per-workspace store.
 type Options struct {
-	Path    string
-	RaftLog RaftLog
+	Path       string
+	RaftLog    RaftLog
+	RequireNew bool
 }
 
 // Store is a concurrency-safe owner for one SQLite connection pool.
@@ -72,8 +74,12 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 		return nil, fmt.Errorf("%w: path must be absolute", ErrInvalidOptions)
 	}
 	path := filepath.Clean(options.Path)
-	if _, err := openDatabaseFile(path, syncDirectory); err != nil {
+	created, err := openDatabaseFile(path, syncDirectory)
+	if err != nil {
 		return nil, err
+	}
+	if options.RequireNew && !created {
+		return nil, ErrDatabaseExists
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

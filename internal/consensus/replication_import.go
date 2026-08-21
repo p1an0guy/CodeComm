@@ -276,8 +276,8 @@ func (replica *SettledReplica) ImportResultBatch(
 func (replica *SettledReplica) mapResultBatch(
 	view store.StateView,
 	replayed resultBatchReplay,
-) ([]store.ResultBatchCommand, domain.Timestamp, error) {
-	commands := make([]store.ResultBatchCommand, len(replayed.commands))
+) ([]store.VerifiedCommandImport, domain.Timestamp, error) {
+	commands := make([]store.VerifiedCommandImport, len(replayed.commands))
 	priorHeads := view.Heads
 	var verifiedAt domain.Timestamp
 	for index, command := range replayed.commands {
@@ -307,12 +307,13 @@ func (replica *SettledReplica) mapResultBatch(
 				err,
 			)
 		}
-		commands[index] = store.ResultBatchCommand{
-			Proposal:    mapped.Proposal,
-			Outcome:     mapped.Outcome,
-			Projections: mapped.Projections,
-			Mutations:   command.mutations,
-			Heads:       command.heads,
+		commands[index] = store.VerifiedCommandImport{
+			Proposal:      mapped.Proposal,
+			Outcome:       mapped.Outcome,
+			EncodedResult: command.encoded,
+			Projections:   mapped.Projections,
+			Mutations:     command.mutations,
+			Heads:         command.heads,
 			Local: store.ResultBatchLocalWrites{
 				AppliedAt:            mapped.AppliedAt,
 				RecordActivity:       mapped.RecordActivity,

@@ -144,7 +144,7 @@ func (store *Store) ExportLogicalSnapshotRecords(
 			conn,
 			state,
 			options.CheckpointEventID,
-			isSettled,
+			!isSettled,
 		)
 		if err != nil {
 			return err
@@ -398,7 +398,7 @@ func verifyLogicalSnapshotCheckpoint(
 	conn *sqlite.Conn,
 	state consensusState,
 	eventID domain.UUIDv7,
-	settled bool,
+	verifyRaftBinding bool,
 ) (CheckpointRecord, error) {
 	checkpoint, found, err := readCheckpointRecord(conn, eventID)
 	if err != nil {
@@ -492,7 +492,7 @@ func verifyLogicalSnapshotCheckpoint(
 				nil,
 			)
 	}
-	if !settled {
+	if verifyRaftBinding {
 		if err := verifyLogicalSnapshotRaftCheckpointBinding(
 			conn,
 			checkpoint,
