@@ -14,7 +14,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
-// ProvisionalAuthorizations retains at most one locally-unapplied successor
+// ProvisionalAuthorizations retains at most one locally-unapplied later
 // authorization per active peer.
 type ProvisionalAuthorizations struct {
 	mu     sync.Mutex
@@ -30,7 +30,7 @@ func NewProvisionalAuthorizations() *ProvisionalAuthorizations {
 	}
 }
 
-// InstallProvisionalAuthorization validates one identity-bound successor
+// InstallProvisionalAuthorization validates one identity-bound later epoch
 // against the current applied membership before making it available to
 // content-certificate admission.
 func (verifiers *Verifiers) InstallProvisionalAuthorization(
@@ -75,6 +75,10 @@ func (verifiers *Verifiers) InstallProvisionalAuthorization(
 		verifiers.provisional.byPeer = make(
 			map[domain.DeviceID]credentialauthorization.Authorization,
 		)
+	}
+	if current, exists := verifiers.provisional.byPeer[peerID]; exists &&
+		current.Epoch > authorization.Epoch {
+		return ErrInvalidProvisionalAuthorization
 	}
 	verifiers.provisional.byPeer[peerID] = authorization.Clone()
 	return nil
@@ -202,9 +206,14 @@ func validProvisionalAuthorization(
 	if !valid ||
 		!exists ||
 		currentEpoch == domain.MaxSafeInteger ||
-		authorization.Epoch != currentEpoch+1 ||
-		authorization.AuthorizationChainIndex <= appliedChainIndex {
+		authorization.Epoch <= currentEpoch ||
+		authorization.AuthorizationChainIndex <= appliedChainIndex ||
+		authorization.Epoch-currentEpoch >
+			authorization.AuthorizationChainIndex-appliedChainIndex {
 		return false
+	}
+	if authorization.Epoch > currentEpoch+1 {
+		return currentEpoch != 0
 	}
 	var prior *credentialauthorization.Authorization
 	if currentEpoch != 0 {

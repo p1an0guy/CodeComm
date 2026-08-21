@@ -160,7 +160,7 @@ func (verifiers *Verifiers) VerifyContentPeer(
 
 // VerifyExpectedContentPeer pins an outbound connection to one device. A
 // verifier constructed with a provisional overlay may accept that device's
-// identity-plane-validated successor until local result replay applies it.
+// identity-plane-validated later epoch until local result replay applies it.
 func (verifiers *Verifiers) VerifyExpectedContentPeer(
 	expectedDeviceID domain.DeviceID,
 	certificate transport.ContentCertificate,

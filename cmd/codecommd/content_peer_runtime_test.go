@@ -309,7 +309,7 @@ func TestDaemonContentPeerRuntimeDetectsActiveRemoteSuccessor(t *testing.T) {
 	}
 }
 
-func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
+func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch(
 	t *testing.T,
 ) {
 	now := time.Now().UTC().Truncate(time.Second)
@@ -339,9 +339,13 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
 	secondEpochKey := ed25519.NewKeyFromSeed(
 		bytes.Repeat([]byte{0xd2}, ed25519.SeedSize),
 	)
+	thirdEpochKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd3}, ed25519.SeedSize),
+	)
 	t.Cleanup(func() {
 		clear(firstEpochKey)
 		clear(secondEpochKey)
+		clear(thirdEpochKey)
 	})
 	first := daemonContentPeerSignedAuthorization(
 		t,
@@ -349,8 +353,8 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
 		peerIdentity,
 		firstEpochKey,
 		nil,
-		now.Add(-29*time.Minute),
-		now.Add(-29*time.Minute),
+		now.Add(-58*time.Minute),
+		now.Add(-58*time.Minute),
 		1,
 	)
 	second := daemonContentPeerSignedAuthorization(
@@ -359,9 +363,19 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
 		peerIdentity,
 		secondEpochKey,
 		&first,
-		now.Add(-2*time.Minute),
-		now.Add(-time.Minute),
+		now.Add(-31*time.Minute),
+		now.Add(-30*time.Minute),
 		2,
+	)
+	third := daemonContentPeerSignedAuthorization(
+		t,
+		peer,
+		peerIdentity,
+		thirdEpochKey,
+		&second,
+		now.Add(-2*time.Minute),
+		now.Add(-2*time.Minute),
+		3,
 	)
 	snapshot, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
 		SessionID:          daemonTestSessionID,
@@ -407,8 +421,8 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
 		t.Fatalf("NewVerifiers(ingress): %v", err)
 	}
 	certificate, _, err := transport.IssueContentCertificate(
-		second,
-		secondEpochKey,
+		third,
+		thirdEpochKey,
 	)
 	if err != nil {
 		t.Fatalf("IssueContentCertificate(): %v", err)
@@ -431,7 +445,7 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
 		response: daemonContentPeerConsensusStatusResponse(
 			t,
 			peer.ID,
-			second,
+			third,
 			0,
 		),
 	}

@@ -518,6 +518,67 @@ func TestContentVerifierKeepsProvisionalSuccessorOutboundOnly(t *testing.T) {
 	}
 }
 
+func TestContentVerifierAcceptsSkippedRemoteEpochOutboundOnly(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	current, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	now := time.Date(2026, 8, 14, 12, 28, 30, 0, time.UTC)
+	provisional := NewProvisionalAuthorizations()
+	verifiers, err := NewVerifiersWithProvisional(
+		func() (*Snapshot, error) { return current, nil },
+		func() time.Time { return now },
+		provisional,
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiersWithProvisional() error = %v", err)
+	}
+
+	epochKey := snapshotPrivateKey(24)
+	later := provisionalAuthorization(t, fixture, epochKey, 3)
+	certificate := parsedContentCertificate(t, later, epochKey)
+	if err := verifiers.InstallProvisionalAuthorization(
+		fixture.deviceID,
+		later,
+	); err != nil {
+		t.Fatalf("InstallProvisionalAuthorization(skipped epoch): %v", err)
+	}
+	if _, err := verifiers.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		certificate,
+	); err != nil {
+		t.Fatalf("VerifyExpectedContentPeer(skipped epoch): %v", err)
+	}
+	if _, err := verifiers.VerifyContentPeer(certificate); !errors.Is(
+		err,
+		ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(skipped epoch) error = %v", err)
+	}
+
+	stale := provisionalAuthorization(
+		t,
+		fixture,
+		snapshotPrivateKey(22),
+		2,
+	)
+	if err := verifiers.InstallProvisionalAuthorization(
+		fixture.deviceID,
+		stale,
+	); !errors.Is(err, ErrInvalidProvisionalAuthorization) {
+		t.Fatalf("InstallProvisionalAuthorization(stale) error = %v", err)
+	}
+	if _, err := verifiers.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		certificate,
+	); err != nil {
+		t.Fatalf("stale install displaced later authorization: %v", err)
+	}
+}
+
 func TestInstallProvisionalAuthorizationRejectsUntrustedOrStaleValues(
 	t *testing.T,
 ) {
@@ -570,7 +631,7 @@ func TestInstallProvisionalAuthorizationRejectsUntrustedOrStaleValues(
 			},
 		},
 		{
-			name:   "skipped epoch",
+			name:   "tampered epoch",
 			peerID: fixture.deviceID,
 			mutate: func(value *credentialauthorization.Authorization) {
 				value.Epoch = 3
@@ -643,8 +704,15 @@ func provisionalAuthorization(
 		ClockEndorsements: []credentialauthorization.ClockEndorsement{{
 			DeviceID: fixture.deviceID,
 		}},
-		BindingSignature:        binding.Signature,
-		AuthorizationChainIndex: fixture.input.AppliedChainIndex + 1,
+		BindingSignature: binding.Signature,
+	}
+	currentEpoch := fixture.input.AuditCounters[fixture.deviceID].
+		CredentialEpoch
+	authorization.AuthorizationChainIndex =
+		fixture.input.AppliedChainIndex + 1
+	if epoch > currentEpoch {
+		authorization.AuthorizationChainIndex =
+			fixture.input.AppliedChainIndex + epoch - currentEpoch
 	}
 	preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
 		authorization,
