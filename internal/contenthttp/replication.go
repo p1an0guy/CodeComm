@@ -201,7 +201,7 @@ func (client *Client) Replication(
 		int64(replication.MaxBatchExpandedBytes),
 	)
 	if err != nil {
-		return replication.Batch{}, err
+		return replication.Batch{}, normalizeClientReplicationError(err)
 	}
 	batch, err := replication.ParseBatch(body)
 	if err != nil {
@@ -225,6 +225,23 @@ func (client *Client) Replication(
 		return replication.Batch{}, ErrResponseProtocol
 	}
 	return batch, nil
+}
+
+func normalizeClientReplicationError(err error) error {
+	var remote *RemoteError
+	if !errors.As(err, &remote) {
+		return err
+	}
+	switch remote.Code {
+	case problemInvalidReplicationCursor.code:
+		return fmt.Errorf("%w: %w", ErrInvalidReplicationCursor, err)
+	case problemSnapshotRequired.code:
+		return fmt.Errorf("%w: %w", ErrReplicationSnapshotRequired, err)
+	case problemReplicationUnavailable.code:
+		return fmt.Errorf("%w: %w", ErrReplicationUnavailable, err)
+	default:
+		return err
+	}
 }
 
 type replicationClientLineage struct {

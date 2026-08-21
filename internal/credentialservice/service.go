@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/discovery"
@@ -113,9 +114,10 @@ type Service struct {
 	started bool
 	closed  bool
 
-	stateMu      sync.RWMutex
-	certificates map[uint64]retainedCertificate
-	fatalErr     error
+	stateMu                sync.RWMutex
+	certificates           map[uint64]retainedCertificate
+	provisionalCertificate *retainedCertificate
+	fatalErr               error
 
 	closeOnce sync.Once
 }
@@ -224,6 +226,14 @@ func (service *Service) ContentCertificate() (tls.Certificate, error) {
 			selected = &value
 		}
 	}
+	if provisional := service.provisionalCertificate; provisional != nil &&
+		provisional.authorization.ActiveAt(now) &&
+		(selected == nil ||
+			provisional.authorization.Epoch >
+				selected.authorization.Epoch) {
+		value := *provisional
+		selected = &value
+	}
 	if selected == nil {
 		service.stateMu.RUnlock()
 		return tls.Certificate{}, transport.ErrContentCertificateUnavailable
@@ -264,6 +274,19 @@ func (service *Service) DiscoveryAdvertisement(
 				retained.authorization.Epoch >
 					selected.authorization.Epoch {
 			value := retained
+			selected = &value
+		}
+	}
+	if provisional := service.provisionalCertificate; provisional != nil {
+		provisionalActive := provisional.authorization.ActiveAt(now)
+		selectedActive := selected != nil &&
+			selected.authorization.ActiveAt(now)
+		if selected == nil ||
+			provisionalActive && !selectedActive ||
+			provisionalActive == selectedActive &&
+				provisional.authorization.Epoch >
+					selected.authorization.Epoch {
+			value := *provisional
 			selected = &value
 		}
 	}
@@ -346,6 +369,8 @@ func (service *Service) Wait() error {
 		service.stateMu.Lock()
 		clearRetainedCertificates(service.certificates)
 		clear(service.certificates)
+		clearRetainedCertificate(service.provisionalCertificate)
+		service.provisionalCertificate = nil
 		service.stateMu.Unlock()
 	})
 	return nil
@@ -440,6 +465,13 @@ func (service *Service) reconcile(
 	if !exists || !domain.ValidUnsignedInteger(currentEpoch) {
 		return time.Time{}, nil, ErrCredentialIntegrity
 	}
+	pending, err := service.provisionalAwaitingApply(currentEpoch, now)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	if pending {
+		return time.Time{}, nil, nil
+	}
 	nextEpoch := uint64(1)
 	var renewalAt time.Time
 	if currentEpoch != 0 {
@@ -509,12 +541,18 @@ func (service *Service) reconcile(
 	}
 	authorization, err := service.consensus.RenewCredential(ctx, binding)
 	if err != nil {
-		return time.Time{}, err, nil
+		transient, fatal := classifyRenewalError(err)
+		return time.Time{}, transient, fatal
 	}
 	if err := validateRenewalResponse(binding, authorization); err != nil {
 		return time.Time{}, nil, err
 	}
-	service.signal()
+	if err := service.installProvisionalCertificate(
+		privateKey,
+		authorization,
+	); err != nil {
+		return time.Time{}, nil, err
+	}
 	return time.Time{}, nil, nil
 }
 
@@ -532,6 +570,7 @@ func (service *Service) refreshCertificates(
 	member, exists := snapshot.Member(service.deviceID)
 	if !exists {
 		service.replaceCertificates(nil)
+		service.clearProvisionalCertificate()
 		return ErrCredentialIntegrity
 	}
 	if member.Status != device.StatusActive {
@@ -572,6 +611,13 @@ func (service *Service) refreshCertificates(
 		if epoch == currentEpoch || authorization.ActiveAt(now) {
 			desired[epoch] = authorization
 		}
+	}
+	provisionalCommitted, err := service.reconcileProvisionalCertificate(
+		snapshot,
+		currentEpoch,
+	)
+	if err != nil {
+		return err
 	}
 
 	service.stateMu.RLock()
@@ -645,6 +691,9 @@ func (service *Service) refreshCertificates(
 		}
 	}
 	service.replaceCertificates(next)
+	if provisionalCommitted {
+		service.clearProvisionalCertificate()
+	}
 
 	obsolete := make([]uint64, 0, 2)
 	if currentEpoch > 2 {
@@ -682,6 +731,7 @@ func (service *Service) eraseInactiveMemberKeys(
 	snapshot *peerauth.Snapshot,
 ) error {
 	service.replaceCertificates(nil)
+	service.clearProvisionalCertificate()
 
 	currentEpoch, exists := snapshot.CurrentCredentialEpoch(service.deviceID)
 	if !exists || !domain.ValidUnsignedInteger(currentEpoch) {
@@ -798,6 +848,132 @@ func validateRenewalResponse(
 	return nil
 }
 
+func (service *Service) installProvisionalCertificate(
+	privateKey ed25519.PrivateKey,
+	authorization credentialauthorization.Authorization,
+) error {
+	if service == nil ||
+		len(privateKey) != ed25519.PrivateKeySize ||
+		authorization.Validate() != nil ||
+		authorization.SessionID != service.sessionID ||
+		authorization.DeviceID != service.deviceID {
+		return ErrCredentialIntegrity
+	}
+	certificate, _, err := transport.IssueContentCertificate(
+		authorization,
+		privateKey,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: issue provisional epoch %d certificate: %v",
+			ErrCredentialIntegrity,
+			authorization.Epoch,
+			err,
+		)
+	}
+	next := &retainedCertificate{
+		authorization: authorization.Clone(),
+		certificate:   certificate,
+	}
+	service.stateMu.Lock()
+	previous := service.provisionalCertificate
+	service.provisionalCertificate = next
+	service.stateMu.Unlock()
+	clearRetainedCertificate(previous)
+	return nil
+}
+
+func (service *Service) reconcileProvisionalCertificate(
+	snapshot *peerauth.Snapshot,
+	currentEpoch uint64,
+) (bool, error) {
+	service.stateMu.RLock()
+	provisional := cloneRetainedCertificate(service.provisionalCertificate)
+	service.stateMu.RUnlock()
+	if provisional == nil {
+		return false, nil
+	}
+	defer clearRetainedCertificate(provisional)
+	if provisional.authorization.Epoch > currentEpoch {
+		if provisional.authorization.Epoch != currentEpoch+1 {
+			return false, ErrCredentialIntegrity
+		}
+		return false, nil
+	}
+	committed, found := snapshot.Authorization(
+		provisional.authorization.PrimaryKey(),
+	)
+	if !found ||
+		!reflect.DeepEqual(committed, provisional.authorization) {
+		return false, ErrCredentialIntegrity
+	}
+	return true, nil
+}
+
+func (service *Service) provisionalAwaitingApply(
+	currentEpoch uint64,
+	now time.Time,
+) (bool, error) {
+	service.stateMu.RLock()
+	provisional := cloneRetainedCertificate(service.provisionalCertificate)
+	service.stateMu.RUnlock()
+	if provisional == nil {
+		return false, nil
+	}
+	defer clearRetainedCertificate(provisional)
+	if currentEpoch == domain.MaxSafeInteger ||
+		provisional.authorization.Epoch != currentEpoch+1 {
+		return false, ErrCredentialIntegrity
+	}
+	notBefore, err := provisional.authorization.NotBefore.Time()
+	if err != nil {
+		return false, ErrCredentialIntegrity
+	}
+	expiresAt := notBefore.Add(
+		time.Duration(provisional.authorization.ValiditySeconds) *
+			time.Second,
+	)
+	if now.Before(expiresAt) {
+		return true, nil
+	}
+	service.clearProvisionalCertificate()
+	return false, nil
+}
+
+func classifyRenewalError(err error) (transient, fatal error) {
+	if err == nil {
+		return nil, nil
+	}
+	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, consensus.ErrCredentialRenewalUnavailable):
+		return err, nil
+	case errors.Is(err, consensus.ErrInvalidCredentialRenewal),
+		errors.Is(err, consensus.ErrCredentialRenewalRejected),
+		errors.Is(err, consensus.ErrCredentialRenewalMismatch),
+		errors.Is(err, consensus.ErrInvalidCredentialBinding):
+		return nil, fmt.Errorf(
+			"%w: renewal response: %w",
+			ErrCredentialIntegrity,
+			err,
+		)
+	default:
+		return err, nil
+	}
+}
+
+func (service *Service) clearProvisionalCertificate() {
+	if service == nil {
+		return
+	}
+	service.stateMu.Lock()
+	previous := service.provisionalCertificate
+	service.provisionalCertificate = nil
+	service.stateMu.Unlock()
+	clearRetainedCertificate(previous)
+}
+
 func (service *Service) replaceCertificates(
 	next map[uint64]retainedCertificate,
 ) {
@@ -820,6 +996,8 @@ func (service *Service) setFatal(err error) {
 		service.fatalErr = err
 		clearRetainedCertificates(service.certificates)
 		clear(service.certificates)
+		clearRetainedCertificate(service.provisionalCertificate)
+		service.provisionalCertificate = nil
 	}
 	service.stateMu.Unlock()
 }
@@ -850,6 +1028,26 @@ func cloneTLSCertificate(certificate tls.Certificate) tls.Certificate {
 		result.PrivateKey = certificate.PrivateKey
 	}
 	return result
+}
+
+func cloneRetainedCertificate(
+	value *retainedCertificate,
+) *retainedCertificate {
+	if value == nil {
+		return nil
+	}
+	return &retainedCertificate{
+		authorization: value.authorization.Clone(),
+		certificate:   cloneTLSCertificate(value.certificate),
+	}
+}
+
+func clearRetainedCertificate(value *retainedCertificate) {
+	if value == nil {
+		return
+	}
+	clearTLSCertificate(&value.certificate)
+	*value = retainedCertificate{}
 }
 
 func clearTLSCertificate(certificate *tls.Certificate) {

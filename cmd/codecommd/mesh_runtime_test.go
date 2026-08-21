@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
@@ -134,6 +134,13 @@ func TestInspectDaemonMeshStateDerivesInterruptedBootstrapVotersOnlyBeforeRaftPr
 			if err != nil {
 				t.Fatalf("inspectDaemonMeshState(): %v", err)
 			}
+			if preflight.evidenceMode != store.ReplicaEvidenceRaft {
+				t.Fatalf(
+					"evidence mode = %q, want %q",
+					preflight.evidenceMode,
+					store.ReplicaEvidenceRaft,
+				)
+			}
 			if test.wantBootstrapVoterIDs {
 				if len(preflight.bootstrapVoterIDs) != 1 ||
 					preflight.bootstrapVoterIDs[0] != deviceID {
@@ -226,6 +233,70 @@ func TestInspectDaemonMeshStateReopensMatureNonvoterWithoutBootstrap(
 	if len(preflight.bootstrapVoterIDs) != 0 {
 		t.Fatalf(
 			"mature nonvoter bootstrap voters = %v, want none",
+			preflight.bootstrapVoterIDs,
+		)
+	}
+	if preflight.evidenceMode != store.ReplicaEvidenceRaft {
+		t.Fatalf(
+			"evidence mode = %q, want %q",
+			preflight.evidenceMode,
+			store.ReplicaEvidenceRaft,
+		)
+	}
+}
+
+func TestInspectDaemonMeshStateSelectsSettledNonvoterWithoutBootstrap(
+	t *testing.T,
+) {
+	initial, identityPrivateKey, deviceID, authorityID :=
+		daemonTestSettledInitialState(t)
+	t.Cleanup(func() { clear(identityPrivateKey) })
+	statePath := filepath.Join(t.TempDir(), "state", "state.db")
+	database := openDaemonMeshTestStore(t, statePath)
+	if _, err := database.Initialize(
+		context.Background(),
+		initial,
+	); err != nil {
+		t.Fatalf("Initialize(): %v", err)
+	}
+	storeDaemonTestConfiguration(
+		t,
+		database,
+		[]domain.DeviceID{authorityID},
+		nil,
+	)
+	enteredAt := domain.Timestamp(
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if _, err := database.EnterSettledNonvoter(
+		context.Background(),
+		enteredAt,
+	); err != nil {
+		t.Fatalf("EnterSettledNonvoter(): %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	preflight, err := inspectDaemonMeshState(
+		context.Background(),
+		daemonMeshTestOptions(statePath),
+		deviceID,
+		identityPrivateKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("inspectDaemonMeshState(): %v", err)
+	}
+	if preflight.evidenceMode != store.ReplicaEvidenceSettledNonvoter {
+		t.Fatalf(
+			"evidence mode = %q, want %q",
+			preflight.evidenceMode,
+			store.ReplicaEvidenceSettledNonvoter,
+		)
+	}
+	if len(preflight.bootstrapVoterIDs) != 0 {
+		t.Fatalf(
+			"settled nonvoter bootstrap voters = %v, want none",
 			preflight.bootstrapVoterIDs,
 		)
 	}
@@ -336,23 +407,12 @@ func storeDaemonMeshTestConfiguration(
 	deviceID domain.DeviceID,
 ) {
 	t.Helper()
-	configuration := []byte(fmt.Sprintf(
-		`{"servers":[{"address":%q,"id":%q,"suffrage":"voter"}]}`,
-		deviceID,
-		deviceID,
-	))
-	stored, err := database.StoreCommittedRaftConfiguration(
-		context.Background(),
-		1,
-		configuration,
+	storeDaemonTestConfiguration(
+		t,
+		database,
+		[]domain.DeviceID{deviceID},
+		nil,
 	)
-	if err != nil || !stored {
-		t.Fatalf(
-			"StoreCommittedRaftConfiguration() = (%t, %v)",
-			stored,
-			err,
-		)
-	}
 }
 
 func applyDaemonMeshTestEntry(

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/event"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
@@ -78,6 +79,9 @@ func (store *Store) AppliedCheckpoint(
 			)
 		}
 		appliedLogIndex := record.CoveredAppliedLogIndex + 1
+		if err := verifyCheckpointResultBinding(conn, record); err != nil {
+			return err
+		}
 
 		state, hasState, err := readConsensusState(conn)
 		if err != nil {
@@ -148,6 +152,209 @@ func (store *Store) AppliedCheckpoint(
 		return AppliedCheckpointLookup{}, false, err
 	}
 	return lookup, found, nil
+}
+
+// SettledAppliedCheckpoint returns an integrity-verified checkpoint from a
+// settled application nonvoter. Its proof uses the accepted result position
+// and signed replication evidence; the source device's Raft position is not
+// treated as local Raft provenance.
+func (store *Store) SettledAppliedCheckpoint(
+	ctx context.Context,
+	eventID domain.UUIDv7,
+) (CheckpointRecord, bool, error) {
+	if ctx == nil {
+		return CheckpointRecord{}, false, fmt.Errorf(
+			"%w: nil context",
+			ErrInvalidOptions,
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return CheckpointRecord{}, false, err
+	}
+	if !eventID.Valid() {
+		return CheckpointRecord{}, false, fmt.Errorf(
+			"%w: invalid checkpoint event ID",
+			ErrInvalidOptions,
+		)
+	}
+
+	var (
+		record CheckpointRecord
+		found  bool
+	)
+	err := store.withConn(ctx, func(conn *sqlite.Conn) (err error) {
+		previousInterrupt := conn.SetInterrupt(ctx.Done())
+		defer conn.SetInterrupt(previousInterrupt)
+
+		end := sqlitex.Transaction(conn)
+		defer end(&err)
+
+		state, hasState, err := readConsensusState(conn)
+		if err != nil {
+			return appliedCheckpointIntegrity(
+				"read active consensus state",
+				err,
+			)
+		}
+		if !hasState {
+			return appliedCheckpointIntegrity(
+				"active consensus state is missing",
+				ErrReplicaEvidenceMode,
+			)
+		}
+		settled, isSettled, err := readSettledNonvoterState(conn)
+		if err != nil {
+			return appliedCheckpointIntegrity(
+				"read settled-nonvoter evidence",
+				err,
+			)
+		}
+		if !isSettled {
+			return appliedCheckpointIntegrity(
+				"active generation is not a settled nonvoter",
+				ErrReplicaEvidenceMode,
+			)
+		}
+		if err := verifyCommitmentHistory(conn, state); err != nil {
+			return appliedCheckpointIntegrity(
+				"verify commitment history",
+				err,
+			)
+		}
+		if err := verifySettledNonvoterEvidence(
+			conn,
+			state,
+			settled,
+		); err != nil {
+			return appliedCheckpointIntegrity(
+				"verify settled-nonvoter evidence",
+				err,
+			)
+		}
+
+		stored, exists, err := readCheckpointRecord(conn, eventID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return nil
+		}
+		if err := stored.Validate(); err != nil {
+			return appliedCheckpointIntegrity(
+				"stored checkpoint is malformed",
+				err,
+			)
+		}
+		if stored.CoveredChainIndex >= domain.MaxSafeInteger ||
+			stored.CoveredResultIndex >= domain.MaxSafeInteger {
+			return appliedCheckpointIntegrity(
+				"checkpoint successor position is exhausted",
+				nil,
+			)
+		}
+		if err := verifyCheckpointResultBinding(conn, stored); err != nil {
+			return err
+		}
+		if state.sessionID != stored.SessionID ||
+			settled.workspaceID != stored.WorkspaceID ||
+			state.recoveryGeneration != stored.RecoveryGeneration ||
+			state.digestVersion != stored.DigestVersion ||
+			state.projectionSchemaVersion !=
+				stored.ProjectionSchemaVersion ||
+			state.chainIndex < stored.CoveredChainIndex+1 ||
+			state.resultIndex < stored.CoveredResultIndex+1 {
+			return appliedCheckpointIntegrity(
+				"active consensus state does not cover checkpoint",
+				nil,
+			)
+		}
+
+		var bindingCount int64
+		if err := queryOneArgs(
+			conn,
+			`SELECT count(*)
+			   FROM command_results
+			  WHERE event_id = ?1
+			    AND session_id = ?2
+			    AND workspace_id = ?3
+			    AND recovery_generation = ?4
+			    AND kind = 'consensus.checkpoint'
+			    AND outcome_status = 'accepted'
+			    AND chain_index = ?5
+			    AND result_index = ?6;`,
+			[]any{
+				string(stored.CheckpointEventID),
+				string(stored.SessionID),
+				string(stored.WorkspaceID),
+				stored.RecoveryGeneration,
+				stored.CoveredChainIndex + 1,
+				stored.CoveredResultIndex + 1,
+			},
+			func(stmt *sqlite.Stmt) {
+				bindingCount = stmt.ColumnInt64(0)
+			},
+		); err != nil {
+			return err
+		}
+		if bindingCount != 1 {
+			return appliedCheckpointIntegrity(
+				"checkpoint lacks its exact accepted result binding",
+				nil,
+			)
+		}
+
+		record = cloneCheckpointRecord(stored)
+		found = true
+		return nil
+	})
+	if err != nil {
+		return CheckpointRecord{}, false, err
+	}
+	return record, found, nil
+}
+
+func verifyCheckpointResultBinding(
+	conn *sqlite.Conn,
+	record CheckpointRecord,
+) error {
+	command, found, err := readStoredCommandResult(
+		conn,
+		record.CheckpointEventID,
+	)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return appliedCheckpointIntegrity(
+			"checkpoint command result is missing",
+			nil,
+		)
+	}
+	if err := verifyStoredCommandResult(conn, command); err != nil {
+		return appliedCheckpointIntegrity(
+			"verify checkpoint command result",
+			err,
+		)
+	}
+	proposal, err := event.InspectUnverifiedProposal(command.proposalJSON)
+	if err != nil ||
+		proposal.EventID != record.CheckpointEventID ||
+		proposal.SessionID != record.SessionID ||
+		proposal.WorkspaceID != record.WorkspaceID ||
+		proposal.Kind != event.KindConsensusCheckpoint ||
+		command.sessionID != record.SessionID ||
+		command.recoveryGeneration != record.RecoveryGeneration ||
+		command.outcome.Status != OutcomeAccepted ||
+		command.chainIndex == nil ||
+		*command.chainIndex != record.CoveredChainIndex+1 ||
+		command.resultIndex != record.CoveredResultIndex+1 ||
+		!record.matchesPayload(proposal.Payload) {
+		return appliedCheckpointIntegrity(
+			"checkpoint differs from its accepted command result",
+			err,
+		)
+	}
+	return nil
 }
 
 func readCheckpointRecord(
@@ -285,7 +492,7 @@ func appliedCheckpointIntegrity(
 		return fmt.Errorf("%w: %s", ErrAppliedCheckpointIntegrity, message)
 	}
 	return fmt.Errorf(
-		"%w: %s: %v",
+		"%w: %s: %w",
 		ErrAppliedCheckpointIntegrity,
 		message,
 		cause,

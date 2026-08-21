@@ -14,20 +14,23 @@ import (
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/peerauth"
+	"github.com/ijonahch/codecomm/internal/replication"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
 const (
-	daemonContentPeerRefreshInterval = 2 * time.Second
-	daemonContentPeerDialTimeout     = 10 * time.Second
-	daemonContentPeerRequestTimeout  = 30 * time.Second
-	daemonContentPeerRetryInitial    = 250 * time.Millisecond
-	daemonContentPeerRetryMaximum    = 30 * time.Second
+	daemonContentPeerRefreshInterval  = 2 * time.Second
+	daemonContentPeerDialTimeout      = 10 * time.Second
+	daemonContentPeerRequestTimeout   = 30 * time.Second
+	daemonContentPeerBootstrapTimeout = 3 * time.Second
+	daemonContentPeerRetryInitial     = 250 * time.Millisecond
+	daemonContentPeerRetryMaximum     = 30 * time.Second
 )
 
 var errDaemonContentPeerConstruction = errors.New(
@@ -79,6 +82,8 @@ type daemonContentPeerRuntime struct {
 	now           func() time.Time
 	credentialNow func() time.Time
 	jitter        func(time.Duration) time.Duration
+	replication   *daemonSettledReplication
+	status        consensus.ConsensusStatusRequester
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -123,6 +128,76 @@ func newDaemonContentPeerRuntime(
 	routes daemonContentPeerRoutes,
 	now func() time.Time,
 ) (*daemonContentPeerRuntime, error) {
+	return newDaemonContentPeerRuntimeWithReplication(
+		ctx,
+		sessionID,
+		workspaceID,
+		generation,
+		localDeviceID,
+		state,
+		admission,
+		certificate,
+		routes,
+		now,
+		nil,
+		nil,
+		nil,
+	)
+}
+
+func newDaemonSettledContentPeerRuntime(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+	localDeviceID domain.DeviceID,
+	state daemonContentPeerState,
+	admission daemonContentPeerAdmission,
+	certificate transport.ContentCertificateProvider,
+	routes daemonContentPeerRoutes,
+	now func() time.Time,
+	replica daemonSettledReplica,
+	control daemonSettledControlTransport,
+) (*daemonContentPeerRuntime, error) {
+	if control == nil || control.contentVerifiers() == nil {
+		return nil, errDaemonContentPeerConstruction
+	}
+	replicationRuntime, err := newDaemonSettledReplication(ctx, replica)
+	if err != nil {
+		return nil, err
+	}
+	return newDaemonContentPeerRuntimeWithReplication(
+		ctx,
+		sessionID,
+		workspaceID,
+		generation,
+		localDeviceID,
+		state,
+		admission,
+		certificate,
+		routes,
+		now,
+		replicationRuntime,
+		control.contentVerifiers(),
+		control,
+	)
+}
+
+func newDaemonContentPeerRuntimeWithReplication(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+	localDeviceID domain.DeviceID,
+	state daemonContentPeerState,
+	admission daemonContentPeerAdmission,
+	certificate transport.ContentCertificateProvider,
+	routes daemonContentPeerRoutes,
+	now func() time.Time,
+	replicationRuntime *daemonSettledReplication,
+	contentVerifiers *peerauth.Verifiers,
+	statusRequester consensus.ConsensusStatusRequester,
+) (*daemonContentPeerRuntime, error) {
 	if ctx == nil ||
 		!sessionID.Valid() ||
 		!workspaceID.Valid() ||
@@ -138,16 +213,23 @@ func newDaemonContentPeerRuntime(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	verifiers, err := peerauth.NewVerifiers(
-		admission.PeerAdmissionSnapshot,
-		now,
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"%w: peer verifiers: %v",
-			errDaemonContentPeerConstruction,
-			err,
+	if (contentVerifiers == nil) != (statusRequester == nil) {
+		return nil, errDaemonContentPeerConstruction
+	}
+	verifiers := contentVerifiers
+	if verifiers == nil {
+		var err error
+		verifiers, err = peerauth.NewVerifiers(
+			admission.PeerAdmissionSnapshot,
+			now,
 		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"%w: peer verifiers: %v",
+				errDaemonContentPeerConstruction,
+				err,
+			)
+		}
 	}
 	runtimeContext, cancel := context.WithCancel(context.Background())
 	runtime := &daemonContentPeerRuntime{
@@ -163,6 +245,8 @@ func newDaemonContentPeerRuntime(
 		now:           time.Now,
 		credentialNow: now,
 		jitter:        daemonContentPeerRetryDelay,
+		replication:   replicationRuntime,
+		status:        statusRequester,
 		ctx:           runtimeContext,
 		cancel:        cancel,
 		done:          make(chan struct{}),
@@ -355,6 +439,10 @@ func (runtime *daemonContentPeerRuntime) dialPeer(
 		daemonContentPeerDialTimeout,
 	)
 	defer cancel()
+	bootstrapErr := runtime.bootstrapPeerAuthorization(
+		dialContext,
+		peerID,
+	)
 	endpoints, err := runtime.routes.ResolveConsensusEndpoints(
 		dialContext,
 		peerID,
@@ -416,11 +504,10 @@ func (runtime *daemonContentPeerRuntime) dialPeer(
 			func(
 				remote transport.ContentCertificate,
 			) (transport.ContentPeerAdmission, error) {
-				if remote.Binding.DeviceID != peerID {
-					return transport.ContentPeerAdmission{},
-						peerauth.ErrPeerNotAdmitted
-				}
-				return runtime.verifiers.VerifyContentPeer(remote)
+				return runtime.verifiers.VerifyExpectedContentPeer(
+					peerID,
+					remote,
+				)
 			},
 		)
 		if configErr != nil {
@@ -501,11 +588,98 @@ func (runtime *daemonContentPeerRuntime) dialPeer(
 	if lastErr == nil {
 		lastErr = transport.ErrConsensusEndpointUnavailable
 	}
+	if bootstrapErr != nil {
+		lastErr = errors.Join(lastErr, bootstrapErr)
+	}
 	return nil, fmt.Errorf(
 		"%w: content dial: %v",
 		errDaemonContentPeerConstruction,
 		lastErr,
 	)
+}
+
+func (runtime *daemonContentPeerRuntime) bootstrapPeerAuthorization(
+	ctx context.Context,
+	peerID domain.DeviceID,
+) error {
+	if runtime == nil ||
+		ctx == nil ||
+		!peerID.Valid() ||
+		peerID == runtime.localDeviceID {
+		return errDaemonContentPeerConstruction
+	}
+	if runtime.status == nil {
+		return nil
+	}
+	snapshot, err := runtime.admission.PeerAdmissionSnapshot()
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read bootstrap admission: %v",
+			errDaemonContentPeerConstruction,
+			err,
+		)
+	}
+	sessionID, generation, valid := snapshot.Lineage()
+	authority, authorityValid := snapshot.CredentialAuthority()
+	now := runtime.credentialNow()
+	if !valid ||
+		sessionID != runtime.sessionID ||
+		generation != runtime.generation ||
+		!authorityValid ||
+		now.IsZero() {
+		return errDaemonContentPeerConstruction
+	}
+	if !authority.Contains(peerID) {
+		return nil
+	}
+	if active, found := snapshot.ActiveCredentialAuthorizationAt(
+		peerID,
+		now,
+	); found {
+		notBefore, timestampErr := active.NotBefore.Time()
+		if timestampErr != nil {
+			return errDaemonContentPeerConstruction
+		}
+		bootstrapAt := notBefore.Add(
+			time.Duration(
+				credentialauthorization.ValiditySeconds-
+					credentialauthorization.OverlapSeconds,
+			) * time.Second,
+		)
+		if now.Before(bootstrapAt) {
+			return nil
+		}
+	}
+	requestContext, cancel := context.WithTimeout(
+		ctx,
+		daemonContentPeerBootstrapTimeout,
+	)
+	defer cancel()
+	status, err := consensus.RequestConsensusStatus(
+		requestContext,
+		runtime.status,
+		peerID,
+	)
+	if err != nil {
+		return err
+	}
+	if status.SessionID != runtime.sessionID ||
+		status.RecoveryGeneration != runtime.generation ||
+		status.ServerDeviceID != peerID {
+		return consensus.ErrConsensusStatusMismatch
+	}
+	if err := runtime.verifiers.InstallProvisionalAuthorization(
+		peerID,
+		status.ContentCredentialAuthorization,
+	); err != nil {
+		return fmt.Errorf(
+			"%w: peer %s: %v",
+			errDaemonContentPeerConstruction,
+			peerID,
+			err,
+		)
+	}
+	return nil
 }
 
 func (runtime *daemonContentPeerRuntime) syncPeer(
@@ -570,6 +744,15 @@ func (runtime *daemonContentPeerRuntime) syncPeer(
 			)
 		}
 	}
+	if runtime.replication != nil {
+		if err := runtime.replication.Sync(
+			requestContext,
+			peerID,
+			connection,
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -610,6 +793,52 @@ func (runtime *daemonContentPeerRuntime) ForwardProposal(
 		return consensus.ForwardedProposalResult{},
 			normalizeDaemonProposalForwardingError(err)
 	}
+	return daemonForwardedProposalResult(result), nil
+}
+
+// Propose sends an initial-hop proposal to one selected active peer. That
+// peer may forward once to its observed leader.
+func (runtime *daemonContentPeerRuntime) Propose(
+	ctx context.Context,
+	target domain.DeviceID,
+	signed event.SignedEvent,
+) (consensus.ForwardedProposalResult, error) {
+	if runtime == nil ||
+		ctx == nil ||
+		!target.Valid() ||
+		target == runtime.localDeviceID ||
+		!signed.Proposal().EventID.Valid() ||
+		signed.Proposal().SessionID != runtime.sessionID ||
+		signed.Proposal().WorkspaceID != runtime.workspaceID {
+		return consensus.ForwardedProposalResult{},
+			errDaemonContentPeerConstruction
+	}
+	if err := ctx.Err(); err != nil {
+		return consensus.ForwardedProposalResult{}, err
+	}
+	runtime.workersMu.Lock()
+	worker := runtime.workers[target]
+	runtime.workersMu.Unlock()
+	if worker == nil {
+		return consensus.ForwardedProposalResult{},
+			consensus.ErrProposalForwardingUnavailable
+	}
+	connection := worker.currentConnection()
+	if connection == nil {
+		return consensus.ForwardedProposalResult{},
+			consensus.ErrProposalForwardingUnavailable
+	}
+	result, err := connection.Propose(ctx, signed)
+	if err != nil {
+		return consensus.ForwardedProposalResult{},
+			normalizeDaemonProposalForwardingError(err)
+	}
+	return daemonForwardedProposalResult(result), nil
+}
+
+func daemonForwardedProposalResult(
+	result contenthttp.EventResult,
+) consensus.ForwardedProposalResult {
 	chainIndex, chainHash, accepted := result.ChainPosition()
 	forwarded := consensus.ForwardedProposalResult{
 		Outcome:     result.Outcome(),
@@ -619,7 +848,7 @@ func (runtime *daemonContentPeerRuntime) ForwardProposal(
 		forwarded.ChainIndex = &chainIndex
 		forwarded.ChainHash = &chainHash
 	}
-	return forwarded, nil
+	return forwarded
 }
 
 func normalizeDaemonProposalForwardingError(err error) error {
@@ -883,6 +1112,37 @@ func (connection *daemonContentPeerConnection) ForwardProposal(
 		return contenthttp.EventResult{}, contenthttp.ErrClientClosed
 	}
 	return connection.client.ForwardProposal(ctx, signed)
+}
+
+func (connection *daemonContentPeerConnection) Propose(
+	ctx context.Context,
+	signed event.SignedEvent,
+) (contenthttp.EventResult, error) {
+	if connection == nil || ctx == nil {
+		return contenthttp.EventResult{},
+			errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	defer connection.mu.RUnlock()
+	if connection.client == nil {
+		return contenthttp.EventResult{}, contenthttp.ErrClientClosed
+	}
+	return connection.client.Propose(ctx, signed)
+}
+
+func (connection *daemonContentPeerConnection) Replication(
+	ctx context.Context,
+	afterResult uint64,
+) (replication.Batch, error) {
+	if connection == nil || ctx == nil {
+		return replication.Batch{}, errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	defer connection.mu.RUnlock()
+	if connection.client == nil {
+		return replication.Batch{}, contenthttp.ErrClientClosed
+	}
+	return connection.client.Replication(ctx, afterResult)
 }
 
 func (worker *daemonContentPeerWorker) setConnection(

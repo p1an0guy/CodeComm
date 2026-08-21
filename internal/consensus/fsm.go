@@ -333,6 +333,7 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		AdvancesEventChain:       outcome.Changes.AdvancesEventChain,
 		Devices:                  outcome.Changes.Devices,
 		AuditCounters:            outcome.Changes.AuditCounters,
+		CredentialAuthority:      outcome.Changes.CredentialAuthority,
 		CredentialAuthorizations: outcome.Changes.CredentialAuthorizations,
 	})
 	if err != nil {

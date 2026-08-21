@@ -66,7 +66,9 @@ func TestOperatorClientReadsStatusAndReconnectsAfterDaemonRestart(t *testing.T) 
 		t.Fatalf("Status(after restart): %v", err)
 	}
 	if got.Consensus.StrongWrites !=
-		string(coordstatus.StrongWritesAvailable) {
+		string(coordstatus.StrongWritesAvailable) ||
+		got.Consensus.LiveConfigurationSource !=
+			string(coordstatus.LiveConfigurationLocal) {
 		t.Fatalf("Status(after restart) = %#v", got)
 	}
 	member, found, err := client.Member(
@@ -167,6 +169,20 @@ func TestDecodeStatusResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {
 			},
 		},
 		{
+			name: "missing live configuration source",
+			mutate: func(value map[string]any) {
+				consensus := value["consensus"].(map[string]any)
+				delete(consensus, "live_configuration_source")
+			},
+		},
+		{
+			name: "unknown live configuration source",
+			mutate: func(value map[string]any) {
+				consensus := value["consensus"].(map[string]any)
+				consensus["live_configuration_source"] = "cached"
+			},
+		},
+		{
 			name: "unknown reconciliation blocker",
 			mutate: func(value map[string]any) {
 				consensus := value["consensus"].(map[string]any)
@@ -203,6 +219,131 @@ func TestDecodeStatusResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestDecodeStatusResponseValidatesSettledUnknownConfiguration(t *testing.T) {
+	valid := snapshotFromCoordination(
+		uiTestSettledUnknownStatusSnapshot(t),
+	)
+	encoded, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatalf("json.Marshal(): %v", err)
+	}
+	got, err := decodeStatusResponse(encoded)
+	if err != nil {
+		t.Fatalf("decodeStatusResponse(): %v", err)
+	}
+	if got.Consensus.State != string(coordstatus.ConsensusSettled) ||
+		got.Consensus.Role != string(coordstatus.RoleNonvoter) ||
+		got.Consensus.LiveConfigurationSource !=
+			string(coordstatus.LiveConfigurationUnknown) {
+		t.Fatalf("settled snapshot = %#v", got.Consensus)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "leader",
+			mutate: func(consensus map[string]any) {
+				consensus["leader_device_id"] = valid.Session.LocalDeviceID
+			},
+		},
+		{
+			name: "live voter",
+			mutate: func(consensus map[string]any) {
+				consensus["live_voter_device_ids"] = []string{
+					valid.Session.LocalDeviceID,
+				}
+			},
+		},
+		{
+			name: "live nonvoter",
+			mutate: func(consensus map[string]any) {
+				consensus["live_nonvoter_device_ids"] = []string{
+					valid.Session.LocalDeviceID,
+				}
+			},
+		},
+		{
+			name: "quorum",
+			mutate: func(consensus map[string]any) {
+				consensus["quorum_required"] = 1
+			},
+		},
+		{
+			name: "exactness claim",
+			mutate: func(consensus map[string]any) {
+				consensus["configuration_reconciled"] = true
+			},
+		},
+		{
+			name: "known reconciliation",
+			mutate: func(consensus map[string]any) {
+				consensus["reconciliation_state"] = "stable"
+			},
+		},
+		{
+			name: "reconciliation device",
+			mutate: func(consensus map[string]any) {
+				consensus["reconciliation_device_id"] =
+					valid.Session.LocalDeviceID
+			},
+		},
+		{
+			name: "available writes",
+			mutate: func(consensus map[string]any) {
+				consensus["strong_writes"] = "available"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var candidate map[string]any
+			if err := json.Unmarshal(encoded, &candidate); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(candidate["consensus"].(map[string]any))
+			raw, err := json.Marshal(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeStatusResponse(raw); !errors.Is(
+				err,
+				ErrStatusProtocol,
+			) {
+				t.Fatalf(
+					"decodeStatusResponse() error = %v, want %v",
+					err,
+					ErrStatusProtocol,
+				)
+			}
+		})
+	}
+}
+
+func TestConsensusStatusAcceptsVoterReportedTopologyWithoutExactness(
+	t *testing.T,
+) {
+	snapshot := snapshotFromCoordination(
+		uiTestSettledUnknownStatusSnapshot(t),
+	)
+	leader := snapshot.Consensus.TargetVoterDeviceIDs[0]
+	snapshot.Consensus.LiveConfigurationSource = string(
+		coordstatus.LiveConfigurationVoterReported,
+	)
+	snapshot.Consensus.LeaderDeviceID = &leader
+	snapshot.Consensus.LiveVoterDeviceIDs = []string{leader}
+	snapshot.Consensus.QuorumRequired = 1
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	snapshot.Consensus.ConfigurationReconciled = true
+	if err := snapshot.Validate(); err == nil {
+		t.Fatal("Validate() accepted nonlocal reconciliation exactness")
 	}
 }
 

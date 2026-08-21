@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -61,14 +62,16 @@ type stagingProofAuthority struct {
 type consensusControlRoute uint8
 
 const (
-	consensusControlRouteProof consensusControlRoute = iota + 1
+	consensusControlRouteStatus consensusControlRoute = iota + 1
+	consensusControlRouteProof
 	consensusControlRouteCredentialRenewal
 	consensusControlRouteCredentialEndorsement
 )
 
 func (route consensusControlRoute) valid() bool {
 	switch route {
-	case consensusControlRouteProof,
+	case consensusControlRouteStatus,
+		consensusControlRouteProof,
 		consensusControlRouteCredentialRenewal,
 		consensusControlRouteCredentialEndorsement:
 		return true
@@ -132,6 +135,10 @@ func (node *SingleNode) serveConsensusControl(
 	forbiddenProblem := proofProblemForbidden
 	unavailableProblem := proofProblemUnavailable
 	switch route {
+	case consensusControlRouteStatus:
+		invalidProblem = consensusStatusProblemInvalid
+		forbiddenProblem = consensusStatusProblemForbidden
+		unavailableProblem = consensusStatusProblemUnavailable
 	case consensusControlRouteCredentialRenewal:
 		invalidProblem = credentialRenewalProblemInvalid
 		forbiddenProblem = credentialRenewalProblemForbidden
@@ -167,7 +174,8 @@ func (node *SingleNode) serveConsensusControl(
 		requestAuthority stagingProofAuthority
 		err              error
 	)
-	if route != consensusControlRouteCredentialRenewal {
+	if route != consensusControlRouteStatus &&
+		route != consensusControlRouteCredentialRenewal {
 		requestAuthority, err =
 			node.consensusProofRequesterAuthority(peer)
 		if err != nil {
@@ -180,6 +188,10 @@ func (node *SingleNode) serveConsensusControl(
 			writeConsensusProofProblem(writer, status, problem)
 			return
 		}
+	}
+	if route == consensusControlRouteStatus {
+		node.serveConsensusStatus(writer, request, peer)
+		return
 	}
 	if !validConsensusProofContentType(request.Header) {
 		writeConsensusProofProblem(
@@ -359,7 +371,6 @@ func consensusControlRouteForRequest(
 	request *http.Request,
 ) (consensusControlRoute, bool) {
 	if request == nil ||
-		request.Method != http.MethodPost ||
 		request.URL == nil ||
 		request.URL.RawPath != "" ||
 		request.URL.RawQuery != "" ||
@@ -370,11 +381,25 @@ func consensusControlRouteForRequest(
 	}
 	var route consensusControlRoute
 	switch request.URL.Path {
+	case consensusStatusPath:
+		if request.Method != http.MethodGet {
+			return 0, false
+		}
+		route = consensusControlRouteStatus
 	case consensusProofPath:
+		if request.Method != http.MethodPost {
+			return 0, false
+		}
 		route = consensusControlRouteProof
 	case credentialRenewalPath:
+		if request.Method != http.MethodPost {
+			return 0, false
+		}
 		route = consensusControlRouteCredentialRenewal
 	case credentialEndorsementPath:
+		if request.Method != http.MethodPost {
+			return 0, false
+		}
 		route = consensusControlRouteCredentialEndorsement
 	default:
 		return 0, false
@@ -763,10 +788,13 @@ func writeConsensusProofProblem(
 		CorrelationID: correlationID,
 		Retryable:     definition.retryable,
 	})
+	if err == nil {
+		body, err = codec.CanonicalizeSignedObject(body)
+	}
 	if err != nil {
 		status = http.StatusInternalServerError
 		body = []byte(
-			`{"type":"urn:codecomm:problem:internal_error","title":"Internal server error","status":500,"code":"internal_error","correlation_id":"unavailable","retryable":true}`,
+			`{"code":"internal_error","correlation_id":"unavailable","retryable":true,"status":500,"title":"Internal server error","type":"urn:codecomm:problem:internal_error"}`,
 		)
 	}
 	writer.Header().Set("Cache-Control", "no-store")

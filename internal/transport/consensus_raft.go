@@ -98,6 +98,21 @@ func NewConsensusNetworkTransport(
 	}, nil
 }
 
+// RequestConsensusStatus forwards the fixed identity-authenticated status
+// route without broadening Raft, proof, or endorsement authorization.
+func (transport *ConsensusNetworkTransport) RequestConsensusStatus(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (ConsensusControlResponse, error) {
+	if transport == nil ||
+		transport.delegate == nil ||
+		transport.control == nil {
+		return ConsensusControlResponse{},
+			ErrInvalidConsensusRaftTransport
+	}
+	return transport.control.RequestConsensusStatus(ctx, deviceID)
+}
+
 // RequestConsensusProof forwards the fixed proof route through the same
 // authenticated HTTP/2 connection pool used by the Raft stream adapter.
 func (transport *ConsensusNetworkTransport) RequestConsensusProof(

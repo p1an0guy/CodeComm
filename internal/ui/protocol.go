@@ -46,6 +46,7 @@ type ConsensusStatus struct {
 	State                    string   `json:"state"`
 	Role                     string   `json:"role"`
 	LeaderDeviceID           *string  `json:"leader_device_id"`
+	LiveConfigurationSource  string   `json:"live_configuration_source"`
 	LiveVoterDeviceIDs       []string `json:"live_voter_device_ids"`
 	LiveNonvoterDeviceIDs    []string `json:"live_nonvoter_device_ids"`
 	TargetVoterDeviceIDs     []string `json:"target_voter_device_ids"`
@@ -54,6 +55,9 @@ type ConsensusStatus struct {
 	ActivatedVoterSetVersion uint64   `json:"activated_voter_set_version"`
 	QuorumRequired           int      `json:"quorum_required"`
 	StrongWrites             string   `json:"strong_writes"`
+	ReplicaCurrency          string   `json:"replica_currency"`
+	ObservedAuthorityIDs     []string `json:"observed_authority_device_ids"`
+	ObservedResultIndex      uint64   `json:"observed_result_index"`
 	ConfigurationReconciled  bool     `json:"configuration_reconciled"`
 	ReconciliationState      string   `json:"reconciliation_state"`
 	ReconciliationStep       string   `json:"reconciliation_step"`
@@ -97,7 +101,10 @@ func (snapshot Snapshot) Validate() error {
 	if err := snapshot.Session.validate(); err != nil {
 		return err
 	}
-	if err := snapshot.Consensus.validate(snapshot.Session.LocalDeviceID); err != nil {
+	if err := snapshot.Consensus.validate(
+		snapshot.Session.LocalDeviceID,
+		snapshot.Session.ResultIndex,
+	); err != nil {
 		return err
 	}
 	if len(snapshot.Members) < 1 ||
@@ -200,11 +207,15 @@ func (value SessionStatus) validate() error {
 	return nil
 }
 
-func (value ConsensusStatus) validate(localDeviceID string) error {
+func (value ConsensusStatus) validate(
+	localDeviceID string,
+	localResultIndex uint64,
+) error {
 	switch coordstatus.ConsensusState(value.State) {
 	case coordstatus.ConsensusStarting,
 		coordstatus.ConsensusElecting,
 		coordstatus.ConsensusReady,
+		coordstatus.ConsensusSettled,
 		coordstatus.ConsensusHalted:
 	default:
 		return fmt.Errorf("ui: invalid consensus state")
@@ -213,9 +224,14 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 	case coordstatus.RoleFollower,
 		coordstatus.RoleCandidate,
 		coordstatus.RoleLeader,
+		coordstatus.RoleNonvoter,
 		coordstatus.RoleShutdown:
 	default:
 		return fmt.Errorf("ui: invalid consensus role")
+	}
+	if (value.State == string(coordstatus.ConsensusSettled)) !=
+		(value.Role == string(coordstatus.RoleNonvoter)) {
+		return fmt.Errorf("ui: inconsistent settled consensus role")
 	}
 	switch coordstatus.StrongWriteState(value.StrongWrites) {
 	case coordstatus.StrongWritesWaiting,
@@ -228,14 +244,9 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 		value.LiveNonvoterDeviceIDs == nil ||
 		value.TargetVoterDeviceIDs == nil ||
 		value.ActivatedVoterDeviceIDs == nil ||
-		len(value.LiveVoterDeviceIDs) < 1 ||
-		len(value.LiveVoterDeviceIDs) > int(policy.MaxMemberDevices) ||
-		len(value.LiveVoterDeviceIDs)+
-			len(value.LiveNonvoterDeviceIDs) >
-			int(policy.MaxMemberDevices) ||
+		value.ObservedAuthorityIDs == nil ||
 		!validVoterSetSize(len(value.TargetVoterDeviceIDs)) ||
 		!validVoterSetSize(len(value.ActivatedVoterDeviceIDs)) ||
-		value.QuorumRequired != len(value.LiveVoterDeviceIDs)/2+1 ||
 		value.VoterSetVersion < 1 ||
 		!domain.ValidUnsignedInteger(value.VoterSetVersion) ||
 		value.ActivatedVoterSetVersion < 1 ||
@@ -255,18 +266,80 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 	if err := validateDeviceIDs(value.ActivatedVoterDeviceIDs); err != nil {
 		return err
 	}
-	liveVoters := make(map[string]struct{}, len(value.LiveVoterDeviceIDs))
-	for _, id := range value.LiveVoterDeviceIDs {
-		liveVoters[id] = struct{}{}
+	if err := validateDeviceIDs(value.ObservedAuthorityIDs); err != nil {
+		return err
 	}
-	for _, id := range value.LiveNonvoterDeviceIDs {
-		if _, exists := liveVoters[id]; exists {
-			return fmt.Errorf("ui: overlapping live voter and nonvoter")
+	for _, observed := range value.ObservedAuthorityIDs {
+		if !containsString(value.ActivatedVoterDeviceIDs, observed) {
+			return fmt.Errorf("ui: observed device is outside authority")
+		}
+	}
+	currency := coordstatus.ReplicaCurrencyState(value.ReplicaCurrency)
+	if value.State != string(coordstatus.ConsensusSettled) {
+		if currency != coordstatus.ReplicaCurrencyRaft ||
+			len(value.ObservedAuthorityIDs) != 0 ||
+			value.ObservedResultIndex != 0 {
+			return fmt.Errorf("ui: invalid Raft replica currency")
+		}
+	} else {
+		switch currency {
+		case coordstatus.ReplicaCurrencyCurrent:
+			if len(value.ObservedAuthorityIDs) !=
+				len(value.ActivatedVoterDeviceIDs) ||
+				value.ObservedResultIndex != localResultIndex {
+				return fmt.Errorf("ui: invalid current replica currency")
+			}
+		case coordstatus.ReplicaCurrencyBehind:
+			if value.ObservedResultIndex <= localResultIndex {
+				return fmt.Errorf("ui: invalid behind replica currency")
+			}
+		case coordstatus.ReplicaCurrencyUnknown:
+			if value.ObservedResultIndex > localResultIndex {
+				return fmt.Errorf("ui: invalid unknown replica currency")
+			}
+		default:
+			return fmt.Errorf("ui: invalid settled replica currency")
 		}
 	}
 	if value.LeaderDeviceID != nil &&
 		!domain.DeviceID(*value.LeaderDeviceID).Valid() {
 		return fmt.Errorf("ui: invalid leader device")
+	}
+	source := coordstatus.LiveConfigurationSource(
+		value.LiveConfigurationSource,
+	)
+	switch source {
+	case coordstatus.LiveConfigurationLocal:
+		if value.State == string(coordstatus.ConsensusSettled) {
+			return fmt.Errorf("ui: local settled configuration")
+		}
+		if err := validateKnownLiveStatus(value); err != nil {
+			return err
+		}
+	case coordstatus.LiveConfigurationVoterReported:
+		if value.State != string(coordstatus.ConsensusSettled) {
+			return fmt.Errorf("ui: invalid voter-reported state")
+		}
+		if err := validateKnownLiveStatus(value); err != nil {
+			return err
+		}
+		if value.LeaderDeviceID != nil &&
+			!containsString(
+				value.LiveVoterDeviceIDs,
+				*value.LeaderDeviceID,
+			) {
+			return fmt.Errorf("ui: invalid voter-reported leader")
+		}
+	case coordstatus.LiveConfigurationUnknown:
+		if value.State != string(coordstatus.ConsensusSettled) ||
+			value.LeaderDeviceID != nil ||
+			len(value.LiveVoterDeviceIDs) != 0 ||
+			len(value.LiveNonvoterDeviceIDs) != 0 ||
+			value.QuorumRequired != 0 {
+			return fmt.Errorf("ui: invalid unknown live configuration")
+		}
+	default:
+		return fmt.Errorf("ui: invalid live configuration source")
 	}
 	if value.StrongWrites == string(coordstatus.StrongWritesAvailable) &&
 		(value.State != string(coordstatus.ConsensusReady) ||
@@ -279,13 +352,18 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 		value.StrongWrites != string(coordstatus.StrongWritesBlocked) {
 		return fmt.Errorf("ui: halted consensus is not blocked")
 	}
+	if value.State == string(coordstatus.ConsensusSettled) &&
+		value.StrongWrites != string(coordstatus.StrongWritesWaiting) {
+		return fmt.Errorf("ui: settled consensus is not waiting")
+	}
 	reconciliationState := coordstatus.ReconciliationState(
 		value.ReconciliationState,
 	)
 	switch reconciliationState {
 	case coordstatus.ReconciliationStable,
 		coordstatus.ReconciliationPending,
-		coordstatus.ReconciliationReconciling:
+		coordstatus.ReconciliationReconciling,
+		coordstatus.ReconciliationUnknown:
 	default:
 		return fmt.Errorf("ui: invalid reconciliation state")
 	}
@@ -302,6 +380,17 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 	if value.ReconciliationDeviceID != nil &&
 		!domain.DeviceID(*value.ReconciliationDeviceID).Valid() {
 		return fmt.Errorf("ui: invalid reconciliation device")
+	}
+	if source != coordstatus.LiveConfigurationLocal {
+		if value.ConfigurationReconciled ||
+			reconciliationState != coordstatus.ReconciliationUnknown ||
+			reconciliationStep != coordstatus.ReconciliationStepObserve ||
+			reconciliationBlocker !=
+				coordstatus.ReconciliationBlockerNone ||
+			value.ReconciliationDeviceID != nil {
+			return fmt.Errorf("ui: invalid nonlocal reconciliation")
+		}
+		return nil
 	}
 	exactlyReconciled := len(value.LiveNonvoterDeviceIDs) == 0 &&
 		value.VoterSetVersion == value.ActivatedVoterSetVersion &&
@@ -335,6 +424,27 @@ func (value ConsensusStatus) validate(localDeviceID string) error {
 	return nil
 }
 
+func validateKnownLiveStatus(value ConsensusStatus) error {
+	if len(value.LiveVoterDeviceIDs) < 1 ||
+		len(value.LiveVoterDeviceIDs) > int(policy.MaxMemberDevices) ||
+		len(value.LiveVoterDeviceIDs)+
+			len(value.LiveNonvoterDeviceIDs) >
+			int(policy.MaxMemberDevices) ||
+		value.QuorumRequired != len(value.LiveVoterDeviceIDs)/2+1 {
+		return fmt.Errorf("ui: invalid live voter configuration")
+	}
+	liveVoters := make(map[string]struct{}, len(value.LiveVoterDeviceIDs))
+	for _, id := range value.LiveVoterDeviceIDs {
+		liveVoters[id] = struct{}{}
+	}
+	for _, id := range value.LiveNonvoterDeviceIDs {
+		if _, exists := liveVoters[id]; exists {
+			return fmt.Errorf("ui: overlapping live voter and nonvoter")
+		}
+	}
+	return nil
+}
+
 func validVoterSetSize(size int) bool {
 	return size == 1 || size == 3 || size == 5
 }
@@ -349,6 +459,15 @@ func sameStrings(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func validateDeviceIDs(values []string) error {

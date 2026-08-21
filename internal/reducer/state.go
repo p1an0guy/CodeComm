@@ -450,6 +450,11 @@ func (state State) CredentialAuthority() credentialauthority.Authority {
 	return state.credentialAuthority.Clone()
 }
 
+// VoterSet returns an independent copy of the committed voter target.
+func (state State) VoterSet() voterset.Set {
+	return state.voterSet
+}
+
 // Apply updates a validated in-memory state only after the corresponding
 // durable apply transaction commits. It validates the complete change set
 // before mutating any row.

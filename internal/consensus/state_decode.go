@@ -137,6 +137,7 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 		AppliedChainIndex:        view.Heads.ChainIndex,
 		Devices:                  snapshot.Devices,
 		AuditCounters:            snapshot.AuditCounters,
+		CredentialAuthority:      snapshot.CredentialAuthority,
 		CredentialAuthorizations: snapshot.CredentialAuthorizations,
 	})
 	if err != nil {

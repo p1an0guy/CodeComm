@@ -2918,8 +2918,19 @@ func openApplyAtGenerationTestNode(
 	t *testing.T,
 ) (*SingleNode, ed25519.PrivateKey, domain.DeviceID) {
 	t.Helper()
+	return openApplyAtGenerationTestNodeWithInitial(t, nil)
+}
+
+func openApplyAtGenerationTestNodeWithInitial(
+	t *testing.T,
+	mutate func(*store.InitialState),
+) (*SingleNode, ed25519.PrivateKey, domain.DeviceID) {
+	t.Helper()
 	root := t.TempDir()
 	initial, identityPrivate, deviceID := nodeTestInitialState(t)
+	if mutate != nil {
+		mutate(&initial)
+	}
 	node, err := OpenSingleNode(context.Background(), SingleNodeOptions{
 		ServerID:     deviceID,
 		StatePath:    filepath.Join(root, "state", "state.db"),

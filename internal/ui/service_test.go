@@ -84,6 +84,90 @@ func TestOperatorServiceBindsOnlyMatchingOperatorClass(t *testing.T) {
 	}
 }
 
+func TestReadOnlyOperatorServiceServesStatusAndRefusesMutations(
+	t *testing.T,
+) {
+	snapshot := uiTestStatusSnapshot(t)
+	service, err := NewReadOnlyOperatorService(
+		statusSourceFunc(
+			func(context.Context) (coordstatus.Snapshot, error) {
+				return snapshot, nil
+			},
+		),
+		uiTestSessionID,
+		uiTestWorkspaceID,
+	)
+	if err != nil {
+		t.Fatalf("NewReadOnlyOperatorService(): %v", err)
+	}
+	_, err = service.Bind(
+		context.Background(),
+		ipc.VerifiedPeer{},
+		ipc.BindRequest{
+			ProtocolVersion:  ipc.LocalProtocolVersion,
+			ClientInstanceID: uiTestClientID,
+			SessionID:        uiTestSessionID,
+			WorkspaceID:      uiTestWorkspaceID,
+			Class:            ipc.ClassOperator,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Bind(): %v", err)
+	}
+	handler := newOperatorHandler(
+		statusSourceFunc(
+			func(context.Context) (coordstatus.Snapshot, error) {
+				return snapshot, nil
+			},
+		),
+		nil,
+		nil,
+		uiTestClientID,
+	)
+	statusRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		statusRecorder,
+		httptest.NewRequest(http.MethodGet, statusQueryPath, nil),
+	)
+	if statusRecorder.Code != http.StatusOK {
+		t.Fatalf(
+			"status response = %d, body %s",
+			statusRecorder.Code,
+			statusRecorder.Body.String(),
+		)
+	}
+	commandRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		commandRecorder,
+		httptest.NewRequest(
+			http.MethodPost,
+			commandPath,
+			bytes.NewReader([]byte(`{}`)),
+		),
+	)
+	if commandRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"command response = %d, want 503",
+			commandRecorder.Code,
+		)
+	}
+	pairingRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		pairingRecorder,
+		httptest.NewRequest(
+			http.MethodGet,
+			pairingInviteCollectionPath,
+			nil,
+		),
+	)
+	if pairingRecorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"pairing response = %d, want 503",
+			pairingRecorder.Code,
+		)
+	}
+}
+
 func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 	source := uiTestStatusSnapshot(t)
 	handler := newOperatorHandler(statusSourceFunc(
@@ -113,6 +197,8 @@ func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 	if got.Session.SessionID != string(uiTestSessionID) ||
 		got.Session.LocalDeviceID != string(source.Durable.Member.ID) ||
 		got.Consensus.State != string(coordstatus.ConsensusReady) ||
+		got.Consensus.LiveConfigurationSource !=
+			string(coordstatus.LiveConfigurationLocal) ||
 		len(got.Members) != 1 ||
 		got.Members[0].EntityVersion != source.Durable.Member.EntityVersion ||
 		len(got.Agents) != 1 ||
@@ -545,10 +631,13 @@ func uiTestStatusSnapshot(t *testing.T) coordstatus.Snapshot {
 			Role:                    coordstatus.RoleLeader,
 			LocalDeviceID:           deviceID,
 			LeaderDeviceID:          deviceID,
+			LiveConfigurationSource: coordstatus.LiveConfigurationLocal,
 			LiveVoterDeviceIDs:      []domain.DeviceID{deviceID},
 			LiveNonvoterDeviceIDs:   []domain.DeviceID{},
 			QuorumRequired:          1,
 			StrongWrites:            coordstatus.StrongWritesAvailable,
+			ReplicaCurrency:         coordstatus.ReplicaCurrencyRaft,
+			ObservedAuthorityIDs:    []domain.DeviceID{},
 			ConfigurationReconciled: true,
 			ReconciliationState:     coordstatus.ReconciliationStable,
 			ReconciliationStep:      coordstatus.ReconciliationStepComplete,
@@ -557,6 +646,29 @@ func uiTestStatusSnapshot(t *testing.T) coordstatus.Snapshot {
 	}
 	if err := snapshot.Validate(); err != nil {
 		t.Fatalf("test snapshot: %v", err)
+	}
+	return snapshot
+}
+
+func uiTestSettledUnknownStatusSnapshot(t *testing.T) coordstatus.Snapshot {
+	t.Helper()
+	snapshot := uiTestStatusSnapshot(t)
+	snapshot.Runtime = coordstatus.RuntimeSnapshot{
+		State:                   coordstatus.ConsensusSettled,
+		Role:                    coordstatus.RoleNonvoter,
+		LocalDeviceID:           snapshot.Durable.Member.ID,
+		LiveConfigurationSource: coordstatus.LiveConfigurationUnknown,
+		LiveVoterDeviceIDs:      []domain.DeviceID{},
+		LiveNonvoterDeviceIDs:   []domain.DeviceID{},
+		StrongWrites:            coordstatus.StrongWritesWaiting,
+		ReplicaCurrency:         coordstatus.ReplicaCurrencyUnknown,
+		ObservedAuthorityIDs:    []domain.DeviceID{},
+		ReconciliationState:     coordstatus.ReconciliationUnknown,
+		ReconciliationStep:      coordstatus.ReconciliationStepObserve,
+		ReconciliationBlocker:   coordstatus.ReconciliationBlockerNone,
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("settled test snapshot: %v", err)
 	}
 	return snapshot
 }

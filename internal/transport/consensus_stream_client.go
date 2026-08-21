@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"golang.org/x/net/http2"
 )
@@ -20,6 +21,7 @@ import (
 const (
 	consensusJSONMediaType             = "application/json"
 	consensusProblemMediaType          = "application/problem+json"
+	consensusStatusPath                = "/v1/consensus/status"
 	consensusProofPath                 = "/v1/consensus/prove"
 	consensusCredentialRenewalPath     = "/v1/credentials/renew"
 	consensusCredentialEndorsementPath = "/v1/credentials/endorse"
@@ -28,13 +30,16 @@ const (
 type consensusControlRoute uint8
 
 const (
-	consensusControlProof consensusControlRoute = iota + 1
+	consensusControlStatus consensusControlRoute = iota + 1
+	consensusControlProof
 	consensusControlCredentialRenewal
 	consensusControlCredentialEndorsement
 )
 
 func (route consensusControlRoute) path() (string, bool) {
 	switch route {
+	case consensusControlStatus:
+		return consensusStatusPath, true
 	case consensusControlProof:
 		return consensusProofPath, true
 	case consensusControlCredentialRenewal:
@@ -46,8 +51,41 @@ func (route consensusControlRoute) path() (string, bool) {
 	}
 }
 
+func (route consensusControlRoute) requestShape() (
+	method string,
+	bodyRequired bool,
+	valid bool,
+) {
+	switch route {
+	case consensusControlStatus:
+		return http.MethodGet, false, true
+	case consensusControlProof,
+		consensusControlCredentialRenewal,
+		consensusControlCredentialEndorsement:
+		return http.MethodPost, true, true
+	default:
+		return "", false, false
+	}
+}
+
 func (route consensusControlRoute) requiresLiveConfiguration() bool {
-	return route != consensusControlCredentialRenewal
+	return route != consensusControlStatus &&
+		route != consensusControlCredentialRenewal
+}
+
+// RequestConsensusStatus reads one bounded canonical status response over
+// identity mTLS. Like credential renewal, this exact route may reach an
+// applied-active peer outside the caller's live Raft configuration.
+func (layer *ConsensusStreamLayer) RequestConsensusStatus(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (ConsensusControlResponse, error) {
+	return layer.requestConsensusControl(
+		ctx,
+		deviceID,
+		consensusControlStatus,
+		nil,
+	)
 }
 
 // RequestConsensusProof sends one bounded JSON request to the fixed proof
@@ -103,13 +141,15 @@ func (layer *ConsensusStreamLayer) requestConsensusControl(
 	body []byte,
 ) (ConsensusControlResponse, error) {
 	path, validRoute := route.path()
+	method, bodyRequired, validShape := route.requestShape()
 	if layer == nil ||
 		layer.ctx == nil ||
 		ctx == nil ||
 		!deviceID.Valid() ||
 		deviceID == layer.localDeviceID ||
 		!validRoute ||
-		len(body) == 0 ||
+		!validShape ||
+		bodyRequired != (len(body) != 0) ||
 		len(body) > ConsensusControlBodyMaxBytes {
 		return ConsensusControlResponse{},
 			ErrInvalidConsensusControlRequest
@@ -153,18 +193,24 @@ func (layer *ConsensusStreamLayer) requestConsensusControl(
 	}
 	defer peer.streamClosed()
 
+	var requestBody io.Reader
+	if bodyRequired {
+		requestBody = bytes.NewReader(body)
+	}
 	request, err := http.NewRequestWithContext(
 		requestContext,
-		http.MethodPost,
+		method,
 		"https://"+ConsensusRaftAuthority+path,
-		bytes.NewReader(body),
+		requestBody,
 	)
 	if err != nil {
 		return ConsensusControlResponse{},
 			ErrInvalidConsensusControlRequest
 	}
 	request.Header.Set("Accept", consensusJSONMediaType+", "+consensusProblemMediaType)
-	request.Header.Set("Content-Type", consensusJSONMediaType)
+	if bodyRequired {
+		request.Header.Set("Content-Type", consensusJSONMediaType)
+	}
 
 	response, err := physical.http2.RoundTrip(request)
 	if err != nil {
@@ -210,6 +256,15 @@ func (layer *ConsensusStreamLayer) requestConsensusControl(
 	if len(responseBody) > ConsensusControlBodyMaxBytes {
 		return ConsensusControlResponse{},
 			ErrConsensusControlResponse
+	}
+	if route == consensusControlStatus {
+		canonical, canonicalErr := codec.CanonicalizeSignedObject(
+			responseBody,
+		)
+		if canonicalErr != nil || !bytes.Equal(canonical, responseBody) {
+			return ConsensusControlResponse{},
+				ErrConsensusControlResponse
+		}
 	}
 	if err := layer.verifyExpected(deviceID, physical.identity); err != nil {
 		layer.invalidateConsensusPeer(peer, deviceID)

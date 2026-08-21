@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/peerauth"
@@ -215,6 +217,103 @@ func TestInitialCredentialPersistsBeforeAuthorizationAndInstalls(
 		parsed.Binding.Epoch != 1 ||
 		parsed.Binding.AuthorizationChainIndex != 1 {
 		t.Fatalf("installed certificate = (%#v, %v)", parsed, err)
+	}
+}
+
+func TestRenewalResponseInstallsProvisionalCertificateUntilApply(
+	t *testing.T,
+) {
+	fixture := newServiceFixture(t, nil)
+	var authorized credentialauthorization.Authorization
+	fixture.consensus.renew = func(
+		binding credential.Binding,
+	) (credentialauthorization.Authorization, error) {
+		authorized = fixture.authorization(binding, fixture.now, 1)
+		return authorized, nil
+	}
+
+	next, transient, fatal := fixture.service.reconcile(t.Context())
+	if !next.IsZero() || transient != nil || fatal != nil {
+		t.Fatalf(
+			"provisional reconcile = (%s, %v, %v)",
+			next,
+			transient,
+			fatal,
+		)
+	}
+	assertServiceCertificateEpoch(t, fixture.service, 1)
+	if epoch, _ := fixture.consensus.snapshot.CurrentCredentialEpoch(
+		fixture.deviceID,
+	); epoch != 0 {
+		t.Fatalf("applied credential epoch = %d, want 0", epoch)
+	}
+	if fixture.service.provisionalCertificate == nil ||
+		fixture.service.provisionalCertificate.authorization.Epoch != 1 {
+		t.Fatal("renewal response was not retained provisionally")
+	}
+	if _, transient, fatal := fixture.service.reconcile(
+		t.Context(),
+	); transient != nil || fatal != nil {
+		t.Fatalf("pending reconcile = (%v, %v)", transient, fatal)
+	}
+	if len(fixture.consensus.calls) != 1 {
+		t.Fatalf(
+			"renewal calls before local apply = %d, want 1",
+			len(fixture.consensus.calls),
+		)
+	}
+
+	fixture.consensus.advance(t, authorized)
+	if _, transient, fatal := fixture.service.reconcile(
+		t.Context(),
+	); transient != nil || fatal != nil {
+		t.Fatalf("committed reconcile = (%v, %v)", transient, fatal)
+	}
+	assertServiceCertificateEpoch(t, fixture.service, 1)
+	if fixture.service.provisionalCertificate != nil {
+		t.Fatal("committed credential remained provisional")
+	}
+}
+
+func TestRenewalErrorClassificationFailsClosedOnAuthenticatedRefusal(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	transient := []error{
+		errors.New("transport unavailable"),
+		consensus.ErrCredentialRenewalUnavailable,
+		context.DeadlineExceeded,
+	}
+	for _, candidate := range transient {
+		retry, fatal := classifyRenewalError(candidate)
+		if !errors.Is(retry, candidate) || fatal != nil {
+			t.Errorf(
+				"classifyRenewalError(%v) = (%v, %v), want retry",
+				candidate,
+				retry,
+				fatal,
+			)
+		}
+	}
+	terminal := []error{
+		consensus.ErrInvalidCredentialRenewal,
+		consensus.ErrCredentialRenewalRejected,
+		consensus.ErrCredentialRenewalMismatch,
+		consensus.ErrInvalidCredentialBinding,
+	}
+	for _, candidate := range terminal {
+		retry, fatal := classifyRenewalError(candidate)
+		if retry != nil ||
+			!errors.Is(fatal, ErrCredentialIntegrity) ||
+			!errors.Is(fatal, candidate) {
+			t.Errorf(
+				"classifyRenewalError(%v) = (%v, %v), want integrity failure",
+				candidate,
+				retry,
+				fatal,
+			)
+		}
 	}
 }
 
@@ -591,6 +690,12 @@ func newServiceFixture(
 		},
 		AuditCounters: map[domain.DeviceID]auditcounter.Counter{
 			deviceID: {DeviceID: deviceID},
+		},
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID:        serviceTestSessionID,
+			VoterDeviceIDs:   []domain.DeviceID{deviceID},
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
 		},
 		CredentialAuthorizations: map[credentialauthorization.Key]credentialauthorization.Authorization{},
 	})

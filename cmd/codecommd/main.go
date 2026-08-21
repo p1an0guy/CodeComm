@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ijonahch/codecomm/internal/agent"
+	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credentialservice"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
@@ -79,10 +80,11 @@ type daemonDependencies struct {
 		context.Context,
 		netip.AddrPort,
 	) (net.Listener, error)
-	openMulticast  daemonMulticastOpener
-	listInterfaces daemonInterfaceLister
-	interfaceAddrs daemonInterfaceAddressProvider
-	credentialNow  func() time.Time
+	openMulticast     daemonMulticastOpener
+	listInterfaces    daemonInterfaceLister
+	interfaceAddrs    daemonInterfaceAddressProvider
+	credentialNow     func() time.Time
+	canonicalCoverage canonicalcoverage.ReceiptCollector
 }
 
 func main() {
@@ -338,6 +340,32 @@ func runDaemon(
 			errInvalidDaemonDependencies,
 		)
 	}
+	if meshPreflight.evidenceMode ==
+		store.ReplicaEvidenceSettledNonvoter {
+		credentials, ok := credentialHandle.(daemonCredentialHandle)
+		if !ok {
+			return errInvalidDaemonDependencies
+		}
+		return runSettledDaemon(
+			ctx,
+			options,
+			dependencies,
+			deviceID,
+			identityPrivateKey,
+			originBootID,
+			meshPreflight,
+			meshFactory,
+			credentials,
+			credentialNow,
+		)
+	}
+	if meshPreflight.evidenceMode != store.ReplicaEvidenceRaft {
+		return fmt.Errorf(
+			"%w: unknown evidence mode %q",
+			errDaemonMeshConstruction,
+			meshPreflight.evidenceMode,
+		)
+	}
 	authority, err := event.NewLocalAuthority(deviceID, originBootID)
 	if err != nil {
 		return fmt.Errorf("codecommd: create local authority: %w", err)
@@ -414,6 +442,7 @@ func runDaemon(
 				return created, err
 			},
 			ProposalForwarder: proposalForwarder,
+			CanonicalCoverage: dependencies.canonicalCoverage,
 			Clock:             processClock,
 			CredentialNow:     credentialNow,
 		},
@@ -660,6 +689,52 @@ func serveUntilStopped(
 	discoveryRuntime *daemonDiscoveryRuntime,
 	contentPeerRuntime *daemonContentPeerRuntime,
 ) error {
+	components := []phasedDaemonComponent{agentService}
+	fatalComponents := []daemonFatalComponent{
+		node,
+		agentService,
+		credentialService,
+		pairingService,
+	}
+	if contentPeerRuntime != nil {
+		components = append(components, contentPeerRuntime)
+		fatalComponents = append(fatalComponents, contentPeerRuntime)
+	}
+	if discoveryRuntime != nil {
+		components = append(components, discoveryRuntime)
+		fatalComponents = append(fatalComponents, discoveryRuntime)
+	}
+	components = append(
+		components,
+		pairingService,
+		credentialService,
+		bootOrigin,
+	)
+	return serveDaemonRuntime(
+		ctx,
+		server,
+		node,
+		peerIngress,
+		components,
+		fatalComponents,
+	)
+}
+
+type daemonFatalComponent interface {
+	FatalError() error
+}
+
+func serveDaemonRuntime(
+	ctx context.Context,
+	server *ipc.Server,
+	consensusRuntime daemonConsensusCloser,
+	peerIngress *transport.Ingress,
+	components []phasedDaemonComponent,
+	fatalComponents []daemonFatalComponent,
+) error {
+	if ctx == nil || server == nil || consensusRuntime == nil {
+		return errInvalidDaemonDependencies
+	}
 	serveContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	serverResults := make(chan daemonServerResult, 2)
@@ -680,23 +755,6 @@ func serveUntilStopped(
 		}()
 	}
 
-	components := []phasedDaemonComponent{agentService}
-	if contentPeerRuntime != nil {
-		components = append(components, contentPeerRuntime)
-	}
-	if discoveryRuntime != nil {
-		components = append(components, discoveryRuntime)
-	}
-	if pairingService != nil {
-		components = append(components, pairingService)
-	}
-	if credentialService != nil {
-		components = append(components, credentialService)
-	}
-	if bootOrigin != nil {
-		components = append(components, bootOrigin)
-	}
-
 	ticker := time.NewTicker(fatalPollInterval)
 	defer ticker.Stop()
 	stop := func(cause error, completed int) error {
@@ -712,7 +770,7 @@ func serveUntilStopped(
 		return errors.Join(
 			cause,
 			shutdownDaemonRuntime(
-				node,
+				consensusRuntime,
 				peerIngress,
 				joinServers,
 				components...,
@@ -726,25 +784,11 @@ func serveUntilStopped(
 		case <-ctx.Done():
 			return stop(nil, 0)
 		case <-ticker.C:
-			if fatal := node.FatalError(); fatal != nil {
-				return stop(fatal, 0)
-			}
-			if fatal := agentService.FatalError(); fatal != nil {
-				return stop(fatal, 0)
-			}
-			if fatal := credentialService.FatalError(); fatal != nil {
-				return stop(fatal, 0)
-			}
-			if fatal := pairingService.FatalError(); fatal != nil {
-				return stop(fatal, 0)
-			}
-			if discoveryRuntime != nil {
-				if fatal := discoveryRuntime.FatalError(); fatal != nil {
-					return stop(fatal, 0)
+			for _, component := range fatalComponents {
+				if component == nil {
+					return stop(errInvalidDaemonDependencies, 0)
 				}
-			}
-			if contentPeerRuntime != nil {
-				if fatal := contentPeerRuntime.FatalError(); fatal != nil {
+				if fatal := component.FatalError(); fatal != nil {
 					return stop(fatal, 0)
 				}
 			}

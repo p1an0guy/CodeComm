@@ -285,11 +285,17 @@ func TestAuthorityHandoffFallsBackAfterBlackholedSigner(t *testing.T) {
 		}
 	})
 	admission, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
-		SessionID:                nodeTestSessionID,
-		RecoveryGeneration:       0,
-		AppliedChainIndex:        0,
-		Devices:                  devices,
-		AuditCounters:            counters,
+		SessionID:          nodeTestSessionID,
+		RecoveryGeneration: 0,
+		AppliedChainIndex:  0,
+		Devices:            devices,
+		AuditCounters:      counters,
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID:        nodeTestSessionID,
+			VoterDeviceIDs:   append([]domain.DeviceID(nil), signerIDs...),
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
+		},
 		CredentialAuthorizations: map[credentialauthorization.Key]credentialauthorization.Authorization{},
 	})
 	if err != nil {
@@ -480,7 +486,18 @@ func openVoterActivationCommitNode(
 	t *testing.T,
 ) (*SingleNode, *voterActivationCommitOrigin) {
 	t.Helper()
+	return openVoterActivationCommitNodeWithInitial(t, nil)
+}
+
+func openVoterActivationCommitNodeWithInitial(
+	t *testing.T,
+	mutate func(*store.InitialState),
+) (*SingleNode, *voterActivationCommitOrigin) {
+	t.Helper()
 	initial, privateKey, deviceID := nodeTestInitialState(t)
+	if mutate != nil {
+		mutate(&initial)
+	}
 	target, err := voterset.New(
 		nodeTestSessionID,
 		[]domain.DeviceID{deviceID},

@@ -10,6 +10,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 )
@@ -526,6 +527,12 @@ func newSnapshotFixture(t *testing.T, currentEpoch uint64) snapshotFixture {
 					DeviceID:        deviceID,
 					CredentialEpoch: currentEpoch,
 				},
+			},
+			CredentialAuthority: credentialauthority.Authority{
+				SessionID:        snapshotTestSessionID,
+				VoterDeviceIDs:   []domain.DeviceID{deviceID},
+				VoterSetVersion:  1,
+				ActivationSource: credentialauthority.ActivationGenesis,
 			},
 			CredentialAuthorizations: authorizations,
 		},

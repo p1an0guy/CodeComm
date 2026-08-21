@@ -4,37 +4,49 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
+	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/replication"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
+)
+
+var ErrSettledReplicaIneligible = errors.New(
+	"consensus: local device is not eligible for settled-nonvoter mode",
 )
 
 // SettledReplicaOptions configures an application nonvoter that catches up
 // from authority-signed result batches and owns no Raft runtime.
 type SettledReplicaOptions struct {
-	StatePath    string
-	OriginBootID domain.UUIDv7
-	Clock        ApplyClock
+	StatePath     string
+	OriginBootID  domain.UUIDv7
+	LocalDeviceID domain.DeviceID
+	Clock         ApplyClock
 }
 
 // SettledReplica owns the SQLite and peer-admission state for one application
 // nonvoter. Result imports are serialized across scratch replay and commit.
 type SettledReplica struct {
-	state        *store.Store
-	localState   store.LocalState
-	originBootID domain.UUIDv7
-	clock        ApplyClock
+	state         *store.Store
+	localState    store.LocalState
+	originBootID  domain.UUIDv7
+	localDeviceID domain.DeviceID
+	clock         ApplyClock
 
-	admissionMu sync.Mutex
-	admission   atomic.Pointer[peerAdmissionPublication]
-	changes     *changeFeed
-	claimed     atomic.Bool
-	importGate  chan struct{}
+	admissionMu             sync.Mutex
+	admission               atomic.Pointer[peerAdmissionPublication]
+	changes                 *changeFeed
+	peerChangesClaimed      atomic.Bool
+	consensusChangesClaimed atomic.Bool
+	transitionRequired      atomic.Bool
+	importGate              chan struct{}
 
 	localStateMu     sync.RWMutex
 	localStateClosed atomic.Bool
@@ -61,7 +73,8 @@ func OpenSettledReplica(
 ) (_ *SettledReplica, err error) {
 	if ctx == nil ||
 		options.StatePath == "" ||
-		!options.OriginBootID.Valid() {
+		!options.OriginBootID.Valid() ||
+		!options.LocalDeviceID.Valid() {
 		return nil, ErrInvalidNodeOptions
 	}
 	if err := ctx.Err(); err != nil {
@@ -91,18 +104,27 @@ func OpenSettledReplica(
 	if err != nil {
 		return nil, err
 	}
+	if err := validateSettledReplicaEligibility(
+		ctx,
+		database,
+		options.LocalDeviceID,
+		decoded.Reducer,
+	); err != nil {
+		return nil, err
+	}
 	clock := options.Clock
 	if clock == nil {
 		clock = NewSystemApplyClock()
 	}
 	replica := &SettledReplica{
-		state:        database,
-		originBootID: options.OriginBootID,
-		clock:        clock,
-		changes:      newChangeFeed(),
-		importGate:   make(chan struct{}, 1),
-		closeStarted: make(chan struct{}),
-		fatalSet:     make(chan struct{}),
+		state:         database,
+		originBootID:  options.OriginBootID,
+		localDeviceID: options.LocalDeviceID,
+		clock:         clock,
+		changes:       newChangeFeed(),
+		importGate:    make(chan struct{}, 1),
+		closeStarted:  make(chan struct{}),
+		fatalSet:      make(chan struct{}),
 	}
 	replica.localState = database.LocalStateWithGuard(
 		replica.beginLocalStateOperation,
@@ -152,6 +174,10 @@ func (replica *SettledReplica) ImportResultBatch(
 	if err := replica.FatalError(); err != nil {
 		return store.ResultBatchImportResult{}, err
 	}
+	if replica.transitionRequired.Load() {
+		return store.ResultBatchImportResult{},
+			ErrSettledReplicaIneligible
+	}
 
 	view, err := replica.state.VerifiedSettledNonvoterView(operationContext)
 	if err != nil {
@@ -178,6 +204,16 @@ func (replica *SettledReplica) ImportResultBatch(
 			ErrInvalidReplicationReplay,
 		)
 	}
+	localMember, localExists := replayed.state.Device(replica.localDeviceID)
+	if !localExists || localMember.ID != replica.localDeviceID {
+		return store.ResultBatchImportResult{}, fmt.Errorf(
+			"%w: replay removed the retained local identity",
+			ErrInvalidReplicationReplay,
+		)
+	}
+	transitionRequired := localMember.Status != device.StatusActive ||
+		replayed.state.VoterSet().Contains(replica.localDeviceID) ||
+		replayed.state.CredentialAuthority().Contains(replica.localDeviceID)
 	commands, verifiedAt, err := replica.mapResultBatch(view, replayed)
 	if err != nil {
 		return store.ResultBatchImportResult{}, err
@@ -201,6 +237,9 @@ func (replica *SettledReplica) ImportResultBatch(
 			revision: result.AdmissionRevision,
 			snapshot: replayed.admission,
 		})
+		if transitionRequired {
+			replica.transitionRequired.Store(true)
+		}
 		if replayed.admissionChanged {
 			replica.changes.signal()
 		}
@@ -290,6 +329,309 @@ func (replica *SettledReplica) View(
 	return replica.state.View(ctx)
 }
 
+// ReplicationHeads returns one fully reverified durable catch-up cursor.
+func (replica *SettledReplica) ReplicationHeads(
+	ctx context.Context,
+) (store.ApplyHeads, error) {
+	if replica == nil || replica.state == nil || ctx == nil {
+		return store.ApplyHeads{}, ErrInvalidNodeOptions
+	}
+	if err := replica.beginOperation(); err != nil {
+		return store.ApplyHeads{}, err
+	}
+	defer replica.endOperation()
+	view, err := replica.state.VerifiedSettledNonvoterView(ctx)
+	if err != nil && fatalSettledImportError(err) {
+		return store.ApplyHeads{},
+			replica.failSettledIntegrity(
+				"read replication heads",
+				err,
+			)
+	}
+	return view.Heads, err
+}
+
+// ReplicationProgress returns the fully reverified settled evidence head and
+// its retained signed authority observations.
+func (replica *SettledReplica) ReplicationProgress(
+	ctx context.Context,
+) (store.SettledReplicationProgress, error) {
+	if replica == nil || replica.state == nil || ctx == nil {
+		return store.SettledReplicationProgress{}, ErrInvalidNodeOptions
+	}
+	if err := replica.beginOperation(); err != nil {
+		return store.SettledReplicationProgress{}, err
+	}
+	defer replica.endOperation()
+	progress, err := replica.state.SettledReplicationProgress(ctx)
+	if err != nil && fatalSettledImportError(err) {
+		return store.SettledReplicationProgress{},
+			replica.failSettledIntegrity(
+				"read replication progress",
+				err,
+			)
+	}
+	return progress, err
+}
+
+// Status returns a read-only operator cut for a settled application
+// nonvoter. A frozen pre-conversion Raft configuration is historical evidence,
+// not a live observation, so topology and reconciliation remain unknown.
+func (replica *SettledReplica) Status(
+	ctx context.Context,
+) (coordstatus.Snapshot, error) {
+	if replica == nil || replica.state == nil || ctx == nil {
+		return coordstatus.Snapshot{}, ErrInvalidNodeOptions
+	}
+	if !replica.localDeviceID.Valid() {
+		return coordstatus.Snapshot{}, ErrInvalidNodeOptions
+	}
+	if err := replica.beginOperation(); err != nil {
+		return coordstatus.Snapshot{}, err
+	}
+	defer replica.endOperation()
+	select {
+	case replica.importGate <- struct{}{}:
+		defer func() { <-replica.importGate }()
+	case <-ctx.Done():
+		return coordstatus.Snapshot{}, ctx.Err()
+	}
+	durable, err := replica.localState.StatusSnapshot(
+		ctx,
+		replica.localDeviceID,
+		coordstatus.MaxTasks,
+	)
+	if err != nil {
+		return coordstatus.Snapshot{}, err
+	}
+	progress, err := replica.state.SettledReplicationProgress(ctx)
+	if err != nil {
+		if fatalSettledImportError(err) {
+			return coordstatus.Snapshot{},
+				replica.failSettledIntegrity(
+					"derive status replication progress",
+					err,
+				)
+		}
+		return coordstatus.Snapshot{}, err
+	}
+	if progress.Heads.ChainIndex != durable.Heads.ChainIndex ||
+		progress.Heads.ResultIndex != durable.Heads.ResultIndex ||
+		progress.Heads.DigestVersion != durable.Heads.DigestVersion ||
+		progress.Heads.ProjectionSchemaVersion !=
+			durable.Heads.ProjectionSchemaVersion {
+		return coordstatus.Snapshot{},
+			replica.failSettledIntegrity(
+				"compare status replication heads",
+				ErrInvalidStateView,
+			)
+	}
+	currency, observedAuthorityIDs, observedResultIndex :=
+		settledReplicaCurrency(
+			progress,
+			durable.CredentialAuthority.VoterDeviceIDs(),
+			durable.CredentialAuthority.VoterSetVersion,
+		)
+	runtime := coordstatus.RuntimeSnapshot{
+		State:                   coordstatus.ConsensusSettled,
+		Role:                    coordstatus.RoleNonvoter,
+		LocalDeviceID:           durable.Member.ID,
+		LiveConfigurationSource: coordstatus.LiveConfigurationUnknown,
+		LiveVoterDeviceIDs:      []domain.DeviceID{},
+		LiveNonvoterDeviceIDs:   []domain.DeviceID{},
+		QuorumRequired:          0,
+		StrongWrites:            coordstatus.StrongWritesWaiting,
+		ReplicaCurrency:         currency,
+		ObservedAuthorityIDs:    observedAuthorityIDs,
+		ObservedResultIndex:     observedResultIndex,
+		ConfigurationReconciled: false,
+		ReconciliationState:     coordstatus.ReconciliationUnknown,
+		ReconciliationStep:      coordstatus.ReconciliationStepObserve,
+		ReconciliationBlocker:   coordstatus.ReconciliationBlockerNone,
+	}
+	snapshot := coordstatus.Snapshot{
+		Durable: durable,
+		Runtime: runtime,
+	}
+	if err := snapshot.Validate(); err != nil {
+		return coordstatus.Snapshot{}, fmt.Errorf(
+			"consensus: invalid settled status snapshot: %w",
+			err,
+		)
+	}
+	return snapshot, nil
+}
+
+func settledReplicaCurrency(
+	progress store.SettledReplicationProgress,
+	authorityIDs []domain.DeviceID,
+	authorityVersion uint64,
+) (coordstatus.ReplicaCurrencyState, []domain.DeviceID, uint64) {
+	authority := make(map[domain.DeviceID]struct{}, len(authorityIDs))
+	for _, deviceID := range authorityIDs {
+		authority[deviceID] = struct{}{}
+	}
+	observedSet := make(map[domain.DeviceID]struct{}, len(authorityIDs))
+	observedResultIndex := uint64(0)
+	for _, observation := range progress.Observations {
+		if observation.ServerAppliedResultIndex > observedResultIndex {
+			observedResultIndex = observation.ServerAppliedResultIndex
+		}
+		if observation.AuthorityVersion != authorityVersion {
+			continue
+		}
+		if _, current := authority[observation.SignerDeviceID]; current {
+			observedSet[observation.SignerDeviceID] = struct{}{}
+		}
+	}
+	observed := make([]domain.DeviceID, 0, len(observedSet))
+	for deviceID := range observedSet {
+		observed = append(observed, deviceID)
+	}
+	sort.Slice(observed, func(left, right int) bool {
+		return observed[left] < observed[right]
+	})
+	if progress.Blocker != nil &&
+		progress.Blocker.ResultIndex > progress.Heads.ResultIndex {
+		return coordstatus.ReplicaCurrencyBehind,
+			observed,
+			progress.Blocker.ResultIndex
+	}
+	if len(observed) == len(authorityIDs) && len(authorityIDs) != 0 {
+		return coordstatus.ReplicaCurrencyCurrent,
+			observed,
+			progress.Heads.ResultIndex
+	}
+	if observedResultIndex > progress.Heads.ResultIndex {
+		observedResultIndex = progress.Heads.ResultIndex
+	}
+	return coordstatus.ReplicaCurrencyUnknown,
+		observed,
+		observedResultIndex
+}
+
+func validateSettledReplicaEligibility(
+	ctx context.Context,
+	database *store.Store,
+	localDeviceID domain.DeviceID,
+	state reducer.State,
+) error {
+	if ctx == nil || database == nil || !localDeviceID.Valid() {
+		return ErrSettledReplicaIneligible
+	}
+	if err := validateSettledReducerEligibility(
+		state,
+		localDeviceID,
+	); err != nil {
+		return err
+	}
+	voters, nonvoters, err := settledDurableConfiguration(ctx, database)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSettledReplicaIneligible, err)
+	}
+	for _, configured := range voters {
+		if configured == localDeviceID {
+			return ErrSettledReplicaIneligible
+		}
+	}
+	for _, configured := range nonvoters {
+		if configured == localDeviceID {
+			return ErrSettledReplicaIneligible
+		}
+	}
+	return nil
+}
+
+func validateSettledReducerEligibility(
+	state reducer.State,
+	localDeviceID domain.DeviceID,
+) error {
+	if !localDeviceID.Valid() {
+		return ErrSettledReplicaIneligible
+	}
+	member, exists := state.Device(localDeviceID)
+	if !exists ||
+		member.ID != localDeviceID ||
+		member.Status != device.StatusActive ||
+		state.VoterSet().Contains(localDeviceID) ||
+		state.CredentialAuthority().Contains(localDeviceID) {
+		return ErrSettledReplicaIneligible
+	}
+	return nil
+}
+
+func settledDurableConfiguration(
+	ctx context.Context,
+	database *store.Store,
+) ([]domain.DeviceID, []domain.DeviceID, error) {
+	if ctx == nil || database == nil {
+		return nil, nil, ErrSettledReplicaIneligible
+	}
+	record, found, err := database.CommittedRaftConfiguration(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !found {
+		return nil, nil, ErrSettledReplicaIneligible
+	}
+	configuration, err := decodeRaftConfigurationJSON(
+		record.ConfigurationJSON,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	voters := make([]domain.DeviceID, 0, len(configuration.Servers))
+	nonvoters := make([]domain.DeviceID, 0, len(configuration.Servers))
+	seen := make(map[domain.DeviceID]struct{}, len(configuration.Servers))
+	for _, server := range configuration.Servers {
+		deviceID := domain.DeviceID(server.ID)
+		if !deviceID.Valid() ||
+			server.Address != raft.ServerAddress(deviceID) {
+			return nil, nil, ErrInvalidRaftTopology
+		}
+		if _, duplicate := seen[deviceID]; duplicate {
+			return nil, nil, ErrInvalidRaftTopology
+		}
+		seen[deviceID] = struct{}{}
+		switch server.Suffrage {
+		case raft.Voter:
+			voters = append(voters, deviceID)
+		case raft.Nonvoter:
+			nonvoters = append(nonvoters, deviceID)
+		default:
+			return nil, nil, ErrInvalidRaftTopology
+		}
+	}
+	if len(voters) == 0 {
+		return nil, nil, ErrInvalidRaftTopology
+	}
+	sort.Slice(voters, func(left, right int) bool {
+		return voters[left] < voters[right]
+	})
+	sort.Slice(nonvoters, func(left, right int) bool {
+		return nonvoters[left] < nonvoters[right]
+	})
+	return voters, nonvoters, nil
+}
+
+// Member returns one exact committed member projection.
+func (replica *SettledReplica) Member(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (coordstatus.MemberSummary, bool, error) {
+	if replica == nil ||
+		replica.state == nil ||
+		ctx == nil ||
+		!deviceID.Valid() {
+		return coordstatus.MemberSummary{}, false, ErrInvalidNodeOptions
+	}
+	if err := replica.beginOperation(); err != nil {
+		return coordstatus.MemberSummary{}, false, err
+	}
+	defer replica.endOperation()
+	return replica.localState.MemberStatus(ctx, deviceID)
+}
+
 // LocalState returns the restricted local-only store capability.
 func (replica *SettledReplica) LocalState() (store.LocalState, error) {
 	if replica == nil || replica.state == nil {
@@ -338,7 +680,17 @@ func (replica *SettledReplica) PeerAdmissionSnapshot() (
 // PeerAdmissionChanges claims the single ingress authorization subscription.
 func (replica *SettledReplica) PeerAdmissionChanges() <-chan struct{} {
 	if replica == nil || replica.changes == nil ||
-		!replica.claimed.CompareAndSwap(false, true) {
+		!replica.peerChangesClaimed.CompareAndSwap(false, true) {
+		return closedChangeChannel()
+	}
+	return replica.changes.subscribe()
+}
+
+// ConsensusAuthorizationChanges claims the control-only identity stream's
+// independent admission-change subscription.
+func (replica *SettledReplica) ConsensusAuthorizationChanges() <-chan struct{} {
+	if replica == nil || replica.changes == nil ||
+		!replica.consensusChangesClaimed.CompareAndSwap(false, true) {
 		return closedChangeChannel()
 	}
 	return replica.changes.subscribe()
@@ -473,6 +825,7 @@ func fatalSettledImportError(err error) bool {
 	return errors.Is(err, store.ErrIntegrityCheck) ||
 		errors.Is(err, store.ErrCorrupt) ||
 		errors.Is(err, store.ErrCommandResultCorrupt) ||
+		errors.Is(err, store.ErrAppliedCheckpointIntegrity) ||
 		errors.Is(err, store.ErrRaftCommandBinding) ||
 		errors.Is(err, store.ErrReplicaEvidenceMode) ||
 		errors.Is(err, ErrInvalidStateView) ||

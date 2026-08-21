@@ -185,6 +185,108 @@ func runSecureCredentialRenewalLeaderForwardingAndMinoritySafety(
 		authorization,
 	)
 
+	if follower.node.IsLeader() {
+		t.Fatal("credential renewal retry fixture unexpectedly changed leader")
+	}
+	retried, err := follower.node.RenewCredential(
+		meshTestContext(t),
+		followerBinding,
+	)
+	if err != nil {
+		t.Fatalf("follower retry RenewCredential(): %v", err)
+	}
+	if !credentialRenewalAuthorizationsEqual(retried, authorization) {
+		t.Fatalf(
+			"follower retry = %#v, want committed %#v",
+			retried,
+			authorization,
+		)
+	}
+	if got := countingRequester.calls.Load(); got != 1 {
+		t.Fatalf("follower retry forwards = %d, want 1 total", got)
+	}
+
+	retryOrigin := &credentialRenewalForbiddenOrigin{
+		deviceID: leader.identity.deviceID,
+		bootID:   leader.identity.bootIDs[leader.startCount-1],
+	}
+	originalLeaderOrigin := leader.node.credentialAuthorizationOrigin
+	leader.node.credentialAuthorizationOrigin = retryOrigin
+	directRetry, err := leader.node.RenewCredential(
+		meshTestContext(t),
+		followerBinding,
+	)
+	leader.node.credentialAuthorizationOrigin = originalLeaderOrigin
+	if err != nil {
+		t.Fatalf("direct retry RenewCredential(): %v", err)
+	}
+	if !credentialRenewalAuthorizationsEqual(directRetry, authorization) {
+		t.Fatalf(
+			"direct retry = %#v, want committed %#v",
+			directRetry,
+			authorization,
+		)
+	}
+	if retryOrigin.calls.Load() != 0 {
+		t.Fatal("exact retry invoked the credential authorization origin")
+	}
+
+	changedBinding := secureCredentialRenewalBindingAtEpoch(
+		t,
+		follower,
+		1,
+		0xd4,
+	)
+	if _, err := follower.node.RenewCredential(
+		meshTestContext(t),
+		changedBinding,
+	); !errors.Is(err, ErrInvalidCredentialBinding) {
+		t.Fatalf("changed current binding error = %v", err)
+	}
+	if got := countingRequester.calls.Load(); got != 1 {
+		t.Fatalf("changed current binding forwards = %d, want 1 total", got)
+	}
+
+	successorNow := fixedNow.Add(
+		time.Duration(
+			credentialauthorization.ValiditySeconds-
+				credentialauthorization.RenewalLeadSeconds,
+		) * time.Second,
+	)
+	for _, candidate := range nodes {
+		candidate.node.credentialEndorsementNow = func() time.Time {
+			return successorNow
+		}
+	}
+	successorBinding := secureCredentialRenewalBindingAtEpoch(
+		t,
+		follower,
+		2,
+		0xd5,
+	)
+	successor, err := follower.node.RenewCredential(
+		meshTestContext(t),
+		successorBinding,
+	)
+	if err != nil {
+		t.Fatalf("successor RenewCredential(): %v", err)
+	}
+	assertCredentialRenewalAuthorization(t, successor, successorBinding)
+	if got := countingRequester.calls.Load(); got != 2 {
+		t.Fatalf("successor renewal forwards = %d, want 2 total", got)
+	}
+	awaitCredentialRenewal(t, nodes, successor)
+
+	if _, err := follower.node.RenewCredential(
+		meshTestContext(t),
+		followerBinding,
+	); !errors.Is(err, ErrInvalidCredentialBinding) {
+		t.Fatalf("stale binding error = %v", err)
+	}
+	if got := countingRequester.calls.Load(); got != 2 {
+		t.Fatalf("stale binding forwards = %d, want 2 total", got)
+	}
+
 	relayedBinding := secureCredentialRenewalBinding(
 		t,
 		relayedSubject,
@@ -201,8 +303,8 @@ func runSecureCredentialRenewalLeaderForwardingAndMinoritySafety(
 		t.Fatalf("submit through follower: %v", err)
 	}
 	assertCredentialRenewalAuthorization(t, relayed, relayedBinding)
-	if got := countingRequester.calls.Load(); got != 2 {
-		t.Fatalf("submitted renewal forwards = %d, want 2 total", got)
+	if got := countingRequester.calls.Load(); got != 3 {
+		t.Fatalf("submitted renewal forwards = %d, want 3 total", got)
 	}
 	awaitCredentialRenewal(t, nodes, relayed)
 
@@ -248,6 +350,16 @@ func secureCredentialRenewalBinding(
 	seed byte,
 ) credential.Binding {
 	t.Helper()
+	return secureCredentialRenewalBindingAtEpoch(t, subject, 1, seed)
+}
+
+func secureCredentialRenewalBindingAtEpoch(
+	t testing.TB,
+	subject *secureMeshNode,
+	epoch uint64,
+	seed byte,
+) credential.Binding {
+	t.Helper()
 	if subject == nil {
 		t.Fatal("nil credential subject")
 	}
@@ -258,7 +370,7 @@ func secureCredentialRenewalBinding(
 	binding, err := credential.SignBinding(
 		nodeTestSessionID,
 		subject.identity.deviceID,
-		1,
+		epoch,
 		epochPrivate.Public().(ed25519.PublicKey),
 		subject.identity.private,
 	)

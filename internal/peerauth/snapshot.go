@@ -11,6 +11,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 )
@@ -27,6 +28,7 @@ type SnapshotInput struct {
 
 	Devices                  map[domain.DeviceID]device.Device
 	AuditCounters            map[domain.DeviceID]auditcounter.Counter
+	CredentialAuthority      credentialauthority.Authority
 	CredentialAuthorizations map[credentialauthorization.Key]credentialauthorization.Authorization
 }
 
@@ -35,19 +37,21 @@ type Changes struct {
 	AdvancesEventChain       bool
 	Devices                  []device.Device
 	AuditCounters            []auditcounter.Counter
+	CredentialAuthority      []credentialauthority.Authority
 	CredentialAuthorizations []credentialauthorization.Authorization
 }
 
 // Snapshot is immutable after construction and safe for concurrent reads.
 // Its maps and mutable row fields are never exposed without a defensive copy.
 type Snapshot struct {
-	sessionID          domain.UUIDv7
-	recoveryGeneration uint64
-	appliedChainIndex  uint64
-	devices            map[domain.DeviceID]device.Device
-	credentialEpochs   map[domain.DeviceID]uint64
-	authorizations     map[credentialauthorization.Key]credentialauthorization.Authorization
-	valid              bool
+	sessionID           domain.UUIDv7
+	recoveryGeneration  uint64
+	appliedChainIndex   uint64
+	devices             map[domain.DeviceID]device.Device
+	credentialEpochs    map[domain.DeviceID]uint64
+	credentialAuthority credentialauthority.Authority
+	authorizations      map[credentialauthorization.Key]credentialauthorization.Authorization
+	valid               bool
 }
 
 // NewSnapshot validates and copies one complete applied-state cut.
@@ -80,6 +84,7 @@ func NewSnapshot(input SnapshotInput) (*Snapshot, error) {
 		input.AppliedChainIndex,
 		devices,
 		epochs,
+		input.CredentialAuthority.Clone(),
 		input.CredentialAuthorizations,
 	)
 }
@@ -98,6 +103,7 @@ func (snapshot *Snapshot) Advance(changes Changes) (*Snapshot, error) {
 		chainIndex++
 	} else if len(changes.Devices) != 0 ||
 		len(changes.AuditCounters) != 0 ||
+		len(changes.CredentialAuthority) != 0 ||
 		len(changes.CredentialAuthorizations) != 0 {
 		return nil, invalidSnapshot(
 			"admission changes do not advance the event chain",
@@ -105,15 +111,17 @@ func (snapshot *Snapshot) Advance(changes Changes) (*Snapshot, error) {
 	}
 	if len(changes.Devices) == 0 &&
 		len(changes.AuditCounters) == 0 &&
+		len(changes.CredentialAuthority) == 0 &&
 		len(changes.CredentialAuthorizations) == 0 {
 		return &Snapshot{
-			sessionID:          snapshot.sessionID,
-			recoveryGeneration: snapshot.recoveryGeneration,
-			appliedChainIndex:  chainIndex,
-			devices:            snapshot.devices,
-			credentialEpochs:   snapshot.credentialEpochs,
-			authorizations:     snapshot.authorizations,
-			valid:              true,
+			sessionID:           snapshot.sessionID,
+			recoveryGeneration:  snapshot.recoveryGeneration,
+			appliedChainIndex:   chainIndex,
+			devices:             snapshot.devices,
+			credentialEpochs:    snapshot.credentialEpochs,
+			credentialAuthority: snapshot.credentialAuthority,
+			authorizations:      snapshot.authorizations,
+			valid:               true,
 		}, nil
 	}
 
@@ -148,6 +156,14 @@ func (snapshot *Snapshot) Advance(changes Changes) (*Snapshot, error) {
 		epochs[counter.DeviceID] = counter.CredentialEpoch
 	}
 
+	if len(changes.CredentialAuthority) > 1 {
+		return nil, invalidSnapshot("multiple credential-authority changes")
+	}
+	authority := snapshot.credentialAuthority
+	if len(changes.CredentialAuthority) == 1 {
+		authority = changes.CredentialAuthority[0].Clone()
+	}
+
 	authorizations := cloneAuthorizations(snapshot.authorizations)
 	seenAuthorizations := make(
 		map[credentialauthorization.Key]struct{},
@@ -172,6 +188,7 @@ func (snapshot *Snapshot) Advance(changes Changes) (*Snapshot, error) {
 		chainIndex,
 		devices,
 		epochs,
+		authority,
 		authorizations,
 	)
 }
@@ -216,6 +233,18 @@ func (snapshot *Snapshot) CurrentCredentialEpoch(
 	}
 	epoch, exists := snapshot.credentialEpochs[deviceID]
 	return epoch, exists
+}
+
+// CredentialAuthority returns an independent copy of the applied authority
+// used to verify successor credential endorsements.
+func (snapshot *Snapshot) CredentialAuthority() (
+	credentialauthority.Authority,
+	bool,
+) {
+	if snapshot == nil || !snapshot.valid {
+		return credentialauthority.Authority{}, false
+	}
+	return snapshot.credentialAuthority.Clone(), true
 }
 
 // Authorization returns an independent copy of a retained current or prior
@@ -357,6 +386,7 @@ func newSnapshot(
 	appliedChainIndex uint64,
 	devices map[domain.DeviceID]device.Device,
 	epochs map[domain.DeviceID]uint64,
+	authority credentialauthority.Authority,
 	authorizations map[credentialauthorization.Key]credentialauthorization.Authorization,
 ) (*Snapshot, error) {
 	if !sessionID.Valid() ||
@@ -365,6 +395,10 @@ func newSnapshot(
 		len(devices) == 0 ||
 		len(devices) != len(epochs) {
 		return nil, ErrInvalidSnapshot
+	}
+	if err := authority.Validate(); err != nil ||
+		authority.SessionID != sessionID {
+		return nil, invalidSnapshot("credential authority is invalid")
 	}
 	for id, member := range devices {
 		if id != member.ID {
@@ -447,13 +481,14 @@ func newSnapshot(
 	}
 
 	return &Snapshot{
-		sessionID:          sessionID,
-		recoveryGeneration: recoveryGeneration,
-		appliedChainIndex:  appliedChainIndex,
-		devices:            devices,
-		credentialEpochs:   epochs,
-		authorizations:     retained,
-		valid:              true,
+		sessionID:           sessionID,
+		recoveryGeneration:  recoveryGeneration,
+		appliedChainIndex:   appliedChainIndex,
+		devices:             devices,
+		credentialEpochs:    epochs,
+		credentialAuthority: authority.Clone(),
+		authorizations:      retained,
+		valid:               true,
 	}, nil
 }
 

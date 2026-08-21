@@ -78,6 +78,23 @@ func NewOperatorService(
 	}, nil
 }
 
+// NewReadOnlyOperatorService serves status and exact-member queries without
+// installing any mutation or pairing capability.
+func NewReadOnlyOperatorService(
+	source StatusSource,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+) (*OperatorService, error) {
+	if source == nil || !sessionID.Valid() || !workspaceID.Valid() {
+		return nil, ErrInvalidOperatorOptions
+	}
+	return &OperatorService{
+		source:      source,
+		sessionID:   sessionID,
+		workspaceID: workspaceID,
+	}, nil
+}
+
 // Bind implements ipc.Binder without constructing event authority.
 func (service *OperatorService) Bind(
 	ctx context.Context,
@@ -288,9 +305,16 @@ func (handler *operatorHandler) command(
 	request *http.Request,
 ) {
 	if request.Body == nil ||
-		handler.submitter == nil ||
 		!handler.clientInstanceID.Valid() {
 		writeOperatorError(writer, http.StatusBadRequest, "invalid_command")
+		return
+	}
+	if handler.submitter == nil {
+		writeOperatorError(
+			writer,
+			http.StatusServiceUnavailable,
+			"strong_writes_unavailable",
+		)
 		return
 	}
 	command, err := localcommand.DecodeReader(request.Body)
@@ -420,10 +444,13 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 			ProjectionVersion: durable.Heads.ProjectionSchemaVersion,
 		},
 		Consensus: ConsensusStatus{
-			State:              string(runtime.State),
-			Role:               string(runtime.Role),
-			LeaderDeviceID:     leader,
-			LiveVoterDeviceIDs: deviceIDStrings(runtime.LiveVoterDeviceIDs),
+			State:                   string(runtime.State),
+			Role:                    string(runtime.Role),
+			LeaderDeviceID:          leader,
+			LiveConfigurationSource: string(runtime.LiveConfigurationSource),
+			LiveVoterDeviceIDs: deviceIDStrings(
+				runtime.LiveVoterDeviceIDs,
+			),
 			LiveNonvoterDeviceIDs: deviceIDStrings(
 				runtime.LiveNonvoterDeviceIDs,
 			),
@@ -434,8 +461,13 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 			VoterSetVersion: durable.VoterSet.VoterSetVersion,
 			ActivatedVoterSetVersion: durable.CredentialAuthority.
 				VoterSetVersion,
-			QuorumRequired:          runtime.QuorumRequired,
-			StrongWrites:            string(runtime.StrongWrites),
+			QuorumRequired:  runtime.QuorumRequired,
+			StrongWrites:    string(runtime.StrongWrites),
+			ReplicaCurrency: string(runtime.ReplicaCurrency),
+			ObservedAuthorityIDs: deviceIDStrings(
+				runtime.ObservedAuthorityIDs,
+			),
+			ObservedResultIndex:     runtime.ObservedResultIndex,
 			ConfigurationReconciled: runtime.ConfigurationReconciled,
 			ReconciliationState:     string(runtime.ReconciliationState),
 			ReconciliationStep:      string(runtime.ReconciliationStep),

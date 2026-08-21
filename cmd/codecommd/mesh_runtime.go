@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -37,15 +39,36 @@ var (
 
 type daemonMeshPreflight struct {
 	recoveryGeneration uint64
+	evidenceMode       store.ReplicaEvidenceMode
 	bootstrapVoterIDs  []domain.DeviceID
+}
+
+type daemonPeerAdmissionRuntime interface {
+	PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+	PeerAdmissionChanges() <-chan struct{}
+}
+
+type daemonSettledControlAdmission interface {
+	PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+	ConsensusAuthorizationChanges() <-chan struct{}
+}
+
+type daemonSettledControlTransport interface {
+	consensus.ConsensusStatusRequester
+	consensus.CredentialRenewalRequester
+	contentVerifiers() *peerauth.Verifiers
+	phasedDaemonComponent
 }
 
 type daemonConsensusTransportFactory interface {
 	Build(consensus.ConsensusTransportGate) (consensus.RaftTransport, error)
+	BuildSettledControl(
+		daemonSettledControlAdmission,
+	) (daemonSettledControlTransport, error)
 	NewIngress(
 		context.Context,
 		daemonOptions,
-		*consensus.Node,
+		daemonPeerAdmissionRuntime,
 		transport.ContentCertificateProvider,
 		transport.ConnectionHandler,
 		transport.ConnectionHandler,
@@ -75,6 +98,14 @@ type daemonMeshTransportFactory struct {
 
 	stream    *transport.ConsensusStreamLayer
 	verifiers *peerauth.Verifiers
+}
+
+type daemonSettledControlStream struct {
+	stream    *transport.ConsensusStreamLayer
+	verifiers *peerauth.Verifiers
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func inspectDaemonMeshState(
@@ -125,6 +156,14 @@ func inspectDaemonMeshState(
 		!bytes.Equal(status.Member.IdentityPublicKey, identityPublicKey) {
 		return daemonMeshPreflight{}, errDaemonIdentityMismatch
 	}
+	evidenceMode, err := database.ReplicaEvidenceMode(ctx)
+	if err != nil {
+		return daemonMeshPreflight{}, fmt.Errorf(
+			"%w: inspect replica evidence mode: %v",
+			errDaemonMeshConstruction,
+			err,
+		)
+	}
 	_, hasCommittedConfiguration, err :=
 		database.CommittedRaftConfiguration(ctx)
 	if err != nil {
@@ -135,12 +174,14 @@ func inspectDaemonMeshState(
 		)
 	}
 	var bootstrapVoterIDs []domain.DeviceID
-	if !hasCommittedConfiguration &&
+	if evidenceMode == store.ReplicaEvidenceRaft &&
+		!hasCommittedConfiguration &&
 		view.LastRaftAppliedLogIndex == nil {
 		bootstrapVoterIDs = status.VoterSet.VoterDeviceIDs()
 	}
 	return daemonMeshPreflight{
 		recoveryGeneration: view.RecoveryGeneration,
+		evidenceMode:       evidenceMode,
 		bootstrapVoterIDs:  bootstrapVoterIDs,
 	}, nil
 }
@@ -200,17 +241,13 @@ func (factory *daemonMeshTransportFactory) Build(
 		!factory.deviceID.Valid() ||
 		factory.routes == nil ||
 		factory.authenticatedDials == nil ||
-		factory.stream != nil ||
-		factory.verifiers != nil {
+		factory.stream != nil {
 		return nil, errDaemonMeshConstruction
 	}
-	verifiers, err := peerauth.NewVerifiers(
-		gate.PeerAdmissionSnapshot,
-		factory.credentialNow,
-	)
-	if err != nil {
+	if err := factory.prepareVerifiers(gate); err != nil {
 		return nil, err
 	}
+	verifiers := factory.verifiers
 	stream, err := transport.NewConsensusStreamLayer(
 		transport.ConsensusStreamOptions{
 			LocalDeviceID:            factory.deviceID,
@@ -246,10 +283,51 @@ func (factory *daemonMeshTransportFactory) Build(
 	return raftTransport, nil
 }
 
+func (factory *daemonMeshTransportFactory) BuildSettledControl(
+	admission daemonSettledControlAdmission,
+) (daemonSettledControlTransport, error) {
+	if factory == nil ||
+		admission == nil ||
+		!factory.deviceID.Valid() ||
+		factory.routes == nil ||
+		factory.authenticatedDials == nil ||
+		factory.stream != nil {
+		return nil, errDaemonMeshConstruction
+	}
+	if err := factory.prepareSettledVerifiers(admission); err != nil {
+		return nil, err
+	}
+	stream, err := transport.NewConsensusStreamLayer(
+		transport.ConsensusStreamOptions{
+			LocalDeviceID:       factory.deviceID,
+			IdentityCertificate: factory.identityCertificate,
+			Endpoints:           factory.routes,
+			Dialer:              factory.routes,
+			VerifyExpectedPeer: factory.verifiers.
+				VerifyExpectedConsensusPeer,
+			AuthorizePeer: func(domain.DeviceID) error {
+				return consensus.ErrConsensusPeerOutsideConfiguration
+			},
+			ObserveAuthenticatedDial: factory.authenticatedDials.observe,
+			AuthorizationChanges: admission.
+				ConsensusAuthorizationChanges(),
+			ControlHandler: http.NotFoundHandler(),
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	factory.stream = stream
+	return &daemonSettledControlStream{
+		stream:    stream,
+		verifiers: factory.verifiers,
+	}, nil
+}
+
 func (factory *daemonMeshTransportFactory) NewIngress(
 	ctx context.Context,
 	options daemonOptions,
-	node *consensus.Node,
+	admission daemonPeerAdmissionRuntime,
 	contentCertificate transport.ContentCertificateProvider,
 	pairingHandler transport.ConnectionHandler,
 	contentHandler transport.ConnectionHandler,
@@ -259,12 +337,17 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 		return nil, nil
 	}
 	if factory == nil ||
-		factory.stream == nil ||
-		factory.verifiers == nil ||
-		node == nil ||
+		admission == nil ||
 		contentCertificate == nil ||
-		pairingHandler == nil ||
 		listen == nil {
+		return nil, errDaemonMeshConstruction
+	}
+	if err := factory.prepareVerifiers(admission); err != nil {
+		return nil, err
+	}
+	if factory.stream == nil &&
+		pairingHandler == nil &&
+		contentHandler == nil {
 		return nil, errDaemonMeshConstruction
 	}
 	listener, err := openDaemonPeerListeners(
@@ -294,7 +377,7 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 			VerifyConsensusPeer: factory.verifiers.VerifyConsensusPeer,
 			VerifyContentPeer:   factory.verifiers.VerifyContentPeer,
 		},
-		PeerAccessChanges: node.PeerAdmissionChanges(),
+		PeerAccessChanges: admission.PeerAdmissionChanges(),
 		PeerAuthenticated: newDaemonAuthenticatedPeerObserver(
 			factory.authenticatedDials,
 		),
@@ -313,11 +396,102 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 	return ingress, nil
 }
 
+func (factory *daemonMeshTransportFactory) prepareVerifiers(
+	admission interface {
+		PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+	},
+) error {
+	if factory == nil ||
+		admission == nil ||
+		factory.credentialNow == nil {
+		return errDaemonMeshConstruction
+	}
+	if factory.verifiers != nil {
+		return nil
+	}
+	verifiers, err := peerauth.NewVerifiers(
+		admission.PeerAdmissionSnapshot,
+		factory.credentialNow,
+	)
+	if err != nil {
+		return err
+	}
+	factory.verifiers = verifiers
+	return nil
+}
+
+func (factory *daemonMeshTransportFactory) prepareSettledVerifiers(
+	admission interface {
+		PeerAdmissionSnapshot() (*peerauth.Snapshot, error)
+	},
+) error {
+	if factory == nil ||
+		admission == nil ||
+		factory.credentialNow == nil ||
+		factory.verifiers != nil {
+		return errDaemonMeshConstruction
+	}
+	verifiers, err := peerauth.NewVerifiersWithProvisional(
+		admission.PeerAdmissionSnapshot,
+		factory.credentialNow,
+		peerauth.NewProvisionalAuthorizations(),
+	)
+	if err != nil {
+		return err
+	}
+	factory.verifiers = verifiers
+	return nil
+}
+
 func (factory *daemonMeshTransportFactory) ClearIdentityCertificate() {
 	if factory == nil {
 		return
 	}
 	clearDaemonTLSCertificate(&factory.identityCertificate)
+}
+
+func (runtime *daemonSettledControlStream) RequestCredentialRenewal(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	body []byte,
+) (transport.ConsensusControlResponse, error) {
+	if runtime == nil || runtime.stream == nil {
+		return transport.ConsensusControlResponse{},
+			errDaemonMeshConstruction
+	}
+	return runtime.stream.RequestCredentialRenewal(ctx, deviceID, body)
+}
+
+func (runtime *daemonSettledControlStream) RequestConsensusStatus(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+) (transport.ConsensusControlResponse, error) {
+	if runtime == nil || runtime.stream == nil {
+		return transport.ConsensusControlResponse{},
+			errDaemonMeshConstruction
+	}
+	return runtime.stream.RequestConsensusStatus(ctx, deviceID)
+}
+
+func (runtime *daemonSettledControlStream) contentVerifiers() *peerauth.Verifiers {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.verifiers
+}
+
+func (runtime *daemonSettledControlStream) BeginClose() error {
+	if runtime == nil || runtime.stream == nil {
+		return errDaemonMeshConstruction
+	}
+	runtime.closeOnce.Do(func() {
+		runtime.closeErr = runtime.stream.Close()
+	})
+	return runtime.closeErr
+}
+
+func (runtime *daemonSettledControlStream) Wait() error {
+	return runtime.BeginClose()
 }
 
 func (factory *daemonMeshTransportFactory) ConsensusRoutes() *transport.ConsensusRouteTable {

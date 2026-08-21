@@ -176,6 +176,79 @@ func TestModelViewNamesVoterReconciliationBlocker(t *testing.T) {
 	}
 }
 
+func TestModelViewLabelsSettledUnknownConfiguration(t *testing.T) {
+	snapshot := snapshotFromCoordination(
+		uiTestSettledUnknownStatusSnapshot(t),
+	)
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("settled snapshot: %v", err)
+	}
+	for _, width := range []int{40, 80} {
+		t.Run(fmt.Sprintf("%d_columns", width), func(t *testing.T) {
+			model := Model{
+				snapshot:    snapshot,
+				hasSnapshot: true,
+				connection:  ConnectionLive,
+				lastGoodAt:  time.Now(),
+				clock:       time.Now,
+				width:       width,
+				height:      30,
+			}
+			view := model.View()
+			for _, expected := range []string{
+				"Consensus SETTLED / nonvoter",
+				"Replica UNKNOWN",
+				"Live configuration UNKNOWN",
+				"Strong writes waiting",
+				"Voter reconciliation UNKNOWN",
+			} {
+				if !strings.Contains(view, expected) {
+					t.Fatalf("view omitted %q:\n%s", expected, view)
+				}
+			}
+			for _, forbidden := range []string{
+				"DEGRADED:",
+				"Voter transition UNKNOWN",
+			} {
+				if strings.Contains(view, forbidden) {
+					t.Fatalf("view included %q:\n%s", forbidden, view)
+				}
+			}
+		})
+	}
+}
+
+func TestModelViewLabelsVoterReportedConfiguration(t *testing.T) {
+	snapshot := snapshotFromCoordination(
+		uiTestSettledUnknownStatusSnapshot(t),
+	)
+	leader := snapshot.Consensus.TargetVoterDeviceIDs[0]
+	snapshot.Consensus.LiveConfigurationSource = string(
+		coordstatus.LiveConfigurationVoterReported,
+	)
+	snapshot.Consensus.LeaderDeviceID = &leader
+	snapshot.Consensus.LiveVoterDeviceIDs = []string{leader}
+	snapshot.Consensus.QuorumRequired = 1
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("voter-reported snapshot: %v", err)
+	}
+	model := Model{
+		snapshot:    snapshot,
+		hasSnapshot: true,
+		connection:  ConnectionLive,
+		lastGoodAt:  time.Now(),
+		clock:       time.Now,
+		width:       80,
+		height:      30,
+	}
+	view := model.View()
+	if !strings.Contains(view, "Live configuration VOTER-REPORTED") ||
+		!strings.Contains(view, "Voter reconciliation UNKNOWN") ||
+		strings.Contains(view, "Voter transition UNKNOWN") {
+		t.Fatalf("voter-reported view:\n%s", view)
+	}
+}
+
 func TestAbbreviateIDsExtendsCollidingPrefixes(t *testing.T) {
 	values := []string{
 		"018f47de-89ab-7def-8123-111111111111",

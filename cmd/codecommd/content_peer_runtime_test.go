@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/netip"
@@ -14,10 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
+	"github.com/ijonahch/codecomm/internal/credential"
+	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/peerauth"
@@ -106,6 +111,23 @@ func (daemonContentPeerRoutesStub) DialConsensusEndpoint(
 
 type daemonContentPeerResolvedRoutesStub struct {
 	dialed bool
+}
+
+type daemonConsensusStatusRequesterStub struct {
+	mu       sync.Mutex
+	response transport.ConsensusControlResponse
+	err      error
+	targets  []domain.DeviceID
+}
+
+func (stub *daemonConsensusStatusRequesterStub) RequestConsensusStatus(
+	_ context.Context,
+	target domain.DeviceID,
+) (transport.ConsensusControlResponse, error) {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	stub.targets = append(stub.targets, target)
+	return stub.response, stub.err
 }
 
 func (*daemonContentPeerResolvedRoutesStub) ResolveConsensusEndpoints(
@@ -257,6 +279,12 @@ func TestDaemonContentPeerRuntimeDetectsActiveRemoteSuccessor(t *testing.T) {
 				CredentialEpoch: 2,
 			},
 		},
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID:        daemonTestSessionID,
+			VoterDeviceIDs:   []domain.DeviceID{local.ID},
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
+		},
 		CredentialAuthorizations: map[credentialauthorization.Key]credentialauthorization.Authorization{
 			first.PrimaryKey():  first,
 			second.PrimaryKey(): second,
@@ -278,6 +306,169 @@ func TestDaemonContentPeerRuntimeDetectsActiveRemoteSuccessor(t *testing.T) {
 	}
 	if runtime.remoteCredentialAdvanced(remote.ID, 2) {
 		t.Fatal("current remote epoch requested a redundant replacement")
+	}
+}
+
+func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedSuccessor(
+	t *testing.T,
+) {
+	now := time.Now().UTC().Truncate(time.Second)
+	local := daemonContentPeerTestMember(t, 0xc1)
+	peerIdentity := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xc2}, ed25519.SeedSize),
+	)
+	t.Cleanup(func() { clear(peerIdentity) })
+	peerID, err := device.DeriveID(
+		peerIdentity.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatalf("device.DeriveID(peer): %v", err)
+	}
+	peer := device.Device{
+		ID:                peerID,
+		Role:              device.RoleOwner,
+		IdentityPublicKey: bytes.Clone(peerIdentity.Public().(ed25519.PublicKey)),
+		DaemonVersion:     "1.0.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+	firstEpochKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd1}, ed25519.SeedSize),
+	)
+	secondEpochKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd2}, ed25519.SeedSize),
+	)
+	t.Cleanup(func() {
+		clear(firstEpochKey)
+		clear(secondEpochKey)
+	})
+	first := daemonContentPeerSignedAuthorization(
+		t,
+		peer,
+		peerIdentity,
+		firstEpochKey,
+		nil,
+		now.Add(-29*time.Minute),
+		now.Add(-29*time.Minute),
+		1,
+	)
+	second := daemonContentPeerSignedAuthorization(
+		t,
+		peer,
+		peerIdentity,
+		secondEpochKey,
+		&first,
+		now.Add(-2*time.Minute),
+		now.Add(-time.Minute),
+		2,
+	)
+	snapshot, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
+		SessionID:          daemonTestSessionID,
+		RecoveryGeneration: 0,
+		AppliedChainIndex:  1,
+		Devices: map[domain.DeviceID]device.Device{
+			local.ID: local,
+			peer.ID:  peer,
+		},
+		AuditCounters: map[domain.DeviceID]auditcounter.Counter{
+			local.ID: {DeviceID: local.ID},
+			peer.ID: {
+				DeviceID:        peer.ID,
+				CredentialEpoch: 1,
+			},
+		},
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID:        daemonTestSessionID,
+			VoterDeviceIDs:   []domain.DeviceID{peer.ID},
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
+		},
+		CredentialAuthorizations: map[credentialauthorization.Key]credentialauthorization.Authorization{
+			first.PrimaryKey(): first,
+		},
+	})
+	if err != nil {
+		t.Fatalf("peerauth.NewSnapshot(): %v", err)
+	}
+	outbound, err := peerauth.NewVerifiersWithProvisional(
+		func() (*peerauth.Snapshot, error) { return snapshot, nil },
+		func() time.Time { return now },
+		peerauth.NewProvisionalAuthorizations(),
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiersWithProvisional(outbound): %v", err)
+	}
+	ingress, err := peerauth.NewVerifiers(
+		func() (*peerauth.Snapshot, error) { return snapshot, nil },
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiers(ingress): %v", err)
+	}
+	certificate, _, err := transport.IssueContentCertificate(
+		second,
+		secondEpochKey,
+	)
+	if err != nil {
+		t.Fatalf("IssueContentCertificate(): %v", err)
+	}
+	t.Cleanup(func() { clearDaemonTLSCertificate(&certificate) })
+	parsed, err := transport.ParseContentCertificate(
+		certificate.Certificate[0],
+	)
+	if err != nil {
+		t.Fatalf("ParseContentCertificate(): %v", err)
+	}
+	if _, err := ingress.VerifyContentPeer(parsed); !errors.Is(
+		err,
+		peerauth.ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(before bootstrap) error = %v", err)
+	}
+
+	requester := &daemonConsensusStatusRequesterStub{
+		response: daemonContentPeerConsensusStatusResponse(
+			t,
+			peer.ID,
+			second,
+			0,
+		),
+	}
+	runtime := &daemonContentPeerRuntime{
+		sessionID:     daemonTestSessionID,
+		generation:    0,
+		localDeviceID: local.ID,
+		admission: daemonContentPeerAdmissionStub{
+			snapshot: snapshot,
+		},
+		verifiers:     outbound,
+		credentialNow: func() time.Time { return now },
+		status:        requester,
+	}
+	if err := runtime.bootstrapPeerAuthorization(
+		t.Context(),
+		peer.ID,
+	); err != nil {
+		t.Fatalf("bootstrapPeerAuthorization(): %v", err)
+	}
+	requester.mu.Lock()
+	targets := slices.Clone(requester.targets)
+	requester.mu.Unlock()
+	if !slices.Equal(targets, []domain.DeviceID{peer.ID}) {
+		t.Fatalf("status targets = %v, want [%s]", targets, peer.ID)
+	}
+	if _, err := outbound.VerifyExpectedContentPeer(
+		peer.ID,
+		parsed,
+	); err != nil {
+		t.Fatalf("VerifyExpectedContentPeer(after bootstrap): %v", err)
+	}
+	if _, err := ingress.VerifyContentPeer(parsed); !errors.Is(
+		err,
+		peerauth.ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(after outbound bootstrap) error = %v", err)
 	}
 }
 
@@ -527,4 +718,139 @@ func daemonContentPeerTestAuthorization(
 		t.Fatal(err)
 	}
 	return authorization
+}
+
+func daemonContentPeerSignedAuthorization(
+	t testing.TB,
+	member device.Device,
+	identityPrivateKey ed25519.PrivateKey,
+	epochPrivateKey ed25519.PrivateKey,
+	previous *credentialauthorization.Authorization,
+	issuedAt time.Time,
+	notBefore time.Time,
+	chainIndex uint64,
+) credentialauthorization.Authorization {
+	t.Helper()
+	epoch := uint64(1)
+	if previous != nil {
+		epoch = previous.Epoch + 1
+	}
+	binding, err := credential.SignBinding(
+		daemonTestSessionID,
+		member.ID,
+		epoch,
+		epochPrivateKey.Public().(ed25519.PublicKey),
+		identityPrivateKey,
+	)
+	if err != nil {
+		t.Fatalf("credential.SignBinding(): %v", err)
+	}
+	authorization := credentialauthorization.Authorization{
+		SessionID:      binding.SessionID,
+		DeviceID:       binding.DeviceID,
+		Epoch:          binding.Epoch,
+		EpochPublicKey: binding.EpochPublicKey,
+		KeyDigest:      binding.KeyDigest,
+		Role:           credentialauthorization.Role(member.Role),
+		IssuedAt: domain.WholeSecondTimestamp(
+			issuedAt.UTC().Truncate(time.Second).Format(time.RFC3339),
+		),
+		NotBefore: domain.WholeSecondTimestamp(
+			notBefore.UTC().Truncate(time.Second).Format(time.RFC3339),
+		),
+		ValiditySeconds:          credentialauthorization.ValiditySeconds,
+		AuthorityVoterSetVersion: 1,
+		ClockEndorsements: []credentialauthorization.ClockEndorsement{{
+			DeviceID: member.ID,
+		}},
+		BindingSignature:        binding.Signature,
+		AuthorizationChainIndex: chainIndex,
+	}
+	preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
+		authorization,
+	)
+	if err != nil {
+		t.Fatalf("CanonicalEndorsementPreimage(): %v", err)
+	}
+	signature, err := codecommcrypto.SignEd25519(
+		identityPrivateKey,
+		codec.SignatureCredentialTimeEndorsement,
+		preimage,
+	)
+	if err != nil {
+		t.Fatalf("SignEd25519(endorsement): %v", err)
+	}
+	copy(authorization.ClockEndorsements[0].Signature[:], signature)
+	clear(signature)
+	if err := authorization.Validate(); err != nil {
+		t.Fatalf("Authorization.Validate(): %v", err)
+	}
+	if err := credentialauthorization.ValidateTransition(
+		previous,
+		authorization,
+	); err != nil {
+		t.Fatalf("ValidateTransition(): %v", err)
+	}
+	return authorization
+}
+
+func daemonContentPeerConsensusStatusResponse(
+	t testing.TB,
+	serverDeviceID domain.DeviceID,
+	authorization credentialauthorization.Authorization,
+	recoveryGeneration uint64,
+) transport.ConsensusControlResponse {
+	t.Helper()
+	endorsements := make(
+		[]map[string]any,
+		len(authorization.ClockEndorsements),
+	)
+	for index, endorsement := range authorization.ClockEndorsements {
+		endorsements[index] = map[string]any{
+			"device_id": string(endorsement.DeviceID),
+			"signature": codec.EncodeBase64URL(
+				endorsement.Signature[:],
+			),
+		}
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"schema_version":              uint64(1),
+		"session_id":                  string(daemonTestSessionID),
+		"recovery_generation":         recoveryGeneration,
+		"server_device_id":            string(serverDeviceID),
+		"local_term":                  uint64(1),
+		"leader_device_id":            string(serverDeviceID),
+		"quorum_required":             uint64(1),
+		"last_raft_applied_log_index": uint64(1),
+		"content_credential_authorization": map[string]any{
+			"schema_version":              uint64(1),
+			"session_id":                  string(authorization.SessionID),
+			"device_id":                   string(authorization.DeviceID),
+			"epoch":                       authorization.Epoch,
+			"epoch_public_key":            codec.EncodeBase64URL(authorization.EpochPublicKey[:]),
+			"key_digest":                  codec.EncodeBase64URL(authorization.KeyDigest[:]),
+			"role":                        string(authorization.Role),
+			"issued_at":                   string(authorization.IssuedAt),
+			"not_before":                  string(authorization.NotBefore),
+			"validity_seconds":            authorization.ValiditySeconds,
+			"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
+			"clock_endorsements":          endorsements,
+			"binding_signature": codec.EncodeBase64URL(
+				authorization.BindingSignature[:],
+			),
+			"authorization_chain_index": authorization.AuthorizationChainIndex,
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(consensus status): %v", err)
+	}
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil {
+		t.Fatalf("CanonicalizeSignedObject(consensus status): %v", err)
+	}
+	return transport.ConsensusControlResponse{
+		StatusCode: 200,
+		MediaType:  "application/json",
+		Body:       canonical,
+	}
 }

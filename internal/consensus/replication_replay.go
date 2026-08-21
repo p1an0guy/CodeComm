@@ -46,6 +46,7 @@ type resultBatchReplay struct {
 	projectionStateDigest chain.Digest
 	admission             *peerauth.Snapshot
 	admissionChanged      bool
+	state                 reducer.State
 }
 
 // replayResultBatch verifies one complete signed batch against an immutable
@@ -143,6 +144,7 @@ func replayResultBatch(
 			AdvancesEventChain:       outcome.Changes.AdvancesEventChain,
 			Devices:                  outcome.Changes.Devices,
 			AuditCounters:            outcome.Changes.AuditCounters,
+			CredentialAuthority:      outcome.Changes.CredentialAuthority,
 			CredentialAuthorizations: outcome.Changes.CredentialAuthorizations,
 		})
 		if err != nil {
@@ -218,6 +220,7 @@ func replayResultBatch(
 		projectionStateDigest: stateDigest,
 		admission:             admission,
 		admissionChanged:      admissionChanged,
+		state:                 state,
 	}, nil
 }
 

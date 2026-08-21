@@ -30,17 +30,29 @@ const (
 	ConsensusStarting ConsensusState = "starting"
 	ConsensusElecting ConsensusState = "electing"
 	ConsensusReady    ConsensusState = "ready"
+	ConsensusSettled  ConsensusState = "settled"
 	ConsensusHalted   ConsensusState = "halted"
 )
 
-// ConsensusRole is the local Raft role at the instant of the read.
+// ConsensusRole is the local consensus role at the instant of the read.
 type ConsensusRole string
 
 const (
 	RoleFollower  ConsensusRole = "follower"
 	RoleCandidate ConsensusRole = "candidate"
 	RoleLeader    ConsensusRole = "leader"
+	RoleNonvoter  ConsensusRole = "nonvoter"
 	RoleShutdown  ConsensusRole = "shutdown"
+)
+
+// LiveConfigurationSource identifies where the volatile voter configuration
+// came from. Durable targets are never treated as live observations.
+type LiveConfigurationSource string
+
+const (
+	LiveConfigurationLocal         LiveConfigurationSource = "local"
+	LiveConfigurationVoterReported LiveConfigurationSource = "voter-reported"
+	LiveConfigurationUnknown       LiveConfigurationSource = "unknown"
 )
 
 // StrongWriteState describes whether this daemon can currently accept a
@@ -53,6 +65,17 @@ const (
 	StrongWritesBlocked   StrongWriteState = "blocked"
 )
 
+// ReplicaCurrencyState describes whether the local durable coordination cut
+// is known to cover every retained current-authority signed watermark.
+type ReplicaCurrencyState string
+
+const (
+	ReplicaCurrencyRaft    ReplicaCurrencyState = "raft"
+	ReplicaCurrencyCurrent ReplicaCurrencyState = "current"
+	ReplicaCurrencyBehind  ReplicaCurrencyState = "behind"
+	ReplicaCurrencyUnknown ReplicaCurrencyState = "unknown"
+)
+
 // ReconciliationState is the local operator view of voter-set convergence.
 type ReconciliationState string
 
@@ -60,6 +83,7 @@ const (
 	ReconciliationStable      ReconciliationState = "stable"
 	ReconciliationPending     ReconciliationState = "pending"
 	ReconciliationReconciling ReconciliationState = "reconciling"
+	ReconciliationUnknown     ReconciliationState = "unknown"
 )
 
 // ReconciliationStep names the next or currently blocked protocol action.
@@ -187,10 +211,14 @@ type RuntimeSnapshot struct {
 	Role                    ConsensusRole
 	LocalDeviceID           domain.DeviceID
 	LeaderDeviceID          domain.DeviceID
+	LiveConfigurationSource LiveConfigurationSource
 	LiveVoterDeviceIDs      []domain.DeviceID
 	LiveNonvoterDeviceIDs   []domain.DeviceID
 	QuorumRequired          int
 	StrongWrites            StrongWriteState
+	ReplicaCurrency         ReplicaCurrencyState
+	ObservedAuthorityIDs    []domain.DeviceID
+	ObservedResultIndex     uint64
 	ConfigurationReconciled bool
 	ReconciliationState     ReconciliationState
 	ReconciliationStep      ReconciliationStep
@@ -214,20 +242,185 @@ func (snapshot Snapshot) Validate() error {
 		return invalid("runtime local device")
 	}
 	switch runtime.State {
-	case ConsensusStarting, ConsensusElecting, ConsensusReady, ConsensusHalted:
+	case ConsensusStarting,
+		ConsensusElecting,
+		ConsensusReady,
+		ConsensusSettled,
+		ConsensusHalted:
 	default:
 		return invalid("consensus state")
 	}
 	switch runtime.Role {
-	case RoleFollower, RoleCandidate, RoleLeader, RoleShutdown:
+	case RoleFollower, RoleCandidate, RoleLeader, RoleNonvoter, RoleShutdown:
 	default:
 		return invalid("consensus role")
+	}
+	if (runtime.State == ConsensusSettled) !=
+		(runtime.Role == RoleNonvoter) {
+		return invalid("settled consensus role")
 	}
 	switch runtime.StrongWrites {
 	case StrongWritesWaiting, StrongWritesAvailable, StrongWritesBlocked:
 	default:
 		return invalid("strong-write state")
 	}
+	if err := validateReplicaCurrency(snapshot); err != nil {
+		return err
+	}
+	if runtime.LeaderDeviceID != "" &&
+		!runtime.LeaderDeviceID.Valid() {
+		return invalid("leader device")
+	}
+	switch runtime.LiveConfigurationSource {
+	case LiveConfigurationLocal:
+		if runtime.State == ConsensusSettled {
+			return invalid("local settled configuration")
+		}
+		if err := validateKnownLiveConfiguration(runtime); err != nil {
+			return err
+		}
+	case LiveConfigurationVoterReported:
+		if runtime.State != ConsensusSettled {
+			return invalid("voter-reported consensus state")
+		}
+		if err := validateKnownLiveConfiguration(runtime); err != nil {
+			return err
+		}
+		if runtime.LeaderDeviceID != "" &&
+			!containsDeviceID(
+				runtime.LiveVoterDeviceIDs,
+				runtime.LeaderDeviceID,
+			) {
+			return invalid("voter-reported leader")
+		}
+	case LiveConfigurationUnknown:
+		if runtime.State != ConsensusSettled ||
+			runtime.LeaderDeviceID != "" ||
+			len(runtime.LiveVoterDeviceIDs) != 0 ||
+			len(runtime.LiveNonvoterDeviceIDs) != 0 ||
+			runtime.QuorumRequired != 0 {
+			return invalid("unknown live configuration")
+		}
+	default:
+		return invalid("live configuration source")
+	}
+	switch runtime.StrongWrites {
+	case StrongWritesAvailable:
+		if runtime.State != ConsensusReady ||
+			runtime.Role != RoleLeader ||
+			runtime.LeaderDeviceID != runtime.LocalDeviceID {
+			return invalid("available strong writes")
+		}
+	case StrongWritesBlocked:
+		if runtime.State != ConsensusHalted {
+			return invalid("blocked strong writes")
+		}
+	}
+	if runtime.State == ConsensusHalted &&
+		runtime.StrongWrites != StrongWritesBlocked {
+		return invalid("halted strong writes")
+	}
+	if runtime.State == ConsensusSettled &&
+		runtime.StrongWrites != StrongWritesWaiting {
+		return invalid("settled strong writes")
+	}
+	if !runtime.ReconciliationStep.Valid() ||
+		!runtime.ReconciliationBlocker.Valid() {
+		return invalid("reconciliation detail")
+	}
+	if runtime.ReconciliationDeviceID != "" &&
+		!runtime.ReconciliationDeviceID.Valid() {
+		return invalid("reconciliation device")
+	}
+	if runtime.LiveConfigurationSource != LiveConfigurationLocal {
+		if runtime.ConfigurationReconciled ||
+			runtime.ReconciliationState != ReconciliationUnknown ||
+			runtime.ReconciliationStep != ReconciliationStepObserve ||
+			runtime.ReconciliationBlocker != ReconciliationBlockerNone ||
+			runtime.ReconciliationDeviceID != "" {
+			return invalid("nonlocal reconciliation")
+		}
+		return nil
+	}
+	switch runtime.ReconciliationState {
+	case ReconciliationStable:
+		if !runtime.ConfigurationReconciled ||
+			runtime.ReconciliationStep != ReconciliationStepComplete ||
+			runtime.ReconciliationBlocker != ReconciliationBlockerNone ||
+			runtime.ReconciliationDeviceID != "" {
+			return invalid("stable reconciliation")
+		}
+	case ReconciliationPending, ReconciliationReconciling:
+		if runtime.ConfigurationReconciled ||
+			runtime.ReconciliationStep == ReconciliationStepComplete {
+			return invalid("unfinished reconciliation")
+		}
+	default:
+		return invalid("reconciliation state")
+	}
+	targetIDs := snapshot.Durable.VoterSet.VoterDeviceIDs()
+	authorityIDs := snapshot.Durable.CredentialAuthority.VoterDeviceIDs()
+	exactlyReconciled := len(runtime.LiveNonvoterDeviceIDs) == 0 &&
+		sameDeviceIDs(runtime.LiveVoterDeviceIDs, targetIDs) &&
+		snapshot.Durable.CredentialAuthority.VoterSetVersion ==
+			snapshot.Durable.VoterSet.VoterSetVersion &&
+		sameDeviceIDs(authorityIDs, targetIDs)
+	if runtime.ConfigurationReconciled != exactlyReconciled {
+		return invalid("reconciliation exactness")
+	}
+	return nil
+}
+
+func validateReplicaCurrency(snapshot Snapshot) error {
+	runtime := snapshot.Runtime
+	if runtime.ObservedAuthorityIDs == nil ||
+		!domain.ValidUnsignedInteger(runtime.ObservedResultIndex) ||
+		!validOrderedDeviceIDs(runtime.ObservedAuthorityIDs) {
+		return invalid("replica currency observation")
+	}
+	if runtime.State != ConsensusSettled {
+		if runtime.ReplicaCurrency != ReplicaCurrencyRaft ||
+			len(runtime.ObservedAuthorityIDs) != 0 ||
+			runtime.ObservedResultIndex != 0 {
+			return invalid("Raft replica currency")
+		}
+		return nil
+	}
+	switch runtime.ReplicaCurrency {
+	case ReplicaCurrencyCurrent,
+		ReplicaCurrencyBehind,
+		ReplicaCurrencyUnknown:
+	default:
+		return invalid("settled replica currency")
+	}
+	authorityIDs := snapshot.Durable.CredentialAuthority.VoterDeviceIDs()
+	for _, observed := range runtime.ObservedAuthorityIDs {
+		if !containsDeviceID(authorityIDs, observed) {
+			return invalid("observed credential authority")
+		}
+	}
+	switch runtime.ReplicaCurrency {
+	case ReplicaCurrencyCurrent:
+		if len(runtime.ObservedAuthorityIDs) != len(authorityIDs) ||
+			runtime.ObservedResultIndex !=
+				snapshot.Durable.Heads.ResultIndex {
+			return invalid("current settled replica")
+		}
+	case ReplicaCurrencyBehind:
+		if runtime.ObservedResultIndex <=
+			snapshot.Durable.Heads.ResultIndex {
+			return invalid("behind settled replica")
+		}
+	case ReplicaCurrencyUnknown:
+		if runtime.ObservedResultIndex >
+			snapshot.Durable.Heads.ResultIndex {
+			return invalid("unknown settled replica")
+		}
+	}
+	return nil
+}
+
+func validateKnownLiveConfiguration(runtime RuntimeSnapshot) error {
 	if len(runtime.LiveVoterDeviceIDs) < 1 ||
 		len(runtime.LiveVoterDeviceIDs) > int(policy.MaxMemberDevices) ||
 		len(runtime.LiveVoterDeviceIDs)+
@@ -249,61 +442,16 @@ func (snapshot Snapshot) Validate() error {
 			return invalid("live configuration overlap")
 		}
 	}
-	if runtime.LeaderDeviceID != "" &&
-		!runtime.LeaderDeviceID.Valid() {
-		return invalid("leader device")
-	}
-	switch runtime.StrongWrites {
-	case StrongWritesAvailable:
-		if runtime.State != ConsensusReady ||
-			runtime.Role != RoleLeader ||
-			runtime.LeaderDeviceID != runtime.LocalDeviceID {
-			return invalid("available strong writes")
-		}
-	case StrongWritesBlocked:
-		if runtime.State != ConsensusHalted {
-			return invalid("blocked strong writes")
-		}
-	}
-	if runtime.State == ConsensusHalted &&
-		runtime.StrongWrites != StrongWritesBlocked {
-		return invalid("halted strong writes")
-	}
-	if !runtime.ReconciliationStep.Valid() ||
-		!runtime.ReconciliationBlocker.Valid() {
-		return invalid("reconciliation detail")
-	}
-	switch runtime.ReconciliationState {
-	case ReconciliationStable:
-		if !runtime.ConfigurationReconciled ||
-			runtime.ReconciliationStep != ReconciliationStepComplete ||
-			runtime.ReconciliationBlocker != ReconciliationBlockerNone ||
-			runtime.ReconciliationDeviceID != "" {
-			return invalid("stable reconciliation")
-		}
-	case ReconciliationPending, ReconciliationReconciling:
-		if runtime.ConfigurationReconciled ||
-			runtime.ReconciliationStep == ReconciliationStepComplete {
-			return invalid("unfinished reconciliation")
-		}
-	default:
-		return invalid("reconciliation state")
-	}
-	if runtime.ReconciliationDeviceID != "" &&
-		!runtime.ReconciliationDeviceID.Valid() {
-		return invalid("reconciliation device")
-	}
-	targetIDs := snapshot.Durable.VoterSet.VoterDeviceIDs()
-	authorityIDs := snapshot.Durable.CredentialAuthority.VoterDeviceIDs()
-	exactlyReconciled := len(runtime.LiveNonvoterDeviceIDs) == 0 &&
-		sameDeviceIDs(runtime.LiveVoterDeviceIDs, targetIDs) &&
-		snapshot.Durable.CredentialAuthority.VoterSetVersion ==
-			snapshot.Durable.VoterSet.VoterSetVersion &&
-		sameDeviceIDs(authorityIDs, targetIDs)
-	if runtime.ConfigurationReconciled != exactlyReconciled {
-		return invalid("reconciliation exactness")
-	}
 	return nil
+}
+
+func containsDeviceID(values []domain.DeviceID, target domain.DeviceID) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate checks the complete durable status contract.

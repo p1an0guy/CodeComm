@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/credentialservice"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -23,7 +22,7 @@ func newDaemonCredentialService(
 	deviceID domain.DeviceID,
 	identityPrivateKey ed25519.PrivateKey,
 	secrets daemonCredentialHandle,
-	node *consensus.Node,
+	consensus credentialservice.Consensus,
 	now func() time.Time,
 ) (*credentialservice.Service, error) {
 	if ctx == nil ||
@@ -31,32 +30,33 @@ func newDaemonCredentialService(
 		!deviceID.Valid() ||
 		len(identityPrivateKey) != ed25519.PrivateKeySize ||
 		secrets == nil ||
-		node == nil ||
+		consensus == nil ||
 		now == nil {
 		return nil, errDaemonCredentialConstruction
+	}
+	sign := func(
+		ctx context.Context,
+		epoch uint64,
+		publicKey ed25519.PublicKey,
+	) (credential.Binding, error) {
+		if err := ctx.Err(); err != nil {
+			return credential.Binding{}, err
+		}
+		return credential.SignBinding(
+			sessionID,
+			deviceID,
+			epoch,
+			publicKey,
+			identityPrivateKey,
+		)
 	}
 	service, err := credentialservice.New(credentialservice.Options{
 		SessionID: sessionID,
 		DeviceID:  deviceID,
 		Secrets:   secrets,
-		Consensus: node,
+		Consensus: consensus,
+		Sign:      sign,
 		Now:       now,
-		Sign: func(
-			ctx context.Context,
-			epoch uint64,
-			publicKey ed25519.PublicKey,
-		) (credential.Binding, error) {
-			if err := ctx.Err(); err != nil {
-				return credential.Binding{}, err
-			}
-			return credential.SignBinding(
-				sessionID,
-				deviceID,
-				epoch,
-				publicKey,
-				identityPrivateKey,
-			)
-		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf(

@@ -124,7 +124,6 @@ func newDaemonContentService(
 		!localDeviceID.Valid() ||
 		state == nil ||
 		endpoints == nil ||
-		proposals == nil ||
 		signResultBatch == nil ||
 		now == nil {
 		return nil, errDaemonContentConstruction
@@ -307,12 +306,15 @@ func (service *daemonContentService) ProposeEvent(
 	hop contenthttp.ProposalHop,
 ) (contenthttp.EventResult, error) {
 	if service == nil ||
-		service.proposals == nil ||
 		ctx == nil ||
 		!senderDeviceID.Valid() ||
 		len(canonical) == 0 {
 		return contenthttp.EventResult{},
 			contenthttp.ErrInvalidEventProposal
+	}
+	if service.proposals == nil {
+		return contenthttp.EventResult{},
+			contenthttp.ErrEventProposalUnavailable
 	}
 	var lookup store.CommandResultLookup
 	var err error

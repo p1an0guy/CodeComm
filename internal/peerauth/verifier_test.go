@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/credential"
+	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
@@ -371,6 +374,298 @@ func TestContentVerifierRejectsExpiryRevocationAndChangedAuthorization(t *testin
 	) {
 		t.Fatalf("VerifyContentPeer(revoked) error = %v", err)
 	}
+}
+
+func TestContentVerifierKeepsProvisionalSuccessorOutboundOnly(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	current, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	now := time.Date(2026, 8, 14, 12, 28, 30, 0, time.UTC)
+	provisional := NewProvisionalAuthorizations()
+	installer, err := NewVerifiersWithProvisional(
+		func() (*Snapshot, error) { return current, nil },
+		func() time.Time { return now },
+		provisional,
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiersWithProvisional(installer) error = %v", err)
+	}
+	ingress, err := NewVerifiersWithProvisional(
+		func() (*Snapshot, error) { return current, nil },
+		func() time.Time { return now },
+		provisional,
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiersWithProvisional(ingress) error = %v", err)
+	}
+
+	firstKey := snapshotPrivateKey(22)
+	first := provisionalAuthorization(
+		t,
+		fixture,
+		firstKey,
+		2,
+	)
+	firstCertificate := parsedContentCertificate(t, first, firstKey)
+	if _, err := ingress.VerifyContentPeer(firstCertificate); !errors.Is(
+		err,
+		ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(before install) error = %v", err)
+	}
+	if err := installer.InstallProvisionalAuthorization(
+		fixture.deviceID,
+		first,
+	); err != nil {
+		t.Fatalf("InstallProvisionalAuthorization() error = %v", err)
+	}
+	first.BindingSignature[0] ^= 0xff
+	if _, err := ingress.VerifyContentPeer(firstCertificate); !errors.Is(
+		err,
+		ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(provisional) error = %v", err)
+	}
+	admission, err := ingress.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		firstCertificate,
+	)
+	if err != nil {
+		t.Fatalf("VerifyExpectedContentPeer(provisional) error = %v", err)
+	}
+	if admission.CloseAfter != 29*time.Minute+30*time.Second {
+		t.Fatalf(
+			"VerifyExpectedContentPeer(provisional) close after = %s",
+			admission.CloseAfter,
+		)
+	}
+
+	secondKey := snapshotPrivateKey(23)
+	second := provisionalAuthorization(
+		t,
+		fixture,
+		secondKey,
+		2,
+	)
+	if err := installer.InstallProvisionalAuthorization(
+		fixture.deviceID,
+		second,
+	); err != nil {
+		t.Fatalf("InstallProvisionalAuthorization(replacement) error = %v", err)
+	}
+	if _, err := ingress.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		firstCertificate,
+	); !errors.Is(
+		err,
+		ErrPeerNotAdmitted,
+	) {
+		t.Fatalf(
+			"VerifyExpectedContentPeer(replaced certificate) error = %v",
+			err,
+		)
+	}
+	secondCertificate := parsedContentCertificate(t, second, secondKey)
+	if _, err := ingress.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		secondCertificate,
+	); err != nil {
+		t.Fatalf("VerifyExpectedContentPeer(replacement) error = %v", err)
+	}
+
+	current, err = current.Advance(Changes{
+		AdvancesEventChain: true,
+		AuditCounters: []auditcounter.Counter{{
+			DeviceID:        fixture.deviceID,
+			CredentialEpoch: 2,
+		}},
+		CredentialAuthorizations: []credentialauthorization.Authorization{
+			second,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Advance(applied successor) error = %v", err)
+	}
+	if _, err := ingress.VerifyContentPeer(secondCertificate); err != nil {
+		t.Fatalf("VerifyContentPeer(applied successor) error = %v", err)
+	}
+
+	revoked := fixture.input.Devices[fixture.deviceID]
+	revoked.Status = device.StatusRevoked
+	revoked.EntityVersion++
+	current, err = current.Advance(Changes{
+		AdvancesEventChain: true,
+		Devices:            []device.Device{revoked},
+	})
+	if err != nil {
+		t.Fatalf("Advance(revoked) error = %v", err)
+	}
+	if _, err := ingress.VerifyContentPeer(secondCertificate); !errors.Is(
+		err,
+		ErrPeerNotAdmitted,
+	) {
+		t.Fatalf("VerifyContentPeer(revoked) error = %v", err)
+	}
+	if _, err := ingress.VerifyExpectedContentPeer(
+		fixture.deviceID,
+		secondCertificate,
+	); !errors.Is(err, ErrPeerNotAdmitted) {
+		t.Fatalf("VerifyExpectedContentPeer(revoked) error = %v", err)
+	}
+}
+
+func TestInstallProvisionalAuthorizationRejectsUntrustedOrStaleValues(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	current, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot() error = %v", err)
+	}
+	now := time.Date(2026, 8, 14, 12, 28, 30, 0, time.UTC)
+	verifiers, err := NewVerifiersWithProvisional(
+		func() (*Snapshot, error) { return current, nil },
+		func() time.Time { return now },
+		NewProvisionalAuthorizations(),
+	)
+	if err != nil {
+		t.Fatalf("NewVerifiersWithProvisional() error = %v", err)
+	}
+	valid := provisionalAuthorization(
+		t,
+		fixture,
+		snapshotPrivateKey(22),
+		2,
+	)
+	otherID := domain.DeviceID(
+		"cc1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	)
+	tests := []struct {
+		name   string
+		peerID domain.DeviceID
+		mutate func(*credentialauthorization.Authorization)
+	}{
+		{
+			name:   "wrong peer",
+			peerID: otherID,
+		},
+		{
+			name:   "invalid identity signature",
+			peerID: fixture.deviceID,
+			mutate: func(value *credentialauthorization.Authorization) {
+				value.BindingSignature[0] ^= 0xff
+			},
+		},
+		{
+			name:   "invalid authority endorsement",
+			peerID: fixture.deviceID,
+			mutate: func(value *credentialauthorization.Authorization) {
+				value.ClockEndorsements[0].Signature[0] ^= 0xff
+			},
+		},
+		{
+			name:   "skipped epoch",
+			peerID: fixture.deviceID,
+			mutate: func(value *credentialauthorization.Authorization) {
+				value.Epoch = 3
+			},
+		},
+		{
+			name:   "already applied chain position",
+			peerID: fixture.deviceID,
+			mutate: func(value *credentialauthorization.Authorization) {
+				value.AuthorizationChainIndex = 1
+			},
+		},
+		{
+			name:   "expired",
+			peerID: fixture.deviceID,
+			mutate: func(value *credentialauthorization.Authorization) {
+				value.NotBefore = domain.WholeSecondTimestamp(
+					"2026-08-14T11:58:00Z",
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid.Clone()
+			if test.mutate != nil {
+				test.mutate(&candidate)
+			}
+			if err := verifiers.InstallProvisionalAuthorization(
+				test.peerID,
+				candidate,
+			); !errors.Is(err, ErrInvalidProvisionalAuthorization) {
+				t.Fatalf(
+					"InstallProvisionalAuthorization() error = %v",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func provisionalAuthorization(
+	t *testing.T,
+	fixture snapshotFixture,
+	epochKey ed25519.PrivateKey,
+	epoch uint64,
+) credentialauthorization.Authorization {
+	t.Helper()
+	binding, err := credential.SignBinding(
+		snapshotTestSessionID,
+		fixture.deviceID,
+		epoch,
+		epochKey.Public().(ed25519.PublicKey),
+		fixture.identityKey,
+	)
+	if err != nil {
+		t.Fatalf("credential.SignBinding() error = %v", err)
+	}
+	authorization := credentialauthorization.Authorization{
+		SessionID:                binding.SessionID,
+		DeviceID:                 binding.DeviceID,
+		Epoch:                    binding.Epoch,
+		EpochPublicKey:           binding.EpochPublicKey,
+		KeyDigest:                binding.KeyDigest,
+		Role:                     credentialauthorization.RoleOwner,
+		IssuedAt:                 "2026-08-14T12:25:00Z",
+		NotBefore:                "2026-08-14T12:28:00Z",
+		ValiditySeconds:          credentialauthorization.ValiditySeconds,
+		AuthorityVoterSetVersion: 1,
+		ClockEndorsements: []credentialauthorization.ClockEndorsement{{
+			DeviceID: fixture.deviceID,
+		}},
+		BindingSignature:        binding.Signature,
+		AuthorizationChainIndex: fixture.input.AppliedChainIndex + 1,
+	}
+	preimage, err := credentialauthorization.CanonicalEndorsementPreimage(
+		authorization,
+	)
+	if err != nil {
+		t.Fatalf("CanonicalEndorsementPreimage() error = %v", err)
+	}
+	signature, err := codecommcrypto.SignEd25519(
+		fixture.identityKey,
+		codec.SignatureCredentialTimeEndorsement,
+		preimage,
+	)
+	if err != nil {
+		t.Fatalf("SignEd25519(endorsement) error = %v", err)
+	}
+	copy(
+		authorization.ClockEndorsements[0].Signature[:],
+		signature,
+	)
+	clear(signature)
+	return authorization
 }
 
 func TestOwnerAuthorizationReadsCurrentMembershipRole(t *testing.T) {

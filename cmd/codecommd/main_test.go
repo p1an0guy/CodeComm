@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -236,6 +238,110 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	waitForDaemonTestLeader(t, reopened)
+}
+
+func TestDaemonStartsSettledReplicaWithoutOpeningRaft(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	consensusDir := filepath.Join(root, "consensus")
+	endpoint := daemonTestEndpoint(t)
+	initial, identityPrivateKey, _, authorityID :=
+		daemonTestSettledInitialState(t)
+	t.Cleanup(func() { clear(identityPrivateKey) })
+	database, err := store.Open(
+		context.Background(),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(): %v", err)
+	}
+	if _, err := database.Initialize(
+		context.Background(),
+		initial,
+	); err != nil {
+		t.Fatalf("Initialize(): %v", err)
+	}
+	storeDaemonTestConfiguration(
+		t,
+		database,
+		[]domain.DeviceID{authorityID},
+		nil,
+	)
+	if _, err := database.EnterSettledNonvoter(
+		context.Background(),
+		domain.Timestamp("2026-08-20T12:00:00Z"),
+	); err != nil {
+		t.Fatalf("EnterSettledNonvoter(): %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(setup): %v", err)
+	}
+
+	runContext, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runDaemon(
+			runContext,
+			daemonOptions{
+				statePath:    statePath,
+				consensusDir: consensusDir,
+				endpoint:     endpoint,
+				sessionID:    daemonTestSessionID,
+				workspaceID:  daemonTestWorkspaceID,
+			},
+			daemonDependencies{
+				loadIdentity: func(
+					context.Context,
+				) (identityHandle, []byte, error) {
+					return testIdentityHandle{},
+						bytes.Clone(identityPrivateKey),
+						nil
+				},
+				newBootID: func() (domain.UUIDv7, error) {
+					return daemonTestFirstBootID, nil
+				},
+				newMeshFactory: newDaemonTestMeshFactory,
+			},
+		)
+	}()
+	snapshot := waitForDaemonTestReadableStatusOrExit(
+		t,
+		endpoint,
+		runDone,
+	)
+	if snapshot.Consensus.StrongWrites != "waiting" ||
+		snapshot.Consensus.Role != "nonvoter" ||
+		snapshot.Consensus.LiveConfigurationSource != "unknown" {
+		t.Fatalf("settled runtime status = %+v", snapshot.Consensus)
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runDaemon(settled): %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("settled daemon did not complete graceful shutdown")
+	}
+	if _, err := os.Stat(consensusDir); !os.IsNotExist(err) {
+		t.Fatalf(
+			"settled startup created Raft storage: stat error %v",
+			err,
+		)
+	}
+	reopened, err := store.Open(
+		context.Background(),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(reopen): %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	if mode, err := reopened.ReplicaEvidenceMode(
+		context.Background(),
+	); err != nil || mode != store.ReplicaEvidenceSettledNonvoter {
+		t.Fatalf("ReplicaEvidenceMode() = (%q, %v)", mode, err)
+	}
 }
 
 func TestShutdownDaemonComponentsClosesConsensusBeforeWaiting(
@@ -579,6 +685,46 @@ func waitForDaemonTestStatusOrExit(
 	return ui.Snapshot{}
 }
 
+func waitForDaemonTestReadableStatusOrExit(
+	t *testing.T,
+	endpoint ipc.Endpoint,
+	runDone <-chan error,
+) ui.Snapshot {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-runDone:
+			t.Fatalf("daemon exited before serving status: %v", err)
+		default:
+		}
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			500*time.Millisecond,
+		)
+		client, err := ui.DialOperator(ctx, ui.OperatorDialOptions{
+			Endpoint:    endpoint,
+			SessionID:   daemonTestSessionID,
+			WorkspaceID: daemonTestWorkspaceID,
+		})
+		if err == nil {
+			snapshot, statusErr := client.Status(ctx)
+			closeErr := client.Close()
+			err = errors.Join(statusErr, closeErr)
+			if err == nil {
+				cancel()
+				return snapshot
+			}
+		}
+		cancel()
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("daemon status did not become readable: %v", lastErr)
+	return ui.Snapshot{}
+}
+
 type daemonShutdownTrace struct {
 	events          []string
 	consensusClosed bool
@@ -634,6 +780,39 @@ func (factory *daemonTestMeshFactory) Build(
 	return &daemonTestProofTransport{RaftTransport: value}, nil
 }
 
+func (*daemonTestMeshFactory) BuildSettledControl(
+	daemonSettledControlAdmission,
+) (daemonSettledControlTransport, error) {
+	return daemonTestSettledControlTransport{}, nil
+}
+
+type daemonTestSettledControlTransport struct{}
+
+func (daemonTestSettledControlTransport) RequestConsensusStatus(
+	context.Context,
+	domain.DeviceID,
+) (transport.ConsensusControlResponse, error) {
+	return transport.ConsensusControlResponse{},
+		consensus.ErrConsensusStatusUnavailable
+}
+
+func (daemonTestSettledControlTransport) RequestCredentialRenewal(
+	context.Context,
+	domain.DeviceID,
+	[]byte,
+) (transport.ConsensusControlResponse, error) {
+	return transport.ConsensusControlResponse{},
+		consensus.ErrCredentialRenewalUnavailable
+}
+
+func (daemonTestSettledControlTransport) contentVerifiers() *peerauth.Verifiers {
+	return nil
+}
+
+func (daemonTestSettledControlTransport) BeginClose() error { return nil }
+
+func (daemonTestSettledControlTransport) Wait() error { return nil }
+
 func (*daemonTestProofTransport) RequestConsensusProof(
 	context.Context,
 	domain.DeviceID,
@@ -646,7 +825,7 @@ func (*daemonTestProofTransport) RequestConsensusProof(
 func (*daemonTestMeshFactory) NewIngress(
 	context.Context,
 	daemonOptions,
-	*consensus.Node,
+	daemonPeerAdmissionRuntime,
 	transport.ContentCertificateProvider,
 	transport.ConnectionHandler,
 	transport.ConnectionHandler,
@@ -807,6 +986,127 @@ func daemonTestInitialState(
 			}},
 		},
 	}, identityPrivateKey, deviceID
+}
+
+func daemonTestSettledInitialState(
+	t *testing.T,
+) (
+	store.InitialState,
+	ed25519.PrivateKey,
+	domain.DeviceID,
+	domain.DeviceID,
+) {
+	t.Helper()
+	initial, authorityPrivateKey, authorityID := daemonTestInitialState(t)
+	clear(authorityPrivateKey)
+
+	localPrivateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd1}, ed25519.SeedSize),
+	)
+	localPublicKey := bytes.Clone(
+		localPrivateKey.Public().(ed25519.PublicKey),
+	)
+	localID, err := device.DeriveID(localPublicKey)
+	if err != nil {
+		clear(localPrivateKey)
+		t.Fatalf("device.DeriveID(settled): %v", err)
+	}
+	initial.Projections.Devices = append(
+		initial.Projections.Devices,
+		device.Device{
+			ID:                localID,
+			Role:              device.RoleEditor,
+			IdentityPublicKey: localPublicKey,
+			DaemonVersion:     "0.1.0",
+			MaxApplyLevel:     1,
+			Status:            device.StatusActive,
+			EntityVersion:     1,
+		},
+	)
+	sort.Slice(initial.Projections.Devices, func(left, right int) bool {
+		return initial.Projections.Devices[left].ID <
+			initial.Projections.Devices[right].ID
+	})
+	initial.Projections.AuditCounters = append(
+		initial.Projections.AuditCounters,
+		auditcounter.Counter{DeviceID: localID},
+	)
+	sort.Slice(
+		initial.Projections.AuditCounters,
+		func(left, right int) bool {
+			return initial.Projections.AuditCounters[left].DeviceID <
+				initial.Projections.AuditCounters[right].DeviceID
+		},
+	)
+	return initial, localPrivateKey, localID, authorityID
+}
+
+func storeDaemonTestConfiguration(
+	t *testing.T,
+	database *store.Store,
+	voters []domain.DeviceID,
+	nonvoters []domain.DeviceID,
+) {
+	t.Helper()
+	if database == nil || len(voters) == 0 {
+		t.Fatal("invalid committed Raft configuration fixture")
+	}
+	voters = append([]domain.DeviceID(nil), voters...)
+	nonvoters = append([]domain.DeviceID(nil), nonvoters...)
+	sort.Slice(voters, func(left, right int) bool {
+		return voters[left] < voters[right]
+	})
+	sort.Slice(nonvoters, func(left, right int) bool {
+		return nonvoters[left] < nonvoters[right]
+	})
+	type server struct {
+		Address  string `json:"address"`
+		ID       string `json:"id"`
+		Suffrage string `json:"suffrage"`
+	}
+	servers := make([]server, 0, len(voters)+len(nonvoters))
+	for _, deviceID := range voters {
+		if !deviceID.Valid() {
+			t.Fatalf("invalid voter ID %q", deviceID)
+		}
+		servers = append(servers, server{
+			Address:  string(deviceID),
+			ID:       string(deviceID),
+			Suffrage: "voter",
+		})
+	}
+	for _, deviceID := range nonvoters {
+		if !deviceID.Valid() {
+			t.Fatalf("invalid nonvoter ID %q", deviceID)
+		}
+		servers = append(servers, server{
+			Address:  string(deviceID),
+			ID:       string(deviceID),
+			Suffrage: "nonvoter",
+		})
+	}
+	raw, err := json.Marshal(struct {
+		Servers []server `json:"servers"`
+	}{Servers: servers})
+	if err != nil {
+		t.Fatalf("json.Marshal(Raft configuration): %v", err)
+	}
+	encoded, err := codec.CanonicalizeSignedObject(raw)
+	if err != nil {
+		t.Fatalf("CanonicalizeSignedObject(Raft configuration): %v", err)
+	}
+	stored, err := database.StoreCommittedRaftConfiguration(
+		context.Background(),
+		1,
+		encoded,
+	)
+	if err != nil || !stored {
+		t.Fatalf(
+			"StoreCommittedRaftConfiguration() = (%t, %v)",
+			stored,
+			err,
+		)
+	}
 }
 
 func daemonTestTaskEvent(

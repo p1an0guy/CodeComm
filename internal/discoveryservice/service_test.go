@@ -15,6 +15,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/peerauth"
@@ -777,11 +778,19 @@ func serviceTestSnapshot(
 		authorizations[authorization.PrimaryKey()] = authorization
 	}
 	snapshot, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
-		SessionID:                discoveryServiceTestSessionID,
-		RecoveryGeneration:       0,
-		AppliedChainIndex:        remoteEpoch + 2,
-		Devices:                  devices,
-		AuditCounters:            counters,
+		SessionID:          discoveryServiceTestSessionID,
+		RecoveryGeneration: 0,
+		AppliedChainIndex:  remoteEpoch + 2,
+		Devices:            devices,
+		AuditCounters:      counters,
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID: discoveryServiceTestSessionID,
+			VoterDeviceIDs: []domain.DeviceID{
+				identities.local.deviceID,
+			},
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
+		},
 		CredentialAuthorizations: authorizations,
 	})
 	if err != nil {

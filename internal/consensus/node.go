@@ -2706,13 +2706,16 @@ func (node *SingleNode) Status(
 		return coordstatus.Snapshot{}, err
 	}
 	runtime := coordstatus.RuntimeSnapshot{
-		LocalDeviceID:         localDeviceID,
-		Role:                  raftStatusRole(node.raft.State()),
-		LiveVoterDeviceIDs:    []domain.DeviceID{},
-		LiveNonvoterDeviceIDs: []domain.DeviceID{},
-		ReconciliationStep:    coordstatus.ReconciliationStepObserve,
-		ReconciliationBlocker: coordstatus.ReconciliationBlockerNone,
-		ReconciliationState:   coordstatus.ReconciliationPending,
+		LocalDeviceID:           localDeviceID,
+		Role:                    raftStatusRole(node.raft.State()),
+		LiveConfigurationSource: coordstatus.LiveConfigurationLocal,
+		LiveVoterDeviceIDs:      []domain.DeviceID{},
+		LiveNonvoterDeviceIDs:   []domain.DeviceID{},
+		ReplicaCurrency:         coordstatus.ReplicaCurrencyRaft,
+		ObservedAuthorityIDs:    []domain.DeviceID{},
+		ReconciliationStep:      coordstatus.ReconciliationStepObserve,
+		ReconciliationBlocker:   coordstatus.ReconciliationBlockerNone,
+		ReconciliationState:     coordstatus.ReconciliationPending,
 	}
 	configuration := node.fsm.committedConfiguration()
 	if configuration == nil && node.transportGate != nil {

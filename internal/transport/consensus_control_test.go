@@ -154,37 +154,64 @@ func testConsensusCredentialEndorsementUsesClosedControlRoute(t *testing.T) {
 	}
 }
 
-func testConsensusCredentialRenewalBypassesOnlyLiveConfiguration(
+func testConsensusIdentityControlBypassesOnlyLiveConfiguration(
 	t *testing.T,
 ) {
 	const (
-		requestBody  = `{"schema_version":1}`
-		responseBody = `{"authorization_chain_index":7}`
+		requestBody         = `{"schema_version":1}`
+		renewalResponseBody = `{"authorization_chain_index":7}`
+		statusResponseBody  = `{"schema_version":1}`
 	)
-	requests := make(chan string, 1)
+	requests := make(chan string, 2)
 	harness := newConsensusHarnessWithControlHandler(
 		t,
 		http.HandlerFunc(func(
 			writer http.ResponseWriter,
 			request *http.Request,
 		) {
-			if request.Method != http.MethodPost ||
-				request.URL == nil ||
-				request.URL.Path != consensusCredentialRenewalPath ||
-				request.Header.Get("Content-Type") !=
-					consensusJSONMediaType {
+			switch {
+			case request.Method == http.MethodGet &&
+				request.URL != nil &&
+				request.URL.Path == consensusStatusPath:
+				body, err := io.ReadAll(request.Body)
+				if err != nil ||
+					len(body) != 0 ||
+					request.ContentLength != 0 ||
+					request.Header.Get("Content-Type") != "" {
+					http.Error(
+						writer,
+						"bad status request",
+						http.StatusBadRequest,
+					)
+					return
+				}
+				requests <- request.URL.Path
+				writer.Header().Set(
+					"Content-Type",
+					consensusJSONMediaType,
+				)
+				writer.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(writer, statusResponseBody)
+			case request.Method == http.MethodPost &&
+				request.URL != nil &&
+				request.URL.Path == consensusCredentialRenewalPath &&
+				request.Header.Get("Content-Type") ==
+					consensusJSONMediaType:
+				body, err := io.ReadAll(request.Body)
+				if err != nil || string(body) != requestBody {
+					http.Error(writer, "bad body", http.StatusBadRequest)
+					return
+				}
+				requests <- request.URL.Path
+				writer.Header().Set(
+					"Content-Type",
+					consensusJSONMediaType,
+				)
+				writer.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(writer, renewalResponseBody)
+			default:
 				http.Error(writer, "bad request", http.StatusBadRequest)
-				return
 			}
-			body, err := io.ReadAll(request.Body)
-			if err != nil || string(body) != requestBody {
-				http.Error(writer, "bad body", http.StatusBadRequest)
-				return
-			}
-			requests <- request.URL.Path
-			writer.Header().Set("Content-Type", consensusJSONMediaType)
-			writer.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(writer, responseBody)
 		}),
 	)
 	harness.clientAllowed.Store(harness.serverID, false)
@@ -192,7 +219,19 @@ func testConsensusCredentialRenewalBypassesOnlyLiveConfiguration(
 		delegate: &raft.NetworkTransport{},
 		control:  harness.client,
 	}
-	response, err := network.RequestCredentialRenewal(
+	statusResponse, err := network.RequestConsensusStatus(
+		t.Context(),
+		harness.serverID,
+	)
+	if err != nil {
+		t.Fatalf("RequestConsensusStatus(): %v", err)
+	}
+	if statusResponse.StatusCode != http.StatusOK ||
+		statusResponse.MediaType != consensusJSONMediaType ||
+		string(statusResponse.Body) != statusResponseBody {
+		t.Fatalf("status response = %#v", statusResponse)
+	}
+	renewalResponse, err := network.RequestCredentialRenewal(
 		t.Context(),
 		harness.serverID,
 		[]byte(requestBody),
@@ -200,18 +239,23 @@ func testConsensusCredentialRenewalBypassesOnlyLiveConfiguration(
 	if err != nil {
 		t.Fatalf("RequestCredentialRenewal(): %v", err)
 	}
-	if response.StatusCode != http.StatusOK ||
-		response.MediaType != consensusJSONMediaType ||
-		string(response.Body) != responseBody {
-		t.Fatalf("renewal response = %#v", response)
+	if renewalResponse.StatusCode != http.StatusOK ||
+		renewalResponse.MediaType != consensusJSONMediaType ||
+		string(renewalResponse.Body) != renewalResponseBody {
+		t.Fatalf("renewal response = %#v", renewalResponse)
 	}
-	select {
-	case path := <-requests:
-		if path != consensusCredentialRenewalPath {
-			t.Fatalf("renewal path = %q", path)
+	for _, expected := range []string{
+		consensusStatusPath,
+		consensusCredentialRenewalPath,
+	} {
+		select {
+		case path := <-requests:
+			if path != expected {
+				t.Fatalf("identity route = %q, want %q", path, expected)
+			}
+		case <-time.After(consensusTestTimeout):
+			t.Fatalf("%s route was not served", expected)
 		}
-	case <-time.After(consensusTestTimeout):
-		t.Fatal("renewal route was not served")
 	}
 
 	for name, request := range map[string]func() error{
@@ -250,6 +294,26 @@ func testConsensusCredentialRenewalBypassesOnlyLiveConfiguration(
 	}
 	if got := harness.dialer.count.Load(); got != 1 {
 		t.Fatalf("physical connection count = %d, want 1", got)
+	}
+}
+
+func testConsensusStatusRejectsNoncanonicalResponse(t *testing.T) {
+	harness := newConsensusHarnessWithControlHandler(
+		t,
+		http.HandlerFunc(func(
+			writer http.ResponseWriter,
+			_ *http.Request,
+		) {
+			writer.Header().Set("Content-Type", consensusJSONMediaType)
+			writer.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(writer, `{ "schema_version": 1 }`)
+		}),
+	)
+	if _, err := harness.client.RequestConsensusStatus(
+		t.Context(),
+		harness.serverID,
+	); !errors.Is(err, ErrConsensusControlResponse) {
+		t.Fatalf("RequestConsensusStatus() error = %v", err)
 	}
 }
 

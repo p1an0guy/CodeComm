@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ijonahch/codecomm/internal/consensus"
-	"github.com/ijonahch/codecomm/internal/credentialservice"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/discoveryservice"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -63,6 +61,11 @@ type daemonDiscoverySelection struct {
 	interfaces []net.Interface
 	addresses  map[daemonDiscoveryAddressKey]netip.Addr
 	selected   []netip.Addr
+}
+
+type daemonDiscoveryCredentials interface {
+	discoveryservice.CredentialAdvertiser
+	daemonConnectivityNotifier
 }
 
 type daemonDiscoveryRuntime struct {
@@ -120,8 +123,8 @@ func newDaemonDiscoveryRuntime(
 	view store.StateView,
 	identityPrivateKey []byte,
 	localState store.LocalState,
-	node *consensus.Node,
-	credentials *credentialservice.Service,
+	admission daemonPeerAdmissionRuntime,
+	credentials daemonDiscoveryCredentials,
 	meshFactory daemonConsensusTransportFactory,
 	dependencies daemonDependencies,
 ) (*daemonDiscoveryRuntime, error) {
@@ -136,7 +139,7 @@ func newDaemonDiscoveryRuntime(
 		return nil, err
 	}
 	if !deviceID.Valid() ||
-		node == nil ||
+		admission == nil ||
 		credentials == nil ||
 		meshFactory == nil ||
 		dependencies.listInterfaces == nil ||
@@ -229,7 +232,7 @@ func newDaemonDiscoveryRuntime(
 		HTTPSPort:             options.peerListeners[0].Port(),
 		AdvertisementInterval: interval,
 		Multicast:             multicast,
-		AdmissionSnapshots:    node.PeerAdmissionSnapshot,
+		AdmissionSnapshots:    admission.PeerAdmissionSnapshot,
 		Credentials:           credentials,
 		SelectedLocalAddress:  book.lookup,
 		Routes:                routes,

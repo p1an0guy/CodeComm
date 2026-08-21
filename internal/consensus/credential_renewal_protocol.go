@@ -89,12 +89,34 @@ type credentialRenewalRequest struct {
 	canonical []byte
 }
 
-type credentialRenewalRequester interface {
+// CredentialRenewalRequester sends one bounded request over an
+// identity-authenticated consensus connection.
+type CredentialRenewalRequester interface {
 	RequestCredentialRenewal(
 		context.Context,
 		domain.DeviceID,
 		[]byte,
 	) (transport.ConsensusControlResponse, error)
+}
+
+type credentialRenewalRequester = CredentialRenewalRequester
+
+// SubmitCredentialRenewal sends a local device's signed next-epoch binding
+// to one applied-active peer. The receiving peer may forward it to its
+// observed leader exactly once.
+func SubmitCredentialRenewal(
+	ctx context.Context,
+	requester CredentialRenewalRequester,
+	peerDeviceID domain.DeviceID,
+	binding credential.Binding,
+) (credentialauthorization.Authorization, error) {
+	return requestCredentialRenewal(
+		ctx,
+		requester,
+		peerDeviceID,
+		binding,
+		credentialRenewalModeSubmit,
+	)
 }
 
 func newCredentialRenewalRequest(
@@ -180,9 +202,30 @@ func decodeCredentialRenewalRequest(
 func encodeCredentialRenewalResponse(
 	authorization credentialauthorization.Authorization,
 ) ([]byte, error) {
+	wire, err := credentialAuthorizationToWire(authorization)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		return nil, ErrInvalidCredentialRenewal
+	}
+	canonical, err := codec.CanonicalizeSignedObject(encoded)
+	if err != nil ||
+		len(canonical) == 0 ||
+		len(canonical) > transport.ConsensusControlBodyMaxBytes {
+		return nil, ErrInvalidCredentialRenewal
+	}
+	return bytes.Clone(canonical), nil
+}
+
+func credentialAuthorizationToWire(
+	authorization credentialauthorization.Authorization,
+) (credentialRenewalResponseWire, error) {
 	if err := authorization.Validate(); err != nil ||
 		authorization.AuthorizationChainIndex == 0 {
-		return nil, ErrInvalidCredentialRenewal
+		return credentialRenewalResponseWire{},
+			ErrInvalidCredentialRenewal
 	}
 	endorsements := make(
 		[]credentialRenewalEndorsementWire,
@@ -196,7 +239,7 @@ func encodeCredentialRenewalResponse(
 			),
 		}
 	}
-	encoded, err := json.Marshal(credentialRenewalResponseWire{
+	return credentialRenewalResponseWire{
 		SchemaVersion: credentialRenewalSchemaVersion,
 		SessionID:     string(authorization.SessionID),
 		DeviceID:      string(authorization.DeviceID),
@@ -217,17 +260,7 @@ func encodeCredentialRenewalResponse(
 			authorization.BindingSignature[:],
 		),
 		AuthorizationChainIndex: authorization.AuthorizationChainIndex,
-	})
-	if err != nil {
-		return nil, ErrInvalidCredentialRenewal
-	}
-	canonical, err := codec.CanonicalizeSignedObject(encoded)
-	if err != nil ||
-		len(canonical) == 0 ||
-		len(canonical) > transport.ConsensusControlBodyMaxBytes {
-		return nil, ErrInvalidCredentialRenewal
-	}
-	return bytes.Clone(canonical), nil
+	}, nil
 }
 
 func decodeCredentialRenewalResponse(
@@ -242,6 +275,28 @@ func decodeCredentialRenewalResponse(
 	if err := decodeCanonicalCredentialRenewal(encoded, &wire); err != nil {
 		return credentialauthorization.Authorization{}, err
 	}
+	authorization, err := credentialAuthorizationFromWire(wire)
+	if err != nil {
+		return credentialauthorization.Authorization{}, err
+	}
+	if !credentialAuthorizationMatchesBinding(
+		authorization,
+		request.binding,
+	) {
+		return credentialauthorization.Authorization{},
+			ErrCredentialRenewalMismatch
+	}
+	expected, err := encodeCredentialRenewalResponse(authorization)
+	if err != nil || !bytes.Equal(expected, encoded) {
+		return credentialauthorization.Authorization{},
+			ErrInvalidCredentialRenewal
+	}
+	return authorization.Clone(), nil
+}
+
+func credentialAuthorizationFromWire(
+	wire credentialRenewalResponseWire,
+) (credentialauthorization.Authorization, error) {
 	publicKey, publicKeyErr := codec.DecodeBase64URLExact(
 		wire.EpochPublicKey,
 		ed25519.PublicKeySize,
@@ -299,17 +354,9 @@ func decodeCredentialRenewalResponse(
 		)
 	}
 	if err := authorization.Validate(); err != nil ||
-		!credentialAuthorizationMatchesBinding(
-			authorization,
-			request.binding,
-		) {
+		authorization.AuthorizationChainIndex == 0 {
 		return credentialauthorization.Authorization{},
 			ErrCredentialRenewalMismatch
-	}
-	expected, err := encodeCredentialRenewalResponse(authorization)
-	if err != nil || !bytes.Equal(expected, encoded) {
-		return credentialauthorization.Authorization{},
-			ErrInvalidCredentialRenewal
 	}
 	return authorization.Clone(), nil
 }

@@ -91,40 +91,137 @@ func (model Model) View() string {
 		),
 		width,
 	))
-	if width >= 60 {
-		lines = append(lines,
-			fitLine(
-				fmt.Sprintf(
-					"Voters live %d  target %d  quorum %d  writes %s",
-					len(snapshot.Consensus.LiveVoterDeviceIDs),
-					len(snapshot.Consensus.TargetVoterDeviceIDs),
-					snapshot.Consensus.QuorumRequired,
-					sanitizeTerminalText(snapshot.Consensus.StrongWrites),
+	if snapshot.Consensus.State == string(coordstatus.ConsensusSettled) {
+		lines = append(lines, fitLine(
+			fmt.Sprintf(
+				"Replica %s  observed %d/%d authorities  watermark %d",
+				strings.ToUpper(
+					sanitizeTerminalText(
+						snapshot.Consensus.ReplicaCurrency,
+					),
 				),
-				width,
+				len(snapshot.Consensus.ObservedAuthorityIDs),
+				len(snapshot.Consensus.ActivatedVoterDeviceIDs),
+				snapshot.Consensus.ObservedResultIndex,
 			),
-			fitLine(appliedLine(snapshot), width),
-		)
-	} else {
-		lines = append(lines,
-			fitLine(
-				fmt.Sprintf(
-					"Voters live %d  target %d  quorum %d",
-					len(snapshot.Consensus.LiveVoterDeviceIDs),
-					len(snapshot.Consensus.TargetVoterDeviceIDs),
-					snapshot.Consensus.QuorumRequired,
+			width,
+		))
+	}
+	switch snapshot.Consensus.LiveConfigurationSource {
+	case string(coordstatus.LiveConfigurationUnknown):
+		lines = append(lines, fitLine(
+			fmt.Sprintf(
+				"Live configuration UNKNOWN  target %d",
+				len(snapshot.Consensus.TargetVoterDeviceIDs),
+			),
+			width,
+		))
+		if width >= 60 {
+			lines = append(
+				lines,
+				fitLine(
+					"Strong writes "+
+						sanitizeTerminalText(
+							snapshot.Consensus.StrongWrites,
+						),
+					width,
 				),
-				width,
-			),
-			fitLine(
+				fitLine(appliedLine(snapshot), width),
+			)
+		} else {
+			lines = append(lines, fitLine(
 				"Strong writes "+
 					sanitizeTerminalText(snapshot.Consensus.StrongWrites),
 				width,
-			),
-		)
-		lines = append(lines, narrowAppliedLines(snapshot)...)
+			))
+			lines = append(lines, narrowAppliedLines(snapshot)...)
+		}
+	case string(coordstatus.LiveConfigurationVoterReported):
+		lines = append(lines, fitLine(
+			"Live configuration VOTER-REPORTED",
+			width,
+		))
+		if width >= 60 {
+			lines = append(
+				lines,
+				fitLine(
+					fmt.Sprintf(
+						"Voters %d  target %d  quorum %d  writes %s",
+						len(snapshot.Consensus.LiveVoterDeviceIDs),
+						len(snapshot.Consensus.TargetVoterDeviceIDs),
+						snapshot.Consensus.QuorumRequired,
+						sanitizeTerminalText(
+							snapshot.Consensus.StrongWrites,
+						),
+					),
+					width,
+				),
+				fitLine(appliedLine(snapshot), width),
+			)
+		} else {
+			lines = append(
+				lines,
+				fitLine(
+					fmt.Sprintf(
+						"Voters %d  target %d  quorum %d",
+						len(snapshot.Consensus.LiveVoterDeviceIDs),
+						len(snapshot.Consensus.TargetVoterDeviceIDs),
+						snapshot.Consensus.QuorumRequired,
+					),
+					width,
+				),
+				fitLine(
+					"Strong writes "+
+						sanitizeTerminalText(
+							snapshot.Consensus.StrongWrites,
+						),
+					width,
+				),
+			)
+			lines = append(lines, narrowAppliedLines(snapshot)...)
+		}
+	default:
+		if width >= 60 {
+			lines = append(lines,
+				fitLine(
+					fmt.Sprintf(
+						"Voters live %d  target %d  quorum %d  writes %s",
+						len(snapshot.Consensus.LiveVoterDeviceIDs),
+						len(snapshot.Consensus.TargetVoterDeviceIDs),
+						snapshot.Consensus.QuorumRequired,
+						sanitizeTerminalText(
+							snapshot.Consensus.StrongWrites,
+						),
+					),
+					width,
+				),
+				fitLine(appliedLine(snapshot), width),
+			)
+		} else {
+			lines = append(lines,
+				fitLine(
+					fmt.Sprintf(
+						"Voters live %d  target %d  quorum %d",
+						len(snapshot.Consensus.LiveVoterDeviceIDs),
+						len(snapshot.Consensus.TargetVoterDeviceIDs),
+						snapshot.Consensus.QuorumRequired,
+					),
+					width,
+				),
+				fitLine(
+					"Strong writes "+
+						sanitizeTerminalText(
+							snapshot.Consensus.StrongWrites,
+						),
+					width,
+				),
+			)
+			lines = append(lines, narrowAppliedLines(snapshot)...)
+		}
 	}
-	if len(snapshot.Consensus.LiveVoterDeviceIDs) < 3 {
+	if snapshot.Consensus.LiveConfigurationSource !=
+		string(coordstatus.LiveConfigurationUnknown) &&
+		len(snapshot.Consensus.LiveVoterDeviceIDs) < 3 {
 		lines = append(
 			lines,
 			wrapLine(
@@ -137,8 +234,14 @@ func (model Model) View() string {
 			)...,
 		)
 	}
-	if snapshot.Consensus.ReconciliationState !=
-		string(coordstatus.ReconciliationStable) {
+	switch snapshot.Consensus.ReconciliationState {
+	case string(coordstatus.ReconciliationUnknown):
+		lines = append(
+			lines,
+			fitLine("Voter reconciliation UNKNOWN", width),
+		)
+	case string(coordstatus.ReconciliationStable):
+	default:
 		reconciliation := fmt.Sprintf(
 			"Voter transition %s  step %s",
 			strings.ToUpper(

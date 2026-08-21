@@ -11,11 +11,14 @@ import (
 )
 
 var (
-	ErrInvalidVerifier      = errors.New("peer auth: invalid verifier")
-	ErrAdmissionUnavailable = errors.New("peer auth: applied admission unavailable")
-	ErrPeerNotAdmitted      = errors.New("peer auth: peer not admitted")
-	ErrPeerNotAuthorized    = errors.New("peer auth: peer role not authorized")
-	ErrAdmissionClock       = errors.New("peer auth: invalid admission clock")
+	ErrInvalidVerifier                 = errors.New("peer auth: invalid verifier")
+	ErrAdmissionUnavailable            = errors.New("peer auth: applied admission unavailable")
+	ErrPeerNotAdmitted                 = errors.New("peer auth: peer not admitted")
+	ErrPeerNotAuthorized               = errors.New("peer auth: peer role not authorized")
+	ErrAdmissionClock                  = errors.New("peer auth: invalid admission clock")
+	ErrInvalidProvisionalAuthorization = errors.New(
+		"peer auth: invalid provisional authorization",
+	)
 )
 
 // SnapshotProvider returns the latest immutable applied-state cut. It must not
@@ -27,8 +30,9 @@ type Clock func() time.Time
 
 // Verifiers supplies the three closed TLS-plane policy callbacks.
 type Verifiers struct {
-	snapshot SnapshotProvider
-	now      Clock
+	snapshot    SnapshotProvider
+	now         Clock
+	provisional *ProvisionalAuthorizations
 }
 
 // NewVerifiers validates a production snapshot and clock provider.
@@ -36,10 +40,36 @@ func NewVerifiers(
 	snapshot SnapshotProvider,
 	now Clock,
 ) (*Verifiers, error) {
+	return newVerifiers(snapshot, now, nil)
+}
+
+// NewVerifiersWithProvisional enables a bounded future-authorization overlay
+// only for peer-pinned outbound content verification. VerifyContentPeer always
+// remains bound to applied state and is safe for ingress.
+func NewVerifiersWithProvisional(
+	snapshot SnapshotProvider,
+	now Clock,
+	provisional *ProvisionalAuthorizations,
+) (*Verifiers, error) {
+	if provisional == nil {
+		return nil, ErrInvalidVerifier
+	}
+	return newVerifiers(snapshot, now, provisional)
+}
+
+func newVerifiers(
+	snapshot SnapshotProvider,
+	now Clock,
+	provisional *ProvisionalAuthorizations,
+) (*Verifiers, error) {
 	if snapshot == nil || now == nil {
 		return nil, ErrInvalidVerifier
 	}
-	return &Verifiers{snapshot: snapshot, now: now}, nil
+	return &Verifiers{
+		snapshot:    snapshot,
+		now:         now,
+		provisional: provisional,
+	}, nil
 }
 
 // VerifyPairingPeer permits an unknown joiner or a retained readmission key in
@@ -121,6 +151,47 @@ func (verifiers *Verifiers) VerifyContentPeer(
 	if err != nil {
 		return transport.ContentPeerAdmission{}, err
 	}
+	now := verifiers.now()
+	if now.IsZero() {
+		return transport.ContentPeerAdmission{}, ErrAdmissionClock
+	}
+	return verifyAppliedContentPeer(snapshot, certificate, now)
+}
+
+// VerifyExpectedContentPeer pins an outbound connection to one device. A
+// verifier constructed with a provisional overlay may accept that device's
+// identity-plane-validated successor until local result replay applies it.
+func (verifiers *Verifiers) VerifyExpectedContentPeer(
+	expectedDeviceID domain.DeviceID,
+	certificate transport.ContentCertificate,
+) (transport.ContentPeerAdmission, error) {
+	if !expectedDeviceID.Valid() ||
+		certificate.Binding.DeviceID != expectedDeviceID {
+		return transport.ContentPeerAdmission{}, ErrPeerNotAdmitted
+	}
+	snapshot, err := verifiers.current()
+	if err != nil {
+		return transport.ContentPeerAdmission{}, err
+	}
+	now := verifiers.now()
+	if now.IsZero() {
+		return transport.ContentPeerAdmission{}, ErrAdmissionClock
+	}
+	if verifiers.provisional != nil {
+		verifiers.provisional.prune(snapshot, now)
+	}
+	admission, err := verifyAppliedContentPeer(snapshot, certificate, now)
+	if err == nil || verifiers.provisional == nil {
+		return admission, err
+	}
+	return verifiers.provisional.verify(snapshot, certificate, now)
+}
+
+func verifyAppliedContentPeer(
+	snapshot *Snapshot,
+	certificate transport.ContentCertificate,
+	now time.Time,
+) (transport.ContentPeerAdmission, error) {
 	member, exists := snapshot.Member(certificate.Binding.DeviceID)
 	if !exists || member.Status != device.StatusActive {
 		return transport.ContentPeerAdmission{}, ErrPeerNotAdmitted
@@ -146,10 +217,6 @@ func (verifiers *Verifiers) VerifyContentPeer(
 	if !exists || !valid ||
 		authorization.AuthorizationChainIndex > appliedChainIndex {
 		return transport.ContentPeerAdmission{}, ErrPeerNotAdmitted
-	}
-	now := verifiers.now()
-	if now.IsZero() {
-		return transport.ContentPeerAdmission{}, ErrAdmissionClock
 	}
 	if err := certificate.VerifyAuthorization(
 		authorization,

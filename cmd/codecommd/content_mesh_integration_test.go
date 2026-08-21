@@ -123,10 +123,19 @@ func (factory *daemonMeshIntegrationTransportFactory) Build(
 	return factory.delegate.Build(gate)
 }
 
+func (factory *daemonMeshIntegrationTransportFactory) BuildSettledControl(
+	admission daemonSettledControlAdmission,
+) (daemonSettledControlTransport, error) {
+	if factory == nil || factory.delegate == nil || admission == nil {
+		return nil, errDaemonMeshContentHarness
+	}
+	return factory.delegate.BuildSettledControl(admission)
+}
+
 func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 	ctx context.Context,
 	options daemonOptions,
-	node *consensus.Node,
+	node daemonPeerAdmissionRuntime,
 	certificate transport.ContentCertificateProvider,
 	pairingHandler transport.ConnectionHandler,
 	contentHandler transport.ConnectionHandler,
@@ -136,10 +145,17 @@ func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 		node == nil || certificate == nil || contentHandler == nil {
 		return nil, errDaemonMeshContentHarness
 	}
-	localState, err := node.LocalState()
+	localStateSource, ok := node.(interface {
+		LocalState() (store.LocalState, error)
+	})
+	if !ok {
+		return nil, errDaemonMeshContentHarness
+	}
+	localState, err := localStateSource.LocalState()
 	if err != nil {
 		return nil, err
 	}
+	consensusNode, _ := node.(*consensus.Node)
 	ingress, err := factory.delegate.NewIngress(
 		ctx,
 		options,
@@ -152,7 +168,7 @@ func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 	if err != nil {
 		return nil, err
 	}
-	factory.capture.replace(certificate, localState, node)
+	factory.capture.replace(certificate, localState, consensusNode)
 	return ingress, nil
 }
 

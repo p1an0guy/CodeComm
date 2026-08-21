@@ -75,8 +75,15 @@ func (node *SingleNode) renewCredential(
 	}()
 	ctx = operationContext
 
-	if err := node.validateCredentialRenewalBinding(ctx, binding); err != nil {
+	committed, retry, err := node.validateCredentialRenewalBinding(
+		ctx,
+		binding,
+	)
+	if err != nil {
 		return credentialauthorization.Authorization{}, err
+	}
+	if retry {
+		return committed, nil
 	}
 	if node.IsLeader() {
 		candidate, _, err := node.AuthorizeCredential(ctx, binding)
@@ -114,16 +121,18 @@ func (node *SingleNode) renewCredential(
 func (node *SingleNode) validateCredentialRenewalBinding(
 	ctx context.Context,
 	binding credential.Binding,
-) error {
+) (credentialauthorization.Authorization, bool, error) {
 	if node == nil || ctx == nil {
-		return ErrInvalidCredentialBinding
+		return credentialauthorization.Authorization{},
+			false,
+			ErrInvalidCredentialBinding
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return credentialauthorization.Authorization{}, false, err
 	}
 	admission, err := node.PeerAdmissionSnapshot()
 	if err != nil {
-		return err
+		return credentialauthorization.Authorization{}, false, err
 	}
 	sessionID, _, valid := admission.Lineage()
 	member, exists := admission.Member(binding.DeviceID)
@@ -135,12 +144,35 @@ func (node *SingleNode) validateCredentialRenewalBinding(
 		!exists ||
 		member.Status != device.StatusActive ||
 		!epochExists ||
-		currentEpoch == domain.MaxSafeInteger ||
-		binding.Epoch != currentEpoch+1 ||
 		binding.Validate(member.IdentityPublicKey) != nil {
-		return ErrInvalidCredentialBinding
+		return credentialauthorization.Authorization{},
+			false,
+			ErrInvalidCredentialBinding
 	}
-	return nil
+	if binding.Epoch == currentEpoch {
+		committed, found := admission.Authorization(
+			credentialauthorization.Key{
+				SessionID: binding.SessionID,
+				DeviceID:  binding.DeviceID,
+				Epoch:     binding.Epoch,
+			},
+		)
+		if !found ||
+			committed.Validate() != nil ||
+			!credentialAuthorizationMatchesBinding(committed, binding) {
+			return credentialauthorization.Authorization{},
+				false,
+				ErrInvalidCredentialBinding
+		}
+		return committed, true, nil
+	}
+	if currentEpoch == domain.MaxSafeInteger ||
+		binding.Epoch != currentEpoch+1 {
+		return credentialauthorization.Authorization{},
+			false,
+			ErrInvalidCredentialBinding
+	}
+	return credentialauthorization.Authorization{}, false, nil
 }
 
 func (node *SingleNode) credentialRenewalLeader() (

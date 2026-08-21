@@ -1,19 +1,25 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
 	"path/filepath"
+	"slices"
+	"sort"
 	"testing"
 
+	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/replication"
+	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 )
 
@@ -91,6 +97,20 @@ func TestSettledReplicaImportsRelayedBatchWithoutRaftProvenance(
 			sourceView.Heads.ChainIndex,
 		)
 	}
+	status, err := fixture.replica.Status(testContext(t))
+	if err != nil {
+		t.Fatalf("Status(): %v", err)
+	}
+	if status.Runtime.ReplicaCurrency !=
+		coordstatus.ReplicaCurrencyCurrent ||
+		!slices.Equal(
+			status.Runtime.ObservedAuthorityIDs,
+			[]domain.DeviceID{fixture.signerDeviceID},
+		) ||
+		status.Runtime.ObservedResultIndex !=
+			sourceView.Heads.ResultIndex {
+		t.Fatalf("settled replica currency = %+v", status.Runtime)
+	}
 
 	if err := fixture.replica.Close(); err != nil {
 		t.Fatalf("Close(): %v", err)
@@ -98,9 +118,10 @@ func TestSettledReplicaImportsRelayedBatchWithoutRaftProvenance(
 	reopened, err := OpenSettledReplica(
 		context.Background(),
 		SettledReplicaOptions{
-			StatePath:    fixture.targetPath,
-			OriginBootID: nodeTestBootID1,
-			Clock:        nodeTestClock(),
+			StatePath:     fixture.targetPath,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: fixture.settledDeviceID,
+			Clock:         nodeTestClock(),
 		},
 	)
 	if err != nil {
@@ -172,6 +193,149 @@ func TestSettledReplicaFailedReplayLeavesDurableCutUnchanged(
 		fixture.batch,
 	); err != nil {
 		t.Fatalf("ImportResultBatch(valid after failure): %v", err)
+	}
+}
+
+func TestSettledReplicaCommitsSelfRevocationBeforeBecomingIneligible(
+	t *testing.T,
+) {
+	settledMember := settledReplicaTestMember(t)
+	source, ownerPrivateKey, ownerDeviceID :=
+		openApplyAtGenerationTestNodeWithInitial(
+			t,
+			func(initial *store.InitialState) {
+				addSettledReplicaTestMember(initial, settledMember)
+			},
+		)
+	start, err := source.View(testContext(t))
+	if err != nil {
+		t.Fatalf("source View(start): %v", err)
+	}
+	revocation := nodeTestMembershipEvent(
+		t,
+		ownerPrivateKey,
+		ownerDeviceID,
+		event.KindMembershipDeviceRevoked,
+		settledMember.ID,
+		settledMember.EntityVersion,
+		map[string]any{
+			"device_id":                  settledMember.ID,
+			"reason":                     "settled replica retired",
+			"voter_set":                  []domain.DeviceID{ownerDeviceID},
+			"expected_voter_set_version": uint64(1),
+		},
+		nodeTestEventID1,
+		1,
+	)
+	applied, err := source.Apply(testContext(t), revocation)
+	if err != nil || applied.Outcome.Status != store.OutcomeAccepted {
+		t.Fatalf("source Apply(revocation) = (%+v, %v)", applied, err)
+	}
+	batch := signedReplayBatch(
+		t,
+		source.state,
+		start.Heads.ResultIndex,
+		ownerDeviceID,
+		ownerPrivateKey,
+	)
+
+	initial, _, initialOwnerID := nodeTestInitialState(t)
+	if initialOwnerID != ownerDeviceID {
+		t.Fatal("deterministic owner identity changed")
+	}
+	addSettledReplicaTestMember(&initial, settledMember)
+	targetPath := filepath.Join(t.TempDir(), "target", "state.db")
+	target, err := store.Open(
+		context.Background(),
+		store.Options{Path: targetPath},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(target): %v", err)
+	}
+	if _, err := target.Initialize(
+		context.Background(),
+		initial,
+	); err != nil {
+		t.Fatalf("target Initialize(): %v", err)
+	}
+	storeSettledReplicaTestConfiguration(
+		t,
+		target,
+		*settledReplicaEligibilityConfiguration(
+			ownerDeviceID,
+			settledMember.ID,
+		),
+	)
+	if _, err := target.EnterSettledNonvoter(
+		context.Background(),
+		nodeTestTimestamp1,
+	); err != nil {
+		t.Fatalf("target EnterSettledNonvoter(): %v", err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatalf("target Close(): %v", err)
+	}
+	replica, err := OpenSettledReplica(
+		context.Background(),
+		SettledReplicaOptions{
+			StatePath:     targetPath,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: settledMember.ID,
+			Clock:         nodeTestClock(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSettledReplica(): %v", err)
+	}
+	t.Cleanup(func() { _ = replica.Close() })
+	imported, err := replica.ImportResultBatch(
+		testContext(t),
+		ownerDeviceID,
+		batch,
+	)
+	if err != nil {
+		t.Fatalf("ImportResultBatch(revocation): %v", err)
+	}
+	after, err := replica.View(testContext(t))
+	if err != nil {
+		t.Fatalf("replica View(after): %v", err)
+	}
+	if after.Heads.ChainIndex != applied.Heads.ChainIndex ||
+		after.Heads.ChainHash != applied.Heads.ChainHash ||
+		after.Heads.ResultIndex != applied.Heads.ResultIndex ||
+		after.Heads.ResultHash != applied.Heads.ResultHash ||
+		after.Heads.ProjectionAccumulator !=
+			applied.Heads.ProjectionAccumulator ||
+		after.Heads.DigestVersion != applied.Heads.DigestVersion ||
+		after.Heads.ProjectionSchemaVersion !=
+			applied.Heads.ProjectionSchemaVersion ||
+		imported.Heads != applied.Heads ||
+		after.AdmissionRevision != imported.AdmissionRevision {
+		t.Fatalf(
+			"revocation import differs from source:\nsource=%+v\nimport=%+v\nafter=%+v",
+			applied,
+			imported,
+			after,
+		)
+	}
+	admission, err := replica.PeerAdmissionSnapshot()
+	if err != nil {
+		t.Fatalf("PeerAdmissionSnapshot(): %v", err)
+	}
+	member, found := admission.Member(settledMember.ID)
+	if !found || member.Status != device.StatusRevoked {
+		t.Fatalf("revoked admission member = (%+v, %t)", member, found)
+	}
+	if _, err := replica.ImportResultBatch(
+		testContext(t),
+		ownerDeviceID,
+		batch,
+	); !errors.Is(err, ErrSettledReplicaIneligible) {
+		t.Fatalf(
+			"ImportResultBatch(after revocation) error = %v, want %v",
+			err,
+			ErrSettledReplicaIneligible,
+		)
 	}
 }
 
@@ -300,7 +464,7 @@ func TestSettledReplicaFatalPublicationExcludesAdmissionReaders(
 }
 
 func TestOpenSettledReplicaRejectsRaftEvidenceMode(t *testing.T) {
-	initial, _, _ := nodeTestInitialState(t)
+	initial, _, deviceID := nodeTestInitialState(t)
 	path := filepath.Join(t.TempDir(), "state", "state.db")
 	database, err := store.Open(
 		context.Background(),
@@ -318,8 +482,9 @@ func TestOpenSettledReplicaRejectsRaftEvidenceMode(t *testing.T) {
 	if _, err := OpenSettledReplica(
 		context.Background(),
 		SettledReplicaOptions{
-			StatePath:    path,
-			OriginBootID: nodeTestBootID1,
+			StatePath:     path,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: deviceID,
 		},
 	); !errors.Is(err, store.ErrReplicaEvidenceMode) {
 		t.Fatalf(
@@ -329,8 +494,214 @@ func TestOpenSettledReplicaRejectsRaftEvidenceMode(t *testing.T) {
 	}
 }
 
+func TestOpenSettledReplicaRequiresEligibleApplicationNonvoter(
+	t *testing.T,
+) {
+	tests := []struct {
+		name          string
+		mutate        func(*testing.T, *store.InitialState, device.Device)
+		configuration func(
+			domain.DeviceID,
+			domain.DeviceID,
+		) *raft.Configuration
+		localDeviceID func(device.Device) domain.DeviceID
+		want          error
+	}{
+		{
+			name:          "eligible",
+			configuration: settledReplicaEligibilityConfiguration,
+			localDeviceID: func(member device.Device) domain.DeviceID {
+				return member.ID
+			},
+		},
+		{
+			name:          "missing local device ID",
+			configuration: settledReplicaEligibilityConfiguration,
+			localDeviceID: func(device.Device) domain.DeviceID {
+				return ""
+			},
+			want: ErrInvalidNodeOptions,
+		},
+		{
+			name: "local device remains in voter target",
+			mutate: func(
+				t *testing.T,
+				initial *store.InitialState,
+				member device.Device,
+			) {
+				t.Helper()
+				target, err := voterset.New(
+					nodeTestSessionID,
+					[]domain.DeviceID{member.ID},
+					2,
+				)
+				if err != nil {
+					t.Fatalf("voterset.New(local target): %v", err)
+				}
+				initial.Projections.VoterSet = []voterset.Set{target}
+			},
+			configuration: settledReplicaEligibilityConfiguration,
+			localDeviceID: func(member device.Device) domain.DeviceID {
+				return member.ID
+			},
+			want: ErrSettledReplicaIneligible,
+		},
+		{
+			name: "local device remains in credential authority",
+			mutate: func(
+				t *testing.T,
+				initial *store.InitialState,
+				member device.Device,
+			) {
+				t.Helper()
+				ownerID := initial.Projections.
+					CredentialAuthority[0].VoterDeviceIDs[0]
+				target, err := voterset.New(
+					nodeTestSessionID,
+					[]domain.DeviceID{ownerID},
+					2,
+				)
+				if err != nil {
+					t.Fatalf("voterset.New(successor target): %v", err)
+				}
+				initial.Projections.VoterSet = []voterset.Set{target}
+				authority := initial.Projections.CredentialAuthority[0]
+				authority.VoterDeviceIDs = []domain.DeviceID{
+					member.ID,
+				}
+				initial.Projections.CredentialAuthority =
+					[]store.CredentialAuthorityRow{authority}
+			},
+			configuration: settledReplicaEligibilityConfiguration,
+			localDeviceID: func(member device.Device) domain.DeviceID {
+				return member.ID
+			},
+			want: ErrSettledReplicaIneligible,
+		},
+		{
+			name: "local device remains in durable Raft configuration",
+			configuration: func(
+				ownerID domain.DeviceID,
+				localID domain.DeviceID,
+			) *raft.Configuration {
+				return &raft.Configuration{Servers: []raft.Server{
+					{
+						Suffrage: raft.Voter,
+						ID:       raft.ServerID(ownerID),
+						Address:  raft.ServerAddress(ownerID),
+					},
+					{
+						Suffrage: raft.Nonvoter,
+						ID:       raft.ServerID(localID),
+						Address:  raft.ServerAddress(localID),
+					},
+				}}
+			},
+			localDeviceID: func(member device.Device) domain.DeviceID {
+				return member.ID
+			},
+			want: ErrSettledReplicaIneligible,
+		},
+		{
+			name: "durable Raft configuration missing",
+			localDeviceID: func(member device.Device) domain.DeviceID {
+				return member.ID
+			},
+			want: ErrSettledReplicaIneligible,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			initial, _, ownerID := nodeTestInitialState(t)
+			member := settledReplicaTestMember(t)
+			addSettledReplicaTestMember(&initial, member)
+			if test.mutate != nil {
+				test.mutate(t, &initial, member)
+			}
+			path := filepath.Join(t.TempDir(), "state", "state.db")
+			database, err := store.Open(
+				context.Background(),
+				store.Options{Path: path},
+			)
+			if err != nil {
+				t.Fatalf("store.Open(): %v", err)
+			}
+			if _, err := database.Initialize(
+				context.Background(),
+				initial,
+			); err != nil {
+				t.Fatalf("Initialize(): %v", err)
+			}
+			if test.configuration != nil {
+				configuration := test.configuration(ownerID, member.ID)
+				storeSettledReplicaTestConfiguration(
+					t,
+					database,
+					*configuration,
+				)
+			}
+			if _, err := database.EnterSettledNonvoter(
+				context.Background(),
+				nodeTestTimestamp1,
+			); err != nil {
+				t.Fatalf("EnterSettledNonvoter(): %v", err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatalf("Close(setup): %v", err)
+			}
+
+			replica, err := OpenSettledReplica(
+				context.Background(),
+				SettledReplicaOptions{
+					StatePath:     path,
+					OriginBootID:  nodeTestBootID1,
+					LocalDeviceID: test.localDeviceID(member),
+					Clock:         nodeTestClock(),
+				},
+			)
+			if test.want == nil {
+				if err != nil {
+					t.Fatalf("OpenSettledReplica(): %v", err)
+				}
+				if closeErr := replica.Close(); closeErr != nil {
+					t.Fatalf("Close(): %v", closeErr)
+				}
+				return
+			}
+			if replica != nil {
+				_ = replica.Close()
+				t.Fatal("ineligible settled replica returned a runtime")
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf(
+					"OpenSettledReplica() error = %v, want %v",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func settledReplicaEligibilityConfiguration(
+	ownerID domain.DeviceID,
+	_ domain.DeviceID,
+) *raft.Configuration {
+	return &raft.Configuration{Servers: []raft.Server{{
+		Suffrage: raft.Voter,
+		ID:       raft.ServerID(ownerID),
+		Address:  raft.ServerAddress(ownerID),
+	}}}
+}
+
 func TestSettledReplicaImportsAndReopensAuthorityHandoff(t *testing.T) {
-	source, origin := openVoterActivationCommitNode(t)
+	settledMember := settledReplicaTestMember(t)
+	source, origin := openVoterActivationCommitNodeWithInitial(
+		t,
+		func(initial *store.InitialState) {
+			addSettledReplicaTestMember(initial, settledMember)
+		},
+	)
 	start, err := source.View(testContext(t))
 	if err != nil {
 		t.Fatalf("source View(start): %v", err)
@@ -366,6 +737,7 @@ func TestSettledReplicaImportsAndReopensAuthorityHandoff(t *testing.T) {
 		t.Fatalf("voterset.New(): %v", err)
 	}
 	initial.Projections.VoterSet = []voterset.Set{targetSet}
+	addSettledReplicaTestMember(&initial, settledMember)
 	path := filepath.Join(t.TempDir(), "handoff-target", "state.db")
 	database, err := store.Open(
 		context.Background(),
@@ -380,6 +752,15 @@ func TestSettledReplicaImportsAndReopensAuthorityHandoff(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Initialize(target): %v", err)
 	}
+	storeSettledReplicaTestConfiguration(
+		t,
+		database,
+		raft.Configuration{Servers: []raft.Server{{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(deviceID),
+			Address:  raft.ServerAddress(deviceID),
+		}}},
+	)
 	if _, err := database.EnterSettledNonvoter(
 		context.Background(),
 		nodeTestTimestamp1,
@@ -393,9 +774,10 @@ func TestSettledReplicaImportsAndReopensAuthorityHandoff(t *testing.T) {
 	replica, err := OpenSettledReplica(
 		context.Background(),
 		SettledReplicaOptions{
-			StatePath:    path,
-			OriginBootID: nodeTestBootID1,
-			Clock:        nodeTestClock(),
+			StatePath:     path,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: settledMember.ID,
+			Clock:         nodeTestClock(),
 		},
 	)
 	if err != nil {
@@ -427,9 +809,10 @@ func TestSettledReplicaImportsAndReopensAuthorityHandoff(t *testing.T) {
 	reopened, err := OpenSettledReplica(
 		context.Background(),
 		SettledReplicaOptions{
-			StatePath:    path,
-			OriginBootID: nodeTestBootID1,
-			Clock:        nodeTestClock(),
+			StatePath:     path,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: settledMember.ID,
+			Clock:         nodeTestClock(),
 		},
 	)
 	if err != nil {
@@ -464,14 +847,21 @@ type settledReplicaImportFixture struct {
 	first            event.SignedEvent
 	batch            replication.Batch
 	finalApplyHeads  store.ApplyHeads
+	settledDeviceID  domain.DeviceID
 }
 
 func newSettledReplicaImportFixture(
 	t *testing.T,
 ) settledReplicaImportFixture {
 	t.Helper()
+	settledMember := settledReplicaTestMember(t)
 	source, signerPrivateKey, signerDeviceID :=
-		openApplyAtGenerationTestNode(t)
+		openApplyAtGenerationTestNodeWithInitial(
+			t,
+			func(initial *store.InitialState) {
+				addSettledReplicaTestMember(initial, settledMember)
+			},
+		)
 	start, err := source.View(testContext(t))
 	if err != nil {
 		t.Fatalf("source View(start): %v", err)
@@ -521,6 +911,7 @@ func newSettledReplicaImportFixture(
 	if initialDeviceID != signerDeviceID {
 		t.Fatal("deterministic initial signer changed")
 	}
+	addSettledReplicaTestMember(&initial, settledMember)
 	targetPath := filepath.Join(t.TempDir(), "target", "state.db")
 	target, err := store.Open(
 		context.Background(),
@@ -532,6 +923,15 @@ func newSettledReplicaImportFixture(
 	if _, err := target.Initialize(context.Background(), initial); err != nil {
 		t.Fatalf("target Initialize(): %v", err)
 	}
+	storeSettledReplicaTestConfiguration(
+		t,
+		target,
+		raft.Configuration{Servers: []raft.Server{{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(signerDeviceID),
+			Address:  raft.ServerAddress(signerDeviceID),
+		}}},
+	)
 	if _, err := target.EnterSettledNonvoter(
 		context.Background(),
 		domain.Timestamp("2026-08-19T20:00:00Z"),
@@ -544,9 +944,10 @@ func newSettledReplicaImportFixture(
 	replica, err := OpenSettledReplica(
 		context.Background(),
 		SettledReplicaOptions{
-			StatePath:    targetPath,
-			OriginBootID: nodeTestBootID1,
-			Clock:        nodeTestClock(),
+			StatePath:     targetPath,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: settledMember.ID,
+			Clock:         nodeTestClock(),
 		},
 	)
 	if err != nil {
@@ -574,5 +975,79 @@ func newSettledReplicaImportFixture(
 		first:            first,
 		batch:            batch,
 		finalApplyHeads:  final.Heads,
+		settledDeviceID:  settledMember.ID,
+	}
+}
+
+func settledReplicaTestMember(t *testing.T) device.Device {
+	t.Helper()
+	privateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd4}, ed25519.SeedSize),
+	)
+	defer clear(privateKey)
+	publicKey := bytes.Clone(
+		privateKey.Public().(ed25519.PublicKey),
+	)
+	deviceID, err := device.DeriveID(publicKey)
+	if err != nil {
+		t.Fatalf("device.DeriveID(settled member): %v", err)
+	}
+	return device.Device{
+		ID:                deviceID,
+		Role:              device.RoleEditor,
+		IdentityPublicKey: publicKey,
+		DaemonVersion:     "0.1.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+}
+
+func addSettledReplicaTestMember(
+	initial *store.InitialState,
+	member device.Device,
+) {
+	initial.Projections.Devices = append(
+		initial.Projections.Devices,
+		member,
+	)
+	sort.Slice(initial.Projections.Devices, func(left, right int) bool {
+		return initial.Projections.Devices[left].ID <
+			initial.Projections.Devices[right].ID
+	})
+	initial.Projections.AuditCounters = append(
+		initial.Projections.AuditCounters,
+		auditcounter.Counter{DeviceID: member.ID},
+	)
+	sort.Slice(
+		initial.Projections.AuditCounters,
+		func(left, right int) bool {
+			return initial.Projections.AuditCounters[left].DeviceID <
+				initial.Projections.AuditCounters[right].DeviceID
+		},
+	)
+}
+
+func storeSettledReplicaTestConfiguration(
+	t *testing.T,
+	database *store.Store,
+	configuration raft.Configuration,
+) {
+	t.Helper()
+	encoded, err := encodeRaftConfiguration(configuration)
+	if err != nil {
+		t.Fatalf("encodeRaftConfiguration(): %v", err)
+	}
+	stored, err := database.StoreCommittedRaftConfiguration(
+		context.Background(),
+		1,
+		encoded,
+	)
+	if err != nil || !stored {
+		t.Fatalf(
+			"StoreCommittedRaftConfiguration() = (%t, %v)",
+			stored,
+			err,
+		)
 	}
 }

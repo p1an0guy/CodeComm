@@ -23,6 +23,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/credential"
@@ -163,6 +164,7 @@ type daemonMeshIntegrationNode struct {
 	credentials   *daemonTestCredentialStore
 	meshCapture   *daemonMeshIntegrationFactoryCapture
 	credentialNow func() time.Time
+	coverage      canonicalcoverage.ReceiptCollector
 
 	listener net.Listener
 	cancel   context.CancelFunc
@@ -948,10 +950,11 @@ func (node *daemonMeshIntegrationNode) start(
 					claimed = true
 					return reserved, nil
 				},
-				openMulticast:  openDaemonMeshIntegrationMulticast,
-				listInterfaces: productionDependencies.listInterfaces,
-				interfaceAddrs: productionDependencies.interfaceAddrs,
-				credentialNow:  node.credentialNow,
+				openMulticast:     openDaemonMeshIntegrationMulticast,
+				listInterfaces:    productionDependencies.listInterfaces,
+				interfaceAddrs:    productionDependencies.interfaceAddrs,
+				credentialNow:     node.credentialNow,
+				canonicalCoverage: node.coverage,
 			},
 		)
 		close(node.exited)

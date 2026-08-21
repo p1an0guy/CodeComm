@@ -277,8 +277,12 @@ func testConsensusStartupEnabled(t *testing.T) {
 		testConsensusCredentialEndorsementUsesClosedControlRoute,
 	)
 	t.Run(
-		"credential renewal configuration exception",
-		testConsensusCredentialRenewalBypassesOnlyLiveConfiguration,
+		"identity control configuration exception",
+		testConsensusIdentityControlBypassesOnlyLiveConfiguration,
+	)
+	t.Run(
+		"status canonical response",
+		testConsensusStatusRejectsNoncanonicalResponse,
 	)
 	t.Run(
 		"proof control input bounds",
