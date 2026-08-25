@@ -124,6 +124,13 @@ func (store *Store) ExportLogicalSnapshotRecords(
 				ErrLogicalSnapshotNotCovered,
 			)
 		}
+		if state.recoveryGeneration >
+			logicalsnapshot.MaxRecoveryGeneration {
+			return logicalSnapshotIntegrity(
+				"active recovery generation exceeds snapshot limit",
+				nil,
+			)
+		}
 		if state.digestVersion !=
 			logicalsnapshot.SupportedDigestVersion ||
 			state.projectionSchemaVersion !=
@@ -340,9 +347,9 @@ func (emitter *logicalSnapshotEmitter) emit(
 	if err := emitter.ctx.Err(); err != nil {
 		return err
 	}
-	if emitter.count >= domain.MaxSafeInteger {
+	if emitter.count >= logicalsnapshot.MaxArtifactRecordCount {
 		return logicalSnapshotIntegrity(
-			"record count exceeds exact protocol range",
+			"record count exceeds snapshot limit",
 			nil,
 		)
 	}

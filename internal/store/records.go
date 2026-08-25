@@ -359,11 +359,13 @@ const (
 	AuditCommittedRejection AuditSourceKind = "committed_rejection"
 	AuditEvent              AuditSourceKind = "audit_event"
 	AuditLocalAggregate     AuditSourceKind = "local_aggregate"
+	AuditRecoveryBoundary   AuditSourceKind = "recovery_boundary"
 )
 
 func (kind AuditSourceKind) valid() bool {
 	switch kind {
-	case AuditAcceptedEvent, AuditCommittedRejection, AuditEvent, AuditLocalAggregate:
+	case AuditAcceptedEvent, AuditCommittedRejection, AuditEvent,
+		AuditLocalAggregate, AuditRecoveryBoundary:
 		return true
 	default:
 		return false
@@ -392,6 +394,12 @@ type AuditRecord struct {
 func (record AuditRecord) Validate() error {
 	if !record.SessionID.Valid() || !record.SourceKind.valid() {
 		return errors.New("invalid session or source")
+	}
+	if record.SourceKind == AuditLocalAggregate &&
+		(record.EventID == "") != (record.ResultIndex == 0) {
+		return errors.New(
+			"local aggregate event and result bindings must both be present or absent",
+		)
 	}
 	if record.EventID != "" && !record.EventID.Valid() {
 		return errors.New("invalid event ID")

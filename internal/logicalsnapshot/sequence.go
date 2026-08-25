@@ -36,6 +36,7 @@ const (
 const (
 	boundaryScratchBytes       = 220
 	acceptedDigestScratchBytes = sha256.Size
+	sessionIndexSlotBytes      = 1 + 36
 	maxScratchOffset           = uint64(1<<63 - 1)
 )
 
@@ -49,7 +50,7 @@ const (
 // SequenceValidator is not safe for concurrent use.
 type SequenceValidator struct {
 	root    RootInput
-	scratch io.ReadWriteSeeker
+	scratch VerificationScratch
 
 	section     sequenceSection
 	recordCount uint64
@@ -116,7 +117,7 @@ type checkpointPreCut struct {
 // root. Root signature and authority validation remain the caller's job.
 func NewSequenceValidator(
 	root Root,
-	scratch io.ReadWriteSeeker,
+	scratch VerificationScratch,
 ) (*SequenceValidator, error) {
 	if err := root.validate(); err != nil {
 		return nil, err
@@ -139,6 +140,13 @@ func NewSequenceValidator(
 		return nil, fmt.Errorf(
 			"%w: record count is below the deterministic minimum",
 			ErrInvalidRecordSequence,
+		)
+	}
+	if err := scratch.Truncate(0); err != nil {
+		return nil, fmt.Errorf(
+			"%w: truncate scratch: %v",
+			ErrInvalidRecordSequence,
+			err,
 		)
 	}
 	if _, err := scratch.Seek(0, io.SeekStart); err != nil {
@@ -334,49 +342,94 @@ func (validator *SequenceValidator) priorGenesisSessionID(
 			ErrInvalidRecordSequence,
 		)
 	}
-	for index := uint64(0); index < validator.genesisCount; index++ {
-		offset, ok := scratchProductOffset(index, boundaryScratchBytes)
-		if !ok {
-			return false, fmt.Errorf(
-				"%w: generation scratch offset exceeds range",
-				ErrInvalidRecordSequence,
-			)
-		}
-		if _, err := validator.scratch.Seek(offset, io.SeekStart); err != nil {
-			return false, fmt.Errorf(
-				"%w: seek generation scratch: %v",
-				ErrInvalidRecordSequence,
-				err,
-			)
-		}
-		var encoded [boundaryScratchBytes]byte
-		if _, err := io.ReadFull(validator.scratch, encoded[:]); err != nil {
-			return false, fmt.Errorf(
-				"%w: read generation scratch: %v",
-				ErrInvalidRecordSequence,
-				err,
-			)
-		}
-		boundary, err := decodeSequenceBoundary(encoded)
-		if err != nil {
-			return false, fmt.Errorf(
-				"%w: decode generation scratch: %v",
-				ErrInvalidRecordSequence,
-				err,
-			)
-		}
-		if boundary.sessionID == sessionID {
-			return true, nil
-		}
-	}
-	if _, err := validator.scratch.Seek(appendOffset, io.SeekStart); err != nil {
+	indexStart, indexSlots, _, ok := validator.sessionIndexLayout()
+	if !ok {
 		return false, fmt.Errorf(
-			"%w: restore generation scratch: %v",
+			"%w: session-index scratch layout exceeds range",
 			ErrInvalidRecordSequence,
-			err,
 		)
 	}
-	return false, nil
+	digest := sha256.Sum256([]byte(sessionID))
+	first := binary.BigEndian.Uint64(digest[:8]) & (indexSlots - 1)
+	for probe := uint64(0); probe < indexSlots; probe++ {
+		slot := (first + probe) & (indexSlots - 1)
+		slotBytes, ok := scratchProductOffsetUint64(
+			slot,
+			sessionIndexSlotBytes,
+		)
+		if !ok || indexStart > maxScratchOffset-slotBytes {
+			return false, fmt.Errorf(
+				"%w: session-index slot exceeds range",
+				ErrInvalidRecordSequence,
+			)
+		}
+		offset := indexStart + slotBytes
+		if _, err := validator.scratch.Seek(
+			int64(offset),
+			io.SeekStart,
+		); err != nil {
+			return false, fmt.Errorf(
+				"%w: seek session-index slot: %v",
+				ErrInvalidRecordSequence,
+				err,
+			)
+		}
+		var encoded [sessionIndexSlotBytes]byte
+		n, err := io.ReadFull(validator.scratch, encoded[:])
+		if err != nil && !(n == 0 && errors.Is(err, io.EOF)) {
+			return false, fmt.Errorf(
+				"%w: read session-index slot: %v",
+				ErrInvalidRecordSequence,
+				err,
+			)
+		}
+		switch encoded[0] {
+		case 0:
+			encoded[0] = 1
+			copy(encoded[1:], sessionID)
+			if _, err := validator.scratch.Seek(
+				int64(offset),
+				io.SeekStart,
+			); err != nil {
+				return false, fmt.Errorf(
+					"%w: restore session-index slot: %v",
+					ErrInvalidRecordSequence,
+					err,
+				)
+			}
+			if err := writeAll(validator.scratch, encoded[:]); err != nil {
+				return false, fmt.Errorf(
+					"%w: write session-index slot: %v",
+					ErrInvalidRecordSequence,
+					err,
+				)
+			}
+			if _, err := validator.scratch.Seek(
+				appendOffset,
+				io.SeekStart,
+			); err != nil {
+				return false, fmt.Errorf(
+					"%w: restore generation scratch: %v",
+					ErrInvalidRecordSequence,
+					err,
+				)
+			}
+			return false, nil
+		case 1:
+			if domain.UUIDv7(string(encoded[1:])) == sessionID {
+				return true, nil
+			}
+		default:
+			return false, fmt.Errorf(
+				"%w: invalid session-index occupancy",
+				ErrInvalidRecordSequence,
+			)
+		}
+	}
+	return false, fmt.Errorf(
+		"%w: session-index scratch is full",
+		ErrInvalidRecordSequence,
+	)
 }
 
 func (validator *SequenceValidator) consumeResult(encoded []byte) error {
@@ -1144,10 +1197,7 @@ func (validator *SequenceValidator) acceptedProposalDigestOffset(
 		!domain.ValidUnsignedInteger(chainIndex) {
 		return 0, false
 	}
-	boundaryBytes, ok := scratchProductOffsetUint64(
-		validator.genesisCount,
-		boundaryScratchBytes,
-	)
+	_, _, digestStart, ok := validator.sessionIndexLayout()
 	if !ok {
 		return 0, false
 	}
@@ -1155,10 +1205,40 @@ func (validator *SequenceValidator) acceptedProposalDigestOffset(
 		chainIndex-1,
 		acceptedDigestScratchBytes,
 	)
-	if !ok || boundaryBytes > maxScratchOffset-digestBytes {
+	if !ok || digestStart > maxScratchOffset-digestBytes {
 		return 0, false
 	}
-	return int64(boundaryBytes + digestBytes), true
+	return int64(digestStart + digestBytes), true
+}
+
+func (validator *SequenceValidator) sessionIndexLayout() (
+	start uint64,
+	slots uint64,
+	end uint64,
+	ok bool,
+) {
+	if validator == nil ||
+		validator.root.RecoveryGeneration >= domain.MaxSafeInteger {
+		return 0, 0, 0, false
+	}
+	count := validator.root.RecoveryGeneration + 1
+	start, ok = scratchProductOffsetUint64(count, boundaryScratchBytes)
+	if !ok || count > uint64(1)<<62 {
+		return 0, 0, 0, false
+	}
+	minimumSlots := count * 2
+	slots = 1
+	for slots < minimumSlots {
+		slots <<= 1
+	}
+	indexBytes, ok := scratchProductOffsetUint64(
+		slots,
+		sessionIndexSlotBytes,
+	)
+	if !ok || start > maxScratchOffset-indexBytes {
+		return 0, 0, 0, false
+	}
+	return start, slots, start + indexBytes, true
 }
 
 func (validator *SequenceValidator) advanceBoundaryReplay() error {

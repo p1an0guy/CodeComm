@@ -10,7 +10,6 @@ import (
 	"io"
 
 	"github.com/ijonahch/codecomm/internal/chain"
-	"github.com/ijonahch/codecomm/internal/domain"
 )
 
 var (
@@ -122,8 +121,9 @@ func (builder *ArtifactBuilder) Consume(record Record) error {
 			framedLength,
 		))
 	}
-	if builder.recordCount >= domain.MaxSafeInteger ||
-		builder.expandedBytes > domain.MaxSafeInteger-framedLength {
+	if builder.recordCount >= MaxArtifactRecordCount ||
+		framedLength > MaxArtifactExpandedBytes ||
+		builder.expandedBytes > MaxArtifactExpandedBytes-framedLength {
 		return builder.fail(ErrArtifactTooLarge)
 	}
 	if err := builder.ctx.Err(); err != nil {
@@ -204,8 +204,9 @@ func (builder *ArtifactBuilder) flushChunk() error {
 		chunkLength > MaxChunkExpandedBytes {
 		return ErrRecordTooLarge
 	}
-	if builder.chunkCount >= domain.MaxSafeInteger ||
-		builder.compressedBytes > domain.MaxSafeInteger-chunkLength {
+	if builder.chunkCount >= MaxArtifactChunkCount ||
+		chunkLength > MaxArtifactCompressedBytes ||
+		builder.compressedBytes > MaxArtifactCompressedBytes-chunkLength {
 		return ErrArtifactTooLarge
 	}
 

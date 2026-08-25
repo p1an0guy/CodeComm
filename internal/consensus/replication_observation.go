@@ -136,6 +136,12 @@ func (replica *SettledReplica) ObserveReplicationAcknowledgement(
 		}
 		return err
 	}
+	if err := replica.refreshReplicationProgress(operationContext); err != nil {
+		return replica.failSettledIntegrity(
+			"refresh progress after acknowledgement commit",
+			err,
+		)
+	}
 	replica.recordLiveReplicationObservation(
 		relayPeerID,
 		metadata.ServerDeviceID,

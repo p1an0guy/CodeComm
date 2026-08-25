@@ -92,8 +92,28 @@ func (runtime *daemonSettledCredentialConsensus) RenewCredential(
 		return credentialauthorization.Authorization{}, err
 	}
 	authorityIDs := status.Durable.CredentialAuthority.VoterDeviceIDs()
-	attemptErrors := make([]error, 0, len(authorityIDs))
+	candidates := make(
+		[]domain.DeviceID,
+		0,
+		len(status.Durable.Members),
+	)
+	seen := make(map[domain.DeviceID]struct{}, len(status.Durable.Members))
 	for _, peerID := range authorityIDs {
+		candidates = append(candidates, peerID)
+		seen[peerID] = struct{}{}
+	}
+	for _, candidate := range status.Durable.Members {
+		if candidate.Status != device.StatusActive {
+			continue
+		}
+		if _, exists := seen[candidate.ID]; exists {
+			continue
+		}
+		candidates = append(candidates, candidate.ID)
+		seen[candidate.ID] = struct{}{}
+	}
+	attemptErrors := make([]error, 0, len(candidates))
+	for _, peerID := range candidates {
 		if peerID == runtime.localDeviceID {
 			continue
 		}
@@ -118,7 +138,7 @@ func (runtime *daemonSettledCredentialConsensus) RenewCredential(
 	if len(attemptErrors) == 0 {
 		return credentialauthorization.Authorization{},
 			fmt.Errorf(
-				"%w: no active authority peer",
+				"%w: no active forwarding peer",
 				errDaemonSettledCredential,
 			)
 	}

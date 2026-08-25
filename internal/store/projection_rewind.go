@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -380,8 +381,16 @@ func rewindProjectionMutation(
 	if count > 1 ||
 		(mutation.After == nil) != (count == 0) ||
 		mutation.After != nil && !bytes.Equal(current, mutation.After) {
-		return errors.New(
-			"projection mutation after-image differs from later state",
+		return fmt.Errorf(
+			"projection mutation after-image differs from later state: "+
+				"table=%q key_sha256=%x expected_present=%t "+
+				"current_rows=%d expected_sha256=%x current_sha256=%x",
+			mutation.Table,
+			sha256.Sum256(mutation.PrimaryKey),
+			mutation.After != nil,
+			count,
+			sha256.Sum256(mutation.After),
+			sha256.Sum256(current),
 		)
 	}
 	if mutation.Before == nil {

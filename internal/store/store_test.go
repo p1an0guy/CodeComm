@@ -15,6 +15,12 @@ import (
 
 const testSessionID = "01890f47-3e72-7000-8000-000000000002"
 
+var (
+	testStoreTemplateOnce sync.Once
+	testStoreTemplate     []byte
+	testStoreTemplateErr  error
+)
+
 var requiredTables = []string{
 	"activity",
 	"agent_launches",
@@ -35,6 +41,8 @@ var requiredTables = []string{
 	"events",
 	"genesis_records",
 	"git_artifacts",
+	"initial_projection_boundary",
+	"initial_projection_rows",
 	"lease_deadlines",
 	"leases",
 	"local_requests",
@@ -69,7 +77,7 @@ var requiredTables = []string{
 
 func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
-	store := openTestStore(t, path, nil)
+	store := openFreshTestStore(t, path, nil)
 
 	if got := store.Path(); got != path {
 		t.Fatalf("Path() = %q, want %q", got, path)
@@ -143,6 +151,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"committed_raft_configuration",
 			"settled_nonvoter_replication",
 			"replication_watermark_observations",
+			"recovery_boundary_audit",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
@@ -244,10 +253,11 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
 	broken := migrationFromText(
-		8,
+		9,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
+	broken.policy = migrationPolicyReviewedReversible
 
 	err := store.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		return applyMigrations(conn, append(embeddedMigrations, broken), systemClock)
@@ -262,7 +272,7 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 8;", 0)
+		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 9;", 0)
 		return nil
 	})
 	if err != nil {
@@ -395,6 +405,18 @@ func TestOpenDatabaseFileSyncsParentOnlyOnCreation(t *testing.T) {
 
 func openTestStore(t *testing.T, path string, raftLog RaftLog) *Store {
 	t.Helper()
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		if err := seedTestStore(path, migratedTestStoreTemplate(t)); err != nil {
+			t.Fatalf("seed migrated test store: %v", err)
+		}
+	} else if err != nil {
+		t.Fatalf("inspect test store path: %v", err)
+	}
+	return openFreshTestStore(t, path, raftLog)
+}
+
+func openFreshTestStore(t *testing.T, path string, raftLog RaftLog) *Store {
+	t.Helper()
 	store, err := Open(context.Background(), Options{Path: path, RaftLog: raftLog})
 	if err != nil {
 		t.Fatal(err)
@@ -405,6 +427,44 @@ func openTestStore(t *testing.T, path string, raftLog RaftLog) *Store {
 		}
 	})
 	return store
+}
+
+func migratedTestStoreTemplate(t *testing.T) []byte {
+	t.Helper()
+	testStoreTemplateOnce.Do(func() {
+		directory, err := os.MkdirTemp("", "codecomm-store-test-template-")
+		if err != nil {
+			testStoreTemplateErr = err
+			return
+		}
+		defer os.RemoveAll(directory)
+
+		path := filepath.Join(directory, "state.db")
+		database, err := Open(context.Background(), Options{Path: path})
+		if err != nil {
+			testStoreTemplateErr = err
+			return
+		}
+		if err := database.Close(); err != nil {
+			testStoreTemplateErr = err
+			return
+		}
+		testStoreTemplate, testStoreTemplateErr = os.ReadFile(path)
+	})
+	if testStoreTemplateErr != nil {
+		t.Fatalf("create migrated test store template: %v", testStoreTemplateErr)
+	}
+	return testStoreTemplate
+}
+
+func seedTestStore(path string, template []byte) error {
+	if len(template) == 0 {
+		return errors.New("empty migrated test store template")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, template, 0o600)
 }
 
 func queryText(t *testing.T, conn *sqlite.Conn, statement string) string {

@@ -579,7 +579,9 @@ type realContentClientHarness struct {
 	client    *Client
 	service   *contentTestService
 	fixture   contentTLSFixture
+	server    *Server
 	ingress   *transport.Ingress
+	address   string
 	cancel    context.CancelFunc
 	serveDone <-chan error
 	stopOnce  sync.Once
@@ -638,7 +640,9 @@ func startRealContentClientWithFixture(
 	}
 	harness := &realContentClientHarness{
 		client: client, service: service, fixture: fixture,
-		ingress: ingress, cancel: cancel, serveDone: serveDone,
+		server: server, ingress: ingress,
+		address: listener.Addr().String(),
+		cancel:  cancel, serveDone: serveDone,
 	}
 	awaitContentCondition(t, "client ingress establishment", func() bool {
 		return ingress.Stats().EstablishedConnections == 1
@@ -673,6 +677,7 @@ func (harness *realContentClientHarness) stop(t testing.TB) {
 
 type scriptedContentHarness struct {
 	client     *Client
+	bulk       *SnapshotBulkClient
 	listener   net.Listener
 	cancel     context.CancelFunc
 	serverDone <-chan error
@@ -807,6 +812,9 @@ func (harness *scriptedContentHarness) stop(t testing.TB) {
 	harness.stopOnce.Do(func() {
 		if harness.client != nil {
 			_ = harness.client.Close()
+		}
+		if harness.bulk != nil {
+			_ = harness.bulk.Close()
 		}
 		harness.cancel()
 		_ = harness.listener.Close()

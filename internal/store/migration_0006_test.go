@@ -282,13 +282,22 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 	); err != nil {
 		return err
 	}
-	var tableSQL, indexSQL string
+	var (
+		tableSQL      string
+		indexSQL      string
+		auditTableSQL string
+		auditIndexes  [3]string
+	)
 	for _, target := range []struct {
 		name string
 		sql  *string
 	}{
 		{name: "replication_attestations", sql: &tableSQL},
 		{name: "replication_attestations_coverage", sql: &indexSQL},
+		{name: "audit_events", sql: &auditTableSQL},
+		{name: "audit_events_session_time", sql: &auditIndexes[0]},
+		{name: "audit_events_subject_time", sql: &auditIndexes[1]},
+		{name: "audit_events_event_result", sql: &auditIndexes[2]},
 	} {
 		if err := queryOneArgs(
 			legacy,
@@ -301,7 +310,12 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 			return err
 		}
 	}
-	var attestationCount, settledCount, watermarkCount int64
+	var (
+		attestationCount   int64
+		settledCount       int64
+		watermarkCount     int64
+		recoveryGeneration int64
+	)
 	if err := queryOne(
 		conn,
 		"SELECT count(*) FROM replication_attestations;",
@@ -329,12 +343,56 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 	); err != nil {
 		return err
 	}
+	if err := queryOne(
+		conn,
+		"SELECT coalesce(max(recovery_generation), 0) FROM consensus_state;",
+		func(stmt *sqlite.Stmt) {
+			recoveryGeneration = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return err
+	}
 	if attestationCount != 0 ||
 		settledCount != 0 ||
-		watermarkCount != 0 {
-		return errors.New("test downgrade would discard replication evidence")
+		watermarkCount != 0 ||
+		recoveryGeneration != 0 {
+		return errors.New(
+			"test downgrade would discard recovery or replication evidence",
+		)
 	}
 	for _, statement := range []string{
+		"DROP INDEX audit_events_recovery_boundary_session;",
+		"DROP INDEX audit_events_session_time;",
+		"DROP INDEX audit_events_subject_time;",
+		"DROP INDEX audit_events_event_result;",
+		"ALTER TABLE audit_events RENAME TO audit_events_v8;",
+		auditTableSQL,
+		`INSERT INTO audit_events(
+		    audit_id, session_id, source_kind, event_id, result_index,
+		    reporter_device_id, subject_device_id,
+		    subject_credential_epoch, actor_type, ipc_channel,
+		    action_code, outcome_code, subject, details_json,
+		    first_seen_at, last_seen_at, observation_count
+		)
+		SELECT audit_id, session_id, source_kind, event_id, result_index,
+		       reporter_device_id, subject_device_id,
+		       subject_credential_epoch, actor_type, ipc_channel,
+		       action_code, outcome_code, subject, details_json,
+		       first_seen_at, last_seen_at, observation_count
+		  FROM audit_events_v8
+		 WHERE source_kind <> 'recovery_boundary';`,
+		"DROP TABLE audit_events_v8;",
+		auditIndexes[0],
+		auditIndexes[1],
+		auditIndexes[2],
+	} {
+		if err := execute(conn, statement); err != nil {
+			return err
+		}
+	}
+	for _, statement := range []string{
+		"DROP TABLE initial_projection_rows;",
+		"DROP TABLE initial_projection_boundary;",
 		"DROP TABLE replication_watermark_observations;",
 		"DROP TABLE settled_nonvoter_state;",
 		"DROP INDEX replication_attestations_coverage;",

@@ -531,6 +531,7 @@ func acceptedApplyRequest(t *testing.T, proposal event.SignedEvent) ApplyRequest
 			EventID:          proposal.Proposal().EventID,
 			ResultIndex:      1,
 			ReporterDeviceID: proposal.Proposal().Origin.DeviceID(),
+			SubjectDeviceID:  proposal.Proposal().Origin.DeviceID(),
 			ActorType:        proposal.Proposal().Origin.ActorType(),
 			IPCChannel:       "agent",
 			ActionCode:       "task.created",
@@ -605,6 +606,7 @@ func rejectedApplyRequest(
 			EventID:          proposal.Proposal().EventID,
 			ResultIndex:      previous.ResultIndex + 1,
 			ReporterDeviceID: proposal.Proposal().Origin.DeviceID(),
+			SubjectDeviceID:  proposal.Proposal().Origin.DeviceID(),
 			ActorType:        proposal.Proposal().Origin.ActorType(),
 			IPCChannel:       "agent",
 			ActionCode:       "task.created",
@@ -834,6 +836,23 @@ func nextCheckpointApplyRequest(
 		logIndex,
 		appliedAt,
 	)
+	request.Audit = []AuditRecord{{
+		SessionID:        domain.UUIDv7(testSessionID),
+		SourceKind:       AuditAcceptedEvent,
+		EventID:          eventID,
+		ResultIndex:      previous.ResultIndex + 1,
+		ReporterDeviceID: proposal.Proposal().Origin.DeviceID(),
+		SubjectDeviceID:  proposal.Proposal().Origin.DeviceID(),
+		ActorType:        event.ActorDaemon,
+		IPCChannel:       "daemon",
+		ActionCode:       string(event.KindConsensusCheckpoint),
+		OutcomeCode:      "accepted",
+		Subject:          "session:" + testSessionID,
+		DetailsJSON:      []byte(`{}`),
+		FirstSeenAt:      appliedAt,
+		LastSeenAt:       appliedAt,
+		ObservationCount: 1,
+	}}
 	request.Checkpoint = &record
 	return request
 }

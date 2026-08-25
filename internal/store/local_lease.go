@@ -28,65 +28,84 @@ func (state LocalState) RearmLeaseDeadlines(
 		return ErrInvalidLocalState
 	}
 	return state.withImmediate(ctx, func(conn *sqlite.Conn) error {
-		var (
-			records []LeaseDeadlineRecord
-			rowErr  error
-		)
-		err := query(
+		return rearmLeaseDeadlines(
 			conn,
-			`SELECT lease_id, entity_version, ttl_seconds
-			   FROM leases
-			  WHERE status = 'active'
-			  ORDER BY lease_id;`,
-			func(stmt *sqlite.Stmt) {
-				if rowErr != nil {
-					return
-				}
-				version := stmt.ColumnInt64(1)
-				ttlSeconds := stmt.ColumnInt64(2)
-				if version < 1 ||
-					!domain.ValidUnsignedInteger(uint64(version)) ||
-					lease.ValidateRequestedTTL(
-						ttlSeconds,
-						lease.MinTTLSeconds,
-						lease.MaxTTLSeconds,
-					) != nil ||
-					ttlSeconds > math.MaxInt64/int64(time.Second) ||
-					monotonicNowNS >
-						math.MaxInt64-ttlSeconds*int64(time.Second) {
-					rowErr = ErrLocalStateIntegrity
-					return
-				}
-				record := LeaseDeadlineRecord{
-					LeaseID:       domain.UUIDv7(stmt.ColumnText(0)),
-					EntityVersion: uint64(version),
-					OriginBootID:  originBootID,
-					MonotonicDeadlineNS: monotonicNowNS +
-						ttlSeconds*int64(time.Second),
-					DisplayDeadlineAt: domain.Timestamp(
-						wallNow.Add(
-							time.Duration(ttlSeconds) * time.Second,
-						).UTC().Format(time.RFC3339Nano),
-					),
-				}
-				if record.Validate() != nil {
-					rowErr = ErrLocalStateIntegrity
-					return
-				}
-				records = append(records, record)
-			},
+			originBootID,
+			wallNow,
+			monotonicNowNS,
 		)
-		if err != nil {
-			return err
-		}
-		if rowErr != nil {
-			return rowErr
-		}
-		if err := execute(conn, "DELETE FROM lease_deadlines;"); err != nil {
-			return err
-		}
-		return writeLeaseDeadlines(conn, records, nil)
 	})
+}
+
+func rearmLeaseDeadlines(
+	conn *sqlite.Conn,
+	originBootID domain.UUIDv7,
+	wallNow time.Time,
+	monotonicNowNS int64,
+) error {
+	if conn == nil ||
+		!originBootID.Valid() ||
+		monotonicNowNS < 0 {
+		return ErrInvalidLocalState
+	}
+	var (
+		records []LeaseDeadlineRecord
+		rowErr  error
+	)
+	err := query(
+		conn,
+		`SELECT lease_id, entity_version, ttl_seconds
+		   FROM leases
+		  WHERE status = 'active'
+		  ORDER BY lease_id;`,
+		func(stmt *sqlite.Stmt) {
+			if rowErr != nil {
+				return
+			}
+			version := stmt.ColumnInt64(1)
+			ttlSeconds := stmt.ColumnInt64(2)
+			if version < 1 ||
+				!domain.ValidUnsignedInteger(uint64(version)) ||
+				lease.ValidateRequestedTTL(
+					ttlSeconds,
+					lease.MinTTLSeconds,
+					lease.MaxTTLSeconds,
+				) != nil ||
+				ttlSeconds > math.MaxInt64/int64(time.Second) ||
+				monotonicNowNS >
+					math.MaxInt64-ttlSeconds*int64(time.Second) {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			record := LeaseDeadlineRecord{
+				LeaseID:       domain.UUIDv7(stmt.ColumnText(0)),
+				EntityVersion: uint64(version),
+				OriginBootID:  originBootID,
+				MonotonicDeadlineNS: monotonicNowNS +
+					ttlSeconds*int64(time.Second),
+				DisplayDeadlineAt: domain.Timestamp(
+					wallNow.Add(
+						time.Duration(ttlSeconds) * time.Second,
+					).UTC().Format(time.RFC3339Nano),
+				),
+			}
+			if record.Validate() != nil {
+				rowErr = ErrLocalStateIntegrity
+				return
+			}
+			records = append(records, record)
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if rowErr != nil {
+		return rowErr
+	}
+	if err := execute(conn, "DELETE FROM lease_deadlines;"); err != nil {
+		return err
+	}
+	return writeLeaseDeadlines(conn, records, nil)
 }
 
 // NextLeaseDeadline returns the earliest active same-boot deadline. Any

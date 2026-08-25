@@ -140,15 +140,69 @@ func TestRootRejectsNoncanonicalUnknownAndInvalidFields(t *testing.T) {
 	tests := map[string]func(*RootInput){
 		"artifact": func(value *RootInput) { value.ArtifactID = "../snapshot" },
 		"session":  func(value *RootInput) { value.SessionID = "" },
-		"result":   func(value *RootInput) { value.ResultIndex = 0 },
+		"recovery generation": func(value *RootInput) {
+			value.RecoveryGeneration = MaxRecoveryGeneration + 1
+		},
+		"result": func(value *RootInput) { value.ResultIndex = 0 },
 		"chain": func(value *RootInput) {
 			value.ChainIndex = value.ResultIndex + 1
 		},
 		"authority": func(value *RootInput) { value.AuthorityVersion = 0 },
 		"encoding":  func(value *RootInput) { value.ContentEncoding = "br" },
 		"records":   func(value *RootInput) { value.RecordCount = 0 },
-		"pages":     func(value *RootInput) { value.DescriptorPageCount = 0 },
-		"chunks":    func(value *RootInput) { value.ChunkCount = 0 },
+		"more records than expanded bytes": func(value *RootInput) {
+			value.RecordCount = value.ExpandedBytes + 1
+		},
+		"more results than records": func(value *RootInput) {
+			value.ResultIndex = value.RecordCount + 1
+		},
+		"more events than records": func(value *RootInput) {
+			value.ChainIndex = value.RecordCount + 1
+			value.ResultIndex = value.ChainIndex
+		},
+		"record quota": func(value *RootInput) {
+			value.RecordCount = MaxArtifactRecordCount + 1
+			value.ExpandedBytes = MaxArtifactExpandedBytes
+		},
+		"expanded quota": func(value *RootInput) {
+			value.ExpandedBytes = MaxArtifactExpandedBytes + 1
+		},
+		"compressed quota": func(value *RootInput) {
+			value.CompressedBytes = MaxArtifactCompressedBytes + 1
+		},
+		"pages": func(value *RootInput) { value.DescriptorPageCount = 0 },
+		"page quota": func(value *RootInput) {
+			value.DescriptorPageCount = MaxDescriptorPageCount + 1
+			value.ChunkCount = value.DescriptorPageCount
+		},
+		"chunks": func(value *RootInput) { value.ChunkCount = 0 },
+		"chunk quota": func(value *RootInput) {
+			value.ChunkCount = MaxArtifactChunkCount + 1
+			value.DescriptorPageCount = MaxDescriptorPageCount + 1
+			value.CompressedBytes = MaxArtifactCompressedBytes
+			value.ExpandedBytes = MaxArtifactExpandedBytes
+		},
+		"more chunks than bytes": func(value *RootInput) {
+			value.ChunkCount = value.CompressedBytes + 1
+			value.DescriptorPageCount = 1
+		},
+		"identity totals differ": func(value *RootInput) {
+			value.ContentEncoding = EncodingIdentity
+		},
+		"page count does not cover chunks": func(value *RootInput) {
+			value.DescriptorPageCount = 2
+		},
+		"more chunks than records": func(value *RootInput) {
+			value.ChunkCount = value.RecordCount + 1
+		},
+		"compressed total exceeds chunk capacity": func(value *RootInput) {
+			value.ChunkCount = 1
+			value.CompressedBytes = MaxChunkCompressedBytes + 1
+		},
+		"expanded total exceeds chunk capacity": func(value *RootInput) {
+			value.ChunkCount = 1
+			value.ExpandedBytes = MaxChunkExpandedBytes + 1
+		},
 	}
 	for name, mutate := range tests {
 		name, mutate := name, mutate

@@ -27,7 +27,9 @@ jobs:
       - name: Test
         env:
           CODECOMM_REQUIRE_DAEMON_MESH: "1"
-        run: go test ./...
+        # Bound both package processes and same-process SQLite pools. The mesh
+        # remains concurrent internally but is not starved by every package.
+        run: go test -p 2 -parallel 2 -timeout 20m ./...
       - name: Vet
         run: go vet ./...
       - name: Staticcheck
@@ -45,7 +47,10 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - run: go test -race ./...
+      # Package binaries do not share allocator state. Serialize them under the
+      # race detector and bound same-process independent SQLite pools while
+      # preserving each store's explicit concurrent operations.
+      - run: go test -race -p 1 -parallel 2 -timeout 20m ./...
 
   native-multicast:
     name: Native multicast ${{ matrix.os }}

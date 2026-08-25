@@ -13,24 +13,26 @@ import (
 func TestDescriptorPageRoundTripAndSequence(t *testing.T) {
 	t.Parallel()
 
-	descriptors := []ChunkDescriptor{
-		{
-			ChunkIndex:       0,
-			CompressedLength: 31,
-			ExpandedLength:   41,
-			SHA256:           sha256.Sum256([]byte("chunk-0")),
-		},
-		{
-			ChunkIndex:       1,
-			CompressedLength: 37,
-			ExpandedLength:   43,
-			SHA256:           sha256.Sum256([]byte("chunk-1")),
-		},
+	descriptors := make(
+		[]ChunkDescriptor,
+		MaxDescriptorsPerPage+1,
+	)
+	for index := range descriptors {
+		descriptors[index] = ChunkDescriptor{
+			ChunkIndex:       uint64(index),
+			CompressedLength: 1,
+			ExpandedLength:   1,
+			SHA256: sha256.Sum256([]byte{
+				byte(index),
+				byte(index >> 8),
+				byte(index >> 16),
+			}),
+		}
 	}
 	first, err := NewDescriptorPage(DescriptorPageInput{
 		ArtifactID:  "artifact",
 		PageIndex:   0,
-		Descriptors: descriptors[:1],
+		Descriptors: descriptors[:MaxDescriptorsPerPage],
 	})
 	if err != nil {
 		t.Fatalf("NewDescriptorPage(first): %v", err)
@@ -39,7 +41,7 @@ func TestDescriptorPageRoundTripAndSequence(t *testing.T) {
 		ArtifactID:       "artifact",
 		PageIndex:        1,
 		PreviousPageHash: first.Hash(),
-		Descriptors:      descriptors[1:],
+		Descriptors:      descriptors[MaxDescriptorsPerPage:],
 	})
 	if err != nil {
 		t.Fatalf("NewDescriptorPage(second): %v", err)
@@ -49,16 +51,18 @@ func TestDescriptorPageRoundTripAndSequence(t *testing.T) {
 		t.Fatalf("ParseDescriptorPage(): %v", err)
 	}
 	if parsed.Hash() != second.Hash() ||
-		parsed.Input().Descriptors[0] != descriptors[1] {
+		parsed.Input().Descriptors[0] !=
+			descriptors[MaxDescriptorsPerPage] {
 		t.Fatalf("parsed page = %#v, want %#v", parsed.Input(), second.Input())
 	}
 
 	rootInput, privateKey, _ := testRootInput(t)
 	rootInput.ArtifactID = "artifact"
 	rootInput.ContentEncoding = EncodingIdentity
-	rootInput.CompressedBytes = 68
-	rootInput.ExpandedBytes = 84
-	rootInput.ChunkCount = 2
+	rootInput.CompressedBytes = uint64(len(descriptors))
+	rootInput.ExpandedBytes = uint64(len(descriptors))
+	rootInput.RecordCount = uint64(len(descriptors))
+	rootInput.ChunkCount = uint64(len(descriptors))
 	rootInput.DescriptorPageCount = 2
 	rootInput.FinalDescriptorPageHash = second.Hash()
 	unsigned, err := NewUnsignedRoot(rootInput)

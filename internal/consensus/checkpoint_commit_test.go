@@ -833,6 +833,25 @@ func openCheckpointCommitNode(
 	return openCheckpointCommitNodeWithSigner(t, configure, nil)
 }
 
+func openCheckpointCommitNodeWithInitial(
+	t *testing.T,
+	configureOrigin func(*checkpointCommitOrigin),
+	configureInitial func(*store.InitialState),
+) (
+	*SingleNode,
+	*checkpointCommitOrigin,
+	ed25519.PrivateKey,
+	domain.DeviceID,
+) {
+	t.Helper()
+	return openCheckpointCommitNodeWithSignerAndInitial(
+		t,
+		configureOrigin,
+		nil,
+		configureInitial,
+	)
+}
+
 func openCheckpointCommitNodeWithSigner(
 	t *testing.T,
 	configure func(*checkpointCommitOrigin),
@@ -847,9 +866,35 @@ func openCheckpointCommitNodeWithSigner(
 	domain.DeviceID,
 ) {
 	t.Helper()
+	return openCheckpointCommitNodeWithSignerAndInitial(
+		t,
+		configure,
+		sign,
+		nil,
+	)
+}
+
+func openCheckpointCommitNodeWithSignerAndInitial(
+	t *testing.T,
+	configure func(*checkpointCommitOrigin),
+	sign func(
+		context.Context,
+		domain.Checkpoint,
+	) (store.Signature, error),
+	configureInitial func(*store.InitialState),
+) (
+	*SingleNode,
+	*checkpointCommitOrigin,
+	ed25519.PrivateKey,
+	domain.DeviceID,
+) {
+	t.Helper()
 
 	root := t.TempDir()
 	initial, privateKey, deviceID := nodeTestInitialState(t)
+	if configureInitial != nil {
+		configureInitial(&initial)
+	}
 	origin := &checkpointCommitOrigin{
 		deviceID:     deviceID,
 		bootID:       nodeTestBootID1,

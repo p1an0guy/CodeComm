@@ -107,6 +107,9 @@ func (client *Client) ReplicationAcknowledgement(
 		!domain.ValidUnsignedInteger(atResult) {
 		return replication.Acknowledgement{}, ErrInvalidClient
 	}
+	if err := ctx.Err(); err != nil {
+		return replication.Acknowledgement{}, err
+	}
 	client.operationMu.Lock()
 	defer client.operationMu.Unlock()
 

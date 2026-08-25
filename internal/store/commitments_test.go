@@ -149,6 +149,7 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 			stateDigest,
 		),
 		RecoveryAuthorizationJSON: []byte(`{"kind":"test-recovery"}`),
+		ObservedAt:                "2026-08-10T12:00:02Z",
 		Predecessor:               predecessor,
 		DigestVersion:             1,
 		ProjectionSchemaVersion:   1,
@@ -194,6 +195,17 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 	if got != want {
 		t.Fatalf("successor heads = %+v, want %+v", got, want)
 	}
+	assertRecoveryBoundaryAudit(t, store, successor, genesisDigest)
+	if _, err := store.InstallSuccessor(
+		context.Background(),
+		successor,
+	); !errors.Is(err, ErrApplyConflict) {
+		t.Fatalf(
+			"repeat InstallSuccessor() error = %v, want ErrApplyConflict",
+			err,
+		)
+	}
+	assertRecoveryBoundaryAudit(t, store, successor, genesisDigest)
 	if revision := store.AdmissionRevision(); revision != 5 {
 		t.Fatalf("successor admission revision = %d, want 5", revision)
 	}
@@ -258,6 +270,7 @@ func TestCommitmentsSuccessorBoundaryRetainsDenseIndicesAndReopens(
 		t.Fatalf("reopened heads = %+v, want %+v", reopenedHeads, want)
 	}
 	commitmentAssertDigest(t, reopened, stateDigest, "reopened successor boundary")
+	assertRecoveryBoundaryAudit(t, reopened, successor, genesisDigest)
 
 	oldGenerationDuplicate := first
 	oldGenerationDuplicate.RecoveryGeneration = 0
@@ -433,6 +446,7 @@ func TestCommitmentsSuccessorGenesisBindingFailsClosed(t *testing.T) {
 			emptyStateDigest,
 		),
 		RecoveryAuthorizationJSON: []byte(`{"kind":"test-recovery"}`),
+		ObservedAt:                "2026-08-10T12:00:02Z",
 		Predecessor:               predecessor,
 		DigestVersion:             1,
 		ProjectionSchemaVersion:   1,
@@ -514,6 +528,7 @@ func TestCommitmentsSuccessorGenesisBindingFailsClosed(t *testing.T) {
 		"genesis_records": 1,
 		"tasks":           0,
 	})
+	assertRecoveryBoundaryAuditCount(t, store, 0)
 }
 
 func TestCommitmentsDuplicateAdvancesWatermarkAndCollisionDoesNotMutate(
@@ -1290,6 +1305,128 @@ func commitmentConsensus(t *testing.T, store *Store) consensusState {
 	return result
 }
 
+func assertRecoveryBoundaryAudit(
+	t *testing.T,
+	store *Store,
+	successor SuccessorState,
+	genesisDigest Digest,
+) {
+	t.Helper()
+	wantDetails := commitmentCanonicalJSON(t, map[string]any{
+		"genesis_digest":      fmt.Sprintf("%x", genesisDigest),
+		"recovery_generation": successor.RecoveryGeneration,
+	})
+	err := store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			var (
+				count            int64
+				actionCode       string
+				outcomeCode      string
+				subject          string
+				details          []byte
+				firstSeen        string
+				lastSeen         string
+				nullBindings     bool
+				actorAndChannel  bool
+				observationCount int64
+			)
+			if err := queryOneArgs(
+				conn,
+				`SELECT count(*), action_code, outcome_code, subject,
+				        details_json, first_seen_at, last_seen_at,
+				        event_id IS NULL
+				          AND result_index IS NULL
+				          AND reporter_device_id IS NULL
+				          AND subject_device_id IS NULL
+				          AND subject_credential_epoch IS NULL,
+				        actor_type = 'human' AND ipc_channel = 'operator',
+				        observation_count
+				   FROM audit_events
+				  WHERE source_kind = 'recovery_boundary'
+				    AND session_id = ?1;`,
+				[]any{string(successor.SessionID)},
+				func(stmt *sqlite.Stmt) {
+					count = stmt.ColumnInt64(0)
+					actionCode = stmt.ColumnText(1)
+					outcomeCode = stmt.ColumnText(2)
+					subject = stmt.ColumnText(3)
+					details = bytes.Clone([]byte(stmt.ColumnText(4)))
+					firstSeen = stmt.ColumnText(5)
+					lastSeen = stmt.ColumnText(6)
+					nullBindings = stmt.ColumnBool(7)
+					actorAndChannel = stmt.ColumnBool(8)
+					observationCount = stmt.ColumnInt64(9)
+				},
+			); err != nil {
+				return err
+			}
+			if count != 1 ||
+				actionCode != "cluster.quorum_recovered" ||
+				outcomeCode != "accepted" ||
+				subject != "session:"+string(successor.SessionID) ||
+				!bytes.Equal(details, wantDetails) ||
+				firstSeen != string(successor.ObservedAt) ||
+				lastSeen != string(successor.ObservedAt) ||
+				!nullBindings ||
+				!actorAndChannel ||
+				observationCount != 1 {
+				return fmt.Errorf(
+					"recovery audit mismatch: count=%d action=%q outcome=%q subject=%q details=%s first=%q last=%q null=%t actor=%t observations=%d",
+					count,
+					actionCode,
+					outcomeCode,
+					subject,
+					details,
+					firstSeen,
+					lastSeen,
+					nullBindings,
+					actorAndChannel,
+					observationCount,
+				)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertRecoveryBoundaryAuditCount(
+	t *testing.T,
+	store *Store,
+	want int64,
+) {
+	t.Helper()
+	if err := store.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			var got int64
+			if err := queryOne(
+				conn,
+				`SELECT count(*) FROM audit_events
+				  WHERE source_kind = 'recovery_boundary';`,
+				func(stmt *sqlite.Stmt) {
+					got = stmt.ColumnInt64(0)
+				},
+			); err != nil {
+				return err
+			}
+			if got != want {
+				return fmt.Errorf(
+					"recovery audit row count = %d, want %d",
+					got,
+					want,
+				)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func commitmentAssertOnlyWatermarkChanged(
 	t *testing.T,
 	before, after consensusState,
@@ -1428,6 +1565,38 @@ func commitmentAssertReopenFails(
 	}
 	if !errors.Is(err, want) {
 		t.Fatalf("Open(tampered store) error = %v, want %v", err, want)
+	}
+}
+
+func commitmentAssertReopenScrubFails(
+	t *testing.T,
+	store *Store,
+	path string,
+	want error,
+) {
+	t.Helper()
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(tampered store): %v", err)
+	}
+	reopened, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open(tampered historical state): %v", err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close(reopened): %v", err)
+		}
+	}()
+	err = reopened.VerifyCommitmentHistory(context.Background())
+	if err == nil {
+		t.Fatalf("VerifyCommitmentHistory() succeeded, want %v", want)
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf(
+			"VerifyCommitmentHistory() error = %v, want %v",
+			err,
+			want,
+		)
 	}
 }
 

@@ -641,6 +641,7 @@ func TestControlFileSuccessorInstallsPendingRows(t *testing.T) {
 			postTransformDigest,
 		),
 		RecoveryAuthorizationJSON: []byte(`{"kind":"test-recovery"}`),
+		ObservedAt:                "2026-08-10T12:00:02Z",
 		Predecessor:               predecessor,
 		Projections:               successorRows,
 		DigestVersion:             1,

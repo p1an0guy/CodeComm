@@ -90,10 +90,11 @@ func TestExportReplicationWatermarkValidatesCapabilityAndContext(
 	t *testing.T,
 ) {
 	fixture := newResultRangeFixture(t)
-	if _, err := fixture.store.ExportReplicationWatermark(
-		nil,
-		fixture.authorityDeviceID,
-	); !errors.Is(err, ErrInvalidOptions) {
+	//lint:ignore SA1012 This test verifies the explicit nil-context contract.
+	if _, err := fixture.store.ExportReplicationWatermark(nil, fixture.authorityDeviceID); !errors.Is(
+		err,
+		ErrInvalidOptions,
+	) {
 		t.Fatalf("nil context error = %v", err)
 	}
 	if _, err := fixture.store.ExportReplicationWatermark(

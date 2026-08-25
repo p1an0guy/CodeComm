@@ -204,7 +204,6 @@ func TestJoinerRealTLSRejectsUnpinnedInviter(t *testing.T) {
 	if len(service.snapshot()) != 0 {
 		t.Fatal("unpinned inviter reached pairing HTTP service")
 	}
-	cancelServer()
 	if err := dialer.wait(t); !errors.Is(err, pairinghttp.ErrTLSBinding) {
 		t.Fatalf(
 			"pairing server error = %v, want %v",

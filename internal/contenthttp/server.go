@@ -31,15 +31,16 @@ const (
 	proposalHopHeader = "CodeComm-Proposal-Hop"
 	proposalHopOnce   = "1"
 
-	HeaderMaxBytes         = 32 << 10
-	ResponseMaxBytes       = 1 << 20
-	ControlStreamsMax      = 32
-	ActiveHandlersMax      = 128
-	ReplicationHandlersMax = 1
-	RequestHeaderTimeout   = 10 * time.Second
-	HandlerTimeout         = 120 * time.Second
-	ConnectionIdle         = 120 * time.Second
-	StreamNoProgress       = 30 * time.Second
+	HeaderMaxBytes           = 32 << 10
+	ResponseMaxBytes         = 1 << 20
+	ControlStreamsMax        = 32
+	ActiveHandlersMax        = 128
+	ReplicationHandlersMax   = 1
+	RequestHeaderTimeout     = 10 * time.Second
+	HandlerTimeout           = 120 * time.Second
+	ConnectionIdle           = 120 * time.Second
+	StreamNoProgress         = 30 * time.Second
+	SnapshotTransferLifetime = 30 * time.Minute
 )
 
 var (
@@ -62,14 +63,16 @@ var (
 
 // Server serves the fixed inbound V1 content-control routes.
 type Server struct {
-	service             Service
-	http2               *http2.Server
-	handlers            chan struct{}
-	replicationHandlers chan struct{}
-	control             *controlRegistry
-	headerTimeout       time.Duration
-	handlerTimeout      time.Duration
-	streamNoProgress    time.Duration
+	service                  Service
+	snapshots                SnapshotService
+	http2                    *http2.Server
+	handlers                 chan struct{}
+	replicationHandlers      chan struct{}
+	control                  *controlRegistry
+	headerTimeout            time.Duration
+	handlerTimeout           time.Duration
+	streamNoProgress         time.Duration
+	snapshotTransferLifetime time.Duration
 }
 
 // New constructs the fixed V1 content-control HTTP/2 server.
@@ -87,8 +90,10 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 	if err != nil {
 		return nil, ErrInvalidOptions
 	}
+	snapshots, _ := service.(SnapshotService)
 	return &Server{
-		service: service,
+		service:   service,
+		snapshots: snapshots,
 		http2: &http2.Server{
 			MaxConcurrentStreams:         ControlStreamsMax,
 			MaxDecoderHeaderTableSize:    4 << 10,
@@ -101,12 +106,13 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 			MaxUploadBufferPerConnection: 1 << 16,
 			MaxUploadBufferPerStream:     event.MaxEventBytes,
 		},
-		handlers:            make(chan struct{}, activeHandlers),
-		replicationHandlers: make(chan struct{}, ReplicationHandlersMax),
-		control:             control,
-		headerTimeout:       RequestHeaderTimeout,
-		handlerTimeout:      HandlerTimeout,
-		streamNoProgress:    StreamNoProgress,
+		handlers:                 make(chan struct{}, activeHandlers),
+		replicationHandlers:      make(chan struct{}, ReplicationHandlersMax),
+		control:                  control,
+		headerTimeout:            RequestHeaderTimeout,
+		handlerTimeout:           HandlerTimeout,
+		streamNoProgress:         StreamNoProgress,
+		snapshotTransferLifetime: SnapshotTransferLifetime,
 	}, nil
 }
 
@@ -116,7 +122,7 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 func (server *Server) ServeAuthenticatedConn(
 	ctx context.Context,
 	connection *tls.Conn,
-) error {
+) (resultErr error) {
 	if server == nil ||
 		server.service == nil ||
 		server.http2 == nil ||
@@ -126,6 +132,7 @@ func (server *Server) ServeAuthenticatedConn(
 		server.headerTimeout <= 0 ||
 		server.handlerTimeout <= 0 ||
 		server.streamNoProgress <= 0 ||
+		server.snapshotTransferLifetime <= 0 ||
 		ctx == nil ||
 		connection == nil {
 		return ErrInvalidConnection
@@ -165,20 +172,36 @@ func (server *Server) ServeAuthenticatedConn(
 		}
 	}()
 
-	handler := newConnectionHandler(server, metadata, cancel)
-	registered := false
+	baseServer := &http.Server{
+		ReadTimeout:       server.handlerTimeout,
+		ReadHeaderTimeout: server.headerTimeout,
+		IdleTimeout:       ConnectionIdle,
+		MaxHeaderBytes:    HeaderMaxBytes,
+	}
+	connectionHTTP2, startGracefulShutdown, err :=
+		newContentHTTP2Connection(server.http2, baseServer)
+	if err != nil {
+		cancel()
+		close(serveDone)
+		<-watcherDone
+		return err
+	}
+	handler := newConnectionHandler(
+		server,
+		metadata,
+		cancel,
+		startGracefulShutdown,
+	)
 	defer func() {
 		handler.close()
-		if registered {
-			server.control.unregister(handler)
-		}
+		resultErr = errors.Join(
+			resultErr,
+			handler.closeSnapshotTransfer(),
+		)
+		server.control.unregister(handler)
 		close(serveDone)
 		<-watcherDone
 	}()
-	if err := server.control.register(handler); err != nil {
-		return err
-	}
-	registered = true
 	deadlineConnection, err := newDeadlineConn(
 		connection,
 		server.headerTimeout,
@@ -188,20 +211,39 @@ func (server *Server) ServeAuthenticatedConn(
 	if err != nil {
 		return err
 	}
-	server.http2.ServeConn(deadlineConnection, &http2.ServeConnOpts{
-		Context: connectionContext,
-		BaseConfig: &http.Server{
-			ReadTimeout:       server.handlerTimeout,
-			ReadHeaderTimeout: server.headerTimeout,
-			IdleTimeout:       ConnectionIdle,
-			MaxHeaderBytes:    HeaderMaxBytes,
-		},
-		Handler: handler,
+	connectionHTTP2.ServeConn(deadlineConnection, &http2.ServeConnOpts{
+		Context:    connectionContext,
+		BaseConfig: baseServer,
+		Handler:    handler,
 	})
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func newContentHTTP2Connection(
+	template *http2.Server,
+	base *http.Server,
+) (*http2.Server, func(), error) {
+	if template == nil || base == nil {
+		return nil, nil, ErrInvalidConnection
+	}
+	connection := *template
+	if err := http2.ConfigureServer(base, &connection); err != nil {
+		return nil, nil, fmt.Errorf(
+			"%w: configure HTTP/2 connection: %w",
+			ErrInvalidConnection,
+			err,
+		)
+	}
+	var shutdown sync.Once
+	startGracefulShutdown := func() {
+		shutdown.Do(func() {
+			_ = base.Shutdown(context.Background())
+		})
+	}
+	return &connection, startGracefulShutdown, nil
 }
 
 func contentConnectionBinding(
@@ -230,13 +272,24 @@ type connectionHandler struct {
 	server *Server
 	peer   transport.AuthenticatedPeer
 
+	registrationMu sync.Mutex
+	registered     bool
+
+	snapshotMu       sync.Mutex
+	snapshotTransfer SnapshotTransfer
+	snapshotScope    SnapshotRequestScope
+	snapshotTimer    *time.Timer
+
 	mu          sync.Mutex
 	active      sync.WaitGroup
 	activeCount int
+	role        contentConnectionRole
+	registering bool
 	accepting   bool
 	closing     bool
 	stop        context.CancelFunc
 	stopOnce    sync.Once
+	drain       func()
 }
 
 func (handler *connectionHandler) ServeHTTP(
@@ -250,46 +303,44 @@ func (handler *connectionHandler) ServeHTTP(
 		writeProblem(writer, http.StatusInternalServerError, problemInternal)
 		return
 	}
-	switch handler.begin() {
-	case handlerClosed:
-		return
-	case handlerDraining:
-		writer.Header().Set("Retry-After", "1")
-		writeProblem(
-			writer,
-			http.StatusServiceUnavailable,
-			problemConnectionDraining,
-		)
-		return
-	case handlerAccepted:
-	}
-	defer handler.end()
-
-	allowed, retryAfter, rateErr := handler.server.control.consume(
-		handler.peer.DeviceID,
-	)
-	if rateErr != nil {
-		writeProblem(
-			writer,
-			http.StatusServiceUnavailable,
-			problemUnavailable,
-		)
+	if !validRequestTransport(request, handler.peer) {
+		writeProblem(writer, http.StatusBadRequest, problemInvalidTransport)
 		return
 	}
-	if !allowed {
-		retrySeconds := max(
-			int64(1),
-			int64((retryAfter+time.Second-1)/time.Second),
-		)
-		writer.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
-		writeProblem(
-			writer,
-			http.StatusTooManyRequests,
-			problemRateLimited,
-		)
+	snapshot, snapshotRoute := snapshotRequestTarget(request)
+	requestRole := contentConnectionControl
+	if snapshotRoute && snapshot.kind != snapshotTargetLatest {
+		requestRole = contentConnectionBulk
+	}
+	if requestRole == contentConnectionControl {
+		select {
+		case handler.server.handlers <- struct{}{}:
+			defer func() { <-handler.server.handlers }()
+		default:
+			writeProblem(
+				writer,
+				http.StatusServiceUnavailable,
+				problemCapacity,
+			)
+			return
+		}
+	}
+	registeredRole, registered, admission := handler.beginRequest()
+	if !handler.acceptRequestAdmission(writer, admission) {
 		return
 	}
-
+	responseWriter := &connectionResponseWriter{
+		ResponseWriter: writer,
+		handler:        handler,
+	}
+	writer = responseWriter
+	defer handler.endResponse(writer)
+	if requestRole == contentConnectionControl ||
+		registered && registeredRole != requestRole {
+		if !handler.consumeControlRate(writer) {
+			return
+		}
+	}
 	if err := transport.ReauthorizeAuthenticatedPeer(request.Context()); err != nil {
 		switch {
 		case errors.Is(err, transport.ErrPeerAuthorizationDenied):
@@ -303,42 +354,222 @@ func (handler *connectionHandler) ServeHTTP(
 		}
 		return
 	}
-	select {
-	case handler.server.handlers <- struct{}{}:
-		defer func() { <-handler.server.handlers }()
-	default:
-		writeProblem(writer, http.StatusServiceUnavailable, problemCapacity)
-		return
-	}
-	if !validRequestTransport(request, handler.peer) {
-		writeProblem(writer, http.StatusBadRequest, problemInvalidTransport)
-		return
-	}
 	if !validRequestPath(request) {
 		writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 		return
 	}
-	switch request.URL.Path {
-	case ReplicationPath, ReplicationAcknowledgementPath:
-	case SessionPath, PeersPath, EventsPath:
+	switch {
+	case request.URL.Path == ReplicationPath,
+		request.URL.Path == ReplicationAcknowledgementPath:
+	case request.URL.Path == SessionPath,
+		request.URL.Path == PeersPath,
+		request.URL.Path == EventsPath:
 		if !validRequestTarget(request) {
 			writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 			return
 		}
+	case snapshotRoute:
 	default:
 		writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 		return
 	}
-	switch request.URL.Path {
-	case SessionPath, PeersPath:
-		handler.serveRead(writer, request)
-	case EventsPath:
-		handler.serveEvent(writer, request)
-	case ReplicationPath:
-		handler.serveReplication(writer, request)
-	case ReplicationAcknowledgementPath:
-		handler.serveReplicationAcknowledgement(writer, request)
+	if err := handler.ensureConnectionRole(requestRole); err != nil {
+		switch {
+		case errors.Is(err, errConnectionRouteMismatch):
+			writeProblem(
+				writer,
+				http.StatusNotFound,
+				problemRouteNotFound,
+			)
+			return
+		case errors.Is(err, ErrControlConnectionSuperseded):
+			handler.closeAfterResponse(writer)
+			writer.Header().Set("Retry-After", "1")
+			writeProblem(
+				writer,
+				http.StatusServiceUnavailable,
+				problemConnectionDraining,
+			)
+		case errors.Is(err, ErrControlConnectionCapacity),
+			errors.Is(err, ErrBulkConnectionCapacity):
+			handler.closeAfterResponse(writer)
+			writer.Header().Set("Retry-After", "1")
+			writeProblem(
+				writer,
+				http.StatusServiceUnavailable,
+				problemCapacity,
+			)
+		default:
+			handler.closeAfterResponse(writer)
+			writeProblem(
+				writer,
+				http.StatusServiceUnavailable,
+				problemUnavailable,
+			)
+		}
+		return
 	}
+
+	switch {
+	case request.URL.Path == SessionPath,
+		request.URL.Path == PeersPath:
+		handler.serveRead(writer, request)
+	case request.URL.Path == EventsPath:
+		handler.serveEvent(writer, request)
+	case request.URL.Path == ReplicationPath:
+		handler.serveReplication(writer, request)
+	case request.URL.Path == ReplicationAcknowledgementPath:
+		handler.serveReplicationAcknowledgement(writer, request)
+	case snapshotRoute:
+		handler.serveSnapshot(writer, request, snapshot)
+	}
+}
+
+type connectionResponseWriter struct {
+	http.ResponseWriter
+	handler     *connectionHandler
+	wroteHeader bool
+}
+
+func (writer *connectionResponseWriter) WriteHeader(status int) {
+	if writer == nil || writer.ResponseWriter == nil || writer.wroteHeader {
+		return
+	}
+	writer.handler.prepareResponse(writer.ResponseWriter)
+	writer.wroteHeader = true
+	writer.ResponseWriter.WriteHeader(status)
+}
+
+func (writer *connectionResponseWriter) Write(content []byte) (int, error) {
+	if writer == nil || writer.ResponseWriter == nil {
+		return 0, http.ErrAbortHandler
+	}
+	if !writer.wroteHeader {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return writer.ResponseWriter.Write(content)
+}
+
+func (writer *connectionResponseWriter) Unwrap() http.ResponseWriter {
+	if writer == nil {
+		return nil
+	}
+	return writer.ResponseWriter
+}
+
+func (handler *connectionHandler) admitRequest(
+	writer http.ResponseWriter,
+) bool {
+	return handler.acceptRequestAdmission(writer, handler.begin())
+}
+
+func (handler *connectionHandler) acceptRequestAdmission(
+	writer http.ResponseWriter,
+	admission handlerAdmission,
+) bool {
+	switch admission {
+	case handlerClosed, handlerDraining:
+		handler.closeAfterResponse(writer)
+		writer.Header().Set("Retry-After", "1")
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemConnectionDraining,
+		)
+		return false
+	case handlerBusy:
+		writer.Header().Set("Retry-After", "1")
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemBulkCapacity,
+		)
+		return false
+	case handlerRegistering:
+		writer.Header().Set("Retry-After", "1")
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemConnectionRegistrationCapacity,
+		)
+		return false
+	case handlerAccepted:
+		return true
+	default:
+		writeProblem(writer, http.StatusInternalServerError, problemInternal)
+		return false
+	}
+}
+
+func (handler *connectionHandler) registeredConnectionRole() (
+	contentConnectionRole,
+	bool,
+) {
+	if handler == nil {
+		return contentConnectionUnbound, false
+	}
+	handler.registrationMu.Lock()
+	defer handler.registrationMu.Unlock()
+	if !handler.registered {
+		return contentConnectionUnbound, false
+	}
+	return handler.connectionRole(), true
+}
+
+func (handler *connectionHandler) ensureConnectionRole(
+	role contentConnectionRole,
+) error {
+	if handler == nil || handler.server == nil ||
+		handler.server.control == nil {
+		return errControlStateUnavailable
+	}
+	handler.registrationMu.Lock()
+	defer handler.registrationMu.Unlock()
+	if err := handler.bindConnectionRole(role); err != nil {
+		return err
+	}
+	if handler.registered {
+		return nil
+	}
+	if err := handler.server.control.register(handler); err != nil {
+		return err
+	}
+	handler.registered = true
+	handler.finishRegistration()
+	return nil
+}
+
+func (handler *connectionHandler) consumeControlRate(
+	writer http.ResponseWriter,
+) bool {
+	allowed, retryAfter, err := handler.server.control.consumeRequest(
+		handler.peer.DeviceID,
+	)
+	if err != nil {
+		writeProblem(
+			writer,
+			http.StatusServiceUnavailable,
+			problemUnavailable,
+		)
+		return false
+	}
+	if allowed {
+		return true
+	}
+	retrySeconds := max(
+		int64(1),
+		int64((retryAfter+time.Second-1)/time.Second),
+	)
+	writer.Header().Set(
+		"Retry-After",
+		strconv.FormatInt(retrySeconds, 10),
+	)
+	writeProblem(
+		writer,
+		http.StatusTooManyRequests,
+		problemRateLimited,
+	)
+	return false
 }
 
 func (handler *connectionHandler) serveRead(
@@ -603,6 +834,14 @@ func validBodylessRequest(request *http.Request) bool {
 }
 
 func validNegotiation(header http.Header) bool {
+	return validNegotiationFor(header, contentJSONMediaType)
+}
+
+func validNegotiationFor(header http.Header, expected string) bool {
+	if expected != contentJSONMediaType &&
+		expected != snapshotChunkMediaType {
+		return false
+	}
 	accept := header.Values("Accept")
 	if len(accept) > 1 {
 		return false
@@ -610,7 +849,7 @@ func validNegotiation(header http.Header) bool {
 	if len(accept) == 1 {
 		mediaType, parameters, err := mime.ParseMediaType(accept[0])
 		if err != nil ||
-			!strings.EqualFold(mediaType, "application/json") ||
+			!strings.EqualFold(mediaType, expected) ||
 			len(parameters) != 0 {
 			return false
 		}
@@ -688,6 +927,15 @@ var (
 	}
 	problemCapacity = problemDefinition{
 		code: "handler_capacity", title: "Handler capacity reached",
+		retryable: true,
+	}
+	problemBulkCapacity = problemDefinition{
+		code: "bulk_stream_capacity", title: "Bulk stream capacity reached",
+		retryable: true,
+	}
+	problemConnectionRegistrationCapacity = problemDefinition{
+		code:      "connection_registration_capacity",
+		title:     "Connection registration in progress",
 		retryable: true,
 	}
 	problemConnectionDraining = problemDefinition{

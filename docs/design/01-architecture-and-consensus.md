@@ -336,9 +336,10 @@ or every eligible owner identity and the recovery key are lost, the session is u
      `activation_source = genesis`; remap copied current-plan/policy rows to the new `session_id`;
    - reset `audit_counters` to successor epoch 0/count 0 and drop every predecessor `origin_scopes`
      row;
-   - end every nonterminal old agent session and release its claims/leases with `recovery`; retire
-     every old draft stream without advertising it in the successor, while keeping currently retained
-     immutable snapshots under local historical retention refs; and
+   - normalize every carried old agent session, including one already terminal in the predecessor,
+     to `ended(recovery)` because no predecessor origin scope survives; release active claims/leases
+     with `recovery`; retire every old draft stream without advertising it in the successor, while
+     keeping currently retained immutable snapshots under local historical retention refs; and
    - clear resume capabilities, invites, endpoint hints, replication cursors/acks, outbox entries,
      agent-launch registrations, local request/challenge/counter rows, lease timers,
      transfer/quarantine state, and pre-proposal staging pins not required by a preserved

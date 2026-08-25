@@ -51,6 +51,10 @@ type SettledReplica struct {
 	replicationObservationsMu sync.RWMutex
 	replicationObservations   map[domain.DeviceID]liveReplicationObservation
 
+	replicationProgressMu  sync.RWMutex
+	replicationProgress    store.SettledReplicationProgress
+	replicationProgressSet bool
+
 	localStateMu     sync.RWMutex
 	localStateClosed atomic.Bool
 
@@ -99,6 +103,10 @@ func OpenSettledReplica(
 	if mode != store.ReplicaEvidenceSettledNonvoter {
 		return nil, store.ErrReplicaEvidenceMode
 	}
+	progress, err := database.SettledReplicationProgressAfterVerification(ctx)
+	if err != nil {
+		return nil, err
+	}
 	view, err := database.View(ctx)
 	if err != nil {
 		return nil, err
@@ -139,6 +147,7 @@ func OpenSettledReplica(
 		revision: view.AdmissionRevision,
 		snapshot: decoded.Admission,
 	})
+	replica.setReplicationProgress(progress)
 	return replica, nil
 }
 
@@ -239,15 +248,28 @@ func (replica *SettledReplica) ImportResultBatch(
 		},
 	)
 	if err == nil {
-		replica.admission.Store(&peerAdmissionPublication{
-			revision: result.AdmissionRevision,
-			snapshot: replayed.admission,
-		})
-		if transitionRequired {
-			replica.transitionRequired.Store(true)
-		}
-		if replayed.admissionChanged {
-			replica.changes.signal()
+		progress, progressErr :=
+			replica.state.SettledReplicationProgressAfterVerification(
+				operationContext,
+			)
+		if progressErr != nil {
+			err = progressErr
+			replica.recordFatalLocked(fmt.Errorf(
+				"consensus: settled-replica integrity failure after result import: %w",
+				progressErr,
+			))
+		} else {
+			replica.setReplicationProgress(progress)
+			replica.admission.Store(&peerAdmissionPublication{
+				revision: result.AdmissionRevision,
+				snapshot: replayed.admission,
+			})
+			if transitionRequired {
+				replica.transitionRequired.Store(true)
+			}
+			if replayed.admissionChanged {
+				replica.changes.signal()
+			}
 		}
 	} else if fatalSettledImportError(err) {
 		replica.recordFatalLocked(fmt.Errorf(
@@ -257,6 +279,9 @@ func (replica *SettledReplica) ImportResultBatch(
 	}
 	replica.admissionMu.Unlock()
 	if err != nil {
+		if fatal := replica.FatalError(); fatal != nil {
+			return store.ResultBatchImportResult{}, fatal
+		}
 		if fatalSettledImportError(err) {
 			return store.ResultBatchImportResult{}, replica.FatalError()
 		}
@@ -344,6 +369,29 @@ func (replica *SettledReplica) View(
 	return replica.state.View(ctx)
 }
 
+// VerifiedGenerationZeroView supplies the fully scrubbed initial boundary
+// retained by this settled replica for logical-snapshot verification.
+func (replica *SettledReplica) VerifiedGenerationZeroView(
+	ctx context.Context,
+) (store.StateView, error) {
+	if replica == nil || replica.state == nil || ctx == nil {
+		return store.StateView{}, ErrInvalidNodeOptions
+	}
+	if err := replica.beginOperation(); err != nil {
+		return store.StateView{}, err
+	}
+	defer replica.endOperation()
+	view, err := replica.state.VerifiedGenerationZeroView(ctx)
+	if err != nil && fatalSettledImportError(err) {
+		return store.StateView{},
+			replica.failSettledIntegrity(
+				"reconstruct generation-zero boundary",
+				err,
+			)
+	}
+	return view, err
+}
+
 // ReplicationHeads returns one fully reverified durable catch-up cursor.
 func (replica *SettledReplica) ReplicationHeads(
 	ctx context.Context,
@@ -419,16 +467,13 @@ func (replica *SettledReplica) Status(
 	if err != nil {
 		return coordstatus.Snapshot{}, err
 	}
-	progress, err := replica.state.SettledReplicationProgress(ctx)
-	if err != nil {
-		if fatalSettledImportError(err) {
-			return coordstatus.Snapshot{},
-				replica.failSettledIntegrity(
-					"derive status replication progress",
-					err,
-				)
-		}
-		return coordstatus.Snapshot{}, err
+	progress, available := replica.replicationProgressSnapshot()
+	if !available {
+		return coordstatus.Snapshot{},
+			replica.failSettledIntegrity(
+				"derive status replication progress",
+				ErrInvalidStateView,
+			)
 	}
 	if progress.Heads.ChainIndex != durable.Heads.ChainIndex ||
 		progress.Heads.ResultIndex != durable.Heads.ResultIndex ||
@@ -598,6 +643,14 @@ func settledDurableConfiguration(
 		return nil, nil, err
 	}
 	if !found {
+		snapshotBaseline, err :=
+			database.HasVerifiedStandaloneLogicalSnapshotBaseline(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if snapshotBaseline {
+			return []domain.DeviceID{}, []domain.DeviceID{}, nil
+		}
 		return nil, nil, ErrSettledReplicaIneligible
 	}
 	configuration, err := decodeRaftConfigurationJSON(
@@ -841,8 +894,8 @@ func (replica *SettledReplica) Close() error {
 		replica.changes.close()
 		replica.active.Wait()
 		replica.localStateMu.Lock()
-		replica.localStateMu.Unlock()
 		replica.closeErr = replica.state.Close()
+		replica.localStateMu.Unlock()
 	})
 	return replica.closeErr
 }

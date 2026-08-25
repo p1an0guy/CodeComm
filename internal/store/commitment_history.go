@@ -13,9 +13,9 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// VerifyCommitmentHistory replays every retained event/result link in the
-// active recovery generation and compares the reconstructed heads with the
-// durable consensus state. It is required before Raft log compaction.
+// VerifyCommitmentHistory performs the explicit full-history scrub required
+// before snapshot export, recovery, or Raft log compaction. Ordinary startup
+// deliberately performs bounded current-tip checks instead.
 func (store *Store) VerifyCommitmentHistory(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil context", ErrInvalidOptions)
@@ -43,31 +43,57 @@ func (store *Store) VerifyCommitmentHistory(ctx context.Context) error {
 				ErrCommandResultCorrupt,
 			)
 		}
-		if err := verifyCommitmentHistory(conn, state); err != nil {
-			return err
-		}
-		settledState, settled, err := readSettledNonvoterState(conn)
-		if err != nil {
-			return err
-		}
-		if settled {
-			if err := verifySettledNonvoterEvidence(
-				conn,
-				state,
-				settledState,
-			); err != nil {
-				return historyIntegrityError(
-					"settled-nonvoter evidence",
-					err,
-				)
-			}
-			return nil
-		}
-		if err := verifyRaftCommandLedger(conn, state); err != nil {
-			return historyIntegrityError("Raft command ledger", err)
-		}
-		return nil
+		return verifyFullCommitmentState(conn, state)
 	})
+}
+
+func verifyFullCommitmentState(
+	conn *sqlite.Conn,
+	state consensusState,
+) error {
+	if err := verifyCompleteLogicalSnapshotHistory(conn, state); err != nil {
+		return historyIntegrityError(
+			"complete retained history",
+			err,
+		)
+	}
+	if err := verifyHistoricalReplicationAttestations(
+		conn,
+		state,
+	); err != nil {
+		return historyIntegrityError(
+			"predecessor replication evidence",
+			err,
+		)
+	}
+	settledState, settled, err := readSettledNonvoterState(conn)
+	if err != nil {
+		return err
+	}
+	if settled {
+		if err := verifySettledNonvoterEvidence(
+			conn,
+			state,
+			settledState,
+		); err != nil {
+			return historyIntegrityError(
+				"settled-nonvoter evidence",
+				err,
+			)
+		}
+	} else if err := verifyRaftCommandLedger(conn, state); err != nil {
+		return historyIntegrityError("Raft command ledger", err)
+	}
+	if err := verifyLogicalSnapshotCheckpointRows(conn); err != nil {
+		return historyIntegrityError(
+			"checkpoint rows",
+			err,
+		)
+	}
+	if err := verifyDerivedViews(conn); err != nil {
+		return historyIntegrityError("derived views", err)
+	}
+	return nil
 }
 
 func verifyCommitmentHistory(

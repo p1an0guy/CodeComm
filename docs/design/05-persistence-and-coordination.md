@@ -248,7 +248,8 @@ reaping cannot both win; no transition leaves `ended`. For `max_active_agent_ses
 every non-`ended` row, independent of ephemeral presence or current device status; retained ended
 rows do not count. Every ordinary retained session has its agent origin scope; the sole missing-scope
 case is an `ended(recovery)` historical row carried into a successor after §3.1 drops predecessor
-scopes. Such a row MUST have no successor-generation scope, and its retained ID cannot be rebound.
+scopes. The transform normalizes both terminal and nonterminal predecessor sessions to that state;
+such a row MUST have no successor-generation scope, and its retained ID cannot be rebound.
 
 **Canonical ref** — the replicated repository pointer, initialized to the verified bootstrap
 commit. V1 has one row and never maps it directly to a user's branch.
@@ -374,6 +375,7 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 |---|---|
 | `schema_migrations` | Applied migration numbers and checksums |
 | `genesis_records` | Initial and successor genesis records, recovery authorizations, and the full boundary projection-state digest: initial state for generation 0, post-transform state for successors (§§3.1, 5.6) |
+| `initial_projection_boundary`, `initial_projection_rows` | Immutable exact generation-zero covered rows plus their genesis-bound digest/version/count. Initialization writes them atomically; a pre-recovery legacy upgrade reconstructs them only after full verification. Successor recovery and verified logical snapshots retain them because the recovery transform is non-invertible |
 | `consensus_state` | Nullable/historical `last_raft_applied_log_index`, term, event/result heads, and current projection accumulator/version |
 | `events` | Accepted events exactly as signed (§5.2) |
 | `event_provenance` | Unsigned local `(term, log_index, applied_at, chain_index, chain_hash)` only for accepted events applied by this store's Raft FSM; result-batch/snapshot imports never synthesize it |
@@ -412,7 +414,7 @@ Identity and live content-epoch private keys stay in the OS credential store, ne
 | `pairing_attempt_finalizations` | **Local only**: `finalizing`/`completed` marker that makes mode-specific admission or rebootstrap retryable without treating SAS agreement as completion |
 | `pairing_secret_deletions` | **Local only**: durable idempotent native-credential deletion queue with stable failure codes and retry history |
 | `origin_counters` | **Local only**: next sequence per agent-session or daemon-boot scope; advanced atomically with creation of the exact signed proposal |
-| `audit_events` | Local projection of accepted action events, first-seen committed rejections, and explicit bounded pre-result rejection audits (§§5.4, 10.1); never independent authority |
+| `audit_events` | Local projection of accepted action events, first-seen committed rejections, signed-genesis recovery boundaries, and explicit bounded pre-result rejection audits (§§3.1, 5.4, 10.1); never independent authority |
 
 Queryable identity/kind/version/status/time fields are typed and indexed; versioned
 payloads use the §4.1 canonical encoding. Network input never becomes SQL; trusted SQL uses
@@ -488,8 +490,10 @@ Event/projection/command-result/result-chain/accumulator/outbox and, for Raft FS
 `result_index` are unique across all results; the origin tuple is unique only across accepted
 events because a distinct event that reuses a consumed sequence must retain its committed rejection.
 Committed but unapplied Raft entries replay idempotently after crash. Checkpointing and
-transactional checksummed migrations are daemon-controlled; irreversible migration requires
-verified backup.
+transactional checksummed migrations are daemon-controlled. The checksum binds the SQL, versioned
+post-SQL hook identity, and CI-verified source fingerprint; released hooks are immutable.
+Every migration has an explicit reviewed-reversible or verified-backup-required classification;
+unclassified and unverified irreversible migrations fail before DDL.
 
 Use the Raft library's production stable store, not a custom log. A Raft participant's backup uses
 SQLite online backup plus matching stable-store snapshot metadata, any installed-snapshot baseline,

@@ -669,6 +669,23 @@ func TestApplyResolvesLocalCheckpointOnlyForDurableTerminalStates(
 						test.code,
 					)),
 				},
+				Audit: []AuditRecord{{
+					SessionID:        domain.UUIDv7(testSessionID),
+					SourceKind:       AuditCommittedRejection,
+					EventID:          signed.Proposal().EventID,
+					ResultIndex:      1,
+					ReporterDeviceID: signed.Proposal().Origin.DeviceID(),
+					SubjectDeviceID:  signed.Proposal().Origin.DeviceID(),
+					ActorType:        event.ActorDaemon,
+					IPCChannel:       "daemon",
+					ActionCode:       string(event.KindConsensusCheckpoint),
+					OutcomeCode:      test.code,
+					Subject:          "session:" + testSessionID,
+					DetailsJSON:      []byte(`{}`),
+					FirstSeenAt:      testAppliedAt,
+					LastSeenAt:       testAppliedAt,
+					ObservationCount: 1,
+				}},
 			}
 			_, err := state.store.Apply(
 				context.Background(),

@@ -63,6 +63,7 @@ func runSettledDaemon(
 		discoveryRuntime    *daemonDiscoveryRuntime
 		contentPeerRuntime  *daemonContentPeerRuntime
 		peerIngress         *transport.Ingress
+		snapshotRepository  *daemonLogicalSnapshotRepository
 	)
 	runtimeClosed := false
 	defer func() {
@@ -76,6 +77,7 @@ func runSettledDaemon(
 			credentialService,
 			discoveryRuntime,
 			contentPeerRuntime,
+			snapshotRepository,
 		)
 		resultErr = errors.Join(
 			resultErr,
@@ -216,6 +218,19 @@ func runSettledDaemon(
 
 	var contentHandler transport.ConnectionHandler
 	if discoveryRuntime != nil {
+		snapshotRepository, err = openDaemonLogicalSnapshotRepository(
+			ctx,
+			options.statePath,
+			options.sessionID,
+			options.workspaceID,
+			view.RecoveryGeneration,
+			deviceID,
+			ed25519.PrivateKey(identityPrivateKey).
+				Public().(ed25519.PublicKey),
+		)
+		if err != nil {
+			return err
+		}
 		contentHandler, err = newDaemonContentServer(
 			options.sessionID,
 			options.workspaceID,
@@ -225,6 +240,7 @@ func runSettledDaemon(
 			discoveryRuntime,
 			commandConsensus,
 			identityPrivateKey,
+			snapshotRepository,
 		)
 		if err != nil {
 			return err
@@ -235,6 +251,8 @@ func runSettledDaemon(
 			options.workspaceID,
 			view.RecoveryGeneration,
 			deviceID,
+			options.statePath,
+			originBootID,
 			localState,
 			replica,
 			credentialService.ContentCertificate,
@@ -242,6 +260,7 @@ func runSettledDaemon(
 			credentialNow,
 			replica,
 			controlTransport,
+			processClock,
 		)
 		if err != nil {
 			return err
@@ -298,6 +317,7 @@ func runSettledDaemon(
 		credentialService,
 		discoveryRuntime,
 		contentPeerRuntime,
+		snapshotRepository,
 	)
 	fatalComponents := []daemonFatalComponent{
 		replica,
@@ -330,13 +350,17 @@ func settledDaemonComponents(
 	credentials *credentialservice.Service,
 	discovery *daemonDiscoveryRuntime,
 	content *daemonContentPeerRuntime,
+	snapshots *daemonLogicalSnapshotRepository,
 ) []phasedDaemonComponent {
-	components := make([]phasedDaemonComponent, 0, 6)
+	components := make([]phasedDaemonComponent, 0, 7)
 	if agents != nil {
 		components = append(components, agents)
 	}
 	if content != nil {
 		components = append(components, content)
+	}
+	if snapshots != nil {
+		components = append(components, snapshots)
 	}
 	if discovery != nil {
 		components = append(components, discovery)

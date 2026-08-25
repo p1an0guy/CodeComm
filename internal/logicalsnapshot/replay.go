@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/ijonahch/codecomm/internal/chain"
 )
@@ -44,7 +45,7 @@ type ArtifactRecordSink func(context.Context, Record) error
 // scratch, and the expected root-signing identity.
 type ArtifactReplayOptions struct {
 	SignerPublicKey []byte
-	SequenceScratch io.ReadWriteSeeker
+	SequenceScratch VerificationScratch
 	OpenPage        DescriptorPageSource
 	OpenChunk       ArtifactChunkSource
 	RecordSink      ArtifactRecordSink
@@ -84,12 +85,52 @@ func ReplayArtifact(
 			err,
 		)
 	}
+	return verifyArtifactTransport(
+		ctx,
+		root,
+		artifactTransportVerificationOptions{
+			SequenceScratch: options.SequenceScratch,
+			OpenPage:        options.OpenPage,
+			OpenChunk:       options.OpenChunk,
+			RecordSink:      options.RecordSink,
+		},
+	)
+}
+
+type artifactTransportVerificationOptions struct {
+	SequenceScratch VerificationScratch
+	OpenPage        DescriptorPageSource
+	OpenChunk       ArtifactChunkSource
+	RecordSink      ArtifactRecordSink
+	ExpandedSink    io.Writer
+}
+
+func verifyArtifactTransport(
+	ctx context.Context,
+	root Root,
+	options artifactTransportVerificationOptions,
+) (ArtifactReplaySummary, error) {
+	if ctx == nil ||
+		options.SequenceScratch == nil ||
+		options.OpenPage == nil ||
+		options.OpenChunk == nil {
+		return ArtifactReplaySummary{}, ErrInvalidArtifactReplay
+	}
+	if err := ctx.Err(); err != nil {
+		return ArtifactReplaySummary{}, err
+	}
+	if err := root.validate(); err != nil {
+		return ArtifactReplaySummary{}, err
+	}
 	input := root.Unsigned().Input()
 	if input.ContentEncoding != EncodingIdentity {
 		return ArtifactReplaySummary{}, ErrUnsupportedCodec
 	}
 
-	sequence, err := NewSequenceValidator(root, options.SequenceScratch)
+	sequence, err := NewSequenceValidator(
+		root,
+		options.SequenceScratch,
+	)
 	if err != nil {
 		return ArtifactReplaySummary{}, replayIntegrity(
 			"construct sequence validator",
@@ -132,6 +173,15 @@ func ReplayArtifact(
 					nil,
 				)
 			}
+			if options.ExpandedSink != nil {
+				if err := writeAll(options.ExpandedSink, content); err != nil {
+					return fmt.Errorf(
+						"logicalsnapshot: write expanded chunk %d: %w",
+						descriptor.ChunkIndex,
+						err,
+					)
+				}
+			}
 			if _, err := artifactHash.Write(content); err != nil {
 				return fmt.Errorf(
 					"logicalsnapshot: hash chunk %d: %w",
@@ -171,12 +221,14 @@ func ReplayArtifact(
 						err,
 					)
 				}
-				if err := options.RecordSink(ctx, record); err != nil {
-					return fmt.Errorf(
-						"logicalsnapshot: stage record %d: %w",
-						recordCount,
-						err,
-					)
+				if options.RecordSink != nil {
+					if err := options.RecordSink(ctx, record); err != nil {
+						return fmt.Errorf(
+							"logicalsnapshot: stage record %d: %w",
+							recordCount,
+							err,
+						)
+					}
 				}
 				recordCount++
 				if err := ctx.Err(); err != nil {
@@ -294,8 +346,19 @@ func readReplaySource(
 			name,
 		)
 	}
+	var (
+		closeOnce sync.Once
+		closeErr  error
+	)
+	closeReader := func() {
+		closeOnce.Do(func() {
+			closeErr = reader.Close()
+		})
+	}
+	stopCancelClose := context.AfterFunc(ctx, closeReader)
 	defer func() {
-		closeErr := reader.Close()
+		stopCancelClose()
+		closeReader()
 		if err == nil && closeErr != nil {
 			err = fmt.Errorf(
 				"logicalsnapshot: close %s: %w",
@@ -309,15 +372,15 @@ func readReplaySource(
 		N: int64(maxBytes) + 1,
 	}
 	content, err := io.ReadAll(limited)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, fmt.Errorf(
 			"logicalsnapshot: read %s: %w",
 			name,
 			err,
 		)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
 	}
 	if uint64(len(content)) > maxBytes {
 		return nil, replayIntegrity(

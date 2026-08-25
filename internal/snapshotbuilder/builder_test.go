@@ -296,13 +296,10 @@ func TestBuildRejectsUntrustedCompositionInputsBeforeReturningRoot(
 		}
 	})
 
-	t.Run("trailing scratch", func(t *testing.T) {
+	t.Run("scratch truncation failure", func(t *testing.T) {
 		t.Parallel()
 		fixture := newBuilderFixture(t)
 		artifactFile := newScratchFile(t, "trailing-artifact-*")
-		if _, err := artifactFile.Write(make([]byte, 8<<20)); err != nil {
-			t.Fatalf("seed artifact scratch: %v", err)
-		}
 		options := fixture.options(
 			t,
 			discardChunk,
@@ -311,20 +308,20 @@ func TestBuildRejectsUntrustedCompositionInputsBeforeReturningRoot(
 				context.Context,
 				logicalsnapshot.UnsignedRoot,
 			) (logicalsnapshot.Root, error) {
-				t.Fatal("root signer called before trailing scratch was rejected")
+				t.Fatal("root signer called after scratch truncation failed")
 				return logicalsnapshot.Root{}, nil
 			},
 		)
-		options.ArtifactScratch = nonTruncatingScratch{
+		options.ArtifactScratch = failingTruncateScratch{
 			Scratch: artifactFile,
 		}
 		if _, err := Build(
 			context.Background(),
 			fixture.database,
 			options,
-		); !errors.Is(err, ErrArtifactReplay) {
+		); !errors.Is(err, ErrArtifactScratch) {
 			t.Fatalf(
-				"Build(trailing scratch) = %v, want ErrArtifactReplay",
+				"Build(failed truncate) = %v, want ErrArtifactScratch",
 				err,
 			)
 		}
@@ -706,8 +703,12 @@ func (scratch *corruptingScratch) Write(value []byte) (int, error) {
 	return scratch.Scratch.Write(copy)
 }
 
-type nonTruncatingScratch struct {
+type failingTruncateScratch struct {
 	Scratch
+}
+
+func (failingTruncateScratch) Truncate(int64) error {
+	return errors.New("test truncate failure")
 }
 
 type mutatingRecordSource struct {

@@ -3,7 +3,10 @@ package store
 import (
 	"crypto/sha256"
 	"embed"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"io/fs"
 	"strconv"
 	"strings"
@@ -17,11 +20,34 @@ import (
 var migrationFiles embed.FS
 
 type migration struct {
-	version  int64
-	name     string
-	sql      string
-	checksum [sha256.Size]byte
+	version       int64
+	name          string
+	sql           string
+	checksum      [sha256.Size]byte
+	policy        migrationPolicy
+	postSQLID     string
+	postSQLDigest string
+	postSQL       func(*sqlite.Conn) error
 }
+
+type migrationPolicy uint8
+
+const (
+	migrationPolicyUnclassified migrationPolicy = iota
+	migrationPolicyReviewedReversible
+	migrationPolicyRequiresVerifiedBackup
+)
+
+var (
+	errMigrationUnclassified = errors.New(
+		"store: migration lacks a reviewed reversibility classification",
+	)
+	errMigrationBackupRequired = errors.New(
+		"store: migration requires a verified backup",
+	)
+)
+
+type migrationBackupVerifier func(*sqlite.Conn, migration) error
 
 var embeddedMigrations = mustLoadMigrations()
 
@@ -30,9 +56,59 @@ func migrationFromText(version int64, name, sqlText string) migration {
 		version:  version,
 		name:     name,
 		sql:      sqlText,
-		checksum: sha256.Sum256([]byte(sqlText)),
+		checksum: migrationChecksum(sqlText, "", ""),
 	}
 }
+
+func migrationChecksum(
+	sqlText string,
+	postSQLID string,
+	postSQLDigest string,
+) [sha256.Size]byte {
+	if postSQLID == "" {
+		return sha256.Sum256([]byte(sqlText))
+	}
+	digest := sha256.New()
+	writeMigrationChecksumPart(digest, "codecomm-migration-post-sql-v2")
+	writeMigrationChecksumPart(digest, sqlText)
+	writeMigrationChecksumPart(digest, postSQLID)
+	writeMigrationChecksumPart(digest, postSQLDigest)
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result
+}
+
+func writeMigrationChecksumPart(digest hash.Hash, value string) {
+	_, _ = digest.Write([]byte(strconv.Itoa(len(value))))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write([]byte(value))
+}
+
+func bindMigrationPostSQL(
+	candidate migration,
+	identifier string,
+	implementationDigest string,
+	postSQL func(*sqlite.Conn) error,
+) migration {
+	decodedDigest, err := hex.DecodeString(implementationDigest)
+	if identifier == "" ||
+		err != nil ||
+		len(decodedDigest) != sha256.Size ||
+		postSQL == nil {
+		panic("store: invalid post-SQL migration binding")
+	}
+	candidate.postSQLID = identifier
+	candidate.postSQLDigest = implementationDigest
+	candidate.postSQL = postSQL
+	candidate.checksum = migrationChecksum(
+		candidate.sql,
+		identifier,
+		implementationDigest,
+	)
+	return candidate
+}
+
+const retainInitialProjectionBoundaryMigrationDigest = "e253d0f29cc56f359773cddb320e9af3f5bcdd26db39f74e434e7b13a07b841d"
 
 func mustLoadMigrations() []migration {
 	entries, err := fs.ReadDir(migrationFiles, "migrations")
@@ -61,7 +137,30 @@ func mustLoadMigrations() []migration {
 		if err != nil {
 			panic(fmt.Sprintf("store: read migration %q: %v", entry.Name(), err))
 		}
-		migrations = append(migrations, migrationFromText(version, name, string(content)))
+		candidate := migrationFromText(version, name, string(content))
+		switch {
+		case version >= 1 && version <= 7 &&
+			name == [...]string{
+				"",
+				"initial",
+				"phase3_foundations",
+				"pairing_finalization",
+				"pairing_authority_fencing",
+				"committed_raft_configuration",
+				"settled_nonvoter_replication",
+				"replication_watermark_observations",
+			}[version]:
+			candidate.policy = migrationPolicyReviewedReversible
+		case version == 8 && name == "recovery_boundary_audit":
+			candidate.policy = migrationPolicyReviewedReversible
+			candidate = bindMigrationPostSQL(
+				candidate,
+				"retain_initial_projection_boundary/v1",
+				retainInitialProjectionBoundaryMigrationDigest,
+				retainInitialProjectionBoundaryMigration,
+			)
+		}
+		migrations = append(migrations, candidate)
 	}
 	if len(migrations) == 0 {
 		panic("store: no embedded migrations")
@@ -101,6 +200,15 @@ func systemClock() time.Time {
 }
 
 func applyMigrations(conn *sqlite.Conn, migrations []migration, now clock) error {
+	return applyMigrationsWithBackup(conn, migrations, now, nil)
+}
+
+func applyMigrationsWithBackup(
+	conn *sqlite.Conn,
+	migrations []migration,
+	now clock,
+	verifyBackup migrationBackupVerifier,
+) error {
 	if conn == nil || len(migrations) == 0 || now == nil {
 		return ErrInvalidOptions
 	}
@@ -179,6 +287,34 @@ func applyMigrations(conn *sqlite.Conn, migrations []migration, now clock) error
 				)
 			}
 		}
+		switch candidate.policy {
+		case migrationPolicyReviewedReversible:
+		case migrationPolicyRequiresVerifiedBackup:
+			if verifyBackup == nil {
+				return fmt.Errorf(
+					"%w: migration %04d_%s",
+					errMigrationBackupRequired,
+					candidate.version,
+					candidate.name,
+				)
+			}
+			if err := verifyBackup(conn, candidate); err != nil {
+				return fmt.Errorf(
+					"%w: migration %04d_%s: %w",
+					errMigrationBackupRequired,
+					candidate.version,
+					candidate.name,
+					err,
+				)
+			}
+		default:
+			return fmt.Errorf(
+				"%w: migration %04d_%s",
+				errMigrationUnclassified,
+				candidate.version,
+				candidate.name,
+			)
+		}
 		if err := applyMigration(conn, candidate, now()); err != nil {
 			return fmt.Errorf("store: apply migration %04d_%s: %w", candidate.version, candidate.name, err)
 		}
@@ -194,6 +330,11 @@ func applyMigration(conn *sqlite.Conn, candidate migration, appliedAt time.Time)
 	defer end(&err)
 	if err = sqlitex.ExecuteScript(conn, candidate.sql, nil); err != nil {
 		return err
+	}
+	if candidate.postSQL != nil {
+		if err = candidate.postSQL(conn); err != nil {
+			return err
+		}
 	}
 	return execute(
 		conn,

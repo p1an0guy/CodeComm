@@ -24,6 +24,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"golang.org/x/net/http2"
@@ -37,23 +38,42 @@ type contentTestService struct {
 	session SessionResponse
 	peers   PeersResponse
 
-	sessionCalls         int
-	peersCalls           int
-	eventCalls           int
-	peersSeen            []transport.AuthenticatedPeer
-	eventPeer            domain.DeviceID
-	eventBody            []byte
-	eventHop             ProposalHop
-	eventResult          EventResult
-	eventErr             error
-	batch                replication.Batch
-	batchErr             error
-	batchCalls           int
-	batchAfter           []uint64
-	acknowledgement      replication.Acknowledgement
-	acknowledgementErr   error
-	acknowledgementCalls int
-	acknowledgementAt    []uint64
+	sessionCalls          int
+	peersCalls            int
+	eventCalls            int
+	peersSeen             []transport.AuthenticatedPeer
+	eventPeer             domain.DeviceID
+	eventBody             []byte
+	eventHop              ProposalHop
+	eventResult           EventResult
+	eventErr              error
+	batch                 replication.Batch
+	batchErr              error
+	batchCalls            int
+	batchAfter            []uint64
+	acknowledgement       replication.Acknowledgement
+	acknowledgementErr    error
+	acknowledgementCalls  int
+	acknowledgementAt     []uint64
+	snapshotRoot          logicalsnapshot.Root
+	snapshotRootErr       error
+	snapshotRootCalls     int
+	snapshotOpenErr       error
+	snapshotOpenCalls     int
+	snapshotOpenScopes    []SnapshotRequestScope
+	snapshotCloseCalls    int
+	snapshotPage          SnapshotManifestPage
+	snapshotPageErr       error
+	snapshotPageCalls     int
+	snapshotPageScopes    []SnapshotRequestScope
+	snapshotPageArtifact  []string
+	snapshotPageIndex     []uint64
+	snapshotChunk         SnapshotChunk
+	snapshotChunkErr      error
+	snapshotChunkCalls    int
+	snapshotChunkScopes   []SnapshotRequestScope
+	snapshotChunkArtifact []string
+	snapshotChunkIndex    []uint64
 
 	entered  chan struct{}
 	release  <-chan struct{}
@@ -92,7 +112,14 @@ func newContentTestService(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &contentTestService{session: session, peers: peers}
+	return &contentTestService{
+		session:          session,
+		peers:            peers,
+		snapshotRootErr:  ErrSnapshotNotFound,
+		snapshotOpenErr:  ErrSnapshotNotFound,
+		snapshotPageErr:  ErrSnapshotNotFound,
+		snapshotChunkErr: ErrSnapshotNotFound,
+	}
 }
 
 func (service *contentTestService) Session(
@@ -204,6 +231,109 @@ func (service *contentTestService) ReplicationAcknowledgement(
 	return service.acknowledgement, service.acknowledgementErr
 }
 
+func (service *contentTestService) LatestSnapshot(
+	_ context.Context,
+) (logicalsnapshot.Root, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.snapshotRootCalls++
+	return service.snapshotRoot, service.snapshotRootErr
+}
+
+func (service *contentTestService) OpenSnapshotTransfer(
+	ctx context.Context,
+	scope SnapshotRequestScope,
+) (SnapshotTransfer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.snapshotOpenCalls++
+	service.snapshotOpenScopes = append(service.snapshotOpenScopes, scope)
+	if service.snapshotOpenErr != nil {
+		return nil, service.snapshotOpenErr
+	}
+	return &contentTestSnapshotTransfer{
+		service: service,
+		scope:   scope,
+	}, nil
+}
+
+type contentTestSnapshotTransfer struct {
+	service *contentTestService
+	scope   SnapshotRequestScope
+	close   sync.Once
+}
+
+func (transfer *contentTestSnapshotTransfer) Scope() SnapshotRequestScope {
+	if transfer == nil {
+		return SnapshotRequestScope{}
+	}
+	return transfer.scope
+}
+
+func (transfer *contentTestSnapshotTransfer) SnapshotManifestPage(
+	_ context.Context,
+	pageIndex uint64,
+) (SnapshotManifestPage, error) {
+	if transfer == nil || transfer.service == nil {
+		return SnapshotManifestPage{}, ErrSnapshotUnavailable
+	}
+	service := transfer.service
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.snapshotPageCalls++
+	service.snapshotPageScopes = append(
+		service.snapshotPageScopes,
+		transfer.scope,
+	)
+	service.snapshotPageArtifact = append(
+		service.snapshotPageArtifact,
+		transfer.scope.ArtifactID,
+	)
+	service.snapshotPageIndex = append(service.snapshotPageIndex, pageIndex)
+	return service.snapshotPage, service.snapshotPageErr
+}
+
+func (transfer *contentTestSnapshotTransfer) SnapshotChunk(
+	_ context.Context,
+	chunkIndex uint64,
+) (SnapshotChunk, error) {
+	if transfer == nil || transfer.service == nil {
+		return SnapshotChunk{}, ErrSnapshotUnavailable
+	}
+	service := transfer.service
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.snapshotChunkCalls++
+	service.snapshotChunkScopes = append(
+		service.snapshotChunkScopes,
+		transfer.scope,
+	)
+	service.snapshotChunkArtifact = append(
+		service.snapshotChunkArtifact,
+		transfer.scope.ArtifactID,
+	)
+	service.snapshotChunkIndex = append(
+		service.snapshotChunkIndex,
+		chunkIndex,
+	)
+	return service.snapshotChunk, service.snapshotChunkErr
+}
+
+func (transfer *contentTestSnapshotTransfer) Close() error {
+	if transfer == nil || transfer.service == nil {
+		return nil
+	}
+	transfer.close.Do(func() {
+		transfer.service.mu.Lock()
+		transfer.service.snapshotCloseCalls++
+		transfer.service.mu.Unlock()
+	})
+	return nil
+}
+
 func (service *contentTestService) snapshot() (int, int, []transport.AuthenticatedPeer) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -215,6 +345,36 @@ type contentPeerPolicy struct {
 	revoked       atomic.Bool
 	verifications atomic.Uint64
 	expected      transport.ContentBinding
+
+	mu      sync.Mutex
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (policy *contentPeerPolicy) setVerificationBarrier(
+	entered chan<- struct{},
+	release <-chan struct{},
+) {
+	policy.mu.Lock()
+	policy.entered = entered
+	policy.release = release
+	policy.mu.Unlock()
+}
+
+func (policy *contentPeerPolicy) waitAtVerificationBarrier() {
+	policy.mu.Lock()
+	entered := policy.entered
+	release := policy.release
+	policy.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		<-release
+	}
 }
 
 type contentTLSFixture struct {
@@ -269,6 +429,7 @@ func newContentTLSFixture(t testing.TB) contentTLSFixture {
 			return contentAdmission(certificate)
 		}
 		policy.verifications.Add(1)
+		policy.waitAtVerificationBarrier()
 		if policy.revoked.Load() || certificate.Binding != policy.expected {
 			return transport.ContentPeerAdmission{}, errors.New("content peer denied")
 		}
@@ -379,6 +540,7 @@ type contentHarness struct {
 	cancel        context.CancelFunc
 	serveDone     <-chan error
 	accessChanges chan struct{}
+	address       string
 	stopOnce      sync.Once
 }
 
@@ -450,15 +612,10 @@ func startContentHarness(
 		service: service, server: server, fixture: fixture,
 		client: client, clientTLS: clientTLS, ingress: ingress,
 		cancel: cancel, serveDone: serveDone, accessChanges: accessChanges,
+		address: listener.Addr().String(),
 	}
 	awaitContentCondition(t, "ingress establishment", func() bool {
-		if ingress.Stats().EstablishedConnections != 1 {
-			return false
-		}
-		server.control.mu.Lock()
-		defer server.control.mu.Unlock()
-		state := server.control.states[fixture.clientBinding.DeviceID]
-		return state != nil && state.current != nil
+		return ingress.Stats().EstablishedConnections == 1
 	})
 	t.Cleanup(func() { harness.stop(t) })
 	return harness
@@ -509,11 +666,43 @@ func (harness *contentHarness) request(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if snapshot, valid := parseSnapshotTarget(request.URL.Path); valid &&
+		snapshot.kind != snapshotTargetLatest {
+		harness.service.mu.Lock()
+		root := harness.service.snapshotRoot
+		harness.service.mu.Unlock()
+		scope, scopeErr := NewSnapshotRequestScope(root)
+		if scopeErr == nil {
+			setSnapshotScopeHeaders(request.Header, scope)
+		}
+	}
 	response, err := harness.client.RoundTrip(request)
 	if err != nil {
 		t.Fatalf("RoundTrip(%s %s): %v", method, target, err)
 	}
 	return response
+}
+
+func (harness *contentHarness) ensureControlRegistered(t testing.TB) {
+	t.Helper()
+	response := harness.request(
+		t,
+		http.MethodGet,
+		SessionPath,
+		nil,
+	)
+	_ = assertContentResponse(
+		t,
+		response,
+		http.StatusOK,
+		contentJSONMediaType,
+	)
+	awaitContentCondition(t, "content-control registration", func() bool {
+		harness.server.control.mu.Lock()
+		defer harness.server.control.mu.Unlock()
+		state := harness.server.control.states[harness.fixture.clientBinding.DeviceID]
+		return state != nil && state.current != nil
+	})
 }
 
 func readContentResponse(t testing.TB, response *http.Response) []byte {
@@ -839,6 +1028,7 @@ func TestServerUsesFixedBoundsAndRejectsOversizedHeaders(t *testing.T) {
 		server.headerTimeout != RequestHeaderTimeout ||
 		server.handlerTimeout != HandlerTimeout ||
 		server.streamNoProgress != StreamNoProgress ||
+		server.snapshotTransferLifetime != SnapshotTransferLifetime ||
 		server.http2.MaxConcurrentStreams != ControlStreamsMax ||
 		server.http2.IdleTimeout != ConnectionIdle ||
 		server.http2.ReadIdleTimeout != StreamNoProgress ||
@@ -1040,6 +1230,7 @@ func TestServeAuthenticatedConnRejectsInvalidArgumentsAndCancellation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	//lint:ignore SA1012 This test verifies the explicit nil-context contract.
 	if err := server.ServeAuthenticatedConn(nil, nil); !errors.Is(err, ErrInvalidConnection) {
 		t.Fatalf("nil connection error = %v", err)
 	}

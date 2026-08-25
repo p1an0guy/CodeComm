@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission, content credentials,
 endpoint and proposal relay, voter reconciliation, and revocation are production-composed; Phase 3
 exit gate remains open
-Last updated: 2026-08-21
+Last updated: 2026-08-25
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -53,7 +53,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   signed origin, explicit hop metadata prevents recursive forwarding, delayed local Raft apply
   cannot trigger hot re-forwarding, and each six-field response is compared with the exact local
   result/event-chain positions after replication. Disconnect, GOAWAY, rollover, draining, and
-  capacity failures remain retryable without weakening malformed-response checks.
+  capacity failures remain retryable without weakening malformed-response checks; explicit
+  per-connection graceful shutdown sends GOAWAY even after response headers flush, lets the final
+  active response finish, and prevents a superseded connection from occupying an idle ingress slot.
 - The six-field command-result record now has a strict canonical decoder. Immutable result-batch
   values bind every envelope field under `codecomm/v1/batch`, verify both dense chains and signer
   identity, and enforce the 256-record/64 MiB expanded limits. SQLite exports bounded ranges only
@@ -103,6 +105,42 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   SQLite temporary storage rather than a history-sized Go allocation. The composition layer spools
   the exact expanded artifact, builds bounded descriptor pages, semantically replays the spool, and
   invokes the identity signer only after every structural commitment passes.
+- Content mTLS serves exact canonical snapshot roots and descriptor pages plus immutable binary
+  chunks under lineage-and-artifact-scoped routes. Clients enforce canonical targets, media types,
+  declared and actual lengths, root/page/chunk bounds, artifact continuity, structured errors, and
+  separate bulk-connection capacity. Roots and descriptor pages share the control-plane global
+  large-response slot with replication; chunks use independently bounded bulk connection/stream
+  capacity. A fresh connection serializes role registration before reauthorization, so concurrent
+  bulk streams cannot bypass the one-stream gate.
+- Snapshot receive is two-pass and file-backed. The first pass authenticates the descriptor chain,
+  chunks, expanded bytes, record order, and root commitments before trusted boundary policy runs.
+  The second verifies genesis/recovery boundaries, origin and checkpoint signatures, frozen-reducer
+  outcomes, exact mutations, both chains, accumulators, and projection state while rebuilding a new
+  SQLite quarantine one bounded command transaction at a time. Failed stages are closed and removed;
+  a successful stage is immutable and root-bound.
+- A verified quarantine can atomically initialize or forward-replace a destination and enter
+  settled-nonvoter mode without inventing Raft provenance. Installation rechecks source and
+  destination history, signed checkpoints, derived views, control decisions, local audit bindings,
+  recovery lineage, lease reconstruction, and foreign keys; it preserves only verified predecessor
+  attestations and stable recovery observation times. Explicit scrub/export and replacement
+  revalidate every historical snapshot/batch signature, checkpoint, signer identity and authority
+  transition, immutable head/accumulator endpoint, state-digest continuity, range, and inventory;
+  bounded startup revalidates the active evidence chain and current commitment tip. Orphaned,
+  duplicate, altered, or cross-lineage evidence fails closed.
+- Initialization and valid generation-zero legacy upgrades retain the exact genesis projection
+  baseline before any non-invertible recovery; an already-recovered legacy store lacking it refuses
+  migration transactionally. Migration checksums bind SQL plus each versioned Go hook's identity and
+  CI-verified source fingerprint; future migrations require an explicit reversibility classification
+  or verified backup gate. Snapshot repositories and caches use trusted-root operations that reject
+  links/reparse points in every managed path component and keep cleanup contained under races,
+  including runtime Windows-junction coverage. They enforce owner-only directories, fsync inventory
+  changes, cap artifacts at 256 MiB/4,096 chunks/one page, bound builds to five minutes, and check
+  cleanup capacity before forcing another checkpoint.
+- Settled catch-up automatically handles `snapshot_required`: it fetches an authority-valid latest
+  root over control mTLS, resumes root-bound pages/chunks from a bounded durable cache, verifies and
+  installs the quarantine, then continues the contiguous signed tail. A five-device production
+  composition covers authority replacement, stale-cursor fallback, post-snapshot tail import, and
+  cold restart.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -127,10 +165,12 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   status remain missing.
 - Result export, serving, scratch replay/import, terminal authority authorization, durable batch
   evidence, mode-aware startup, and peer fetch/catch-up orchestration are implemented.
-  Multi-activation integration coverage, snapshot fallback, SSE, and divergence recovery remain open.
-  Promotion also remains blocked on the designed logical snapshot plus metadata-bound Raft
-  `InstallSnapshot` path; removal needs the reciprocal verified freeze before restarting in settled
-  mode. Neither transition may relabel imported results as local Raft provenance.
+  Snapshot artifact transport, two-pass quarantine replay, and standalone settled installation are
+  implemented, including automatic fallback selection and tail resumption. Multi-activation
+  integration coverage, SSE, and divergence recovery remain open. Promotion also remains blocked on
+  metadata-bound Raft `InstallSnapshot`; removal needs the reciprocal verified freeze before
+  restarting in settled mode. Neither transition may relabel imported results as local Raft
+  provenance.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
@@ -156,12 +196,17 @@ Primary tests:
 - `TestInspectDaemonMeshState*`
 - `TestSettledReplicaImportsAndReopensAuthorityHandoff`
 - `TestSettledReplicaCoherentLocalRewriteLatchesFatalState`
+- `TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart`
+- `TestSnapshotClientRoundTripBindsRootAndArtifact`
+- `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
+- `TestVerifiedLogicalSnapshotStageInstallsSuccessorOverPredecessor`
+- `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
 
 Run:
 
 ```text
-go test ./...
-go test -race ./...
+go test -p 2 -parallel 2 -timeout 20m ./...
+go test -race -p 1 -parallel 2 -timeout 20m ./...
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 ```

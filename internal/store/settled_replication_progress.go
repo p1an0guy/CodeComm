@@ -42,6 +42,22 @@ type SettledReplicationProgress struct {
 func (store *Store) SettledReplicationProgress(
 	ctx context.Context,
 ) (SettledReplicationProgress, error) {
+	return store.settledReplicationProgress(ctx, true)
+}
+
+// SettledReplicationProgressAfterVerification derives progress without
+// replaying evidence. The caller must serialize mutations and establish the
+// complete settled evidence chain immediately before the current store cut.
+func (store *Store) SettledReplicationProgressAfterVerification(
+	ctx context.Context,
+) (SettledReplicationProgress, error) {
+	return store.settledReplicationProgress(ctx, false)
+}
+
+func (store *Store) settledReplicationProgress(
+	ctx context.Context,
+	verifyEvidence bool,
+) (SettledReplicationProgress, error) {
 	if store == nil || ctx == nil {
 		return SettledReplicationProgress{}, ErrInvalidOptions
 	}
@@ -79,15 +95,17 @@ func (store *Store) SettledReplicationProgress(
 		if !found {
 			return ErrReplicaEvidenceMode
 		}
-		if err := verifyCommitmentHistory(conn, state); err != nil {
-			return err
-		}
-		if err := verifySettledNonvoterEvidence(
-			conn,
-			state,
-			settled,
-		); err != nil {
-			return err
+		if verifyEvidence {
+			if err := verifyCommitmentHistory(conn, state); err != nil {
+				return err
+			}
+			if err := verifySettledNonvoterEvidence(
+				conn,
+				state,
+				settled,
+			); err != nil {
+				return err
+			}
 		}
 
 		type observationKey struct {

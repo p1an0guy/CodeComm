@@ -12,6 +12,57 @@ import (
 	"zombiezen.com/go/sqlite"
 )
 
+func TestLogicalSnapshotStageReplayRejectsFalseReducerOutcome(t *testing.T) {
+	fixture := newResultBatchAtomicityFixture(t)
+	stage := openLogicalSnapshotTestStage(t)
+	initial, err := stage.Initialize(
+		context.Background(),
+		resultBatchInitialState(t, fixture.source.authorityDeviceID),
+	)
+	if err != nil {
+		t.Fatalf("Initialize(): %v", err)
+	}
+	command := fixture.request.Commands[0]
+	result, err := chain.DecodeResult(command.EncodedResult)
+	if err != nil {
+		t.Fatalf("DecodeResult(): %v", err)
+	}
+	result.Outcome = []byte(
+		`{"code":"entity_not_found","status":"rejected"}`,
+	)
+	result.ChainIndex = nil
+	result.ChainHash = nil
+	encodedResult, err := chain.EncodeResult(result)
+	if err != nil {
+		t.Fatalf("EncodeResult(): %v", err)
+	}
+	encodedMutations, err := chain.EncodeMutations(command.Mutations)
+	if err != nil {
+		t.Fatalf("EncodeMutations(): %v", err)
+	}
+	if _, err := stage.ReplayCommand(
+		context.Background(),
+		encodedResult,
+		encodedMutations,
+		testAppliedAt,
+		testBootID,
+		1,
+	); !errors.Is(err, ErrInvalidLogicalSnapshotStage) {
+		t.Fatalf("ReplayCommand(false outcome) error = %v", err)
+	}
+	view, err := stage.View(context.Background())
+	if err != nil {
+		t.Fatalf("View(): %v", err)
+	}
+	if view.Heads != initial {
+		t.Fatalf(
+			"false outcome advanced heads = %+v, want %+v",
+			view.Heads,
+			initial,
+		)
+	}
+}
+
 func TestLogicalSnapshotStageRebuildsAndFreezesVerifiedCut(t *testing.T) {
 	fixture := newResultBatchAtomicityFixture(t)
 	cut := exportLogicalSnapshotTestCut(t, fixture)
@@ -28,7 +79,7 @@ func TestLogicalSnapshotStageRebuildsAndFreezesVerifiedCut(t *testing.T) {
 		t.Fatalf("initial heads = %+v, want %+v", initial, fixture.initial)
 	}
 	for index, command := range fixture.request.Commands {
-		heads, err := stage.ImportCommand(context.Background(), command)
+		heads, err := stage.importCommand(context.Background(), command)
 		if err != nil {
 			t.Fatalf("ImportCommand(%d): %v", index, err)
 		}
@@ -71,7 +122,7 @@ func TestLogicalSnapshotStageRebuildsAndFreezesVerifiedCut(t *testing.T) {
 		"tasks":                     1,
 		"leases":                    1,
 	})
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		fixture.request.Commands[0],
 	); !errors.Is(err, ErrLogicalSnapshotStageFinalized) {
@@ -91,6 +142,48 @@ func TestLogicalSnapshotStageRebuildsAndFreezesVerifiedCut(t *testing.T) {
 	}
 }
 
+func TestLogicalSnapshotStageVerifyRejectsCheckpointRowTamper(t *testing.T) {
+	tests := []struct {
+		name   string
+		tamper string
+	}{
+		{
+			name:   "missing row",
+			tamper: "DELETE FROM chain_checkpoints;",
+		},
+		{
+			name: "changed binding",
+			tamper: `UPDATE chain_checkpoints
+			           SET covered_applied_log_index =
+			               covered_applied_log_index + 1;`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newResultBatchAtomicityFixture(t)
+			stage := openLogicalSnapshotTestStage(t)
+			rebuildLogicalSnapshotStage(t, stage, fixture)
+			if err := stage.store.LocalState().withImmediate(
+				context.Background(),
+				func(conn *sqlite.Conn) error {
+					return execute(conn, test.tamper)
+				},
+			); err != nil {
+				t.Fatalf("tamper checkpoint row: %v", err)
+			}
+			if err := stage.Verify(
+				context.Background(),
+				exportLogicalSnapshotTestCut(t, fixture),
+			); !errors.Is(err, ErrInvalidLogicalSnapshotStage) {
+				t.Fatalf(
+					"Verify(tampered checkpoint) error = %v",
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 	fixture := newResultBatchAtomicityFixture(t)
 	stage := openLogicalSnapshotTestStage(t)
@@ -100,7 +193,7 @@ func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 	); err != nil {
 		t.Fatalf("Initialize(): %v", err)
 	}
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		fixture.request.Commands[0],
 	); err != nil {
@@ -116,7 +209,7 @@ func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 		Table:      "tasks",
 		PrimaryKey: []byte(`{"task_id":"tampered"}`),
 	}}
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		tampered,
 	); !errors.Is(err, ErrInvalidLogicalSnapshotStage) {
@@ -137,7 +230,7 @@ func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 		"tasks":           1,
 	})
 
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		fixture.request.Commands[1],
 	); err != nil {
@@ -154,7 +247,7 @@ func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		fixture.request.Commands[2],
 	); !errors.Is(err, injected) {
@@ -175,7 +268,7 @@ func TestLogicalSnapshotStageRollsBackOneCommandAndCanResume(t *testing.T) {
 		"chain_checkpoints": 0,
 		"leases":            0,
 	})
-	if _, err := stage.ImportCommand(
+	if _, err := stage.importCommand(
 		context.Background(),
 		fixture.request.Commands[2],
 	); err != nil {
@@ -269,6 +362,7 @@ func TestVerifyCompleteLogicalSnapshotHistoryScansPredecessorGenerations(
 				emptyDigest,
 			),
 			RecoveryAuthorizationJSON: []byte(`{"kind":"test-recovery"}`),
+			ObservedAt:                "2026-08-10T12:00:02Z",
 			Predecessor:               secondResult.Heads,
 			DigestVersion:             1,
 			ProjectionSchemaVersion:   1,

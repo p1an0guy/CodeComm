@@ -121,6 +121,9 @@ defect.
 | Snapshot signed-root / descriptor-page encoded maximum | 64 KiB / 4 MiB | Local, enforced before allocation |
 | Snapshot record payload / raw result-mutation slice maximum | 3 MiB / 2 MiB | Local; leaves framing and compression overhead below the 4 MiB transmitted-chunk bound |
 | Snapshot data-chunk compressed / expanded maximum | 4 MiB / 64 MiB | Local, enforced before allocation |
+| Snapshot aggregate artifact maximum | 64 GiB compressed, 64 GiB expanded, 16,777,216 records, 131,072 chunks, 8 descriptor pages, and recovery generation 4,095 | Immutable V1 root bound; rejects disproportionate work before opening any page or chunk |
+| Daemon snapshot receive quota | 256 MiB compressed/expanded, 100,000 records, 4,096 chunks, 1 descriptor page, and recovery generation 255 | Operational V1 bound checked with the authenticated root signature before bulk transfer; may increase without changing the wire format |
+| Logical-snapshot publication interval / build deadline | 30 min / 5 min | Local; publication checks retention capacity before forcing a checkpoint, and the deadline bounds the source WAL reader while writer-side receive quotas stop oversized staging |
 | Replication-batch compressed / expanded limit | 4 MiB / 64 MiB | Local, enforced before allocation |
 | Concurrent replication-batch responses | 1 per daemon | Local; bounds expanded-page memory while ordinary control requests continue |
 | Local IPC JSON body maximum | 1 MiB | Local; event payload remains subject to `max_event_bytes` |
@@ -205,8 +208,9 @@ Production quality is a release criterion:
   capped exponential backoff and jitter.
 - Make startup/shutdown idempotent and crash-safe: drain accepted work, close listeners,
   persist/checkpoint, reap children, and recover every boundary.
-- Use atomic replacement, explicit modes/ACLs, canonical paths, symlink checks, required
-  directory durability, direct argv, and sanitized child environments.
+- Use atomic replacement, explicit modes/ACLs, canonical paths, trusted-root filesystem operations
+  that reject symlink/reparse components, required directory durability, direct argv, and sanitized
+  child environments.
 - Keep config typed/versioned/validated/secure by default. Insecure test/dev wiring MUST be
   constructor/build-only, visibly reported, never remotely enabled, and absent from releases
   when it weakens security.

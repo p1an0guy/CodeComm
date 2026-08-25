@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -258,7 +259,7 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 	for _, node := range nodes {
 		node.start(t, nodes)
 	}
-	statuses := waitForDaemonMeshIntegrationCluster(
+	waitForDaemonMeshIntegrationCluster(
 		t,
 		nodes,
 		func(statuses []ui.Snapshot) bool {
@@ -284,7 +285,7 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		credentialClock,
 		credentialBase,
 	)
-	statuses = exerciseDaemonFollowerProposalForwarding(t, nodes)
+	statuses := exerciseDaemonFollowerProposalForwarding(t, nodes)
 	leaderID := domain.DeviceID(*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
 		Consensus.LeaderDeviceID)
 	leader := daemonMeshIntegrationNodeByID(t, nodes, leaderID)
@@ -530,13 +531,12 @@ func exerciseDaemonNextDayCredentialRecovery(
 		},
 	)
 	waitForDaemonMeshContentCredentialEpoch(t, quorum, 3)
-	nextDayClient := openDaemonMeshPeersClient(
+	nextDayClient := openReadyDaemonMeshPeersClient(
 		t,
 		first,
 		second,
 		clock.Now,
 	)
-	nextDayClient.request(t, second)
 	if err := nextDayClient.Close(); err != nil {
 		t.Fatalf("close next-day quorum content client: %v", err)
 	}
@@ -576,13 +576,12 @@ func exerciseDaemonNextDayCredentialRecovery(
 		},
 	)
 	waitForDaemonMeshContentCredentialEpoch(t, nodes, 3)
-	recoveredClient := openDaemonMeshPeersClient(
+	recoveredClient := openReadyDaemonMeshPeersClient(
 		t,
 		third,
 		first,
 		clock.Now,
 	)
-	recoveredClient.request(t, first)
 	if err := recoveredClient.Close(); err != nil {
 		t.Fatalf("close fully recovered content client: %v", err)
 	}
@@ -920,6 +919,7 @@ func (node *daemonMeshIntegrationNode) start(
 	node.exited = make(chan struct{})
 	node.exitErr = nil
 	node.running = true
+	node.meshCapture.reset()
 	go func() {
 		productionDependencies := productionDaemonDependencies()
 		node.exitErr = runDaemon(
@@ -1013,8 +1013,10 @@ func waitForDaemonMeshIntegrationCluster(
 	ready func([]ui.Snapshot) bool,
 ) []ui.Snapshot {
 	t.Helper()
+	_, callerFile, callerLine, _ := runtime.Caller(1)
 	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
 	var lastErr error
+	var lastStatuses []ui.Snapshot
 	for time.Now().Before(deadline) {
 		statuses := make([]ui.Snapshot, len(nodes))
 		complete := true
@@ -1039,13 +1041,76 @@ func waitForDaemonMeshIntegrationCluster(
 			}
 			statuses[index] = status
 		}
-		if complete && ready(statuses) {
-			return statuses
+		if complete {
+			lastStatuses = statuses
+			if ready(statuses) {
+				return statuses
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("daemon mesh did not converge: %v", lastErr)
+	states := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		stage, ready := node.meshCapture.lifecycleState()
+		state := fmt.Sprintf(
+			"%s(running=%t, stage=%q, ready=%t, fatal=%v)",
+			node.deviceID,
+			node.running,
+			stage,
+			ready,
+			node.meshCapture.fatalError(),
+		)
+		select {
+		case <-node.exited:
+			state = fmt.Sprintf(
+				"%s(running=%t, exited=%v, stage=%q, ready=%t, fatal=%v)",
+				node.deviceID,
+				node.running,
+				node.exitErr,
+				stage,
+				ready,
+				node.meshCapture.fatalError(),
+			)
+		default:
+		}
+		states = append(states, state)
+	}
+	t.Fatalf(
+		"daemon mesh wait at %s:%d did not converge: %v; statuses: %s; nodes: %s",
+		filepath.Base(callerFile),
+		callerLine,
+		lastErr,
+		daemonMeshIntegrationStatusSummary(lastStatuses),
+		strings.Join(states, ", "),
+	)
 	return nil
+}
+
+func daemonMeshIntegrationStatusSummary(statuses []ui.Snapshot) string {
+	if len(statuses) == 0 {
+		return "<none>"
+	}
+	summaries := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		taskIDs := make([]string, 0, len(status.Tasks))
+		for _, task := range status.Tasks {
+			taskIDs = append(taskIDs, task.TaskID)
+		}
+		summaries = append(summaries, fmt.Sprintf(
+			"%s(result=%d, chain=%d, raft=%v, state=%s, role=%s, voter_version=%d, activated_version=%d, target=%v, tasks=%v)",
+			status.Session.LocalDeviceID,
+			status.Session.ResultIndex,
+			status.Session.EventChainIndex,
+			status.Session.AppliedRaftIndex,
+			status.Consensus.State,
+			status.Consensus.Role,
+			status.Consensus.VoterSetVersion,
+			status.Consensus.ActivatedVoterSetVersion,
+			status.Consensus.TargetVoterDeviceIDs,
+			taskIDs,
+		))
+	}
+	return strings.Join(summaries, ", ")
 }
 
 func readDaemonMeshIntegrationStatus(

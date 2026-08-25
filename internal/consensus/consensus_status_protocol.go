@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -40,26 +42,41 @@ var (
 type consensusStatusResponseWire struct {
 	SchemaVersion                  uint64                        `json:"schema_version"`
 	SessionID                      string                        `json:"session_id"`
+	WorkspaceID                    string                        `json:"workspace_id"`
 	RecoveryGeneration             uint64                        `json:"recovery_generation"`
 	ServerDeviceID                 string                        `json:"server_device_id"`
 	LocalTerm                      uint64                        `json:"local_term"`
 	LeaderDeviceID                 *string                       `json:"leader_device_id"`
 	QuorumRequired                 uint64                        `json:"quorum_required"`
 	LastRaftAppliedLogIndex        *uint64                       `json:"last_raft_applied_log_index"`
+	CredentialAuthority            consensusStatusAuthorityWire  `json:"credential_authority"`
 	ContentCredentialAuthorization credentialRenewalResponseWire `json:"content_credential_authorization"`
 }
 
+type consensusStatusAuthorityWire struct {
+	SessionID                   string            `json:"session_id"`
+	VoterDeviceIDs              []string          `json:"voter_device_ids"`
+	VoterSetVersion             uint64            `json:"voter_set_version"`
+	ActivationSource            string            `json:"activation_source"`
+	ActivationCheckpointEventID *string           `json:"activation_checkpoint_event_id"`
+	ActivationProofs            []json.RawMessage `json:"activation_proofs"`
+	PriorAuthoritySigner        *string           `json:"prior_authority_signer"`
+	PriorAuthorityHandoff       *string           `json:"prior_authority_handoff"`
+}
+
 // ConsensusStatusResult is one peer-pinned identity-plane bootstrap cut.
-// The caller still verifies the authorization's signatures and compares the
-// returned lineage with its own applied state before provisional use.
+// The caller still verifies any authority handoff and authorization signatures
+// against its own applied state before provisional use.
 type ConsensusStatusResult struct {
 	SessionID                      domain.UUIDv7
+	WorkspaceID                    domain.UUIDv4
 	RecoveryGeneration             uint64
 	ServerDeviceID                 domain.DeviceID
 	LocalTerm                      uint64
 	LeaderDeviceID                 *domain.DeviceID
 	QuorumRequired                 uint64
 	LastRaftAppliedLogIndex        *uint64
+	CredentialAuthority            credentialauthority.Authority
 	ContentCredentialAuthorization credentialauthorization.Authorization
 }
 
@@ -185,15 +202,23 @@ func encodeConsensusStatusResponseForUse(
 	if err != nil {
 		return nil, ErrInvalidConsensusStatus
 	}
+	authority, err := consensusStatusAuthorityToWire(
+		status.CredentialAuthority,
+	)
+	if err != nil {
+		return nil, ErrInvalidConsensusStatus
+	}
 	wire := consensusStatusResponseWire{
 		SchemaVersion:                  consensusStatusSchemaVersion,
 		SessionID:                      string(status.SessionID),
+		WorkspaceID:                    string(status.WorkspaceID),
 		RecoveryGeneration:             status.RecoveryGeneration,
 		ServerDeviceID:                 string(status.ServerDeviceID),
 		LocalTerm:                      status.LocalTerm,
 		LeaderDeviceID:                 encodeOptionalDeviceID(status.LeaderDeviceID),
 		QuorumRequired:                 status.QuorumRequired,
 		LastRaftAppliedLogIndex:        cloneOptionalUint64(status.LastRaftAppliedLogIndex),
+		CredentialAuthority:            authority,
 		ContentCredentialAuthorization: authorization,
 	}
 	encoded, err := json.Marshal(wire)
@@ -224,14 +249,22 @@ func decodeConsensusStatusResponse(
 	if err != nil {
 		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
 	}
+	authority, err := consensusStatusAuthorityFromWire(
+		wire.CredentialAuthority,
+	)
+	if err != nil {
+		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+	}
 	status := ConsensusStatusResult{
 		SessionID:                      domain.UUIDv7(wire.SessionID),
+		WorkspaceID:                    domain.UUIDv4(wire.WorkspaceID),
 		RecoveryGeneration:             wire.RecoveryGeneration,
 		ServerDeviceID:                 domain.DeviceID(wire.ServerDeviceID),
 		LocalTerm:                      wire.LocalTerm,
 		LeaderDeviceID:                 decodeOptionalDeviceID(wire.LeaderDeviceID),
 		QuorumRequired:                 wire.QuorumRequired,
 		LastRaftAppliedLogIndex:        cloneOptionalUint64(wire.LastRaftAppliedLogIndex),
+		CredentialAuthority:            authority,
 		ContentCredentialAuthorization: authorization,
 	}
 	if err := validateConsensusStatusResult(
@@ -262,6 +295,7 @@ func validateConsensusStatusResult(
 	maximumQuorum := uint64(policy.MaxMemberDevices/2 + 1)
 	if !expectedServerDeviceID.Valid() ||
 		!status.SessionID.Valid() ||
+		!status.WorkspaceID.Valid() ||
 		!domain.ValidUnsignedInteger(status.RecoveryGeneration) ||
 		status.ServerDeviceID != expectedServerDeviceID ||
 		status.LocalTerm < 1 ||
@@ -277,10 +311,17 @@ func validateConsensusStatusResult(
 				)) {
 		return ErrConsensusStatusMismatch
 	}
+	authority := status.CredentialAuthority
+	if authority.Validate() != nil ||
+		authority.SessionID != status.SessionID {
+		return ErrConsensusStatusMismatch
+	}
 	authorization := status.ContentCredentialAuthorization
 	if authorization.Validate() != nil ||
 		authorization.SessionID != status.SessionID ||
 		authorization.DeviceID != status.ServerDeviceID ||
+		authorization.AuthorityVoterSetVersion >
+			authority.VoterSetVersion ||
 		!consensusStatusAuthorizationUsableAt(
 			authorization,
 			now,
@@ -289,6 +330,110 @@ func validateConsensusStatusResult(
 		return ErrConsensusStatusMismatch
 	}
 	return nil
+}
+
+func consensusStatusAuthorityToWire(
+	authority credentialauthority.Authority,
+) (consensusStatusAuthorityWire, error) {
+	if authority.Validate() != nil {
+		return consensusStatusAuthorityWire{}, ErrInvalidConsensusStatus
+	}
+	voters := make([]string, len(authority.VoterDeviceIDs))
+	for index, deviceID := range authority.VoterDeviceIDs {
+		voters[index] = string(deviceID)
+	}
+	proofs := make(
+		[]json.RawMessage,
+		len(authority.ActivationProofs),
+	)
+	for index, proof := range authority.ActivationProofs {
+		proofs[index] = bytes.Clone(proof.CanonicalJSON)
+	}
+	var checkpointEventID *string
+	if authority.ActivationCheckpointEventID != "" {
+		value := string(authority.ActivationCheckpointEventID)
+		checkpointEventID = &value
+	}
+	var priorSigner *string
+	if authority.PriorAuthoritySigner != "" {
+		value := string(authority.PriorAuthoritySigner)
+		priorSigner = &value
+	}
+	var handoff *string
+	if authority.PriorAuthorityHandoff != nil {
+		value := codec.EncodeBase64URL(
+			authority.PriorAuthorityHandoff[:],
+		)
+		handoff = &value
+	}
+	return consensusStatusAuthorityWire{
+		SessionID:                   string(authority.SessionID),
+		VoterDeviceIDs:              voters,
+		VoterSetVersion:             authority.VoterSetVersion,
+		ActivationSource:            string(authority.ActivationSource),
+		ActivationCheckpointEventID: checkpointEventID,
+		ActivationProofs:            proofs,
+		PriorAuthoritySigner:        priorSigner,
+		PriorAuthorityHandoff:       handoff,
+	}, nil
+}
+
+func consensusStatusAuthorityFromWire(
+	wire consensusStatusAuthorityWire,
+) (credentialauthority.Authority, error) {
+	voters := make([]domain.DeviceID, len(wire.VoterDeviceIDs))
+	for index, encoded := range wire.VoterDeviceIDs {
+		voters[index] = domain.DeviceID(encoded)
+	}
+	proofs := make(
+		[]credentialauthority.ActivationProof,
+		len(wire.ActivationProofs),
+	)
+	for index, encoded := range wire.ActivationProofs {
+		var deviceID domain.DeviceID
+		if index < len(voters) {
+			deviceID = voters[index]
+		}
+		proofs[index] = credentialauthority.ActivationProof{
+			VoterDeviceID: deviceID,
+			CanonicalJSON: bytes.Clone(encoded),
+		}
+	}
+	var handoff *[ed25519.SignatureSize]byte
+	if wire.PriorAuthorityHandoff != nil {
+		decoded, err := codec.DecodeBase64URLExact(
+			*wire.PriorAuthorityHandoff,
+			ed25519.SignatureSize,
+		)
+		if err != nil {
+			return credentialauthority.Authority{},
+				ErrInvalidConsensusStatus
+		}
+		value := [ed25519.SignatureSize]byte{}
+		copy(value[:], decoded)
+		handoff = &value
+	}
+	authority := credentialauthority.Authority{
+		SessionID:       domain.UUIDv7(wire.SessionID),
+		VoterDeviceIDs:  voters,
+		VoterSetVersion: wire.VoterSetVersion,
+		ActivationSource: credentialauthority.ActivationSource(
+			wire.ActivationSource,
+		),
+		ActivationCheckpointEventID: domain.UUIDv7(
+			optionalString(wire.ActivationCheckpointEventID),
+		),
+		ActivationProofs: proofs,
+		PriorAuthoritySigner: domain.DeviceID(
+			optionalString(wire.PriorAuthoritySigner),
+		),
+		PriorAuthorityHandoff: handoff,
+	}
+	if authority.Validate() != nil {
+		return credentialauthority.Authority{},
+			ErrInvalidConsensusStatus
+	}
+	return authority, nil
 }
 
 func consensusStatusAuthorizationUsableAt(
@@ -439,6 +584,7 @@ func cloneConsensusStatusResult(
 	result.LastRaftAppliedLogIndex = cloneOptionalUint64(
 		status.LastRaftAppliedLogIndex,
 	)
+	result.CredentialAuthority = status.CredentialAuthority.Clone()
 	result.ContentCredentialAuthorization =
 		status.ContentCredentialAuthorization.Clone()
 	return result

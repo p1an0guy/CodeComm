@@ -338,9 +338,6 @@ func TestMulticastReceiveBoundsAndIPv6Zone(t *testing.T) {
 		datagram.InterfaceIndex != iface.Index {
 		t.Fatalf("ReceiveDatagram(exact limit) = %+v", datagram)
 	}
-	payload := datagram.Payload
-	source := datagram.Source
-
 	ipv4Socket.inject(fakeRead{
 		payload:        bytes.Repeat([]byte{0x6b}, MaxDatagramBytes+1),
 		source:         &net.UDPAddr{IP: net.ParseIP("192.0.2.9"), Port: 60400},
@@ -355,7 +352,7 @@ func TestMulticastReceiveBoundsAndIPv6Zone(t *testing.T) {
 		},
 		interfaceIndex: iface.Index,
 	})
-	payload, source, err = multicast.Receive(context.Background())
+	payload, source, err := multicast.Receive(context.Background())
 	if err != nil {
 		t.Fatalf("Receive(link-local control index) error = %v", err)
 	}

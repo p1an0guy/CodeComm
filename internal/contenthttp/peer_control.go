@@ -3,6 +3,7 @@ package contenthttp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"time"
 
@@ -17,6 +18,8 @@ const (
 	ProposalRatePerSecond = 50
 	ProposalRateBurst     = 200
 	ControlPeerStatesMax  = int(policy.MaxMemberDevices)
+	BulkConnectionsMax    = 2
+	BulkStreamsMax        = 1
 
 	controlTokenUnit      = int64(time.Second)
 	controlTokenCapacity  = int64(ControlRateBurst) * controlTokenUnit
@@ -30,8 +33,14 @@ var (
 	ErrControlConnectionSuperseded = errors.New(
 		"content HTTP: control connection credential is superseded",
 	)
+	ErrBulkConnectionCapacity = errors.New(
+		"content HTTP: bulk connection capacity reached",
+	)
 	errControlStateUnavailable = errors.New(
 		"content HTTP: control state unavailable",
+	)
+	errConnectionRouteMismatch = errors.New(
+		"content HTTP: connection route class mismatch",
 	)
 )
 
@@ -44,10 +53,22 @@ type controlRegistry struct {
 type controlPeerState struct {
 	current        *connectionHandler
 	draining       *connectionHandler
+	bulkCurrent    [BulkConnectionsMax]*connectionHandler
+	bulkDraining   [BulkConnectionsMax]*connectionHandler
+	credential     transport.AuthenticatedPeer
+	credentialSet  bool
 	bucket         controlTokenBucket
 	proposalBucket controlTokenBucket
 	lastSeen       time.Time
 }
+
+type contentConnectionRole uint8
+
+const (
+	contentConnectionUnbound contentConnectionRole = iota
+	contentConnectionControl
+	contentConnectionBulk
+)
 
 type controlTokenBucket struct {
 	credit int64
@@ -70,8 +91,15 @@ func (registry *controlRegistry) register(
 	if registry == nil ||
 		registry.now == nil ||
 		handler == nil ||
-		!validControlPeer(handler.peer) ||
-		!handler.registrationReady() {
+		!validControlPeer(handler.peer) {
+		return errControlStateUnavailable
+	}
+	role := handler.connectionRole()
+	if role != contentConnectionControl &&
+		role != contentConnectionBulk {
+		return errControlStateUnavailable
+	}
+	if !handler.registrationReady() {
 		return errControlStateUnavailable
 	}
 	now := registry.now()
@@ -85,33 +113,51 @@ func (registry *controlRegistry) register(
 		registry.mu.Unlock()
 		return err
 	}
-	incumbent := state.current
-	if incumbent == nil {
-		incumbent = state.draining
-	}
-	if incumbent != nil &&
-		compareControlCredentials(handler.peer, incumbent.peer) < 0 {
+	if state.credentialSet &&
+		compareControlCredentials(handler.peer, state.credential) < 0 {
 		registry.mu.Unlock()
 		return ErrControlConnectionSuperseded
 	}
 
-	olderDrain := state.draining
-	priorCurrent := state.current
-	stopPriorCurrent := false
-	if priorCurrent != nil {
-		stopPriorCurrent = priorCurrent.markDraining()
-		state.draining = priorCurrent
+	switch role {
+	case contentConnectionControl:
+		var (
+			registered bool
+			stop       *connectionHandler
+		)
+		registered, stop = state.registerControl(handler)
+		if !registered {
+			registry.mu.Unlock()
+			return ErrControlConnectionCapacity
+		}
+		defer func() {
+			if stop != nil {
+				stop.stopConnection()
+			}
+		}()
+	case contentConnectionBulk:
+		var (
+			registered bool
+			stop       *connectionHandler
+		)
+		registered, stop = state.registerBulk(handler)
+		if !registered {
+			registry.mu.Unlock()
+			return ErrBulkConnectionCapacity
+		}
+		defer func() {
+			if stop != nil {
+				stop.stopConnection()
+			}
+		}()
 	}
-	state.current = handler
+	if !state.credentialSet ||
+		compareControlCredentials(handler.peer, state.credential) > 0 {
+		state.credential = handler.peer
+		state.credentialSet = true
+	}
 	state.lastSeen = monotonicControlTime(state.lastSeen, now)
 	registry.mu.Unlock()
-
-	if olderDrain != nil && olderDrain != priorCurrent {
-		olderDrain.forceClose()
-	}
-	if stopPriorCurrent {
-		priorCurrent.stopConnection()
-	}
 	return nil
 }
 
@@ -131,6 +177,14 @@ func (registry *controlRegistry) unregister(handler *connectionHandler) {
 		}
 		if state.draining == handler {
 			state.draining = nil
+		}
+		for index := range state.bulkCurrent {
+			if state.bulkCurrent[index] == handler {
+				state.bulkCurrent[index] = nil
+			}
+			if state.bulkDraining[index] == handler {
+				state.bulkDraining[index] = nil
+			}
 		}
 		if !now.IsZero() {
 			state.lastSeen = monotonicControlTime(state.lastSeen, now)
@@ -152,8 +206,30 @@ func (registry *controlRegistry) consume(
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	state := registry.states[deviceID]
-	if state == nil || state.current == nil && state.draining == nil {
+	if state == nil || !state.activeConnections() {
 		return false, 0, errControlStateUnavailable
+	}
+	now = monotonicControlTime(state.lastSeen, now)
+	state.lastSeen = now
+	allowed, retryAfter := state.bucket.consume(now)
+	return allowed, retryAfter, nil
+}
+
+func (registry *controlRegistry) consumeRequest(
+	deviceID domain.DeviceID,
+) (bool, time.Duration, error) {
+	if registry == nil || registry.now == nil || !deviceID.Valid() {
+		return false, 0, errControlStateUnavailable
+	}
+	now := registry.now()
+	if now.IsZero() {
+		return false, 0, errControlStateUnavailable
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	state, err := registry.stateForRegistrationLocked(deviceID, now)
+	if err != nil {
+		return false, 0, err
 	}
 	now = monotonicControlTime(state.lastSeen, now)
 	state.lastSeen = now
@@ -174,7 +250,7 @@ func (registry *controlRegistry) consumeProposal(
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	state := registry.states[deviceID]
-	if state == nil || state.current == nil && state.draining == nil {
+	if state == nil || !state.activeConnections() {
 		return false, 0, errControlStateUnavailable
 	}
 	now = monotonicControlTime(state.lastSeen, now)
@@ -201,8 +277,7 @@ func (registry *controlRegistry) stateForRegistrationLocked(
 		)
 		for candidateID, candidate := range registry.states {
 			if candidate == nil ||
-				candidate.current != nil ||
-				candidate.draining != nil {
+				candidate.activeConnections() {
 				continue
 			}
 			if evictionState == nil ||
@@ -231,6 +306,104 @@ func (registry *controlRegistry) stateForRegistrationLocked(
 	}
 	registry.states[deviceID] = state
 	return state, nil
+}
+
+func (state *controlPeerState) activeConnections() bool {
+	if state == nil {
+		return false
+	}
+	if state.current != nil || state.draining != nil {
+		return true
+	}
+	for index := range state.bulkCurrent {
+		if state.bulkCurrent[index] != nil ||
+			state.bulkDraining[index] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (state *controlPeerState) registerControl(
+	handler *connectionHandler,
+) (bool, *connectionHandler) {
+	if state == nil || handler == nil {
+		return false, nil
+	}
+	if state.current != nil &&
+		compareControlCredentials(
+			handler.peer,
+			state.current.peer,
+		) < 0 {
+		return false, nil
+	}
+	if state.current != nil && state.draining != nil {
+		return false, nil
+	}
+	var stop *connectionHandler
+	if state.current != nil {
+		if state.current.markDraining() {
+			stop = state.current
+		}
+		state.draining = state.current
+	}
+	state.current = handler
+	return true, stop
+}
+
+func (state *controlPeerState) registerBulk(
+	handler *connectionHandler,
+) (bool, *connectionHandler) {
+	if state == nil || handler == nil {
+		return false, nil
+	}
+
+	slot := -1
+	for index := range state.bulkCurrent {
+		if state.bulkCurrent[index] == nil &&
+			state.bulkDraining[index] == nil {
+			slot = index
+			break
+		}
+	}
+	if slot < 0 {
+		for index := range state.bulkCurrent {
+			if state.bulkCurrent[index] == nil {
+				slot = index
+				break
+			}
+		}
+	}
+	if slot < 0 {
+		for index, current := range state.bulkCurrent {
+			if state.bulkDraining[index] != nil {
+				continue
+			}
+			if compareControlCredentials(handler.peer, current.peer) < 0 {
+				continue
+			}
+			if slot < 0 ||
+				compareControlCredentials(
+					current.peer,
+					state.bulkCurrent[slot].peer,
+				) < 0 {
+				slot = index
+			}
+		}
+	}
+	if slot < 0 {
+		return false, nil
+	}
+
+	var stop *connectionHandler
+	if state.bulkCurrent[slot] != nil {
+		if state.bulkCurrent[slot].markDraining() {
+			stop = state.bulkCurrent[slot]
+		}
+		state.bulkDraining[slot] = state.bulkCurrent[slot]
+	}
+	state.bulkCurrent[slot] = handler
+	return true, stop
 }
 
 func (bucket *controlTokenBucket) consume(
@@ -323,6 +496,8 @@ type handlerAdmission uint8
 const (
 	handlerClosed handlerAdmission = iota
 	handlerDraining
+	handlerBusy
+	handlerRegistering
 	handlerAccepted
 )
 
@@ -330,13 +505,42 @@ func newConnectionHandler(
 	server *Server,
 	peer transport.AuthenticatedPeer,
 	stop context.CancelFunc,
+	drain func(),
 ) *connectionHandler {
 	return &connectionHandler{
 		server:    server,
 		peer:      peer,
 		accepting: true,
 		stop:      stop,
+		drain:     drain,
 	}
+}
+
+func (handler *connectionHandler) bindConnectionRole(
+	role contentConnectionRole,
+) error {
+	if handler == nil ||
+		(role != contentConnectionControl &&
+			role != contentConnectionBulk) {
+		return errControlStateUnavailable
+	}
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if handler.role != contentConnectionUnbound &&
+		handler.role != role {
+		return errConnectionRouteMismatch
+	}
+	handler.role = role
+	return nil
+}
+
+func (handler *connectionHandler) connectionRole() contentConnectionRole {
+	if handler == nil {
+		return contentConnectionUnbound
+	}
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.role
 }
 
 func (handler *connectionHandler) registrationReady() bool {
@@ -347,7 +551,51 @@ func (handler *connectionHandler) registrationReady() bool {
 	defer handler.mu.Unlock()
 	return handler.accepting &&
 		!handler.closing &&
-		handler.activeCount == 0
+		handler.role != contentConnectionUnbound &&
+		(handler.registering && handler.activeCount == 1 ||
+			!handler.registering && handler.activeCount == 0)
+}
+
+func (handler *connectionHandler) beginRequest() (
+	contentConnectionRole,
+	bool,
+	handlerAdmission,
+) {
+	if handler == nil {
+		return contentConnectionUnbound, false, handlerClosed
+	}
+	handler.registrationMu.Lock()
+	defer handler.registrationMu.Unlock()
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+
+	role := handler.role
+	if !handler.registered && handler.registering {
+		return role, false, handlerRegistering
+	}
+	switch {
+	case handler.closing:
+		return role, handler.registered, handlerClosed
+	case !handler.accepting:
+		return role, handler.registered, handlerDraining
+	case handler.registered &&
+		role == contentConnectionBulk &&
+		handler.activeCount >= BulkStreamsMax:
+		return role, true, handlerBusy
+	default:
+		if !handler.registered {
+			handler.registering = true
+		}
+		handler.active.Add(1)
+		handler.activeCount++
+		return role, handler.registered, handlerAccepted
+	}
+}
+
+func (handler *connectionHandler) finishRegistration() {
+	handler.mu.Lock()
+	handler.registering = false
+	handler.mu.Unlock()
 }
 
 func (handler *connectionHandler) begin() handlerAdmission {
@@ -358,6 +606,9 @@ func (handler *connectionHandler) begin() handlerAdmission {
 		return handlerClosed
 	case !handler.accepting:
 		return handlerDraining
+	case handler.role == contentConnectionBulk &&
+		handler.activeCount >= BulkStreamsMax:
+		return handlerBusy
 	default:
 		handler.active.Add(1)
 		handler.activeCount++
@@ -365,31 +616,51 @@ func (handler *connectionHandler) begin() handlerAdmission {
 	}
 }
 
-func (handler *connectionHandler) end() {
+func (handler *connectionHandler) endResponse(writer http.ResponseWriter) {
 	handler.mu.Lock()
 	handler.activeCount--
-	stop := !handler.accepting && handler.activeCount == 0
+	handler.registering = false
+	releaseRegistrySlot := handler.activeCount == 0 && !handler.accepting
+	if releaseRegistrySlot {
+		handler.closing = true
+		if writer != nil {
+			writer.Header().Set("Connection", "close")
+		}
+	}
 	handler.mu.Unlock()
 	handler.active.Done()
-	if stop {
-		handler.stopConnection()
+	if releaseRegistrySlot &&
+		handler.server != nil &&
+		handler.server.control != nil {
+		handler.server.control.unregister(handler)
+	}
+}
+
+func (handler *connectionHandler) prepareResponse(
+	writer http.ResponseWriter,
+) {
+	if handler == nil || writer == nil {
+		return
+	}
+	handler.mu.Lock()
+	closeConnection := !handler.accepting || handler.closing
+	handler.mu.Unlock()
+	if closeConnection {
+		writer.Header().Set("Connection", "close")
 	}
 }
 
 func (handler *connectionHandler) markDraining() bool {
 	handler.mu.Lock()
 	handler.accepting = false
-	stop := handler.activeCount == 0
+	idle := handler.activeCount == 0
+	drain := handler.drain
 	handler.mu.Unlock()
-	return stop
-}
-
-func (handler *connectionHandler) forceClose() {
-	handler.mu.Lock()
-	handler.accepting = false
-	handler.closing = true
-	handler.mu.Unlock()
-	handler.stopConnection()
+	if drain != nil {
+		drain()
+		return false
+	}
+	return idle
 }
 
 func (handler *connectionHandler) close() {
@@ -399,6 +670,24 @@ func (handler *connectionHandler) close() {
 	handler.mu.Unlock()
 	handler.stopConnection()
 	handler.active.Wait()
+}
+
+func (handler *connectionHandler) closeAfterResponse(
+	writer http.ResponseWriter,
+) {
+	if writer != nil {
+		// Retain the HTTP/1 compatibility signal in addition to the explicit
+		// per-connection HTTP/2 graceful shutdown.
+		writer.Header().Set("Connection", "close")
+	}
+	handler.mu.Lock()
+	handler.accepting = false
+	handler.closing = true
+	drain := handler.drain
+	handler.mu.Unlock()
+	if drain != nil {
+		drain()
+	}
 }
 
 func (handler *connectionHandler) stopConnection() {

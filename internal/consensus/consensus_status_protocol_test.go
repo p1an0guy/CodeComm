@@ -11,6 +11,7 @@ import (
 
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
@@ -45,6 +46,7 @@ func TestConsensusStatusResponseIsCanonicalBoundedAndClosed(
 		t.Fatalf("decodeConsensusStatusResponse(): %v", err)
 	}
 	if decoded.SessionID != status.SessionID ||
+		decoded.WorkspaceID != status.WorkspaceID ||
 		decoded.RecoveryGeneration != status.RecoveryGeneration ||
 		decoded.ServerDeviceID != status.ServerDeviceID ||
 		decoded.LocalTerm != status.LocalTerm ||
@@ -54,6 +56,8 @@ func TestConsensusStatusResponseIsCanonicalBoundedAndClosed(
 		decoded.LastRaftAppliedLogIndex == nil ||
 		*decoded.LastRaftAppliedLogIndex !=
 			*status.LastRaftAppliedLogIndex ||
+		decoded.CredentialAuthority.VoterSetVersion !=
+			status.CredentialAuthority.VoterSetVersion ||
 		!credentialRenewalAuthorizationsEqual(
 			decoded.ContentCredentialAuthorization,
 			status.ContentCredentialAuthorization,
@@ -278,17 +282,25 @@ func consensusStatusProtocolFixture(
 	t.Helper()
 	binding := credentialRenewalTestBinding(t, 1)
 	authorization := credentialRenewalTestAuthorization(t, binding)
+	authorization.AuthorityVoterSetVersion = 1
 	now := time.Date(2026, 8, 18, 12, 1, 0, 0, time.UTC)
 	leader := credentialRenewalTestDeviceID(t, 0xd0)
 	applied := uint64(23)
 	return ConsensusStatusResult{
-		SessionID:                      authorization.SessionID,
-		RecoveryGeneration:             2,
-		ServerDeviceID:                 authorization.DeviceID,
-		LocalTerm:                      7,
-		LeaderDeviceID:                 &leader,
-		QuorumRequired:                 2,
-		LastRaftAppliedLogIndex:        &applied,
+		SessionID:               authorization.SessionID,
+		WorkspaceID:             nodeTestWorkspaceID,
+		RecoveryGeneration:      2,
+		ServerDeviceID:          authorization.DeviceID,
+		LocalTerm:               7,
+		LeaderDeviceID:          &leader,
+		QuorumRequired:          2,
+		LastRaftAppliedLogIndex: &applied,
+		CredentialAuthority: credentialauthority.Authority{
+			SessionID:        authorization.SessionID,
+			VoterDeviceIDs:   []domain.DeviceID{authorization.DeviceID},
+			VoterSetVersion:  1,
+			ActivationSource: credentialauthority.ActivationGenesis,
+		},
 		ContentCredentialAuthorization: authorization,
 	}, now
 }

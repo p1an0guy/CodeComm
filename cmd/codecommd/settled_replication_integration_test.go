@@ -7,29 +7,40 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"os/exec"
 	"reflect"
+	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/credential"
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
+	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/ui"
 )
 
-const daemonSettledReplicationChildMarker = "CODECOMM_TEST_SETTLED_REPLICATION_CHILD"
+const (
+	daemonSettledReplicationChildMarker = "CODECOMM_TEST_SETTLED_REPLICATION_CHILD"
+	daemonSettledSnapshotChildMarker    = "CODECOMM_TEST_SETTLED_SNAPSHOT_CHILD"
+	daemonSettledSnapshotProcessTimeout = 10 * time.Minute
+)
 
 func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart(
 	t *testing.T,
@@ -39,6 +50,16 @@ func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart(
 		return
 	}
 	runDaemonSettledReplicationIntegration(t)
+}
+
+func TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart(
+	t *testing.T,
+) {
+	if os.Getenv(daemonSettledSnapshotChildMarker) != "1" {
+		runDaemonSettledSnapshotFallbackChild(t)
+		return
+	}
+	runDaemonSettledSnapshotFallbackIntegration(t)
 }
 
 func runDaemonSettledReplicationIntegration(t *testing.T) {
@@ -298,7 +319,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		taskResult.Outcome.Code != "accepted" {
 		t.Fatalf("post-handoff task apply = (%+v, %v)", taskResult, err)
 	}
-	statuses = waitForDaemonMeshIntegrationCluster(
+	waitForDaemonMeshIntegrationCluster(
 		t,
 		targetNodes,
 		func(statuses []ui.Snapshot) bool {
@@ -311,9 +332,6 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				)
 		},
 	)
-	frozenResultIndex := statuses[0].Session.ResultIndex
-	frozenChainIndex := statuses[0].Session.EventChainIndex
-
 	for _, voter := range removedVoters {
 		voter.stop(t)
 	}
@@ -324,12 +342,600 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 	settled.start(t, allNodes)
 	waitForDaemonMeshIntegrationCluster(
 		t,
+		[]*daemonMeshIntegrationNode{settled, target},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 2 &&
+				statuses[0].Session.ResultIndex ==
+					statuses[1].Session.ResultIndex &&
+				statuses[0].Session.EventChainIndex ==
+					statuses[1].Session.EventChainIndex &&
+				statuses[0].Session.AppliedRaftIndex == nil &&
+				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+
+	target.stop(t)
+	settled.stop(t)
+	assertDaemonSettledReplicationDurableState(
+		t,
+		target,
+		settled,
+		leader.deviceID,
+		target.deviceID,
+	)
+}
+
+func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
+	t.Helper()
+	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 5)
+	root := t.TempDir()
+	credentialClock := newDaemonMeshIntegrationCredentialClock(
+		time.Now().UTC().Truncate(time.Second),
+	)
+	allNodes := newDaemonMeshIntegrationNodes(
+		t,
+		root,
+		selectedAddress,
+		listeners,
+		credentialClock.Now,
+	)
+	voters := append(
+		[]*daemonMeshIntegrationNode(nil),
+		allNodes[:3]...,
+	)
+	target := allNodes[3]
+	settled := allNodes[4]
+	var targetCoverageCalls atomic.Uint64
+	nonvoterStageReached := make(chan struct{})
+	releasePromotion := make(chan struct{})
+	promotionReleased := false
+	defer func() {
+		if !promotionReleased {
+			close(releasePromotion)
+		}
+	}()
+	raftParticipants := append(
+		append(
+			[]*daemonMeshIntegrationNode(nil),
+			voters...,
+		),
+		target,
+	)
+	coverage := &daemonSettledCoverageCollector{
+		privateKeys: make(
+			map[domain.DeviceID]ed25519.PrivateKey,
+			len(raftParticipants),
+		),
+		afterCollect: func(requirement canonicalcoverage.Requirement) {
+			if requirement.VoterSet.VoterSetVersion != 2 ||
+				targetCoverageCalls.Add(1) != 2 {
+				return
+			}
+			close(nonvoterStageReached)
+			<-releasePromotion
+		},
+	}
+	for _, participant := range raftParticipants {
+		coverage.privateKeys[participant.deviceID] = participant.privateKey
+		participant.coverage = coverage
+	}
+	t.Cleanup(func() {
+		for _, node := range allNodes {
+			node.cleanup(t)
+			clear(node.privateKey)
+		}
+	})
+
+	settledMember := device.Device{
+		ID:   settled.deviceID,
+		Role: device.RoleEditor,
+		IdentityPublicKey: bytes.Clone(
+			settled.privateKey.Public().(ed25519.PublicKey),
+		),
+		DaemonVersion: "0.1.0",
+		MaxApplyLevel: 1,
+		Status:        device.StatusActive,
+		EntityVersion: 1,
+	}
+	targetMember := device.Device{
+		ID:   target.deviceID,
+		Role: device.RoleEditor,
+		IdentityPublicKey: bytes.Clone(
+			target.privateKey.Public().(ed25519.PublicKey),
+		),
+		DaemonVersion: "0.1.0",
+		MaxApplyLevel: 1,
+		Status:        device.StatusActive,
+		EntityVersion: 1,
+	}
+	initial := daemonMeshIntegrationInitialState(
+		t,
+		voters,
+		settledMember,
+	)
+	initial.Projections.Devices = append(
+		initial.Projections.Devices,
+		targetMember,
+	)
+	sort.Slice(initial.Projections.Devices, func(left, right int) bool {
+		return initial.Projections.Devices[left].ID <
+			initial.Projections.Devices[right].ID
+	})
+	initial.Projections.AuditCounters = append(
+		initial.Projections.AuditCounters,
+		auditcounter.Counter{DeviceID: target.deviceID},
+	)
+	sort.Slice(
+		initial.Projections.AuditCounters,
+		func(left, right int) bool {
+			return initial.Projections.AuditCounters[left].DeviceID <
+				initial.Projections.AuditCounters[right].DeviceID
+		},
+	)
+	bootstrap := daemonMeshIntegrationBootstrap(voters)
+	for _, participant := range raftParticipants {
+		initializeDaemonMeshIntegrationStore(
+			t,
+			participant.statePath,
+			initial,
+		)
+		seedDaemonMeshIntegrationRaft(
+			t,
+			participant.consensusDir,
+			participant.deviceID,
+			bootstrap,
+		)
+	}
+	targetStore, err := store.Open(
+		context.Background(),
+		store.Options{Path: target.statePath},
+	)
+	if err != nil {
+		t.Fatalf("open staging nonvoter state: %v", err)
+	}
+	storeDaemonTestConfiguration(
+		t,
+		targetStore,
+		daemonMeshIntegrationDeviceIDs(voters),
+		nil,
+	)
+	if err := targetStore.Close(); err != nil {
+		t.Fatalf("close staging nonvoter state: %v", err)
+	}
+	initializeDaemonMeshIntegrationStore(t, settled.statePath, initial)
+	enterDaemonSettledReplicationMode(
+		t,
+		settled.statePath,
+		daemonMeshIntegrationDeviceIDs(voters),
+	)
+
+	for _, voter := range voters {
+		voter.start(t, allNodes)
+	}
+	voterIDs := daemonMeshIntegrationDeviceIDs(voters)
+	statuses := waitForDaemonMeshIntegrationCluster(
+		t,
+		voters,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationTarget(statuses, 1, voterIDs)
+		},
+	)
+	waitForDaemonMeshContentCredentials(t, voters)
+	leaderID := domain.DeviceID(
+		*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
+			Consensus.LeaderDeviceID,
+	)
+	leader := daemonMeshIntegrationNodeByID(t, voters, leaderID)
+	targetNodes := []*daemonMeshIntegrationNode{target}
+	targetIDs := daemonMeshIntegrationDeviceIDs(targetNodes)
+	removedVoters := append([]*daemonMeshIntegrationNode(nil), voters...)
+
+	settledCertificate := authorizeDaemonSettledCredential(
+		t,
+		voters,
+		leader,
+		settled,
+		credentialClock.Now(),
+	)
+	defer clearDaemonTLSCertificate(&settledCertificate)
+	bootstrapResultIndex := bootstrapDaemonSettledReplica(
+		t,
+		selectedAddress,
+		leader,
+		settled,
+		settledCertificate,
+	)
+
+	settled.start(t, allNodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
 		[]*daemonMeshIntegrationNode{settled},
 		func(statuses []ui.Snapshot) bool {
 			return len(statuses) == 1 &&
-				statuses[0].Session.ResultIndex == frozenResultIndex &&
-				statuses[0].Session.EventChainIndex == frozenChainIndex &&
+				statuses[0].Session.ResultIndex == bootstrapResultIndex &&
 				statuses[0].Session.AppliedRaftIndex == nil &&
+				daemonMeshIntegrationTarget(statuses, 1, voterIDs)
+		},
+	)
+	authorityOneTaskID := domain.UUIDv7(
+		"018f47de-89ab-7def-8123-7123456789ab",
+	)
+	authorityOneEventID := domain.UUIDv7(
+		"018f47de-89ab-7def-8123-8123456789ab",
+	)
+	if _, ready := leader.meshCapture.consensusNode(); !ready {
+		t.Fatal("snapshot-fallback authority-v1 leader was not captured")
+	}
+	applyContext, cancelApply := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	authorityOneResult, err := applyDaemonSettledEventWithLeaderRetry(
+		applyContext,
+		voters,
+		daemonSettledTaskEvent(
+			t,
+			leader.privateKey,
+			leader.deviceID,
+			authorityOneEventID,
+			authorityOneTaskID,
+			"anchor snapshot fallback cursor",
+		),
+	)
+	cancelApply()
+	if err != nil ||
+		authorityOneResult.Outcome.Status != store.OutcomeAccepted ||
+		authorityOneResult.Outcome.Code != "accepted" {
+		t.Fatalf(
+			"snapshot-fallback anchor apply = (%+v, %v)",
+			authorityOneResult,
+			err,
+		)
+	}
+	statuses = waitForDaemonMeshIntegrationCluster(
+		t,
+		voters,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationTarget(statuses, 1, voterIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+				)
+		},
+	)
+	staleResultIndex := statuses[0].Session.ResultIndex
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{settled},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 1 &&
+				statuses[0].Session.ResultIndex == staleResultIndex &&
+				statuses[0].Session.AppliedRaftIndex == nil &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+				)
+		},
+	)
+	settled.stop(t)
+
+	backlogContext, cancelBacklog := context.WithTimeout(
+		context.Background(),
+		2*daemonMeshIntegrationTimeout,
+	)
+	var backlogResultIndex uint64
+	for index := 0; index < replication.MaxBatchResults; index++ {
+		result, applyErr := applyDaemonSettledEventWithLeaderRetry(
+			backlogContext,
+			voters,
+			daemonSettledTaskEventAtSequence(
+				t,
+				leader.privateKey,
+				leader.deviceID,
+				daemonSettledSnapshotFallbackEventID(t, index),
+				authorityOneTaskID,
+				"force bounded authority handoff",
+				uint64(index)+2,
+			),
+		)
+		if applyErr != nil ||
+			result.Outcome.Status != store.OutcomeRejected ||
+			result.Outcome.Code != "entity_already_exists" {
+			cancelBacklog()
+			t.Fatalf(
+				"snapshot-fallback backlog apply %d = (%+v, %v)",
+				index,
+				result,
+				applyErr,
+			)
+		}
+		backlogResultIndex = result.Heads.ResultIndex
+	}
+	cancelBacklog()
+	if backlogResultIndex < staleResultIndex+replication.MaxBatchResults {
+		t.Fatalf(
+			"snapshot-fallback backlog cursor = %d after %d, want at least %d",
+			backlogResultIndex,
+			staleResultIndex,
+			staleResultIndex+replication.MaxBatchResults,
+		)
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		voters,
+		func(statuses []ui.Snapshot) bool {
+			if !daemonMeshIntegrationClusterReady(statuses, voterIDs) ||
+				!daemonMeshIntegrationTarget(statuses, 1, voterIDs) {
+				return false
+			}
+			for _, status := range statuses {
+				if status.Session.ResultIndex < backlogResultIndex {
+					return false
+				}
+			}
+			return true
+		},
+	)
+	target.start(t, allNodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		targetNodes,
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 1 &&
+				statuses[0].Session.LocalDeviceID ==
+					string(target.deviceID) &&
+				statuses[0].Consensus.VoterSetVersion == 1 &&
+				statuses[0].Consensus.ActivatedVoterSetVersion == 1 &&
+				sameDaemonMeshIntegrationIDs(
+					statuses[0].Consensus.LiveVoterDeviceIDs,
+					voterIDs,
+				) &&
+				len(statuses[0].Consensus.LiveNonvoterDeviceIDs) == 0
+		},
+	)
+
+	operator := dialDaemonMeshIntegrationOperator(t, leader.localEndpoint)
+	changeContext, cancelChange := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	changeResult, err := operator.SetVoters(
+		changeContext,
+		ui.SetVotersRequest{
+			ExpectedVoterSetVersion: 1,
+			VoterDeviceIDs:          targetIDs,
+		},
+	)
+	cancelChange()
+	closeErr := operator.Close()
+	if err != nil {
+		t.Fatalf("SetVoters(snapshot fallback): %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("close snapshot-fallback set-voters client: %v", closeErr)
+	}
+	if changeResult.Status != store.OutcomeAccepted ||
+		changeResult.Code != "accepted" ||
+		changeResult.Duplicate {
+		t.Fatalf(
+			"SetVoters(snapshot fallback) result = %+v",
+			changeResult,
+		)
+	}
+	select {
+	case <-nonvoterStageReached:
+	case <-time.After(daemonMeshIntegrationTimeout):
+		t.Fatal("target did not reach the proven nonvoter stage")
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		raftParticipants,
+		func(statuses []ui.Snapshot) bool {
+			if !daemonMeshIntegrationClusterReady(statuses, voterIDs) {
+				return false
+			}
+			for _, status := range statuses {
+				if status.Consensus.VoterSetVersion != 2 ||
+					status.Consensus.ActivatedVoterSetVersion != 1 ||
+					!sameDaemonMeshIntegrationIDs(
+						status.Consensus.TargetVoterDeviceIDs,
+						targetIDs,
+					) ||
+					!sameDaemonMeshIntegrationIDs(
+						status.Consensus.ActivatedVoterDeviceIDs,
+						voterIDs,
+					) ||
+					!sameDaemonMeshIntegrationIDs(
+						status.Consensus.LiveNonvoterDeviceIDs,
+						targetIDs,
+					) {
+					return false
+				}
+			}
+			return true
+		},
+	)
+	close(releasePromotion)
+	promotionReleased = true
+
+	statuses = waitForDaemonMeshIntegrationCluster(
+		t,
+		targetNodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, targetIDs) &&
+				daemonMeshIntegrationTarget(statuses, 2, targetIDs)
+		},
+	)
+	activatedResultIndex := statuses[0].Session.ResultIndex
+	if activatedResultIndex <= backlogResultIndex {
+		t.Fatalf(
+			"activated cursor = %d, backlog cursor = %d",
+			activatedResultIndex,
+			backlogResultIndex,
+		)
+	}
+	for _, voter := range removedVoters {
+		voter.stop(t)
+	}
+
+	contentContext, cancelContent := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancelContent()
+	contentConnection, err := dialDaemonMeshExternalContentClient(
+		contentContext,
+		settledCertificate,
+		selectedAddress,
+		target,
+	)
+	if err != nil {
+		t.Fatalf("dial snapshot-fallback source: %v", err)
+	}
+	contentConnectionClosed := false
+	defer func() {
+		if !contentConnectionClosed {
+			_ = contentConnection.Close()
+		}
+	}()
+	if _, err := contentConnection.client.Session(contentContext); err != nil {
+		t.Fatalf("bind snapshot-fallback source: %v", err)
+	}
+	if _, err := contentConnection.client.Replication(
+		contentContext,
+		staleResultIndex,
+	); !errors.Is(err, contenthttp.ErrReplicationSnapshotRequired) {
+		t.Fatalf(
+			"replication after stale cursor error = %v, want snapshot_required",
+			err,
+		)
+	}
+	snapshotRoot := waitForDaemonSettledLogicalSnapshot(
+		t,
+		contentContext,
+		contentConnection.client,
+		target.deviceID,
+		target.privateKey.Public().(ed25519.PublicKey),
+		activatedResultIndex,
+	)
+	snapshotInput := snapshotRoot.Unsigned().Input()
+	contentCloseErr := contentConnection.Close()
+	contentConnectionClosed = true
+	if contentCloseErr != nil {
+		t.Fatalf(
+			"close snapshot-fallback source: %v",
+			contentCloseErr,
+		)
+	}
+	cancelContent()
+	if snapshotInput.ResultIndex <= staleResultIndex {
+		t.Fatalf(
+			"snapshot cursor = %d, stale cursor = %d",
+			snapshotInput.ResultIndex,
+			staleResultIndex,
+		)
+	}
+
+	if _, ready := target.meshCapture.consensusNode(); !ready {
+		t.Fatal("snapshot-fallback authority-v2 leader was not captured")
+	}
+	tailContext, cancelTail := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	tailResult, err := applyDaemonSettledEventWithLeaderRetry(
+		tailContext,
+		targetNodes,
+		daemonTestTaskEvent(
+			t,
+			target.privateKey,
+			target.deviceID,
+		),
+	)
+	cancelTail()
+	if err != nil ||
+		tailResult.Outcome.Status != store.OutcomeAccepted ||
+		tailResult.Outcome.Code != "accepted" ||
+		tailResult.Heads.ResultIndex <= snapshotInput.ResultIndex {
+		t.Fatalf(
+			"post-snapshot tail apply = (%+v, %v), snapshot cursor %d",
+			tailResult,
+			err,
+			snapshotInput.ResultIndex,
+		)
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		targetNodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, targetIDs) &&
+				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
+				statuses[0].Session.ResultIndex >=
+					tailResult.Heads.ResultIndex &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+
+	settled.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		settled.peerEndpoint,
+	)
+	settled.start(t, allNodes)
+	finalStatuses := waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{target, settled},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 2 &&
+				statuses[0].Session.ResultIndex ==
+					statuses[1].Session.ResultIndex &&
+				statuses[0].Session.EventChainIndex ==
+					statuses[1].Session.EventChainIndex &&
+				statuses[1].Session.AppliedRaftIndex == nil &&
+				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+	finalResultIndex := finalStatuses[0].Session.ResultIndex
+	finalChainIndex := finalStatuses[0].Session.EventChainIndex
+	if finalResultIndex <= snapshotInput.ResultIndex {
+		t.Fatalf(
+			"settled cursor %d did not resume after snapshot %d",
+			finalResultIndex,
+			snapshotInput.ResultIndex,
+		)
+	}
+
+	settled.stop(t)
+	settled.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		settled.peerEndpoint,
+	)
+	settled.start(t, allNodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{target, settled},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 2 &&
+				statuses[0].Session.ResultIndex == finalResultIndex &&
+				statuses[1].Session.ResultIndex == finalResultIndex &&
+				statuses[0].Session.EventChainIndex == finalChainIndex &&
+				statuses[1].Session.EventChainIndex == finalChainIndex &&
+				statuses[1].Session.AppliedRaftIndex == nil &&
 				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
 				daemonSettledTasksConverged(
 					statuses,
@@ -341,12 +947,11 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 
 	settled.stop(t)
 	target.stop(t)
-	assertDaemonSettledReplicationDurableState(
+	assertDaemonSettledSnapshotFallbackDurableState(
 		t,
 		target,
 		settled,
-		leader.deviceID,
-		target.deviceID,
+		snapshotRoot,
 	)
 }
 
@@ -356,6 +961,26 @@ func daemonSettledTaskEvent(
 	deviceID domain.DeviceID,
 	eventID, taskID domain.UUIDv7,
 	title string,
+) event.SignedEvent {
+	t.Helper()
+	return daemonSettledTaskEventAtSequence(
+		t,
+		privateKey,
+		deviceID,
+		eventID,
+		taskID,
+		title,
+		1,
+	)
+}
+
+func daemonSettledTaskEventAtSequence(
+	t *testing.T,
+	privateKey ed25519.PrivateKey,
+	deviceID domain.DeviceID,
+	eventID, taskID domain.UUIDv7,
+	title string,
+	originSequence uint64,
 ) event.SignedEvent {
 	t.Helper()
 	authority, err := event.NewLocalAuthority(
@@ -393,7 +1018,7 @@ func daemonSettledTaskEvent(
 			SessionID:      daemonTestSessionID,
 			WorkspaceID:    daemonTestWorkspaceID,
 			CreatedAt:      daemonTestTimestamp,
-			OriginSequence: 1,
+			OriginSequence: originSequence,
 		},
 	)
 	if err != nil {
@@ -404,6 +1029,119 @@ func daemonSettledTaskEvent(
 		t.Fatalf("event.Sign(): %v", err)
 	}
 	return signed
+}
+
+func applyDaemonSettledEventWithLeaderRetry(
+	ctx context.Context,
+	nodes []*daemonMeshIntegrationNode,
+	signed event.SignedEvent,
+) (store.ApplyResult, error) {
+	if ctx == nil || len(nodes) == 0 {
+		return store.ApplyResult{}, errors.New(
+			"invalid settled integration apply fixture",
+		)
+	}
+	var lastErr error
+	for ctx.Err() == nil {
+		for _, candidate := range nodes {
+			node, ready := candidate.meshCapture.consensusNode()
+			if !ready || !node.IsLeader() {
+				continue
+			}
+			result, err := node.Apply(ctx, signed)
+			if err == nil {
+				return result, nil
+			}
+			lastErr = err
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no Raft leader became available")
+	}
+	return store.ApplyResult{}, errors.Join(ctx.Err(), lastErr)
+}
+
+func daemonSettledSnapshotFallbackEventID(
+	t *testing.T,
+	index int,
+) domain.UUIDv7 {
+	t.Helper()
+	eventID := domain.UUIDv7(fmt.Sprintf(
+		"018f47de-89ab-7def-9234-%012x",
+		index+1,
+	))
+	if index < 0 || !eventID.Valid() {
+		t.Fatalf("invalid snapshot-fallback event ID at %d: %q", index, eventID)
+	}
+	return eventID
+}
+
+func waitForDaemonSettledLogicalSnapshot(
+	t *testing.T,
+	ctx context.Context,
+	client *contenthttp.Client,
+	signerDeviceID domain.DeviceID,
+	signerPublicKey ed25519.PublicKey,
+	minimumResultIndex uint64,
+) logicalsnapshot.Root {
+	t.Helper()
+	if ctx == nil ||
+		client == nil ||
+		!signerDeviceID.Valid() ||
+		len(signerPublicKey) != ed25519.PublicKeySize {
+		t.Fatal("invalid logical snapshot wait fixture")
+	}
+	var (
+		lastInput logicalsnapshot.RootInput
+		lastErr   error
+	)
+	for {
+		root, err := client.LatestSnapshot(ctx)
+		if err == nil {
+			input := root.Unsigned().Input()
+			lastInput = input
+			if input.SessionID == daemonTestSessionID &&
+				input.WorkspaceID == daemonTestWorkspaceID &&
+				input.RecoveryGeneration == 0 &&
+				input.SignerDeviceID == signerDeviceID &&
+				input.AuthorityVersion == 2 &&
+				input.ResultIndex >= minimumResultIndex &&
+				input.DescriptorPageCount > 0 &&
+				input.ChunkCount > 0 &&
+				input.RecordCount > 0 {
+				if err := logicalsnapshot.VerifyRoot(
+					root,
+					signerPublicKey,
+				); err != nil {
+					t.Fatalf(
+						"verify published logical snapshot root: %v",
+						err,
+					)
+				}
+				return root
+			}
+			lastErr = errors.New("latest snapshot does not cover activation")
+		} else if !errors.Is(err, contenthttp.ErrSnapshotUnavailable) {
+			t.Fatalf("fetch latest logical snapshot: %v", err)
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf(
+				"logical snapshot publication timed out: %v; last root %+v; last error %v",
+				ctx.Err(),
+				lastInput,
+				lastErr,
+			)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func daemonSettledTasksConverged(
@@ -712,14 +1450,22 @@ func assertDaemonSettledReplicationDurableState(
 	if err != nil {
 		t.Fatalf("settled VerifiedSettledNonvoterView(): %v", err)
 	}
+	rowsEqual := reflect.DeepEqual(
+		sourceView.ProjectionRows,
+		settledView.ProjectionRows,
+	)
 	if sourceView.Heads != settledView.Heads ||
 		sourceView.ProjectionStateDigest !=
 			settledView.ProjectionStateDigest ||
-		!reflect.DeepEqual(
-			sourceView.ProjectionRows,
-			settledView.ProjectionRows,
-		) {
-		t.Fatal("settled durable logical state differs from authority source")
+		!rowsEqual {
+		t.Fatalf(
+			"settled durable logical state differs from authority source: heads=(%+v, %+v) digests=(%x, %x) rows_equal=%t",
+			sourceView.Heads,
+			settledView.Heads,
+			sourceView.ProjectionStateDigest,
+			settledView.ProjectionStateDigest,
+			rowsEqual,
+		)
 	}
 	if sourceView.LastRaftAppliedLogIndex == nil ||
 		settledView.CurrentTerm != nil ||
@@ -778,8 +1524,124 @@ func assertDaemonSettledReplicationDurableState(
 	}
 }
 
+func assertDaemonSettledSnapshotFallbackDurableState(
+	t *testing.T,
+	source, settled *daemonMeshIntegrationNode,
+	snapshotRoot logicalsnapshot.Root,
+) {
+	t.Helper()
+	snapshotInput := snapshotRoot.Unsigned().Input()
+	sourceStore, err := store.Open(
+		context.Background(),
+		store.Options{Path: source.statePath},
+	)
+	if err != nil {
+		t.Fatalf("open snapshot source store: %v", err)
+	}
+	defer func() { _ = sourceStore.Close() }()
+	settledStore, err := store.Open(
+		context.Background(),
+		store.Options{Path: settled.statePath},
+	)
+	if err != nil {
+		t.Fatalf("open snapshot-restored settled store: %v", err)
+	}
+	defer func() { _ = settledStore.Close() }()
+
+	sourceView, err := sourceStore.View(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot source View(): %v", err)
+	}
+	settledView, err := settledStore.VerifiedSettledNonvoterView(
+		context.Background(),
+	)
+	if err != nil {
+		t.Fatalf("snapshot-restored VerifiedSettledNonvoterView(): %v", err)
+	}
+	if sourceView.SessionID != settledView.SessionID ||
+		sourceView.WorkspaceID != settledView.WorkspaceID ||
+		sourceView.RecoveryGeneration != settledView.RecoveryGeneration ||
+		!bytes.Equal(sourceView.GenesisJSON, settledView.GenesisJSON) ||
+		sourceView.Heads != settledView.Heads ||
+		sourceView.ProjectionStateDigest !=
+			settledView.ProjectionStateDigest ||
+		!reflect.DeepEqual(
+			sourceView.ProjectionRows,
+			settledView.ProjectionRows,
+		) {
+		t.Fatalf(
+			"snapshot-restored durable state differs:\nsource=%+v\nsettled=%+v",
+			sourceView,
+			settledView,
+		)
+	}
+	if sourceView.LastRaftAppliedLogIndex == nil ||
+		settledView.CurrentTerm != nil ||
+		settledView.LastRaftAppliedLogIndex != nil {
+		t.Fatalf(
+			"snapshot source/settled Raft provenance = (%v, %v, %v)",
+			sourceView.LastRaftAppliedLogIndex,
+			settledView.CurrentTerm,
+			settledView.LastRaftAppliedLogIndex,
+		)
+	}
+	if settledView.Heads.ResultIndex <= snapshotInput.ResultIndex {
+		t.Fatalf(
+			"settled result cursor %d did not include tail after snapshot %d",
+			settledView.Heads.ResultIndex,
+			snapshotInput.ResultIndex,
+		)
+	}
+	if err := sourceStore.VerifyCommitmentHistory(
+		context.Background(),
+	); err != nil {
+		t.Fatalf("VerifyCommitmentHistory(snapshot source): %v", err)
+	}
+	if err := settledStore.VerifyCommitmentHistory(
+		context.Background(),
+	); err != nil {
+		t.Fatalf("VerifyCommitmentHistory(snapshot-restored settled): %v", err)
+	}
+	storedRoot, hasSnapshot, err :=
+		settledStore.VerifiedStandaloneLogicalSnapshotBaseline(
+			context.Background(),
+		)
+	if err != nil ||
+		!hasSnapshot ||
+		!bytes.Equal(
+			storedRoot.CanonicalBytes(),
+			snapshotRoot.CanonicalBytes(),
+		) ||
+		storedRoot.Signature() != snapshotRoot.Signature() {
+		t.Fatalf(
+			"verified standalone snapshot baseline = (%x, %t, %v), want %x",
+			storedRoot.CanonicalBytes(),
+			hasSnapshot,
+			err,
+			snapshotRoot.CanonicalBytes(),
+		)
+	}
+	mode, err := settledStore.ReplicaEvidenceMode(context.Background())
+	if err != nil || mode != store.ReplicaEvidenceSettledNonvoter {
+		t.Fatalf("snapshot-restored evidence mode = (%q, %v)", mode, err)
+	}
+	progress, err := settledStore.SettledReplicationProgress(
+		context.Background(),
+	)
+	if err != nil {
+		t.Fatalf("snapshot-restored SettledReplicationProgress(): %v", err)
+	}
+	if progress.Blocker != nil || progress.Heads != settledView.Heads {
+		t.Fatalf("snapshot-restored settled progress = %+v", progress)
+	}
+	if _, err := os.Stat(settled.consensusDir); !os.IsNotExist(err) {
+		t.Fatalf("snapshot-restored runtime created Raft storage: %v", err)
+	}
+}
+
 type daemonSettledCoverageCollector struct {
-	privateKeys map[domain.DeviceID]ed25519.PrivateKey
+	privateKeys  map[domain.DeviceID]ed25519.PrivateKey
+	afterCollect func(canonicalcoverage.Requirement)
 }
 
 func (collector *daemonSettledCoverageCollector) CollectCanonicalCoverage(
@@ -810,6 +1672,9 @@ func (collector *daemonSettledCoverageCollector) CollectCanonicalCoverage(
 		}
 		receipts = append(receipts, receipt)
 		if len(receipts) == required {
+			if collector.afterCollect != nil {
+				collector.afterCollect(requirement)
+			}
 			return receipts, nil
 		}
 	}
@@ -887,6 +1752,39 @@ func runDaemonSettledReplicationChild(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("settled replication child failed: %v\n%s", err, output)
+	}
+}
+
+func runDaemonSettledSnapshotFallbackChild(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonSettledSnapshotProcessTimeout,
+	)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		os.Args[0],
+		"-test.run=^TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart$",
+		"-test.count=1",
+		"-test.v",
+	)
+	command.Env = append(
+		daemonTestEnvironment(os.Environ()),
+		daemonSettledSnapshotChildMarker+"=1",
+		daemonMeshIntegrationRequired+"=1",
+	)
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf(
+			"settled snapshot child timed out after %s: %v\n%s",
+			daemonSettledSnapshotProcessTimeout,
+			ctx.Err(),
+			output,
+		)
+	}
+	if err != nil {
+		t.Fatalf("settled snapshot child failed: %v\n%s", err, output)
 	}
 }
 

@@ -19,8 +19,8 @@ import (
 
 const (
 	SchemaVersion           uint64 = 1
-	MaxRequiredCapabilities        = 256
-	MaxCapabilityBytes             = 128
+	MaxRequiredCapabilities int    = 256
+	MaxCapabilityBytes      int    = 128
 )
 
 var ErrInvalidResponse = errors.New("content HTTP: invalid response")

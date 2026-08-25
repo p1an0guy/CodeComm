@@ -90,46 +90,9 @@ func (state decodedState) CanonicalCoverageSnapshot() (
 // decodeStateView reconstructs reducer state from one transactionally
 // consistent, commitment-verified store view.
 func decodeStateView(view store.StateView) (decodedState, error) {
-	if err := validateStateViewMetadata(view); err != nil {
-		return decodedState{}, err
-	}
-
-	recoveryPublicKey, err := recoveryPublicKeyFromGenesis(view)
+	snapshot, state, err := decodeReducerStateView(view)
 	if err != nil {
 		return decodedState{}, err
-	}
-	digest, err := chain.StateDigest(
-		chain.Versions{
-			Digest:           view.Heads.DigestVersion,
-			ProjectionSchema: view.Heads.ProjectionSchemaVersion,
-		},
-		view.ProjectionRows,
-	)
-	if err != nil {
-		return decodedState{}, fmt.Errorf(
-			"%w: projection rows: %w",
-			ErrInvalidStateView,
-			err,
-		)
-	}
-	if store.Digest(digest) != view.ProjectionStateDigest {
-		return decodedState{}, fmt.Errorf(
-			"%w: projection-state digest mismatch",
-			ErrInvalidStateView,
-		)
-	}
-
-	snapshot := newSnapshot(view, recoveryPublicKey)
-	if err := decodeProjectionRows(&snapshot, view.ProjectionRows); err != nil {
-		return decodedState{}, err
-	}
-	state, err := reducer.NewState(snapshot)
-	if err != nil {
-		return decodedState{}, fmt.Errorf(
-			"%w: reducer snapshot: %w",
-			ErrInvalidStateView,
-			err,
-		)
 	}
 	admission, err := peerauth.NewSnapshot(peerauth.SnapshotInput{
 		SessionID:                view.SessionID,
@@ -161,6 +124,53 @@ func decodeStateView(view store.StateView) (decodedState, error) {
 		return decodedState{}, err
 	}
 	return decoded, nil
+}
+
+func decodeReducerStateView(
+	view store.StateView,
+) (reducer.Snapshot, reducer.State, error) {
+	if err := validateStateViewMetadata(view); err != nil {
+		return reducer.Snapshot{}, reducer.State{}, err
+	}
+
+	recoveryPublicKey, err := recoveryPublicKeyFromGenesis(view)
+	if err != nil {
+		return reducer.Snapshot{}, reducer.State{}, err
+	}
+	digest, err := chain.StateDigest(
+		chain.Versions{
+			Digest:           view.Heads.DigestVersion,
+			ProjectionSchema: view.Heads.ProjectionSchemaVersion,
+		},
+		view.ProjectionRows,
+	)
+	if err != nil {
+		return reducer.Snapshot{}, reducer.State{}, fmt.Errorf(
+			"%w: projection rows: %w",
+			ErrInvalidStateView,
+			err,
+		)
+	}
+	if store.Digest(digest) != view.ProjectionStateDigest {
+		return reducer.Snapshot{}, reducer.State{}, fmt.Errorf(
+			"%w: projection-state digest mismatch",
+			ErrInvalidStateView,
+		)
+	}
+
+	snapshot := newSnapshot(view, recoveryPublicKey)
+	if err := decodeProjectionRows(&snapshot, view.ProjectionRows); err != nil {
+		return reducer.Snapshot{}, reducer.State{}, err
+	}
+	state, err := reducer.NewState(snapshot)
+	if err != nil {
+		return reducer.Snapshot{}, reducer.State{}, fmt.Errorf(
+			"%w: reducer snapshot: %w",
+			ErrInvalidStateView,
+			err,
+		)
+	}
+	return snapshot, state, nil
 }
 
 func validateStateViewMetadata(view store.StateView) error {

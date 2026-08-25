@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -113,6 +115,11 @@ type daemonContentPeerResolvedRoutesStub struct {
 	dialed bool
 }
 
+type daemonContentPeerDeadlineRoutes struct {
+	deadline time.Time
+	ok       bool
+}
+
 type daemonContentPeerReplicationStub struct {
 	forgotten chan domain.DeviceID
 }
@@ -165,6 +172,21 @@ func (routes *daemonContentPeerResolvedRoutesStub) DialConsensusEndpoint(
 	return nil, transport.ErrConsensusEndpointUnavailable
 }
 
+func (*daemonContentPeerDeadlineRoutes) ResolveConsensusEndpoints(
+	context.Context,
+	domain.DeviceID,
+) ([]netip.AddrPort, error) {
+	return nil, transport.ErrConsensusEndpointUnavailable
+}
+
+func (routes *daemonContentPeerDeadlineRoutes) DialConsensusEndpoint(
+	ctx context.Context,
+	_ netip.AddrPort,
+) (net.Conn, error) {
+	routes.deadline, routes.ok = ctx.Deadline()
+	return nil, transport.ErrConsensusEndpointUnavailable
+}
+
 func TestDaemonContentPeerWorkerForgetsReplicationPeerOnExit(t *testing.T) {
 	replicationRuntime := &daemonContentPeerReplicationStub{
 		forgotten: make(chan domain.DeviceID, 1),
@@ -193,6 +215,44 @@ func TestDaemonContentPeerWorkerForgetsReplicationPeerOnExit(t *testing.T) {
 	case <-worker.done:
 	default:
 		t.Fatal("worker exit did not close done")
+	}
+}
+
+func TestDaemonContentPeerTransientErrorsAreBoundedAndClear(t *testing.T) {
+	firstID := daemonContentTestDeviceID(t, 0xe1)
+	secondID := daemonContentTestDeviceID(t, 0xe2)
+	first := &daemonContentPeerWorker{deviceID: firstID}
+	second := &daemonContentPeerWorker{deviceID: secondID}
+	runtime := &daemonContentPeerRuntime{
+		workers: map[domain.DeviceID]*daemonContentPeerWorker{
+			secondID: second,
+			firstID:  first,
+		},
+	}
+	first.recordTransientError(
+		"sync",
+		errors.New(strings.Repeat("x", daemonContentPeerDiagnosticMaxBytes+64)),
+	)
+	second.recordTransientError("dial", errors.New("endpoint unavailable"))
+
+	snapshots := runtime.transientPeerErrors()
+	if len(snapshots) != 2 ||
+		snapshots[0].PeerID > snapshots[1].PeerID {
+		t.Fatalf("transient error snapshot = %+v", snapshots)
+	}
+	for _, snapshot := range snapshots {
+		if len(snapshot.Message) == 0 ||
+			len(snapshot.Message) > daemonContentPeerDiagnosticMaxBytes {
+			t.Fatalf("unbounded transient error = %+v", snapshot)
+		}
+	}
+
+	first.clearTransientError()
+	snapshots = runtime.transientPeerErrors()
+	if len(snapshots) != 1 ||
+		snapshots[0].PeerID != secondID ||
+		snapshots[0].Operation != "dial" {
+		t.Fatalf("snapshot after successful-sync clear = %+v", snapshots)
 	}
 }
 
@@ -288,6 +348,94 @@ func TestDaemonContentPeerRuntimeRejectsMalformedLocalCertificate(t *testing.T) 
 	}
 	if runtime.localCredentialAdvanced(1) {
 		t.Fatal("malformed local certificate advanced the credential epoch")
+	}
+}
+
+func TestDaemonContentPeerSnapshotBulkDialUsesBoundedContext(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	local := daemonContentPeerTestMember(t, 0xe3)
+	remote := daemonContentPeerTestMember(t, 0xe4)
+	epochPrivateKey := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xe5}, ed25519.SeedSize),
+	)
+	authorization := daemonContentPeerTestAuthorization(
+		t,
+		now,
+		local,
+		0xe5,
+		1,
+		1,
+	)
+	certificate, _, err := transport.IssueContentCertificate(
+		authorization,
+		epochPrivateKey,
+	)
+	if err != nil {
+		t.Fatalf("IssueContentCertificate(): %v", err)
+	}
+	t.Cleanup(func() { clearDaemonTLSCertificate(&certificate) })
+
+	unsigned, err := logicalsnapshot.NewUnsignedRoot(
+		logicalsnapshot.RootInput{
+			ArtifactID:  "bulk-dial-deadline",
+			SessionID:   daemonTestSessionID,
+			WorkspaceID: daemonTestWorkspaceID,
+			CheckpointEventID: domain.UUIDv7(
+				"01890f47-3e72-7000-8000-000000000099",
+			),
+			ResultIndex:             1,
+			AuthorityVersion:        1,
+			SignerDeviceID:          remote.ID,
+			DigestVersion:           1,
+			ProjectionSchemaVersion: 1,
+			ContentEncoding:         logicalsnapshot.EncodingIdentity,
+			ExpandedBytes:           1,
+			CompressedBytes:         1,
+			RecordCount:             1,
+			DescriptorPageCount:     1,
+			ChunkCount:              1,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewUnsignedRoot(): %v", err)
+	}
+	root, err := logicalsnapshot.NewRoot(
+		unsigned,
+		[ed25519.SignatureSize]byte{},
+	)
+	if err != nil {
+		t.Fatalf("NewRoot(): %v", err)
+	}
+	routes := &daemonContentPeerDeadlineRoutes{}
+	runtime := &daemonContentPeerRuntime{
+		sessionID:     daemonTestSessionID,
+		workspaceID:   daemonTestWorkspaceID,
+		localDeviceID: local.ID,
+		certificate: func() (tls.Certificate, error) {
+			return certificate, nil
+		},
+		routes: routes,
+	}
+	started := time.Now()
+	if _, err := runtime.dialSnapshotBulk(
+		t.Context(),
+		remote.ID,
+		netip.MustParseAddrPort("192.0.2.10:47831"),
+		root,
+	); !errors.Is(err, errDaemonContentPeerConstruction) {
+		t.Fatalf("dialSnapshotBulk() error = %v", err)
+	}
+	if !routes.ok {
+		t.Fatal("bulk route dial received no deadline")
+	}
+	timeout := routes.deadline.Sub(started)
+	if timeout <= 0 ||
+		timeout > daemonContentPeerDialTimeout+time.Second {
+		t.Fatalf(
+			"bulk route dial timeout = %s, want at most %s",
+			timeout,
+			daemonContentPeerDialTimeout,
+		)
 	}
 }
 
@@ -500,6 +648,7 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch(
 	}
 	runtime := &daemonContentPeerRuntime{
 		sessionID:     daemonTestSessionID,
+		workspaceID:   daemonTestWorkspaceID,
 		generation:    0,
 		localDeviceID: local.ID,
 		admission: daemonContentPeerAdmissionStub{
@@ -879,12 +1028,23 @@ func daemonContentPeerConsensusStatusResponse(
 	encoded, err := json.Marshal(map[string]any{
 		"schema_version":              uint64(1),
 		"session_id":                  string(daemonTestSessionID),
+		"workspace_id":                string(daemonTestWorkspaceID),
 		"recovery_generation":         recoveryGeneration,
 		"server_device_id":            string(serverDeviceID),
 		"local_term":                  uint64(1),
 		"leader_device_id":            string(serverDeviceID),
 		"quorum_required":             uint64(1),
 		"last_raft_applied_log_index": uint64(1),
+		"credential_authority": map[string]any{
+			"session_id":                     string(daemonTestSessionID),
+			"voter_device_ids":               []string{string(serverDeviceID)},
+			"voter_set_version":              uint64(1),
+			"activation_source":              "genesis",
+			"activation_checkpoint_event_id": nil,
+			"activation_proofs":              []any{},
+			"prior_authority_signer":         nil,
+			"prior_authority_handoff":        nil,
+		},
 		"content_credential_authorization": map[string]any{
 			"schema_version":              uint64(1),
 			"session_id":                  string(authorization.SessionID),

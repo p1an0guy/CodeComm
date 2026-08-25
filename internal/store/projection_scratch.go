@@ -114,7 +114,11 @@ func (scratch *ProjectionScratch) StateDigest(
 	if scratch == nil || scratch.rows == nil {
 		return chain.Digest{}, ErrInvalidOptions
 	}
-	return chain.StateDigest(versions, scratch.Rows())
+	rows := make([]chain.LogicalRow, 0, len(scratch.rows))
+	for _, row := range scratch.rows {
+		rows = append(rows, row)
+	}
+	return chain.StateDigest(versions, rows)
 }
 
 func projectionScratchIdentity(table string, primaryKey []byte) string {

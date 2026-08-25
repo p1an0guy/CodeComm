@@ -26,6 +26,9 @@ func TestManifestValidatorStreamsCompleteSignedSequence(t *testing.T) {
 	}
 	rootInput.DescriptorPageCount = 1
 	rootInput.ChunkCount = 2
+	rootInput.ChainIndex = 2
+	rootInput.ResultIndex = 2
+	rootInput.RecordCount = 2
 	rootInput.CompressedBytes =
 		descriptors[0].CompressedLength +
 			descriptors[1].CompressedLength
@@ -122,9 +125,10 @@ func TestManifestValidatorRejectsShortInteriorPageBeforeSink(
 		t.Fatalf("NewDescriptorPage(second): %v", err)
 	}
 	rootInput.DescriptorPageCount = 2
-	rootInput.ChunkCount = 2
-	rootInput.CompressedBytes = 2
-	rootInput.ExpandedBytes = 2
+	rootInput.ChunkCount = MaxDescriptorsPerPage + 1
+	rootInput.RecordCount = rootInput.ChunkCount
+	rootInput.CompressedBytes = rootInput.ChunkCount
+	rootInput.ExpandedBytes = rootInput.ChunkCount
 	rootInput.FinalDescriptorPageHash = second.Hash()
 	unsigned, err := NewUnsignedRoot(rootInput)
 	if err != nil {
@@ -177,6 +181,9 @@ func TestManifestValidatorLatchesSinkFailureWithoutAdvancing(
 	}
 	rootInput.DescriptorPageCount = 1
 	rootInput.ChunkCount = 1
+	rootInput.ChainIndex = 1
+	rootInput.ResultIndex = 1
+	rootInput.RecordCount = 1
 	rootInput.CompressedBytes = descriptor.CompressedLength
 	rootInput.ExpandedBytes = descriptor.ExpandedLength
 	rootInput.FinalDescriptorPageHash = page.Hash()

@@ -91,6 +91,7 @@ type SuccessorState struct {
 	RecoveryGeneration        uint64
 	GenesisJSON               []byte
 	RecoveryAuthorizationJSON []byte
+	ObservedAt                domain.Timestamp
 	Predecessor               ApplyHeads
 	Projections               ProjectionWrites
 	DigestVersion             uint64
@@ -114,9 +115,13 @@ type successorGenesisBinding struct {
 func (successor SuccessorState) validate() error {
 	if !successor.SessionID.Valid() ||
 		!successor.WorkspaceID.Valid() ||
+		!successor.ObservedAt.Valid() ||
 		successor.RecoveryGeneration < 1 ||
 		!domain.ValidUnsignedInteger(successor.RecoveryGeneration) {
-		return fmt.Errorf("%w: invalid successor lineage identity", ErrInvalidApply)
+		return fmt.Errorf(
+			"%w: invalid successor lineage identity or observation time",
+			ErrInvalidApply,
+		)
 	}
 	if successor.DigestVersion < 1 ||
 		successor.ProjectionSchemaVersion < 1 ||
@@ -413,6 +418,21 @@ func (store *Store) Initialize(
 		if err != nil {
 			return err
 		}
+		initialRows, err := projectionLogicalRows(conn)
+		if err != nil {
+			return err
+		}
+		if err := writeInitialProjectionBoundary(
+			conn,
+			initialRows,
+			chain.Versions{
+				Digest:           initial.DigestVersion,
+				ProjectionSchema: initial.ProjectionSchemaVersion,
+			},
+			stateDigest,
+		); err != nil {
+			return err
+		}
 		eventSeed, err := chain.EventSeed(chain.Boundary{
 			Genesis: genesisDigest,
 		})
@@ -565,8 +585,17 @@ func (store *Store) InstallSuccessor(
 				ErrApplyConflict,
 			)
 		}
+		if err := ensureInitialProjectionBoundary(conn, prior); err != nil {
+			return fmt.Errorf(
+				"store: retain predecessor projection baseline: %w",
+				err,
+			)
+		}
 
 		if err := replaceCoveredProjections(conn, prepared); err != nil {
+			return err
+		}
+		if err := clearSuccessorGitArtifacts(conn); err != nil {
 			return err
 		}
 		if err := ensurePendingControlFileApprovals(
@@ -656,6 +685,13 @@ func (store *Store) InstallSuccessor(
 		); err != nil {
 			return err
 		}
+		if err := writeRecoveryBoundaryAudit(
+			conn,
+			successor,
+			genesisDigest,
+		); err != nil {
+			return err
+		}
 		return writeSuccessorConsensusState(conn, successor, heads)
 	})
 	if err != nil {
@@ -663,6 +699,36 @@ func (store *Store) InstallSuccessor(
 	}
 	store.advanceAdmissionRevision()
 	return heads, nil
+}
+
+func writeRecoveryBoundaryAudit(
+	conn *sqlite.Conn,
+	successor SuccessorState,
+	genesisDigest Digest,
+) error {
+	record := AuditRecord{
+		SessionID:   successor.SessionID,
+		SourceKind:  AuditRecoveryBoundary,
+		ActorType:   "human",
+		IPCChannel:  "operator",
+		ActionCode:  "cluster.quorum_recovered",
+		OutcomeCode: "accepted",
+		Subject:     "session:" + string(successor.SessionID),
+		DetailsJSON: recoveryBoundaryAuditDetails(
+			successor.RecoveryGeneration,
+			genesisDigest,
+		),
+		FirstSeenAt:      successor.ObservedAt,
+		LastSeenAt:       successor.ObservedAt,
+		ObservationCount: 1,
+	}
+	if err := record.Validate(); err != nil {
+		return fmt.Errorf("store: validate recovery audit row: %w", err)
+	}
+	if err := writeAudit(conn, []AuditRecord{record}); err != nil {
+		return fmt.Errorf("store: write recovery audit row: %w", err)
+	}
+	return nil
 }
 
 func sameCommitmentHeads(left, right ApplyHeads) bool {
@@ -692,6 +758,46 @@ func replaceCoveredProjections(
 		}
 	}
 	return writePreparedProjections(conn, prepared)
+}
+
+func clearSuccessorGitArtifacts(conn *sqlite.Conn) error {
+	if err := execute(
+		conn,
+		`DELETE FROM git_artifacts
+		  WHERE retention_class = 'quarantine'
+		     OR state IN (
+		            'reserved', 'downloading', 'downloaded', 'verifying',
+		            'failed'
+		        )
+		     OR (
+		            retention_class IN ('preproposal', 'nonterminal')
+		        AND NOT EXISTS (
+		                SELECT 1
+		                  FROM publications
+		                 WHERE publications.artifact_digest =
+		                           git_artifacts.artifact_digest
+		                   AND (
+		                        (
+		                            publications.state = 'applied'
+		                            AND publications.canonical_lineage_member = 1
+		                        )
+		                        OR EXISTS (
+		                            SELECT 1
+		                              FROM merge_conflicts
+		                             WHERE merge_conflicts.publication_id =
+		                                       publications.publication_id
+		                               AND merge_conflicts.status = 'unresolved'
+		                        )
+		                   )
+		            )
+		        );`,
+	); err != nil {
+		return fmt.Errorf(
+			"store: clear unprotected successor Git artifacts: %w",
+			err,
+		)
+	}
+	return nil
 }
 
 func clearGenerationLocalState(conn *sqlite.Conn) error {

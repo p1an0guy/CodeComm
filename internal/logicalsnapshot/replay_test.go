@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"testing"
+	"time"
 )
 
 type artifactReplayFixture struct {
@@ -58,6 +60,26 @@ func TestReplayArtifactVerifiesCompleteQuarantinedStream(t *testing.T) {
 				fixture.records[index].Payload,
 			) {
 			t.Fatalf("staged record %d differs", index)
+		}
+	}
+}
+
+func TestReplayArtifactTruncatesReusableSequenceScratch(t *testing.T) {
+	t.Parallel()
+
+	fixture := newArtifactReplayFixture(t)
+	options := replayOptions(
+		t,
+		fixture,
+		func(context.Context, Record) error { return nil },
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := ReplayArtifact(
+			context.Background(),
+			fixture.root,
+			options,
+		); err != nil {
+			t.Fatalf("ReplayArtifact(attempt %d): %v", attempt+1, err)
 		}
 	}
 }
@@ -282,6 +304,92 @@ func TestReplayArtifactObservesCancellation(t *testing.T) {
 	}
 }
 
+func TestReadReplaySourceCancellationClosesBlockedSource(t *testing.T) {
+	t.Parallel()
+
+	source := newBlockingReplaySource()
+	t.Cleanup(func() {
+		_ = source.Close()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := readReplaySource(
+			ctx,
+			"blocked source",
+			1,
+			func() (io.ReadCloser, error) {
+				return source, nil
+			},
+		)
+		result <- err
+	}()
+
+	select {
+	case <-source.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("source read did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("readReplaySource() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readReplaySource() did not return after cancellation")
+	}
+	select {
+	case <-source.closed:
+	default:
+		t.Fatal("readReplaySource() returned without closing source")
+	}
+}
+
+func TestReadReplaySourcePreservesReadAndCloseErrors(t *testing.T) {
+	t.Parallel()
+
+	readErr := errors.New("read failed")
+	closeErr := errors.New("close failed")
+	tests := []struct {
+		name   string
+		reader io.Reader
+		want   error
+	}{
+		{
+			name:   "close error after successful read",
+			reader: bytes.NewReader(nil),
+			want:   closeErr,
+		},
+		{
+			name:   "read error takes precedence",
+			reader: errorReplayReader{err: readErr},
+			want:   readErr,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := readReplaySource(
+				context.Background(),
+				"error source",
+				1,
+				func() (io.ReadCloser, error) {
+					return replayTestReadCloser{
+						Reader:   test.reader,
+						closeErr: closeErr,
+					}, nil
+				},
+			)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("readReplaySource() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestReplayArtifactRejectsInvalidOptions(t *testing.T) {
 	t.Parallel()
 
@@ -311,6 +419,52 @@ var (
 	errReplayTestChunkSource = errors.New("chunk source failed")
 	errReplayTestRecordSink  = errors.New("record sink failed")
 )
+
+type blockingReplaySource struct {
+	readStarted chan struct{}
+	closed      chan struct{}
+	startOnce   sync.Once
+	closeOnce   sync.Once
+}
+
+func newBlockingReplaySource() *blockingReplaySource {
+	return &blockingReplaySource{
+		readStarted: make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (source *blockingReplaySource) Read([]byte) (int, error) {
+	source.startOnce.Do(func() {
+		close(source.readStarted)
+	})
+	<-source.closed
+	return 0, errors.New("source closed")
+}
+
+func (source *blockingReplaySource) Close() error {
+	source.closeOnce.Do(func() {
+		close(source.closed)
+	})
+	return nil
+}
+
+type replayTestReadCloser struct {
+	io.Reader
+	closeErr error
+}
+
+func (reader replayTestReadCloser) Close() error {
+	return reader.closeErr
+}
+
+type errorReplayReader struct {
+	err error
+}
+
+func (reader errorReplayReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
 
 func newArtifactReplayFixture(t *testing.T) artifactReplayFixture {
 	t.Helper()

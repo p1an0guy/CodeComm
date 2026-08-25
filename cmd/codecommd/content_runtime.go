@@ -12,6 +12,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/replication"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -74,6 +75,7 @@ type daemonContentService struct {
 	state               daemonContentState
 	endpoints           daemonEndpointSetSource
 	proposals           daemonEventProposalConsensus
+	snapshots           contenthttp.SnapshotService
 	signResultBatch     daemonResultBatchSigner
 	signAcknowledgement daemonReplicationAcknowledgementSigner
 	now                 func() time.Time
@@ -88,7 +90,11 @@ func newDaemonContentServer(
 	endpoints daemonEndpointSetSource,
 	proposals daemonEventProposalConsensus,
 	identityPrivateKey []byte,
+	snapshots contenthttp.SnapshotService,
 ) (*contenthttp.Server, error) {
+	if snapshots == nil {
+		return nil, errDaemonContentConstruction
+	}
 	service, err := newDaemonContentService(
 		sessionID,
 		workspaceID,
@@ -105,6 +111,7 @@ func newDaemonContentServer(
 	if err != nil {
 		return nil, err
 	}
+	service.snapshots = snapshots
 	service.signAcknowledgement = func(
 		unsigned replication.UnsignedAcknowledgement,
 	) (replication.Acknowledgement, error) {
@@ -433,4 +440,24 @@ func (service *daemonContentService) snapshot(
 	return snapshot, nil
 }
 
+func (service *daemonContentService) LatestSnapshot(
+	ctx context.Context,
+) (logicalsnapshot.Root, error) {
+	if service == nil || service.snapshots == nil {
+		return logicalsnapshot.Root{}, contenthttp.ErrSnapshotUnavailable
+	}
+	return service.snapshots.LatestSnapshot(ctx)
+}
+
+func (service *daemonContentService) OpenSnapshotTransfer(
+	ctx context.Context,
+	scope contenthttp.SnapshotRequestScope,
+) (contenthttp.SnapshotTransfer, error) {
+	if service == nil || service.snapshots == nil {
+		return nil, contenthttp.ErrSnapshotUnavailable
+	}
+	return service.snapshots.OpenSnapshotTransfer(ctx, scope)
+}
+
 var _ contenthttp.Service = (*daemonContentService)(nil)
+var _ contenthttp.SnapshotService = (*daemonContentService)(nil)

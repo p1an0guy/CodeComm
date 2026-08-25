@@ -83,6 +83,7 @@ type Client struct {
 	raw         *tls.Conn
 	peerBinding transport.ContentBinding
 	peerDER     []byte
+	role        contentConnectionRole
 
 	lineageSet         bool
 	sessionBound       bool
@@ -98,6 +99,7 @@ type clientConnection struct {
 	raw         *tls.Conn
 	peerBinding transport.ContentBinding
 	peerDER     []byte
+	role        contentConnectionRole
 }
 
 // OpenClient performs a bounded content-plane handshake and starts an explicit
@@ -111,7 +113,13 @@ func OpenClient(
 	expectedDeviceID domain.DeviceID,
 	admission *transport.ContentAdmissionRecorder,
 ) (_ *Client, err error) {
-	return openClient(ctx, connection, expectedDeviceID, admission)
+	return openClientForRole(
+		ctx,
+		connection,
+		expectedDeviceID,
+		admission,
+		contentConnectionControl,
+	)
 }
 
 func openClient(
@@ -119,6 +127,22 @@ func openClient(
 	connection *tls.Conn,
 	expectedDeviceID domain.DeviceID,
 	admission *transport.ContentAdmissionRecorder,
+) (_ *Client, err error) {
+	return openClientForRole(
+		ctx,
+		connection,
+		expectedDeviceID,
+		admission,
+		contentConnectionControl,
+	)
+}
+
+func openClientForRole(
+	ctx context.Context,
+	connection *tls.Conn,
+	expectedDeviceID domain.DeviceID,
+	admission *transport.ContentAdmissionRecorder,
+	role contentConnectionRole,
 ) (_ *Client, err error) {
 	if connection == nil {
 		return nil, ErrInvalidClient
@@ -131,7 +155,9 @@ func openClient(
 	}()
 	if ctx == nil ||
 		!expectedDeviceID.Valid() ||
-		admission == nil {
+		admission == nil ||
+		(role != contentConnectionControl &&
+			role != contentConnectionBulk) {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -208,6 +234,7 @@ func openClient(
 		raw:         connection,
 		peerBinding: binding,
 		peerDER:     bytes.Clone(state.PeerCertificates[0].Raw),
+		role:        role,
 		expiryTimer: expiryTimer,
 		expiryDone:  make(chan struct{}),
 	}
@@ -236,6 +263,9 @@ func (client *Client) watchExpiry() {
 func (client *Client) Session(ctx context.Context) (SessionResponse, error) {
 	if client == nil || ctx == nil {
 		return SessionResponse{}, ErrInvalidClient
+	}
+	if err := ctx.Err(); err != nil {
+		return SessionResponse{}, err
 	}
 	client.operationMu.Lock()
 	defer client.operationMu.Unlock()
@@ -266,6 +296,9 @@ func (client *Client) Session(ctx context.Context) (SessionResponse, error) {
 func (client *Client) Peers(ctx context.Context) (PeersResponse, error) {
 	if client == nil || ctx == nil {
 		return PeersResponse{}, ErrInvalidClient
+	}
+	if err := ctx.Err(); err != nil {
+		return PeersResponse{}, err
 	}
 	client.operationMu.Lock()
 	defer client.operationMu.Unlock()
@@ -327,6 +360,9 @@ func (client *Client) propose(
 		inspected.SessionID != proposal.SessionID ||
 		inspected.WorkspaceID != proposal.WorkspaceID {
 		return EventResult{}, ErrInvalidClient
+	}
+	if err := ctx.Err(); err != nil {
+		return EventResult{}, err
 	}
 
 	client.operationMu.Lock()
@@ -402,13 +438,15 @@ func (client *Client) requestBounded(
 		validClientReplicationAcknowledgementTarget(path)
 	replicationRequest := batchReplicationRequest ||
 		acknowledgementRequest
+	snapshot, snapshotRequest := parseSnapshotTarget(path)
 	if client == nil ||
 		ctx == nil ||
 		(method != http.MethodGet && method != http.MethodPost) ||
 		(path != SessionPath &&
 			path != PeersPath &&
 			path != EventsPath &&
-			!replicationRequest) ||
+			!replicationRequest &&
+			!snapshotRequest) ||
 		method == http.MethodGet && len(body) != 0 ||
 		method == http.MethodPost &&
 			(path != EventsPath || len(body) == 0 ||
@@ -419,7 +457,12 @@ func (client *Client) requestBounded(
 		acknowledgementRequest &&
 			(method != http.MethodGet ||
 				responseLimit != int64(replication.MaxAcknowledgementBytes)) ||
-		!replicationRequest && responseLimit != ResponseMaxBytes {
+		snapshotRequest &&
+			(method != http.MethodGet ||
+				responseLimit != snapshot.responseLimit()) ||
+		!replicationRequest &&
+			!snapshotRequest &&
+			responseLimit != ResponseMaxBytes {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -428,6 +471,15 @@ func (client *Client) requestBounded(
 	connection, err := client.connection()
 	if err != nil {
 		return nil, err
+	}
+	if connection.role == contentConnectionBulk {
+		if !snapshotRequest ||
+			snapshot.kind == snapshotTargetLatest {
+			return nil, ErrInvalidClient
+		}
+	} else if connection.role != contentConnectionControl ||
+		snapshotRequest && snapshot.kind != snapshotTargetLatest {
+		return nil, ErrInvalidClient
 	}
 	callContext, cancel := context.WithTimeout(ctx, HandlerTimeout)
 	defer cancel()
@@ -444,7 +496,11 @@ func (client *Client) requestBounded(
 	if err != nil {
 		return nil, ErrInvalidClient
 	}
-	request.Header.Set("Accept", contentJSONMediaType)
+	successMediaType := contentJSONMediaType
+	if snapshotRequest {
+		successMediaType = snapshot.mediaType()
+	}
+	request.Header.Set("Accept", successMediaType)
 	request.Header.Set("Accept-Encoding", "identity")
 	if configure != nil {
 		configure(request.Header)
@@ -484,9 +540,10 @@ func (client *Client) requestBounded(
 		client.invalidate()
 		return nil, err
 	}
-	limit, problem, err := validateResponseEnvelope(
+	limit, problem, err := validateResponseEnvelopeForMediaType(
 		response,
 		responseLimit,
+		successMediaType,
 	)
 	if err != nil {
 		_ = response.Body.Close()
@@ -571,6 +628,7 @@ func (client *Client) connection() (clientConnection, error) {
 		raw:         client.raw,
 		peerBinding: client.peerBinding,
 		peerDER:     bytes.Clone(client.peerDER),
+		role:        client.role,
 	}, nil
 }
 
@@ -636,9 +694,23 @@ func validateResponseEnvelope(
 	response *http.Response,
 	successLimit int64,
 ) (limit int64, problem bool, err error) {
+	return validateResponseEnvelopeForMediaType(
+		response,
+		successLimit,
+		contentJSONMediaType,
+	)
+}
+
+func validateResponseEnvelopeForMediaType(
+	response *http.Response,
+	successLimit int64,
+	successMediaType string,
+) (limit int64, problem bool, err error) {
 	if response == nil ||
 		response.Body == nil ||
 		successLimit < 1 ||
+		(successMediaType != contentJSONMediaType &&
+			successMediaType != snapshotChunkMediaType) ||
 		response.StatusCode < http.StatusOK ||
 		response.StatusCode > 599 ||
 		response.Uncompressed ||
@@ -649,7 +721,7 @@ func validateResponseEnvelope(
 		return 0, false, ErrResponseProtocol
 	}
 
-	expectedMediaType := contentJSONMediaType
+	expectedMediaType := successMediaType
 	limit = successLimit
 	switch {
 	case response.StatusCode == http.StatusOK:
@@ -1037,6 +1109,7 @@ func (client *Client) close() error {
 	clear(client.peerDER)
 	client.peerDER = nil
 	client.peerBinding = transport.ContentBinding{}
+	client.role = contentConnectionUnbound
 	client.workspaceID = ""
 	client.recoveryGeneration = 0
 	client.lineageSet = false

@@ -110,7 +110,8 @@ Required unit/component subjects:
   become `withdrawn` with `terminal_source = recovery`, applied rows recompute
   `canonical_lineage_member` against the selected first-parent lineage, rollback-excluded pins
   release unless conflict-protected, old draft streams stop advertising while retained snapshots
-  remain historical, pending launches clear, and survivors require conditional readmission;
+  remain historical, every carried predecessor agent session becomes `ended(recovery)` with no
+  successor origin scope, pending launches clear, and survivors require conditional readmission;
 - credential objects (§4.6): a peer verifies discovery using `epoch_public_key` from the committed
   authorization alone; a certificate whose fields disagree with that object is refused; a peer that
   has not applied the authorization refuses and retries; authority version, endorsement ordering,
@@ -581,7 +582,10 @@ local-IPC framing/binds/idempotency, control-file proposals, Git metadata, and e
 schema. Prove previous protocol
 interop, unknown optional/required behavior, cross-platform signature stability, all
 historical migrations, migration+replay digest, snapshot+tail equivalence, and recoverable
-failed migration. Fixture changes require explicit protocol/schema review.
+failed migration. Mutating a post-SQL migration-hook identity or fingerprinted implementation MUST
+fail checksum verification. Snapshot path tests cover intermediate symlink/reparse substitution,
+including a runtime Windows junction, and prove failed cleanup leaves the external target unchanged.
+Fixture changes require explicit protocol/schema review.
 
 ### 12.3 Integration harness
 

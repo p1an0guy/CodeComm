@@ -531,10 +531,11 @@ func TestExportResultRangeValidatesOptionsContextAndClosedStore(t *testing.T) {
 	); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled error = %v, want context.Canceled", err)
 	}
-	if _, _, err := fixture.store.ExportResultRange(
-		nil,
-		valid,
-	); !errors.Is(err, ErrInvalidOptions) {
+	//lint:ignore SA1012 This test verifies the explicit nil-context contract.
+	if _, _, err := fixture.store.ExportResultRange(nil, valid); !errors.Is(
+		err,
+		ErrInvalidOptions,
+	) {
 		t.Fatalf("nil context error = %v, want ErrInvalidOptions", err)
 	}
 	if _, _, err := (LocalState{}).ExportResultRange(

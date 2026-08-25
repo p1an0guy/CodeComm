@@ -358,20 +358,30 @@ func TestSequenceValidatorRejectsAnyPriorGenesisSessionReuse(
 		t.Fatal(err)
 	}
 	defer scratch.Close()
+	validator := &SequenceValidator{
+		root:    RootInput{RecoveryGeneration: 2},
+		scratch: scratch,
+	}
 	for generation, sessionID := range []domain.UUIDv7{
 		semanticSession0,
 		semanticSession1,
 	} {
+		seen, err := validator.priorGenesisSessionID(sessionID)
+		if err != nil || seen {
+			t.Fatalf(
+				"priorGenesisSessionID(new %d) = %t, %v",
+				generation,
+				seen,
+				err,
+			)
+		}
 		if err := writeSequenceBoundary(scratch, sequenceBoundary{
 			generation: uint64(generation),
 			sessionID:  sessionID,
 		}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	validator := &SequenceValidator{
-		scratch:      scratch,
-		genesisCount: 2,
+		validator.genesisCount++
 	}
 	seen, err := validator.priorGenesisSessionID(semanticSession0)
 	if err != nil || !seen {
@@ -573,6 +583,8 @@ func TestSequenceValidatorRequiresTerminalCheckpointAndExactRootCount(
 
 	input := fixture.root.Unsigned().Input()
 	input.RecordCount++
+	input.ExpandedBytes++
+	input.CompressedBytes++
 	unsigned, err := NewUnsignedRoot(input)
 	if err != nil {
 		t.Fatalf("NewUnsignedRoot(): %v", err)
@@ -990,8 +1002,8 @@ func newSemanticFixtureFromState(
 		DigestVersion:           1,
 		ProjectionSchemaVersion: 1,
 		ContentEncoding:         EncodingIdentity,
-		ExpandedBytes:           1,
-		CompressedBytes:         1,
+		ExpandedBytes:           uint64(len(records)),
+		CompressedBytes:         uint64(len(records)),
 		RecordCount:             uint64(len(records)),
 		DescriptorPageCount:     1,
 		ChunkCount:              1,

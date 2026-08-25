@@ -1716,9 +1716,9 @@ func TestRestartVerifiesFullHistoryBeforeTrustingSnapshot(t *testing.T) {
 			Clock:        nodeTestClock(),
 			RaftConfig:   nodeTestRaftConfig(),
 		},
-	); !errors.Is(err, ErrSnapshotAnchorCoverage) {
+	); !errors.Is(err, store.ErrCommandResultCorrupt) {
 		t.Fatalf(
-			"OpenSingleNode(tampered history) error = %v, want ErrSnapshotAnchorCoverage",
+			"OpenSingleNode(tampered history) error = %v, want ErrCommandResultCorrupt",
 			err,
 		)
 	}
@@ -3144,6 +3144,13 @@ func assertNodeUsesLocalAddress(t *testing.T, node *SingleNode) {
 func testContext(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func logicalSnapshotTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 	return ctx
 }

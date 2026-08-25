@@ -11,6 +11,7 @@ import (
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
+	"github.com/ijonahch/codecomm/internal/reducer"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
@@ -21,6 +22,9 @@ var (
 	)
 	ErrLogicalSnapshotStageFinalized = errors.New(
 		"store: logical snapshot stage is finalized",
+	)
+	ErrLogicalSnapshotStageConsumed = errors.New(
+		"store: logical snapshot stage is consumed",
 	)
 )
 
@@ -34,7 +38,22 @@ type LogicalSnapshotStage struct {
 	path     string
 	closed   bool
 	verified bool
+	consumed bool
+	root     logicalsnapshot.Root
+	artifact logicalsnapshot.VerifiedExpandedArtifact
+	hasRoot  bool
 	closeErr error
+
+	reducerState       reducer.State
+	projections        *ProjectionScratch
+	heads              ApplyHeads
+	sessionID          domain.UUIDv7
+	workspaceID        domain.UUIDv4
+	generation         uint64
+	derivedViewsDigest Digest
+	reducerReady       bool
+	hasDerivedDigest   bool
+	failed             error
 }
 
 // OpenLogicalSnapshotStage exclusively creates a quarantine database. An
@@ -80,7 +99,22 @@ func (stage *LogicalSnapshotStage) Initialize(
 	if err := stage.mutable(); err != nil {
 		return ApplyHeads{}, err
 	}
-	return stage.store.Initialize(ctx, initial)
+	heads, err := stage.store.Initialize(ctx, initial)
+	if err != nil {
+		return ApplyHeads{}, err
+	}
+	if err := stage.installReducerBoundary(
+		initial.SessionID,
+		initial.WorkspaceID,
+		0,
+		initial.GenesisJSON,
+		heads,
+		initial.Projections,
+	); err != nil {
+		stage.failed = err
+		return ApplyHeads{}, err
+	}
+	return heads, nil
 }
 
 // InstallSuccessor installs one independently verified deterministic recovery
@@ -97,12 +131,28 @@ func (stage *LogicalSnapshotStage) InstallSuccessor(
 	if err := stage.mutable(); err != nil {
 		return ApplyHeads{}, err
 	}
-	return stage.store.InstallSuccessor(ctx, successor)
+	heads, err := stage.store.InstallSuccessor(ctx, successor)
+	if err != nil {
+		return ApplyHeads{}, err
+	}
+	if err := stage.installReducerBoundary(
+		successor.SessionID,
+		successor.WorkspaceID,
+		successor.RecoveryGeneration,
+		successor.GenesisJSON,
+		heads,
+		successor.Projections,
+	); err != nil {
+		stage.failed = err
+		return ApplyHeads{}, err
+	}
+	return heads, nil
 }
 
-// ImportCommand writes one independently verified command without creating
-// foreign event/Raft provenance or advancing a Raft watermark.
-func (stage *LogicalSnapshotStage) ImportCommand(
+// importCommand is the persistence primitive exercised by store tests. The
+// production snapshot path uses ReplayCommand, which derives this input by
+// re-running the reducer inside the store package.
+func (stage *LogicalSnapshotStage) importCommand(
 	ctx context.Context,
 	command VerifiedCommandImport,
 ) (ApplyHeads, error) {
@@ -133,6 +183,31 @@ func (stage *LogicalSnapshotStage) View(
 	return stage.store.View(ctx)
 }
 
+// StreamProjectionRows visits the staged covered projection rows in canonical
+// table/key order without materializing another complete state copy.
+func (stage *LogicalSnapshotStage) StreamProjectionRows(
+	ctx context.Context,
+	visit func(chain.LogicalRow) error,
+) error {
+	if stage == nil || ctx == nil || visit == nil {
+		return ErrInvalidLogicalSnapshotStage
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if err := stage.open(); err != nil {
+		return err
+	}
+	stage.store.applyMu.Lock()
+	defer stage.store.applyMu.Unlock()
+	return stage.store.withConn(ctx, func(conn *sqlite.Conn) (err error) {
+		previousInterrupt := conn.SetInterrupt(ctx.Done())
+		defer conn.SetInterrupt(previousInterrupt)
+		end := sqlitex.Transaction(conn)
+		defer end(&err)
+		return streamProjectionLogicalRows(conn, visit)
+	})
+}
+
 // Verify replays every retained generation, verifies the terminal checkpoint
 // and signer authority, and compares the exact signed root cut. Success
 // permanently freezes the stage.
@@ -155,6 +230,81 @@ func (stage *LogicalSnapshotStage) Verify(
 	return nil
 }
 
+// VerifyArtifact binds replayed state to one structurally verified expanded
+// artifact and its complete authority-signed root. Only this stronger
+// verification makes a stage eligible for installation.
+func (stage *LogicalSnapshotStage) VerifyArtifact(
+	ctx context.Context,
+	root logicalsnapshot.Root,
+	artifact logicalsnapshot.VerifiedExpandedArtifact,
+) error {
+	if stage == nil {
+		return ErrInvalidLogicalSnapshotStage
+	}
+	if !artifact.MatchesRoot(root) {
+		return logicalSnapshotStageError(
+			"expanded artifact proof differs from signed root",
+			nil,
+		)
+	}
+	expected, err := logicalSnapshotCutFromRoot(root)
+	if err != nil {
+		return err
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if err := stage.open(); err != nil {
+		return err
+	}
+	if stage.hasRoot {
+		return ErrLogicalSnapshotStageFinalized
+	}
+	if err := stage.store.verifyLogicalSnapshotRoot(
+		ctx,
+		root,
+		expected,
+	); err != nil {
+		return err
+	}
+	derivedDigest, err := stage.store.logicalSnapshotDerivedViewsDigest(ctx)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"digest rebuilt local views",
+			err,
+		)
+	}
+	stage.root = root
+	stage.artifact = artifact
+	stage.derivedViewsDigest = derivedDigest
+	stage.hasRoot = true
+	stage.hasDerivedDigest = true
+	stage.verified = true
+	return nil
+}
+
+func (store *Store) logicalSnapshotDerivedViewsDigest(
+	ctx context.Context,
+) (Digest, error) {
+	if store == nil || ctx == nil {
+		return Digest{}, ErrInvalidLogicalSnapshotStage
+	}
+	if err := ctx.Err(); err != nil {
+		return Digest{}, err
+	}
+	store.applyMu.Lock()
+	defer store.applyMu.Unlock()
+	var digest Digest
+	err := store.withConn(ctx, func(conn *sqlite.Conn) (err error) {
+		previousInterrupt := conn.SetInterrupt(ctx.Done())
+		defer conn.SetInterrupt(previousInterrupt)
+		end := sqlitex.Transaction(conn)
+		defer end(&err)
+		digest, err = logicalSnapshotDerivedViewsDigest(conn)
+		return err
+	})
+	return digest, err
+}
+
 // Close closes the quarantine database without deleting it. The installer or
 // caller owns eventual replacement or secure cleanup of the closed file.
 func (stage *LogicalSnapshotStage) Close() error {
@@ -175,6 +325,9 @@ func (stage *LogicalSnapshotStage) open() error {
 	if stage == nil || stage.store == nil || stage.path == "" || stage.closed {
 		return ErrInvalidLogicalSnapshotStage
 	}
+	if stage.consumed {
+		return ErrLogicalSnapshotStageConsumed
+	}
 	return nil
 }
 
@@ -182,9 +335,67 @@ func (stage *LogicalSnapshotStage) mutable() error {
 	if err := stage.open(); err != nil {
 		return err
 	}
+	if stage.failed != nil {
+		return fmt.Errorf(
+			"%w: stage previously failed: %v",
+			ErrInvalidLogicalSnapshotStage,
+			stage.failed,
+		)
+	}
 	if stage.verified {
 		return ErrLogicalSnapshotStageFinalized
 	}
+	return nil
+}
+
+func (stage *LogicalSnapshotStage) installReducerBoundary(
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	generation uint64,
+	genesisJSON []byte,
+	heads ApplyHeads,
+	writes ProjectionWrites,
+) error {
+	state, err := reducerStateFromProjectionWrites(
+		sessionID,
+		workspaceID,
+		generation,
+		genesisJSON,
+		heads,
+		writes,
+	)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"construct reducer boundary state",
+			err,
+		)
+	}
+	projections, err := NewProjectionScratch(
+		nil,
+		chain.Versions{
+			Digest:           heads.DigestVersion,
+			ProjectionSchema: heads.ProjectionSchemaVersion,
+		},
+	)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"construct reducer projection scratch",
+			err,
+		)
+	}
+	if _, err := projections.Apply(writes); err != nil {
+		return logicalSnapshotStageError(
+			"populate reducer projection scratch",
+			err,
+		)
+	}
+	stage.reducerState = state
+	stage.projections = projections
+	stage.heads = heads
+	stage.sessionID = sessionID
+	stage.workspaceID = workspaceID
+	stage.generation = generation
+	stage.reducerReady = true
 	return nil
 }
 
@@ -296,146 +507,347 @@ func (store *Store) verifyLogicalSnapshotStage(
 		defer conn.SetInterrupt(previousInterrupt)
 		end := sqlitex.Transaction(conn)
 		defer end(&err)
+		return verifyLogicalSnapshotStageConnection(
+			conn,
+			expected,
+			nil,
+			true,
+		)
+	})
+}
 
-		if err := checkIntegrity(conn); err != nil {
-			return err
-		}
-		state, found, err := readConsensusState(conn)
+func (store *Store) verifyLogicalSnapshotRoot(
+	ctx context.Context,
+	root logicalsnapshot.Root,
+	expected LogicalSnapshotCut,
+) error {
+	if ctx == nil {
+		return fmt.Errorf(
+			"%w: nil context",
+			ErrInvalidLogicalSnapshotStage,
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store.applyMu.Lock()
+	defer store.applyMu.Unlock()
+	return store.withConn(ctx, func(conn *sqlite.Conn) (err error) {
+		previousInterrupt := conn.SetInterrupt(ctx.Done())
+		defer conn.SetInterrupt(previousInterrupt)
+		end := sqlitex.Transaction(conn)
+		defer end(&err)
+		return verifyLogicalSnapshotStageConnection(
+			conn,
+			expected,
+			&root,
+			true,
+		)
+	})
+}
+
+func verifyLogicalSnapshotStageConnection(
+	conn *sqlite.Conn,
+	expected LogicalSnapshotCut,
+	root *logicalsnapshot.Root,
+	requireEmptyEvidence bool,
+) error {
+	if err := validateLogicalSnapshotCut(expected); err != nil {
+		return err
+	}
+	if root != nil {
+		rootCut, err := logicalSnapshotCutFromRoot(*root)
 		if err != nil {
 			return err
 		}
-		if !found {
-			return logicalSnapshotStageError("active generation is missing", nil)
-		}
-		workspaceID, err := activeWorkspaceID(conn, state)
-		if err != nil {
+		if rootCut != expected {
 			return logicalSnapshotStageError(
-				"read active workspace",
-				err,
-			)
-		}
-		if state.sessionID != expected.SessionID ||
-			workspaceID != expected.WorkspaceID ||
-			state.recoveryGeneration != expected.RecoveryGeneration ||
-			state.chainIndex != expected.ChainIndex ||
-			state.chainHash != expected.ChainHash ||
-			state.resultIndex != expected.ResultIndex ||
-			state.resultHash != expected.ResultHash ||
-			state.projectionAccumulator !=
-				expected.ProjectionAccumulator ||
-			state.digestVersion != expected.DigestVersion ||
-			state.projectionSchemaVersion !=
-				expected.ProjectionSchemaVersion {
-			return logicalSnapshotStageError(
-				"durable cut differs from signed root",
+				"signed root differs from expected cut",
 				nil,
 			)
 		}
-		if state.currentTerm != 0 || state.lastAppliedLogIndex != 0 {
-			return logicalSnapshotStageError(
-				"staged state carries a Raft watermark",
-				nil,
-			)
-		}
+	}
+	if err := checkIntegrity(conn); err != nil {
+		return err
+	}
+	state, found, err := readConsensusState(conn)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return logicalSnapshotStageError("active generation is missing", nil)
+	}
+	workspaceID, err := activeWorkspaceID(conn, state)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"read active workspace",
+			err,
+		)
+	}
+	if state.sessionID != expected.SessionID ||
+		workspaceID != expected.WorkspaceID ||
+		state.recoveryGeneration != expected.RecoveryGeneration ||
+		state.chainIndex != expected.ChainIndex ||
+		state.chainHash != expected.ChainHash ||
+		state.resultIndex != expected.ResultIndex ||
+		state.resultHash != expected.ResultHash ||
+		state.projectionAccumulator !=
+			expected.ProjectionAccumulator ||
+		state.digestVersion != expected.DigestVersion ||
+		state.projectionSchemaVersion !=
+			expected.ProjectionSchemaVersion {
+		return logicalSnapshotStageError(
+			"durable cut differs from signed root",
+			nil,
+		)
+	}
+	if state.currentTerm != 0 || state.lastAppliedLogIndex != 0 {
+		return logicalSnapshotStageError(
+			"staged state carries a Raft watermark",
+			nil,
+		)
+	}
+	if requireEmptyEvidence {
 		if err := requireLogicalSnapshotStageEvidenceEmpty(conn); err != nil {
 			return err
 		}
-		if err := verifyCompleteLogicalSnapshotHistory(conn, state); err != nil {
-			return logicalSnapshotStageError(
-				"verify complete commitment history",
-				err,
-			)
-		}
+	}
+	if err := verifyCompleteLogicalSnapshotHistory(conn, state); err != nil {
+		return logicalSnapshotStageError(
+			"verify complete commitment history",
+			err,
+		)
+	}
+	if err := verifyLogicalSnapshotCheckpointRows(conn); err != nil {
+		return logicalSnapshotStageError(
+			"verify complete checkpoint rows",
+			err,
+		)
+	}
+	if err := verifyDerivedViews(conn); err != nil {
+		return logicalSnapshotStageError(
+			"verify rebuilt derived views",
+			err,
+		)
+	}
 
-		digest, err := projectionStateDigest(conn, chain.Versions{
-			Digest:           state.digestVersion,
-			ProjectionSchema: state.projectionSchemaVersion,
-		})
-		if err != nil {
-			return err
-		}
-		if digest != expected.ProjectionStateDigest {
-			return logicalSnapshotStageError(
-				"projection-state digest differs from signed root",
-				nil,
-			)
-		}
-
-		checkpoint, err := verifyLogicalSnapshotCheckpoint(
-			conn,
-			state,
-			expected.CheckpointEventID,
-			false,
-		)
-		if err != nil {
-			return logicalSnapshotStageError(
-				"verify terminal checkpoint",
-				err,
-			)
-		}
-		if checkpoint.AuthorityVoterSetVersion !=
-			expected.AuthorityVersion {
-			return logicalSnapshotStageError(
-				"checkpoint authority differs from signed root",
-				nil,
-			)
-		}
-		if err := verifyLogicalSnapshotCheckpointKeepsAuthority(
-			conn,
-			checkpoint.CheckpointEventID,
-		); err != nil {
-			return logicalSnapshotStageError(
-				"terminal checkpoint changes authority",
-				err,
-			)
-		}
-		authority, err := readStatusCredentialAuthority(
-			conn,
-			state.sessionID,
-		)
-		if err != nil {
-			return err
-		}
-		if authority.VoterSetVersion != expected.AuthorityVersion {
-			return logicalSnapshotStageError(
-				"terminal authority differs from signed root",
-				nil,
-			)
-		}
-		if _, err := requireLogicalSnapshotSigner(
-			conn,
-			authority,
-			expected.SignerDeviceID,
-		); err != nil {
-			return logicalSnapshotStageError(
-				"snapshot signer authorization",
-				err,
-			)
-		}
-		checkpointSigner, err := requireLogicalSnapshotSigner(
-			conn,
-			authority,
-			checkpoint.SignerDeviceID,
-		)
-		if err != nil {
-			return logicalSnapshotStageError(
-				"checkpoint signer authorization",
-				err,
-			)
-		}
-		if err := codecommcrypto.VerifyEd25519(
-			checkpointSigner.IdentityPublicKey,
-			codec.SignatureCheckpoint,
-			checkpoint.CheckpointJSON,
-			checkpoint.AuthoritySignature[:],
-		); err != nil {
-			return logicalSnapshotStageError(
-				"checkpoint signature",
-				err,
-			)
-		}
-		return nil
+	digest, err := projectionStateDigest(conn, chain.Versions{
+		Digest:           state.digestVersion,
+		ProjectionSchema: state.projectionSchemaVersion,
 	})
+	if err != nil {
+		return err
+	}
+	if digest != expected.ProjectionStateDigest {
+		return logicalSnapshotStageError(
+			"projection-state digest differs from signed root",
+			nil,
+		)
+	}
+
+	checkpoint, err := verifyLogicalSnapshotCheckpoint(
+		conn,
+		state,
+		expected.CheckpointEventID,
+		false,
+	)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"verify terminal checkpoint",
+			err,
+		)
+	}
+	if checkpoint.AuthorityVoterSetVersion !=
+		expected.AuthorityVersion {
+		return logicalSnapshotStageError(
+			"checkpoint authority differs from signed root",
+			nil,
+		)
+	}
+	if err := verifyLogicalSnapshotCheckpointKeepsAuthority(
+		conn,
+		checkpoint.CheckpointEventID,
+	); err != nil {
+		return logicalSnapshotStageError(
+			"terminal checkpoint changes authority",
+			err,
+		)
+	}
+	authority, err := readStatusCredentialAuthority(
+		conn,
+		state.sessionID,
+	)
+	if err != nil {
+		return err
+	}
+	if authority.VoterSetVersion != expected.AuthorityVersion {
+		return logicalSnapshotStageError(
+			"terminal authority differs from signed root",
+			nil,
+		)
+	}
+	rootSigner, err := requireLogicalSnapshotSigner(
+		conn,
+		authority,
+		expected.SignerDeviceID,
+	)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"snapshot signer authorization",
+			err,
+		)
+	}
+	if root != nil {
+		if err := logicalsnapshot.VerifyRoot(
+			*root,
+			rootSigner.IdentityPublicKey,
+		); err != nil {
+			return logicalSnapshotStageError(
+				"snapshot root signature",
+				err,
+			)
+		}
+	}
+	checkpointSigner, err := requireLogicalSnapshotSigner(
+		conn,
+		authority,
+		checkpoint.SignerDeviceID,
+	)
+	if err != nil {
+		return logicalSnapshotStageError(
+			"checkpoint signer authorization",
+			err,
+		)
+	}
+	if err := codecommcrypto.VerifyEd25519(
+		checkpointSigner.IdentityPublicKey,
+		codec.SignatureCheckpoint,
+		checkpoint.CheckpointJSON,
+		checkpoint.AuthoritySignature[:],
+	); err != nil {
+		return logicalSnapshotStageError(
+			"checkpoint signature",
+			err,
+		)
+	}
+	return nil
+}
+
+func verifyLogicalSnapshotCheckpointRows(conn *sqlite.Conn) error {
+	var (
+		acceptedCount int64
+		storedCount   int64
+	)
+	if err := queryOne(
+		conn,
+		`SELECT count(*) FROM command_results
+		  WHERE kind = 'consensus.checkpoint'
+		    AND outcome_status = 'accepted';`,
+		func(stmt *sqlite.Stmt) {
+			acceptedCount = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return appliedCheckpointIntegrity(
+			"count accepted checkpoint results",
+			err,
+		)
+	}
+	if err := queryOne(
+		conn,
+		"SELECT count(*) FROM chain_checkpoints;",
+		func(stmt *sqlite.Stmt) {
+			storedCount = stmt.ColumnInt64(0)
+		},
+	); err != nil {
+		return appliedCheckpointIntegrity(
+			"count stored checkpoint rows",
+			err,
+		)
+	}
+	if acceptedCount < 0 || storedCount != acceptedCount {
+		return appliedCheckpointIntegrity(
+			"checkpoint rows do not exactly cover accepted checkpoint results",
+			nil,
+		)
+	}
+	var rowErr error
+	if err := query(
+		conn,
+		`SELECT checkpoint_event_id FROM chain_checkpoints
+		  ORDER BY recovery_generation, covered_result_index,
+		           checkpoint_event_id;`,
+		func(stmt *sqlite.Stmt) {
+			if rowErr != nil {
+				return
+			}
+			eventID := domain.UUIDv7(stmt.ColumnText(0))
+			if !eventID.Valid() {
+				rowErr = errors.New("invalid checkpoint row identity")
+				return
+			}
+			record, found, err := readCheckpointRecord(conn, eventID)
+			if err != nil {
+				rowErr = err
+				return
+			}
+			if !found {
+				rowErr = errors.New(
+					"checkpoint row disappeared during verification",
+				)
+				return
+			}
+			if err := record.Validate(); err != nil {
+				rowErr = err
+				return
+			}
+			rowErr = verifyCheckpointResultBinding(conn, record)
+		},
+	); err != nil {
+		return appliedCheckpointIntegrity(
+			"enumerate checkpoint rows",
+			err,
+		)
+	}
+	if rowErr != nil {
+		return appliedCheckpointIntegrity(
+			"checkpoint row differs from accepted result",
+			rowErr,
+		)
+	}
+	return nil
+}
+
+func logicalSnapshotCutFromRoot(
+	root logicalsnapshot.Root,
+) (LogicalSnapshotCut, error) {
+	if len(root.CanonicalBytes()) == 0 {
+		return LogicalSnapshotCut{}, logicalSnapshotStageError(
+			"invalid signed root",
+			nil,
+		)
+	}
+	input := root.Unsigned().Input()
+	cut := LogicalSnapshotCut{
+		SessionID:               input.SessionID,
+		WorkspaceID:             input.WorkspaceID,
+		RecoveryGeneration:      input.RecoveryGeneration,
+		CheckpointEventID:       input.CheckpointEventID,
+		ChainIndex:              input.ChainIndex,
+		ChainHash:               Digest(input.ChainHash),
+		ResultIndex:             input.ResultIndex,
+		ResultHash:              Digest(input.ResultHash),
+		ProjectionAccumulator:   Digest(input.ProjectionAccumulator),
+		ProjectionStateDigest:   Digest(input.ProjectionStateDigest),
+		AuthorityVersion:        input.AuthorityVersion,
+		SignerDeviceID:          input.SignerDeviceID,
+		DigestVersion:           input.DigestVersion,
+		ProjectionSchemaVersion: input.ProjectionSchemaVersion,
+		RecordCount:             input.RecordCount,
+	}
+	if err := validateLogicalSnapshotCut(cut); err != nil {
+		return LogicalSnapshotCut{}, err
+	}
+	return cut, nil
 }
 
 func validateLogicalSnapshotCut(cut LogicalSnapshotCut) error {

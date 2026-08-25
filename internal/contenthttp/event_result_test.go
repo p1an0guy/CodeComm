@@ -378,6 +378,7 @@ func TestServerRejectsEventTransportBeforeService(t *testing.T) {
 
 func TestMalformedEventConsumesIndependentProposalBudget(t *testing.T) {
 	harness := startContentHarness(t, ActiveHandlersMax)
+	harness.ensureControlRegistered(t)
 	signed := contentTestSignedEvent(t)
 	future := time.Now().Add(time.Hour)
 	harness.server.control.mu.Lock()

@@ -194,6 +194,9 @@ func (client *Client) Replication(
 		!domain.ValidUnsignedInteger(afterResult) {
 		return replication.Batch{}, ErrInvalidClient
 	}
+	if err := ctx.Err(); err != nil {
+		return replication.Batch{}, err
+	}
 	client.operationMu.Lock()
 	defer client.operationMu.Unlock()
 

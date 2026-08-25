@@ -11,9 +11,14 @@ import (
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/chain"
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/lease"
+	"github.com/ijonahch/codecomm/internal/domain/plan"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/domain/publication"
 	"github.com/ijonahch/codecomm/internal/domain/task"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/replication"
@@ -692,11 +697,20 @@ func resultBatchInitialState(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return commitmentInitialState(
+	canonicalCommit, err := domain.ParseGitOID(
+		"sha1:" + strings.Repeat("1", 40),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := commitmentInitialState(
 		t,
 		domain.UUIDv7(testSessionID),
 		0,
 		ProjectionWrites{
+			AuditCounters: []auditcounter.Counter{{
+				DeviceID: authorityDeviceID,
+			}},
 			Devices:  []device.Device{authorityDevice},
 			VoterSet: []voterset.Set{target},
 			CredentialAuthority: []CredentialAuthorityRow{{
@@ -705,8 +719,31 @@ func resultBatchInitialState(
 				VoterSetVersion:  1,
 				ActivationSource: CredentialAuthorityGenesis,
 			}},
+			PlanCurrent: []plan.Current{{
+				SessionID:     domain.UUIDv7(testSessionID),
+				EntityVersion: 1,
+			}},
+			CanonicalRefs: []publication.CanonicalRef{{
+				RefName:       publication.CanonicalRefName,
+				CommitOID:     canonicalCommit,
+				EntityVersion: 1,
+			}},
+			SessionPolicy: []policy.Policy{{
+				SessionID:     domain.UUIDv7(testSessionID),
+				Values:        policy.DefaultValues(),
+				EntityVersion: 1,
+			}},
 		},
 	)
+	initial.GenesisJSON = commitmentCanonicalJSON(t, map[string]any{
+		"recovery_generation": uint64(0),
+		"recovery_public_key": codec.EncodeBase64URL(
+			authorityDevice.IdentityPublicKey,
+		),
+		"session_id":   testSessionID,
+		"workspace_id": testWorkspaceID,
+	})
+	return initial
 }
 
 func resultBatchCommand(

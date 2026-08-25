@@ -461,15 +461,23 @@ func runDaemon(
 		peerIngress        *transport.Ingress
 		discoveryRuntime   *daemonDiscoveryRuntime
 		contentPeerRuntime *daemonContentPeerRuntime
+		snapshotRepository *daemonLogicalSnapshotRepository
+		snapshotPublisher  *daemonLogicalSnapshotPublisher
 	)
 	runtimeClosed := false
 	defer func() {
 		if runtimeClosed {
 			return
 		}
-		components := make([]phasedDaemonComponent, 0, 6)
+		components := make([]phasedDaemonComponent, 0, 7)
 		if agentService != nil {
 			components = append(components, agentService)
+		}
+		if snapshotPublisher != nil {
+			components = append(components, snapshotPublisher)
+		}
+		if snapshotRepository != nil {
+			components = append(components, snapshotRepository)
 		}
 		if contentPeerRuntime != nil {
 			components = append(components, contentPeerRuntime)
@@ -592,6 +600,29 @@ func runDaemon(
 	}
 	var contentHandler transport.ConnectionHandler
 	if discoveryRuntime != nil {
+		snapshotRepository, err = openDaemonLogicalSnapshotRepository(
+			ctx,
+			options.statePath,
+			options.sessionID,
+			options.workspaceID,
+			view.RecoveryGeneration,
+			deviceID,
+			ed25519.PublicKey(identityPublicKey),
+		)
+		if err != nil {
+			return err
+		}
+		snapshotPublisher, err = newDaemonLogicalSnapshotPublisher(
+			ctx,
+			node,
+			localState,
+			snapshotRepository,
+			deviceID,
+			ed25519.PrivateKey(identityPrivateKey),
+		)
+		if err != nil {
+			return err
+		}
 		contentHandler, err = newDaemonContentServer(
 			options.sessionID,
 			options.workspaceID,
@@ -601,6 +632,7 @@ func runDaemon(
 			discoveryRuntime,
 			node,
 			identityPrivateKey,
+			snapshotRepository,
 		)
 		if err != nil {
 			return err
@@ -672,6 +704,8 @@ func runDaemon(
 		peerIngress,
 		discoveryRuntime,
 		contentPeerRuntime,
+		snapshotPublisher,
+		snapshotRepository,
 	)
 	runtimeClosed = true
 	return serveErr
@@ -688,6 +722,8 @@ func serveUntilStopped(
 	peerIngress *transport.Ingress,
 	discoveryRuntime *daemonDiscoveryRuntime,
 	contentPeerRuntime *daemonContentPeerRuntime,
+	snapshotPublisher *daemonLogicalSnapshotPublisher,
+	snapshotRepository *daemonLogicalSnapshotRepository,
 ) error {
 	components := []phasedDaemonComponent{agentService}
 	fatalComponents := []daemonFatalComponent{
@@ -695,6 +731,13 @@ func serveUntilStopped(
 		agentService,
 		credentialService,
 		pairingService,
+	}
+	if snapshotPublisher != nil {
+		components = append(components, snapshotPublisher)
+		fatalComponents = append(fatalComponents, snapshotPublisher)
+	}
+	if snapshotRepository != nil {
+		components = append(components, snapshotRepository)
 	}
 	if contentPeerRuntime != nil {
 		components = append(components, contentPeerRuntime)

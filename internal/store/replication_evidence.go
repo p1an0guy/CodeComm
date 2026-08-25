@@ -58,7 +58,41 @@ func verifySettledNonvoterEvidence(
 	if err := validateSettledNonvoterState(conn, state, settled); err != nil {
 		return err
 	}
-	if err := verifyRaftCommandLedgerThrough(
+	snapshot, hasSnapshot, err := readLogicalSnapshotAttestation(
+		conn,
+		state,
+	)
+	if err != nil {
+		return err
+	}
+	baselineAttestationCount := int64(0)
+	if hasSnapshot {
+		if settled.frozenCurrentTerm != 0 ||
+			settled.frozenLastRaftAppliedLogIndex != 0 {
+			return replicationEvidenceError(
+				"standalone snapshot baseline carries a frozen Raft watermark",
+				nil,
+			)
+		}
+		if err := verifyLogicalSnapshotBaseline(
+			conn,
+			state,
+			settled,
+			snapshot,
+		); err != nil {
+			return replicationEvidenceError(
+				"verify settled snapshot baseline",
+				err,
+			)
+		}
+		if err := requireNoStandaloneSnapshotRaftEvidence(conn); err != nil {
+			return replicationEvidenceError(
+				"snapshot baseline has local Raft evidence",
+				err,
+			)
+		}
+		baselineAttestationCount = 1
+	} else if err := verifyRaftCommandLedgerThrough(
 		conn,
 		state,
 		settled.baselineHeads.ResultIndex,
@@ -122,9 +156,9 @@ func verifySettledNonvoterEvidence(
 		return err
 	}
 	if state.resultIndex == baseline.ResultIndex {
-		if attestationCount != 0 {
+		if attestationCount != baselineAttestationCount {
 			return replicationEvidenceError(
-				"boundary-only settled state has attestations",
+				"settled baseline has unexpected attestations",
 				nil,
 			)
 		}
@@ -172,7 +206,7 @@ func verifySettledNonvoterEvidence(
 	}
 	cursor := baseline
 	cursorStateDigest := chain.Digest(verifiedStateDigest)
-	verifiedCount := int64(0)
+	verifiedCount := baselineAttestationCount
 	for cursor.ResultIndex < state.resultIndex {
 		if cursor.ResultIndex == domain.MaxSafeInteger {
 			return replicationEvidenceError(

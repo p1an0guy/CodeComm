@@ -422,21 +422,39 @@ func applyDaemonMeshTestEntry(
 	deviceID domain.DeviceID,
 ) {
 	t.Helper()
+	proposal := daemonTestTaskEvent(
+		t,
+		identityPrivateKey,
+		deviceID,
+	)
 	_, err := database.Apply(context.Background(), store.ApplyRequest{
 		Term:               1,
 		LogIndex:           1,
 		AppliedAt:          daemonTestTimestamp,
 		RecoveryGeneration: 0,
-		Proposal: daemonTestTaskEvent(
-			t,
-			identityPrivateKey,
-			deviceID,
-		),
+		Proposal:           proposal,
 		Outcome: store.CommandOutcome{
 			Status: store.OutcomeAccepted,
 			Code:   "accepted",
 			JSON:   []byte(`{"code":"accepted","status":"accepted"}`),
 		},
+		Audit: []store.AuditRecord{{
+			SessionID:        daemonTestSessionID,
+			SourceKind:       store.AuditAcceptedEvent,
+			EventID:          proposal.Proposal().EventID,
+			ResultIndex:      1,
+			ReporterDeviceID: deviceID,
+			SubjectDeviceID:  deviceID,
+			ActorType:        proposal.Proposal().Origin.ActorType(),
+			IPCChannel:       "operator",
+			ActionCode:       "task.created",
+			OutcomeCode:      "accepted",
+			Subject:          string(daemonTestTaskID),
+			DetailsJSON:      []byte(`{}`),
+			FirstSeenAt:      daemonTestTimestamp,
+			LastSeenAt:       daemonTestTimestamp,
+			ObservationCount: 1,
+		}},
 	})
 	if err != nil {
 		t.Fatalf("Apply(): %v", err)

@@ -362,6 +362,7 @@ func secureCredentialRenewalBindingAtEpoch(
 	t.Helper()
 	if subject == nil {
 		t.Fatal("nil credential subject")
+		return credential.Binding{}
 	}
 	epochPrivate := ed25519.NewKeyFromSeed(
 		bytes.Repeat([]byte{seed}, ed25519.SeedSize),

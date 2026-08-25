@@ -210,12 +210,17 @@ func (node *SingleNode) consensusStatusResult(
 
 		sessionID, recoveryGeneration, valid :=
 			before.snapshot.Lineage()
+		authority, authorityValid :=
+			before.snapshot.CredentialAuthority()
 		requester, requesterExists :=
 			before.snapshot.Member(peer.DeviceID)
 		localDeviceID := domain.DeviceID(node.serverID)
 		local, localExists := before.snapshot.Member(localDeviceID)
 		if !valid ||
 			view.SessionID != sessionID ||
+			!view.WorkspaceID.Valid() ||
+			!authorityValid ||
+			authority.SessionID != sessionID ||
 			view.RecoveryGeneration != recoveryGeneration {
 			continue
 		}
@@ -256,12 +261,14 @@ func (node *SingleNode) consensusStatusResult(
 		}
 		result := ConsensusStatusResult{
 			SessionID:                      sessionID,
+			WorkspaceID:                    view.WorkspaceID,
 			RecoveryGeneration:             recoveryGeneration,
 			ServerDeviceID:                 localDeviceID,
 			LocalTerm:                      termAfter,
 			LeaderDeviceID:                 leader,
 			QuorumRequired:                 quorum,
 			LastRaftAppliedLogIndex:        cloneOptionalUint64(view.LastRaftAppliedLogIndex),
+			CredentialAuthority:            authority,
 			ContentCredentialAuthorization: authorization,
 		}
 		if err := validateConsensusStatusResult(

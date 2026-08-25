@@ -41,9 +41,6 @@ func verifyCurrentCommitmentTip(conn *sqlite.Conn) error {
 		return err
 	}
 	if settled {
-		if err := verifyCommitmentHistory(conn, state); err != nil {
-			return err
-		}
 		if err := verifySettledNonvoterEvidence(
 			conn,
 			state,

@@ -368,8 +368,8 @@ resulting accumulator. Registry completeness and explicit regeneration gates pre
 Current verification:
 
 ```text
-go test -count=1 ./...
-go test -race -count=1 ./internal/mcp ./internal/store ./internal/agent ./internal/ui
+go test -count=1 -parallel 2 ./...
+go test -race -count=1 -parallel 2 ./internal/mcp ./internal/store ./internal/agent ./internal/ui
 go vet ./...
 go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 go mod tidy -diff
@@ -384,10 +384,11 @@ race, endpoint restart/resume, and process-kill recovery. Test binaries compile 
 for Linux, Windows, and Darwin on AMD64 and ARM64. Linux/Windows native credential-store behavior
 still requires their CI runners as noted in step 3.
 
-Independent store pools are not scheduled concurrently inside one test process: both the pinned and
+Extreme independent-store fan-out is not scheduled inside one test process: both the pinned and
 current modernc stacks showed allocator/binding corruption under that artificial shape, while V1
-runs one store per daemon process. Concurrent use and close of one production-sized pool remain
-normal- and race-tested. Reassess the driver before any future multi-store process architecture.
+runs one store per daemon process. CI admits at most two top-level tests per package; concurrent use
+and close of one production-sized pool remain normal- and race-tested. Reassess the driver before
+any future multi-store process architecture.
 
 ## Next
 

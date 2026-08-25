@@ -613,7 +613,12 @@ With a 32-byte zero seed and UTF-8 artifact-ID bytes,
 artifact_id || u64be(i) || page_hash_(i-1) || JCS(descriptors))`. The receiver resumes
 pages from its durable verified page head and trusts the descriptor stream only when page/chunk
 counts, byte sums, and final hash match the signed root. Each root, page, and chunk independently
-obeys §11.2's preallocation limits and is fetched idempotently by artifact ID/index. The receiver
+obeys §11.2's preallocation limits; the root also obeys §11.2's aggregate byte, record, chunk,
+page, and generation ceilings before any indexed fetch. Before opening bulk transfer, the receiver
+requires the root signer to equal the authenticated serving peer, verifies its identity signature
+from applied membership, rejects a signer outside the matching applied authority, and applies the
+smaller daemon receive quota in §11.2; a later authority version remains subject to full handoff
+verification during replay. Parts are fetched idempotently by artifact ID/index. The receiver
 writes pages/chunks to quarantine, verifies compressed bytes before bounded streaming decompression,
 then verifies expanded lengths, record count/order, and full artifact digest before replay. Partial
 artifacts are resumable and never visible as state; no request or allocation grows with history.

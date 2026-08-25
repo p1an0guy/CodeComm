@@ -761,7 +761,6 @@ func clearTLSConfig(config *tls.Config) {
 		clearTLSCertificate(&config.Certificates[index])
 	}
 	config.Certificates = nil
-	config.NameToCertificate = nil
 	config.GetCertificate = nil
 	config.GetClientCertificate = nil
 	config.VerifyPeerCertificate = nil

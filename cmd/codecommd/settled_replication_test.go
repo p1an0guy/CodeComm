@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,8 @@ import (
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -33,6 +36,19 @@ func (stub *daemonSettledReplicaStub) ReplicationHeads(
 	return stub.heads, nil
 }
 
+func (*daemonSettledReplicaStub) VerifiedGenerationZeroView(
+	context.Context,
+) (store.StateView, error) {
+	return store.StateView{}, errors.New("unexpected snapshot boundary lookup")
+}
+
+func (*daemonSettledReplicaStub) PeerAdmissionSnapshot() (
+	*peerauth.Snapshot,
+	error,
+) {
+	return nil, errors.New("unexpected snapshot admission lookup")
+}
+
 func (stub *daemonSettledReplicaStub) ImportResultBatch(
 	_ context.Context,
 	_ domain.DeviceID,
@@ -53,6 +69,15 @@ func (stub *daemonSettledReplicaStub) ImportResultBatch(
 	return store.ResultBatchImportResult{
 		Heads: stub.heads,
 	}, nil
+}
+
+func (*daemonSettledReplicaStub) InstallLogicalSnapshot(
+	context.Context,
+	*consensus.VerifiedLogicalSnapshotStage,
+	domain.Timestamp,
+) (store.StandaloneLogicalSnapshotInstallResult, error) {
+	return store.StandaloneLogicalSnapshotInstallResult{},
+		errors.New("unexpected snapshot install")
 }
 
 func (stub *daemonSettledReplicaStub) FatalError() error {
@@ -145,16 +170,23 @@ func (stub *daemonReplicationClientStub) Replication(
 	return batch, nil
 }
 
+func (*daemonReplicationClientStub) LatestSnapshot(
+	context.Context,
+) (logicalsnapshot.Root, error) {
+	return logicalsnapshot.Root{}, contenthttp.ErrSnapshotUnavailable
+}
+
+func (*daemonReplicationClientStub) OpenSnapshotBulk(
+	context.Context,
+	logicalsnapshot.Root,
+) (daemonSnapshotBulkClient, error) {
+	return nil, contenthttp.ErrSnapshotUnavailable
+}
+
 func TestDaemonSettledReplicationImportsAndFailsOver(t *testing.T) {
 	batch := daemonSettledReplicationTestBatch(t, 1)
 	replica := &daemonSettledReplicaStub{}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatalf("newDaemonSettledReplication(): %v", err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	relay := daemonContentTestDeviceID(t, 0xd1)
 	stale := &daemonReplicationClientStub{
 		errs: []error{contenthttp.ErrReplicationSnapshotRequired},
@@ -196,13 +228,7 @@ func TestDaemonSettledReplicationDoesNotExcuseInvalidConcurrentPage(
 	replica := &daemonSettledReplicaStub{
 		importErr: store.ErrInvalidResultBatchImport,
 	}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	client := &daemonReplicationClientStub{
 		batches: []replication.Batch{batch},
 	}
@@ -222,13 +248,7 @@ func TestDaemonSettledReplicationKeepsCurrencyUnknownWithoutAcknowledgement(
 	t *testing.T,
 ) {
 	replica := &daemonSettledReplicaStub{}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	client := &daemonReplicationClientStub{}
 	if err := runtime.Sync(
 		context.Background(),
@@ -257,13 +277,7 @@ func TestDaemonSettledReplicationRecordsEqualCursorAcknowledgement(
 	t *testing.T,
 ) {
 	replica := &daemonSettledReplicaStub{}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	relay := daemonContentTestDeviceID(t, 0xd6)
 	client := &daemonReplicationClientStub{
 		acknowledgements: []replication.Acknowledgement{
@@ -302,19 +316,13 @@ func TestDaemonSettledReplicationRejectsInvalidAcknowledgement(
 	replica := &daemonSettledReplicaStub{
 		ackErr: consensus.ErrInvalidReplicationReplay,
 	}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	client := &daemonReplicationClientStub{
 		acknowledgements: []replication.Acknowledgement{
 			daemonSettledReplicationTestAcknowledgement(t),
 		},
 	}
-	err = runtime.Sync(
+	err := runtime.Sync(
 		context.Background(),
 		daemonContentTestDeviceID(t, 0xd7),
 		client,
@@ -336,19 +344,13 @@ func TestDaemonSettledReplicationPreservesFatalReplicaCause(t *testing.T) {
 		fatal:     fatal,
 		importErr: fatal,
 	}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	client := &daemonReplicationClientStub{
 		batches: []replication.Batch{
 			daemonSettledReplicationTestBatch(t, 1),
 		},
 	}
-	err = runtime.Sync(
+	err := runtime.Sync(
 		context.Background(),
 		daemonContentTestDeviceID(t, 0xd4),
 		client,
@@ -360,19 +362,23 @@ func TestDaemonSettledReplicationPreservesFatalReplicaCause(t *testing.T) {
 			err,
 		)
 	}
+	if len(client.after) != 0 ||
+		len(replica.forgotten) != 0 ||
+		replica.imports != 0 {
+		t.Fatalf(
+			"Sync(fatal) performed work: requests %v, forgotten %v, imports %d",
+			client.after,
+			replica.forgotten,
+			replica.imports,
+		)
+	}
 }
 
 func TestDaemonSettledReplicationCancellation(
 	t *testing.T,
 ) {
 	replica := &daemonSettledReplicaStub{}
-	runtime, err := newDaemonSettledReplication(
-		context.Background(),
-		replica,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := runtime.Sync(
@@ -382,6 +388,29 @@ func TestDaemonSettledReplicationCancellation(
 	); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Sync(canceled) error = %v", err)
 	}
+}
+
+func newDaemonSettledReplicationTestRuntime(
+	t *testing.T,
+	replica daemonSettledReplica,
+) *daemonSettledReplication {
+	t.Helper()
+	runtime, err := newDaemonSettledReplication(
+		context.Background(),
+		daemonSettledReplicationOptions{
+			Replica: replica,
+			ScratchRoot: filepath.Join(
+				t.TempDir(),
+				"snapshot-scratch",
+			),
+			OriginBootID: daemonTestVerifyBootID,
+			Clock:        consensus.NewSystemApplyClock(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDaemonSettledReplication(): %v", err)
+	}
+	return runtime
 }
 
 func daemonSettledReplicationTestBatch(

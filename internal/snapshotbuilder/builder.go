@@ -45,6 +45,7 @@ type Scratch interface {
 	io.Reader
 	io.Writer
 	io.Seeker
+	Truncate(int64) error
 }
 
 // RecordSource provides one stable, integrity-verified checkpoint stream.
@@ -446,12 +447,8 @@ func replayArtifact(
 }
 
 func resetArtifactScratch(scratch Scratch) error {
-	if truncater, ok := scratch.(interface {
-		Truncate(int64) error
-	}); ok {
-		if err := truncater.Truncate(0); err != nil {
-			return err
-		}
+	if err := scratch.Truncate(0); err != nil {
+		return err
 	}
 	_, err := scratch.Seek(0, io.SeekStart)
 	return err

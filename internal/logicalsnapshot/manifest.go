@@ -98,7 +98,7 @@ func (builder *ManifestBuilder) Consume(descriptor ChunkDescriptor) error {
 	if err := validateManifestDescriptor(descriptor); err != nil {
 		return builder.fail(err)
 	}
-	if builder.descriptorCount >= domain.MaxSafeInteger {
+	if builder.descriptorCount >= MaxArtifactChunkCount {
 		return builder.fail(ErrManifestTooLarge)
 	}
 	if descriptor.ChunkIndex != builder.descriptorCount {
@@ -156,7 +156,7 @@ func (builder *ManifestBuilder) flushPage() error {
 	if err := builder.ctx.Err(); err != nil {
 		return err
 	}
-	if builder.pageCount >= domain.MaxSafeInteger {
+	if builder.pageCount >= MaxDescriptorPageCount {
 		return ErrManifestTooLarge
 	}
 

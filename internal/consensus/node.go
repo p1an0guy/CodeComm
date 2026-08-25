@@ -1449,7 +1449,7 @@ func verifyLatestSnapshotAnchor(
 	}
 	if err := state.VerifyCommitmentHistory(ctx); err != nil {
 		return fmt.Errorf(
-			"%w: verify snapshot-covered history: %v",
+			"%w: verify snapshot-covered history: %w",
 			ErrSnapshotAnchorCoverage,
 			err,
 		)

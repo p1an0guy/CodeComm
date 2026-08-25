@@ -116,6 +116,126 @@ func TestAppliedCheckpointRejectsBrokenRaftBinding(t *testing.T) {
 	}
 }
 
+func TestCommitmentScrubRejectsNonterminalCheckpointRowCorruption(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Store)
+	}{
+		{
+			name: "deleted",
+			mutate: func(t *testing.T, state *Store) {
+				t.Helper()
+				executeCheckpointStartupMutation(
+					t,
+					state,
+					`DELETE FROM chain_checkpoints
+					  WHERE checkpoint_event_id = ?1;`,
+					string(testCheckpointEventID),
+				)
+			},
+		},
+		{
+			name: "changed",
+			mutate: func(t *testing.T, state *Store) {
+				t.Helper()
+				executeCheckpointStartupMutation(
+					t,
+					state,
+					`UPDATE chain_checkpoints
+					    SET authority_signature = zeroblob(64)
+					  WHERE checkpoint_event_id = ?1;`,
+					string(testCheckpointEventID),
+				)
+			},
+		},
+		{
+			name: "fabricated",
+			mutate: func(t *testing.T, state *Store) {
+				t.Helper()
+				executeCheckpointStartupMutation(
+					t,
+					state,
+					`INSERT INTO chain_checkpoints(
+					    checkpoint_event_id, session_id, workspace_id,
+					    recovery_generation, authority_voter_set_version,
+					    signer_device_id, term, covered_applied_log_index,
+					    covered_chain_index, covered_chain_hash,
+					    covered_result_index, covered_result_hash,
+					    projection_accumulator, digest_version,
+					    projection_schema_version, checkpoint_json,
+					    authority_signature
+					)
+					SELECT ?1, session_id, workspace_id,
+					       recovery_generation, authority_voter_set_version,
+					       signer_device_id, term, covered_applied_log_index,
+					       0, covered_chain_hash, 0, covered_result_hash,
+					       projection_accumulator, digest_version,
+					       projection_schema_version, checkpoint_json,
+					       authority_signature
+					  FROM chain_checkpoints
+					 WHERE checkpoint_event_id = ?2;`,
+					string(testEventID),
+					string(testCheckpointEventID),
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			state, _ := appliedCheckpointTestState(t)
+			view, err := state.View(context.Background())
+			if err != nil {
+				t.Fatalf("View(before second checkpoint): %v", err)
+			}
+			secondID := domain.UUIDv7(
+				"01890f47-3e72-7000-8000-000000000092",
+			)
+			second := nextCheckpointApplyRequest(
+				t,
+				view.Heads,
+				secondID,
+				2,
+				3,
+				domain.Timestamp("2026-08-10T12:00:02Z"),
+			)
+			if _, err := state.Apply(
+				context.Background(),
+				second,
+			); err != nil {
+				t.Fatalf("Apply(second checkpoint): %v", err)
+			}
+
+			test.mutate(t, state)
+			commitmentAssertReopenScrubFails(
+				t,
+				state,
+				state.Path(),
+				ErrAppliedCheckpointIntegrity,
+			)
+		})
+	}
+}
+
+func executeCheckpointStartupMutation(
+	t *testing.T,
+	state *Store,
+	statement string,
+	args ...any,
+) {
+	t.Helper()
+	if err := state.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			return execute(conn, statement, args...)
+		},
+	); err != nil {
+		t.Fatalf("checkpoint startup mutation: %v", err)
+	}
+}
+
 func appliedCheckpointTestState(
 	t *testing.T,
 ) (*Store, ApplyRequest) {

@@ -128,11 +128,11 @@ func TestDaemonProposalForwarderRelayRejectsNilReceiverAndContext(
 		t.Fatalf("nil relay error = %v", err)
 	}
 	relay = &daemonProposalForwarderRelay{}
-	if _, err := relay.ForwardProposal(
-		nil,
-		"",
-		event.SignedEvent{},
-	); !errors.Is(err, errDaemonProposalForwarderUnavailable) {
+	//lint:ignore SA1012 This test verifies the explicit nil-context contract.
+	if _, err := relay.ForwardProposal(nil, "", event.SignedEvent{}); !errors.Is(
+		err,
+		errDaemonProposalForwarderUnavailable,
+	) {
 		t.Fatalf("nil context error = %v", err)
 	}
 }

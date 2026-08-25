@@ -18,10 +18,18 @@ import (
 )
 
 const (
-	RootSchemaVersion                = 1
-	SupportedDigestVersion           = 1
-	SupportedProjectionSchemaVersion = 1
-	MaxRootBytes                     = 64 << 10
+	RootSchemaVersion                       = 1
+	SupportedDigestVersion                  = 1
+	SupportedProjectionSchemaVersion        = 1
+	MaxRootBytes                            = 64 << 10
+	MaxArtifactExpandedBytes         uint64 = 64 << 30
+	MaxArtifactCompressedBytes       uint64 = 64 << 30
+	MaxArtifactRecordCount           uint64 = 16 << 20
+	MaxArtifactChunkCount            uint64 = 1 << 17
+	MaxRecoveryGeneration            uint64 = 4_095
+	MaxDescriptorPageCount                  = (MaxArtifactChunkCount +
+		uint64(MaxDescriptorsPerPage) - 1) /
+		uint64(MaxDescriptorsPerPage)
 )
 
 var (
@@ -331,12 +339,16 @@ func validateRootInput(input RootInput) error {
 			SupportedProjectionSchemaVersion {
 		return ErrUnsupportedVersion
 	}
+	expectedPageCount := (input.ChunkCount +
+		uint64(MaxDescriptorsPerPage) - 1) /
+		uint64(MaxDescriptorsPerPage)
 	if !validArtifactID(input.ArtifactID) ||
 		!input.SessionID.Valid() ||
 		!input.WorkspaceID.Valid() ||
 		!input.CheckpointEventID.Valid() ||
 		!input.SignerDeviceID.Valid() ||
 		!domain.ValidUnsignedInteger(input.RecoveryGeneration) ||
+		input.RecoveryGeneration > MaxRecoveryGeneration ||
 		!domain.ValidUnsignedInteger(input.ChainIndex) ||
 		input.ResultIndex < 1 ||
 		!domain.ValidUnsignedInteger(input.ResultIndex) ||
@@ -346,14 +358,34 @@ func validateRootInput(input RootInput) error {
 		!input.ContentEncoding.valid() ||
 		input.ExpandedBytes < 1 ||
 		!domain.ValidUnsignedInteger(input.ExpandedBytes) ||
+		input.ExpandedBytes > MaxArtifactExpandedBytes ||
 		input.CompressedBytes < 1 ||
 		!domain.ValidUnsignedInteger(input.CompressedBytes) ||
+		input.CompressedBytes > MaxArtifactCompressedBytes ||
 		input.RecordCount < 1 ||
 		!domain.ValidUnsignedInteger(input.RecordCount) ||
+		input.RecordCount > MaxArtifactRecordCount ||
+		input.RecordCount > input.ExpandedBytes ||
+		input.ResultIndex > input.RecordCount ||
+		input.ChainIndex > input.RecordCount ||
 		input.DescriptorPageCount < 1 ||
 		!domain.ValidUnsignedInteger(input.DescriptorPageCount) ||
+		input.DescriptorPageCount > MaxDescriptorPageCount ||
+		input.DescriptorPageCount > input.ChunkCount ||
+		input.DescriptorPageCount != expectedPageCount ||
 		input.ChunkCount < 1 ||
-		!domain.ValidUnsignedInteger(input.ChunkCount) {
+		!domain.ValidUnsignedInteger(input.ChunkCount) ||
+		input.ChunkCount > MaxArtifactChunkCount ||
+		input.ChunkCount > input.RecordCount ||
+		input.ChunkCount > input.CompressedBytes ||
+		input.ChunkCount > input.ExpandedBytes ||
+		input.CompressedBytes >
+			input.ChunkCount*uint64(MaxChunkCompressedBytes) ||
+		input.ExpandedBytes >
+			input.ChunkCount*uint64(MaxChunkExpandedBytes) ||
+		input.ContentEncoding == EncodingIdentity &&
+			input.CompressedBytes != input.ExpandedBytes ||
+		input.RecoveryGeneration >= input.RecordCount {
 		return ErrInvalidRoot
 	}
 	return nil

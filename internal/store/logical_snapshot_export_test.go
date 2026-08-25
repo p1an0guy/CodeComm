@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -208,6 +209,65 @@ func TestExportLogicalSnapshotRecordsRejectsCheckpointCorruption(
 	}
 	if sinkCalls != 0 {
 		t.Fatalf("corrupt checkpoint emitted %d records", sinkCalls)
+	}
+}
+
+func TestExportLogicalSnapshotRecordsRejectsUnrepresentableGeneration(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newLogicalSnapshotExportFixture(t)
+	executeSettledCheckpointTestSQL(
+		t,
+		fixture.store,
+		`UPDATE consensus_state
+		    SET recovery_generation = ?1;`,
+		logicalsnapshot.MaxRecoveryGeneration+1,
+	)
+	sinkCalls := 0
+	_, err := fixture.store.ExportLogicalSnapshotRecords(
+		context.Background(),
+		fixture.options,
+		func(context.Context, logicalsnapshot.Record) error {
+			sinkCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrLogicalSnapshotIntegrity) ||
+		!strings.Contains(err.Error(), "recovery generation") {
+		t.Fatalf(
+			"ExportLogicalSnapshotRecords() error = %v, want generation limit",
+			err,
+		)
+	}
+	if sinkCalls != 0 {
+		t.Fatalf("invalid generation emitted %d records", sinkCalls)
+	}
+}
+
+func TestLogicalSnapshotEmitterRejectsRecordLimitBeforeSink(t *testing.T) {
+	t.Parallel()
+
+	sinkCalls := 0
+	emitter := logicalSnapshotEmitter{
+		ctx: context.Background(),
+		sink: func(context.Context, logicalsnapshot.Record) error {
+			sinkCalls++
+			return nil
+		},
+		count: logicalsnapshot.MaxArtifactRecordCount,
+	}
+	err := emitter.emit(
+		logicalsnapshot.RecordCheckpoint,
+		[]byte(`{"test":true}`),
+	)
+	if !errors.Is(err, ErrLogicalSnapshotIntegrity) ||
+		!strings.Contains(err.Error(), "record count") {
+		t.Fatalf("emit() error = %v, want record limit", err)
+	}
+	if sinkCalls != 0 {
+		t.Fatalf("record limit invoked sink %d times", sinkCalls)
 	}
 }
 
@@ -556,8 +616,8 @@ func validateLogicalSnapshotSequence(
 			DigestVersion:           cut.DigestVersion,
 			ProjectionSchemaVersion: cut.ProjectionSchemaVersion,
 			ContentEncoding:         logicalsnapshot.EncodingIdentity,
-			ExpandedBytes:           1,
-			CompressedBytes:         1,
+			ExpandedBytes:           cut.RecordCount,
+			CompressedBytes:         cut.RecordCount,
 			RecordCount:             cut.RecordCount,
 			DescriptorPageCount:     1,
 			ChunkCount:              1,
