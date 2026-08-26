@@ -441,7 +441,7 @@ func testConsensusRaftFraming(t *testing.T) {
 		ConsensusNetworkTransportOptions{
 			Stream:        harness.client,
 			LocalServerID: raft.ServerID(harness.clientID),
-			Timeout:       time.Second,
+			Timeout:       ConsensusRaftOperationTimeout,
 			Logger:        hclog.NewNullLogger(),
 			AuthorizeReplication: func(domain.DeviceID) error {
 				return nil
@@ -458,7 +458,7 @@ func testConsensusRaftFraming(t *testing.T) {
 		ConsensusNetworkTransportOptions{
 			Stream:        harness.server,
 			LocalServerID: raft.ServerID(harness.serverID),
-			Timeout:       time.Second,
+			Timeout:       ConsensusRaftOperationTimeout,
 			Logger:        hclog.NewNullLogger(),
 			AuthorizeReplication: func(domain.DeviceID) error {
 				return nil
@@ -561,8 +561,25 @@ func testConsensusLocalIdentityBinding(t *testing.T) {
 	_, err = NewConsensusNetworkTransport(
 		ConsensusNetworkTransportOptions{
 			Stream:        harness.client,
+			LocalServerID: raft.ServerID(harness.clientID),
+			Timeout:       ConsensusRaftOperationTimeout - time.Nanosecond,
+			Logger:        hclog.NewNullLogger(),
+			AuthorizeReplication: func(domain.DeviceID) error {
+				return nil
+			},
+			AuthorizeCommitProbe: func(domain.DeviceID) error {
+				return nil
+			},
+		},
+	)
+	if !errors.Is(err, ErrInvalidConsensusRaftTransport) {
+		t.Fatalf("NewConsensusNetworkTransport(short timeout) error = %v", err)
+	}
+	_, err = NewConsensusNetworkTransport(
+		ConsensusNetworkTransportOptions{
+			Stream:        harness.client,
 			LocalServerID: raft.ServerID(harness.serverID),
-			Timeout:       time.Second,
+			Timeout:       ConsensusRaftOperationTimeout,
 			Logger:        hclog.NewNullLogger(),
 			AuthorizeReplication: func(domain.DeviceID) error {
 				return nil

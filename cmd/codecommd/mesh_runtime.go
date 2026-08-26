@@ -26,8 +26,6 @@ import (
 	"github.com/ijonahch/codecomm/internal/voteractivation"
 )
 
-const daemonConsensusTransportTimeout = 10 * time.Second
-
 var (
 	errDaemonIdentityMismatch = errors.New(
 		"codecommd: installation identity is not the active enrolled member",
@@ -268,7 +266,7 @@ func (factory *daemonMeshTransportFactory) Build(
 		transport.ConsensusNetworkTransportOptions{
 			Stream:               stream,
 			LocalServerID:        raft.ServerID(factory.deviceID),
-			Timeout:              daemonConsensusTransportTimeout,
+			Timeout:              transport.ConsensusRaftOperationTimeout,
 			Logger:               hclog.NewNullLogger(),
 			AuthorizeReplication: gate.AuthorizeReplication,
 			AuthorizeCommitProbe: gate.AuthorizeCommitProbe,

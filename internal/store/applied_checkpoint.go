@@ -25,7 +25,9 @@ type AppliedCheckpointLookup struct {
 
 // AppliedCheckpoint returns an integrity-verified checkpoint from the active
 // generation. A missing event is not an error; incomplete evidence for a
-// present checkpoint is.
+// present checkpoint is. A checkpoint covered by an installed Raft snapshot
+// is proved by that snapshot's signed logical root and command watermark
+// instead of a local per-entry command binding.
 func (store *Store) AppliedCheckpoint(
 	ctx context.Context,
 	eventID domain.UUIDv7,
@@ -99,46 +101,76 @@ func (store *Store) AppliedCheckpoint(
 			)
 		}
 
-		var bindingCount int64
-		if err := queryOneArgs(
+		snapshot, hasSnapshot, err := validateRaftSnapshotInstallBinding(
 			conn,
-			`SELECT count(*)
-			   FROM command_results AS r
-			   JOIN raft_command_applications AS a
-			     ON a.recovery_generation = r.recovery_generation
-			    AND a.event_id = r.event_id
-			    AND a.proposal_digest = r.proposal_digest
-			  WHERE r.event_id = ?1
-			    AND r.session_id = ?2
-			    AND r.workspace_id = ?3
-			    AND r.recovery_generation = ?4
-			    AND r.kind = 'consensus.checkpoint'
-			    AND r.outcome_status = 'accepted'
-			    AND r.chain_index = ?5
-			    AND r.result_index = ?6
-			    AND a.log_index = ?7
-			    AND a.term = ?8;`,
-			[]any{
-				string(record.CheckpointEventID),
-				string(record.SessionID),
-				string(record.WorkspaceID),
-				record.RecoveryGeneration,
-				record.CoveredChainIndex + 1,
-				record.CoveredResultIndex + 1,
-				appliedLogIndex,
-				record.Term,
-			},
-			func(stmt *sqlite.Stmt) {
-				bindingCount = stmt.ColumnInt64(0)
-			},
-		); err != nil {
-			return err
-		}
-		if bindingCount != 1 {
+			state,
+		)
+		if err != nil {
 			return appliedCheckpointIntegrity(
-				"checkpoint lacks its exact accepted Raft command binding",
-				nil,
+				"verify installed snapshot binding",
+				err,
 			)
+		}
+		coveredBySnapshot := hasSnapshot &&
+			snapshot.hasBaselineCommand &&
+			record.CoveredChainIndex+1 <= snapshot.heads.ChainIndex &&
+			record.CoveredResultIndex+1 <= snapshot.heads.ResultIndex &&
+			appliedLogIndex <= snapshot.baselineCommandLogIndex &&
+			record.Term <= snapshot.baselineCommandTerm &&
+			(appliedLogIndex != snapshot.baselineCommandLogIndex ||
+				record.Term == snapshot.baselineCommandTerm)
+		if coveredBySnapshot {
+			if err := verifyRaftSnapshotInstallEvidence(
+				conn,
+				state,
+			); err != nil {
+				return appliedCheckpointIntegrity(
+					"verify installed snapshot evidence",
+					err,
+				)
+			}
+		} else {
+			var bindingCount int64
+			if err := queryOneArgs(
+				conn,
+				`SELECT count(*)
+				   FROM command_results AS r
+				   JOIN raft_command_applications AS a
+				     ON a.recovery_generation = r.recovery_generation
+				    AND a.event_id = r.event_id
+				    AND a.proposal_digest = r.proposal_digest
+				  WHERE r.event_id = ?1
+				    AND r.session_id = ?2
+				    AND r.workspace_id = ?3
+				    AND r.recovery_generation = ?4
+				    AND r.kind = 'consensus.checkpoint'
+				    AND r.outcome_status = 'accepted'
+				    AND r.chain_index = ?5
+				    AND r.result_index = ?6
+				    AND a.log_index = ?7
+				    AND a.term = ?8;`,
+				[]any{
+					string(record.CheckpointEventID),
+					string(record.SessionID),
+					string(record.WorkspaceID),
+					record.RecoveryGeneration,
+					record.CoveredChainIndex + 1,
+					record.CoveredResultIndex + 1,
+					appliedLogIndex,
+					record.Term,
+				},
+				func(stmt *sqlite.Stmt) {
+					bindingCount = stmt.ColumnInt64(0)
+				},
+			); err != nil {
+				return err
+			}
+			if bindingCount != 1 {
+				return appliedCheckpointIntegrity(
+					"checkpoint lacks an accepted Raft proof",
+					nil,
+				)
+			}
 		}
 
 		lookup = AppliedCheckpointLookup{

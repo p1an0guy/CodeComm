@@ -47,10 +47,12 @@ func NewSystemApplyClock() ApplyClock {
 
 // FSMOptions binds one Raft state machine to its durable store and daemon boot.
 type FSMOptions struct {
-	Store        *store.Store
-	OriginBootID domain.UUIDv7
-	Clock        ApplyClock
-	LogStore     raft.LogStore
+	Store          *store.Store
+	OriginBootID   domain.UUIDv7
+	Clock          ApplyClock
+	LogStore       raft.LogStore
+	SnapshotDir    string
+	SnapshotSigner RaftSnapshotSigner
 	// ValidateConfiguration may be omitted only by direct, non-Raft harnesses;
 	// the default rejects every configuration callback.
 	ValidateConfiguration func(raft.Configuration) error
@@ -71,6 +73,8 @@ type FSM struct {
 	originBootID         domain.UUIDv7
 	clock                ApplyClock
 	logStore             raft.LogStore
+	snapshotDir          string
+	snapshotSigner       RaftSnapshotSigner
 	validateConfig       func(raft.Configuration) error
 	admission            atomic.Pointer[peerAdmissionPublication]
 	admissionMu          sync.Mutex
@@ -107,14 +111,27 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 	}
 	feed := newChangeFeed()
 	fsm := &FSM{
-		store:                options.Store,
-		originBootID:         options.OriginBootID,
-		clock:                options.Clock,
-		logStore:             options.LogStore,
+		store:        options.Store,
+		originBootID: options.OriginBootID,
+		clock:        options.Clock,
+		logStore:     options.LogStore,
+		snapshotDir:  options.SnapshotDir,
+		snapshotSigner: normalizedRaftSnapshotSigner(
+			options.SnapshotSigner,
+		),
 		validateConfig:       validateConfiguration,
 		authorizationChanges: feed,
 		admissionChanged:     feed.subscribeWithoutInitial(),
 		halted:               make(chan error, 1),
+	}
+	if fsm.snapshotSigner != nil {
+		if options.SnapshotDir == "" ||
+			validateRaftSnapshotSigner(
+				fsm.snapshotSigner.DeviceID(),
+				fsm.snapshotSigner,
+			) != nil {
+			return nil, ErrInvalidFSMOptions
+		}
 	}
 	if view.LastRaftAppliedLogIndex != nil {
 		fsm.appliedCommandIndex.Store(*view.LastRaftAppliedLogIndex)

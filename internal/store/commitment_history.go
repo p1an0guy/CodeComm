@@ -81,8 +81,26 @@ func verifyFullCommitmentState(
 				err,
 			)
 		}
-	} else if err := verifyRaftCommandLedger(conn, state); err != nil {
-		return historyIntegrityError("Raft command ledger", err)
+	} else {
+		if err := verifyRaftCommandLedger(conn, state); err != nil {
+			return historyIntegrityError("Raft command ledger", err)
+		}
+		if _, found, err := readRaftSnapshotInstallRecord(conn); err != nil {
+			return historyIntegrityError(
+				"Raft snapshot baseline",
+				err,
+			)
+		} else if found {
+			if err := verifyRaftSnapshotInstallEvidence(
+				conn,
+				state,
+			); err != nil {
+				return historyIntegrityError(
+					"Raft snapshot baseline",
+					err,
+				)
+			}
+		}
 	}
 	if err := verifyLogicalSnapshotCheckpointRows(conn); err != nil {
 		return historyIntegrityError(

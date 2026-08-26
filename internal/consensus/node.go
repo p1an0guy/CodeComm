@@ -122,6 +122,7 @@ type NodeOptions struct {
 	BootstrapVoterDeviceIDs     []domain.DeviceID
 	CanonicalCoverage           canonicalcoverage.ReceiptCollector
 	CheckpointSigner            CheckpointSigner
+	RaftSnapshotSigner          RaftSnapshotSigner
 	VoterActivationSigner       VoterActivationSigner
 	CredentialEndorsementSigner CredentialEndorsementSigner
 	CheckpointOrigin            CheckpointOrigin
@@ -141,7 +142,7 @@ type SingleNode struct {
 	fsm                           *FSM
 	state                         *store.Store
 	stable                        *raftboltdb.BoltStore
-	snapshots                     *raft.FileSnapshotStore
+	snapshots                     raft.SnapshotStore
 	transport                     RaftTransport
 	serverID                      raft.ServerID
 	originBootID                  domain.UUIDv7
@@ -220,6 +221,7 @@ type nodeOpenOptions struct {
 	ConfigurationReadiness      ConfigurationReadinessProvider
 	VoterReconciliationNow      func() time.Time
 	CheckpointSigner            CheckpointSigner
+	RaftSnapshotSigner          RaftSnapshotSigner
 	VoterActivationSigner       VoterActivationSigner
 	CredentialEndorsementSigner CredentialEndorsementSigner
 	CheckpointOrigin            CheckpointOrigin
@@ -287,6 +289,7 @@ func OpenNode(
 		BootstrapConfiguration:      bootstrap,
 		CanonicalCoverage:           options.CanonicalCoverage,
 		CheckpointSigner:            options.CheckpointSigner,
+		RaftSnapshotSigner:          options.RaftSnapshotSigner,
 		VoterActivationSigner:       options.VoterActivationSigner,
 		CredentialEndorsementSigner: options.CredentialEndorsementSigner,
 		CheckpointOrigin:            options.CheckpointOrigin,
@@ -368,13 +371,40 @@ func openNode(
 	if logOutput == nil {
 		logOutput = io.Discard
 	}
-	snapshots, err := raft.NewFileSnapshotStore(
+	retention := snapshotRetention
+	if !options.Single {
+		// Keep one validation slot so a finalized inbound snapshot cannot
+		// evict the prior good set before FSM.Restore accepts its semantics.
+		retention++
+	}
+	fileSnapshots, err := raft.NewFileSnapshotStore(
 		consensusDir,
-		snapshotRetention,
+		retention,
 		logOutput,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("consensus: open snapshot store: %w", err)
+	}
+	var (
+		snapshots             raft.SnapshotStore = fileSnapshots
+		rejectUnboundSnapshot func(string) error
+	)
+	if !options.Single {
+		reject, rejectErr := newRaftSnapshotFileRejecter(consensusDir)
+		if rejectErr != nil {
+			return nil, rejectErr
+		}
+		rejectUnboundSnapshot = reject
+		snapshots, err = newRaftSnapshotStoreWithReject(
+			fileSnapshots,
+			reject,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"consensus: bind snapshot metadata: %w",
+				err,
+			)
+		}
 	}
 	if options.Single {
 		_, transport = raft.NewInmemTransport(
@@ -522,13 +552,25 @@ func openNode(
 			return nil, ErrSingleVoterTopology
 		}
 	}
-	if err := verifyLatestSnapshotAnchor(
+	if options.Single {
+		if err := verifyLatestSnapshotAnchor(
+			ctx,
+			snapshots,
+			state,
+			view,
+			options.ServerID,
+			true,
+		); err != nil {
+			return nil, err
+		}
+	} else if err := verifyLatestLogicalRaftSnapshot(
 		ctx,
 		snapshots,
 		state,
 		view,
 		options.ServerID,
-		options.Single,
+		consensusDir,
+		rejectUnboundSnapshot,
 	); err != nil {
 		return nil, err
 	}
@@ -583,6 +625,8 @@ func openNode(
 		OriginBootID:          options.OriginBootID,
 		Clock:                 clock,
 		LogStore:              stable,
+		SnapshotDir:           consensusDir,
+		SnapshotSigner:        options.RaftSnapshotSigner,
 		ValidateConfiguration: validateConfiguration,
 	})
 	if err != nil {
@@ -887,6 +931,12 @@ func validateNodeOptions(
 	if err := validateCheckpointSigner(
 		options.ServerID,
 		options.CheckpointSigner,
+	); err != nil {
+		return err
+	}
+	if err := validateRaftSnapshotSigner(
+		options.ServerID,
+		options.RaftSnapshotSigner,
 	); err != nil {
 		return err
 	}
@@ -1535,6 +1585,239 @@ func verifyLatestSnapshotAnchor(
 		ProjectionSchemaVersion: anchor.ProjectionSchemaVersion,
 	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrSnapshotAnchorCoverage, err)
+	}
+	return nil
+}
+
+func verifyLatestLogicalRaftSnapshot(
+	ctx context.Context,
+	snapshots raft.SnapshotStore,
+	state *store.Store,
+	view store.StateView,
+	localServerID domain.DeviceID,
+	snapshotDir string,
+	rejectUnbound func(string) error,
+) error {
+	if ctx == nil ||
+		snapshots == nil ||
+		state == nil ||
+		!localServerID.Valid() ||
+		snapshotDir == "" {
+		return ErrSnapshotAnchorCoverage
+	}
+	metas, err := snapshots.List()
+	if err != nil {
+		return fmt.Errorf("consensus: list logical Raft snapshots: %w", err)
+	}
+	if err := state.VerifyCommitmentHistory(ctx); err != nil {
+		return fmt.Errorf(
+			"%w: verify snapshot baseline history: %v",
+			ErrSnapshotAnchorCoverage,
+			err,
+		)
+	}
+	install, installed, err := state.VerifiedRaftSnapshotInstall(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: verify installed snapshot record: %v",
+			ErrSnapshotAnchorCoverage,
+			err,
+		)
+	}
+	if len(metas) == 0 {
+		if installed {
+			return fmt.Errorf(
+				"%w: installed snapshot %q is absent",
+				ErrSnapshotAnchorCoverage,
+				install.SnapshotID,
+			)
+		}
+		return nil
+	}
+	latest, err := verifyLogicalRaftSnapshotFrame(
+		snapshots,
+		metas[0].ID,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: verify latest logical snapshot: %v",
+			ErrSnapshotAnchorCoverage,
+			err,
+		)
+	}
+	if latest.Envelope.SourceServerID == localServerID {
+		if err := verifyLocalLogicalRaftSnapshot(
+			ctx,
+			snapshots,
+			latest,
+			state,
+			view,
+			localServerID,
+			snapshotDir,
+		); err != nil {
+			return fmt.Errorf(
+				"%w: verify local logical snapshot: %v",
+				ErrSnapshotAnchorCoverage,
+				err,
+			)
+		}
+	} else if !installed || install.SnapshotID != latest.Meta.ID {
+		if rejectUnbound != nil {
+			if err := rejectUnbound(latest.Meta.ID); err != nil {
+				return fmt.Errorf(
+					"%w: quarantine unbound foreign snapshot %q: %v",
+					ErrSnapshotAnchorCoverage,
+					latest.Meta.ID,
+					err,
+				)
+			}
+			return verifyLatestLogicalRaftSnapshot(
+				ctx,
+				snapshots,
+				state,
+				view,
+				localServerID,
+				snapshotDir,
+				rejectUnbound,
+			)
+		}
+		return fmt.Errorf(
+			"%w: foreign snapshot %q lacks its durable install binding",
+			ErrSnapshotAnchorCoverage,
+			latest.Meta.ID,
+		)
+	}
+	if !installed {
+		return nil
+	}
+	bound := latest
+	if latest.Meta.ID != install.SnapshotID {
+		retained := false
+		for _, meta := range metas {
+			if meta.ID == install.SnapshotID {
+				retained = true
+				break
+			}
+		}
+		if !retained {
+			// A newer locally signed snapshot covers the installed prefix
+			// after FileSnapshotStore reaps the older inbound file. The
+			// verified SQLite install record remains its durable provenance.
+			return nil
+		}
+		bound, err = verifyLogicalRaftSnapshotFrame(
+			snapshots,
+			install.SnapshotID,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"%w: verify installed snapshot binding: %v",
+				ErrSnapshotAnchorCoverage,
+				err,
+			)
+		}
+	}
+	if err := validateInstalledRaftSnapshotBinding(
+		install,
+		bound,
+	); err != nil {
+		return fmt.Errorf("%w: %v", ErrSnapshotAnchorCoverage, err)
+	}
+	return nil
+}
+
+func verifyLogicalRaftSnapshotFrame(
+	snapshots raft.SnapshotStore,
+	id string,
+) (raftSnapshotRestoreMetadata, error) {
+	meta, reader, err := snapshots.Open(id)
+	if err != nil {
+		return raftSnapshotRestoreMetadata{}, fmt.Errorf(
+			"consensus: open logical Raft snapshot %q: %w",
+			id,
+			err,
+		)
+	}
+	defer reader.Close()
+	metadata, err := raftSnapshotMetadataFromReader(reader)
+	if err != nil {
+		return raftSnapshotRestoreMetadata{}, err
+	}
+	if meta == nil || meta.ID != metadata.Meta.ID {
+		return raftSnapshotRestoreMetadata{},
+			ErrRaftSnapshotMetadataMismatch
+	}
+	verifier := newRaftSnapshotFrameVerifier(meta)
+	var (
+		buffer  [32 << 10]byte
+		written int64
+	)
+	for {
+		count, readErr := reader.Read(buffer[:])
+		if count < 0 || count > len(buffer) {
+			return raftSnapshotRestoreMetadata{}, io.ErrUnexpectedEOF
+		}
+		if count != 0 {
+			if err := verifier.Consume(buffer[:count]); err != nil {
+				return raftSnapshotRestoreMetadata{}, fmt.Errorf(
+					"consensus: verify logical Raft snapshot %q frame: %w",
+					id,
+					err,
+				)
+			}
+			written += int64(count)
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return raftSnapshotRestoreMetadata{}, fmt.Errorf(
+					"consensus: read logical Raft snapshot %q: %w",
+					id,
+					readErr,
+				)
+			}
+			break
+		}
+		if count == 0 {
+			return raftSnapshotRestoreMetadata{}, io.ErrNoProgress
+		}
+	}
+	if written != meta.Size {
+		return raftSnapshotRestoreMetadata{}, fmt.Errorf(
+			"%w: snapshot metadata size %d differs from content size %d",
+			ErrSnapshotAnchorCoverage,
+			meta.Size,
+			written,
+		)
+	}
+	if err := verifier.Finish(); err != nil {
+		return raftSnapshotRestoreMetadata{}, err
+	}
+	return metadata, nil
+}
+
+func validateInstalledRaftSnapshotBinding(
+	record store.RaftSnapshotInstallRecord,
+	metadata raftSnapshotRestoreMetadata,
+) error {
+	meta := metadata.Meta
+	envelope := metadata.Envelope
+	if record.SnapshotID != meta.ID ||
+		record.SourceServerID != envelope.SourceServerID ||
+		record.SnapshotIndex != meta.Index ||
+		record.SnapshotTerm != meta.Term ||
+		record.ConfigurationIndex != meta.ConfigurationIndex ||
+		record.ConfigurationDigest !=
+			store.Digest(envelope.ConfigurationDigest) ||
+		record.PayloadDigest != store.Digest(envelope.PayloadDigest) ||
+		!sameRaftSnapshotOptionalUint64(
+			record.BaselineCommandLogIndex,
+			envelope.BaselineCommandLogIndex,
+		) ||
+		!sameRaftSnapshotOptionalUint64(
+			record.BaselineCommandTerm,
+			envelope.BaselineCommandTerm,
+		) {
+		return ErrRaftSnapshotMetadataMismatch
 	}
 	return nil
 }

@@ -117,74 +117,106 @@ func verifyRaftCommandLedgerThrough(
 			nil,
 		)
 	}
+	baseline, hasBaseline, err := validateRaftSnapshotInstallBinding(
+		conn,
+		state,
+	)
+	if err != nil {
+		return raftCommandLedgerError(
+			"verify installed snapshot baseline",
+			err,
+		)
+	}
+	baselineResultIndex := uint64(0)
+	baselineLogIndex := uint64(0)
+	baselineTerm := uint64(0)
+	if hasBaseline {
+		baselineResultIndex = baseline.heads.ResultIndex
+		if resultCut < baselineResultIndex {
+			return raftCommandLedgerError(
+				"result cut precedes the installed snapshot baseline",
+				nil,
+			)
+		}
+		if baseline.hasBaselineCommand {
+			baselineLogIndex = baseline.baselineCommandLogIndex
+			baselineTerm = baseline.baselineCommandTerm
+		}
+	}
 	var (
 		count    int64
 		maxIndex int64
 		maxTerm  int64
+		minTerm  int64
 		missing  int64
 	)
 	if err := queryOneArgs(
 		conn,
-		`SELECT count(*), coalesce(max(log_index), 0)
+		`SELECT count(*), coalesce(max(log_index), 0),
+		        coalesce(min(term), 0)
 		   FROM raft_command_applications
 		  WHERE recovery_generation = ?1;`,
 		[]any{state.recoveryGeneration},
 		func(stmt *sqlite.Stmt) {
 			count = stmt.ColumnInt64(0)
 			maxIndex = stmt.ColumnInt64(1)
+			minTerm = stmt.ColumnInt64(2)
 		},
 	); err != nil {
 		return err
 	}
-	if state.lastAppliedLogIndex == 0 {
-		if count != 0 {
+	switch {
+	case count == 0 && hasBaseline && baseline.hasBaselineCommand:
+		if state.lastAppliedLogIndex != baselineLogIndex ||
+			state.currentTerm != baselineTerm {
 			return raftCommandLedgerError(
-				"unapplied state has command bindings",
+				"installed baseline differs from applied watermark",
+				nil,
+			)
+		}
+	case count == 0:
+		if state.lastAppliedLogIndex != 0 || state.currentTerm != 0 {
+			return raftCommandLedgerError(
+				"unbound state has a Raft command watermark",
+				nil,
+			)
+		}
+	case count > 0:
+		if maxIndex != int64(state.lastAppliedLogIndex) {
+			return raftCommandLedgerError(
+				"latest command binding differs from applied watermark",
+				nil,
+			)
+		}
+		if hasBaseline &&
+			(uint64(maxIndex) <= baseline.snapshotIndex ||
+				minTerm < int64(baselineTerm)) {
+			return raftCommandLedgerError(
+				"post-snapshot command binding precedes its baseline",
 				nil,
 			)
 		}
 		if err := queryOneArgs(
 			conn,
-			`SELECT count(*)
-			   FROM command_results
-			  WHERE recovery_generation = ?1
-			    AND result_index <= ?2;`,
-			[]any{state.recoveryGeneration, resultCut},
+			`SELECT term
+			   FROM raft_command_applications
+			  WHERE recovery_generation = ?1 AND log_index = ?2;`,
+			[]any{state.recoveryGeneration, state.lastAppliedLogIndex},
 			func(stmt *sqlite.Stmt) {
-				missing = stmt.ColumnInt64(0)
+				maxTerm = stmt.ColumnInt64(0)
 			},
 		); err != nil {
 			return err
 		}
-		if missing != 0 {
+		if maxTerm < 1 || uint64(maxTerm) != state.currentTerm {
 			return raftCommandLedgerError(
-				"unapplied state has unbound command results",
+				"latest command term differs from applied watermark",
 				nil,
 			)
 		}
-		return nil
-	}
-	if count < 1 || maxIndex != int64(state.lastAppliedLogIndex) {
+	default:
 		return raftCommandLedgerError(
-			"latest command binding differs from applied watermark",
-			nil,
-		)
-	}
-	if err := queryOneArgs(
-		conn,
-		`SELECT term
-		   FROM raft_command_applications
-		  WHERE recovery_generation = ?1 AND log_index = ?2;`,
-		[]any{state.recoveryGeneration, state.lastAppliedLogIndex},
-		func(stmt *sqlite.Stmt) {
-			maxTerm = stmt.ColumnInt64(0)
-		},
-	); err != nil {
-		return err
-	}
-	if maxTerm < 1 || uint64(maxTerm) != state.currentTerm {
-		return raftCommandLedgerError(
-			"latest command term differs from applied watermark",
+			"invalid command binding count",
 			nil,
 		)
 	}
@@ -193,7 +225,8 @@ func verifyRaftCommandLedgerThrough(
 		`SELECT count(*)
 			   FROM command_results AS r
 			  WHERE r.recovery_generation = ?1
-			    AND r.result_index <= ?2
+			    AND r.result_index > ?2
+			    AND r.result_index <= ?3
 			    AND NOT EXISTS (
 		        SELECT 1
 		          FROM raft_command_applications AS a
@@ -201,7 +234,11 @@ func verifyRaftCommandLedgerThrough(
 		           AND a.event_id = r.event_id
 		           AND a.proposal_digest = r.proposal_digest
 		  );`,
-		[]any{state.recoveryGeneration, resultCut},
+		[]any{
+			state.recoveryGeneration,
+			baselineResultIndex,
+			resultCut,
+		},
 		func(stmt *sqlite.Stmt) {
 			missing = stmt.ColumnInt64(0)
 		},
@@ -235,6 +272,27 @@ func verifyRaftCommandLedgerThrough(
 			"Raft binding lacks an exact command result",
 			nil,
 		)
+	}
+	if hasBaseline && count != 0 {
+		if err := queryOneArgs(
+			conn,
+			`SELECT count(*)
+			   FROM raft_command_applications
+			  WHERE recovery_generation = ?1
+			    AND log_index <= ?2;`,
+			[]any{state.recoveryGeneration, baseline.snapshotIndex},
+			func(stmt *sqlite.Stmt) {
+				missing = stmt.ColumnInt64(0)
+			},
+		); err != nil {
+			return err
+		}
+		if missing != 0 {
+			return raftCommandLedgerError(
+				"retained command binding is covered by the snapshot",
+				nil,
+			)
+		}
 	}
 	if err := queryOneArgs(
 		conn,
@@ -276,13 +334,18 @@ func verifyRaftCommandLedgerThrough(
 		                  AND a.event_id = r.event_id
 		                  AND a.proposal_digest = r.proposal_digest
 			                 WHERE r.recovery_generation = ?1
-			                   AND r.result_index <= ?2
+			                   AND r.result_index > ?2
+			                   AND r.result_index <= ?3
 			                GROUP BY r.event_id, r.result_index
 		          )
 		   )
 		  WHERE prior_first_log_index IS NOT NULL
 		    AND first_log_index <= prior_first_log_index;`,
-		[]any{state.recoveryGeneration, resultCut},
+		[]any{
+			state.recoveryGeneration,
+			baselineResultIndex,
+			resultCut,
+		},
 		func(stmt *sqlite.Stmt) {
 			missing = stmt.ColumnInt64(0)
 		},

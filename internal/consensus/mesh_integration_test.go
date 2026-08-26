@@ -37,6 +37,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -419,6 +420,12 @@ type secureMeshHarness struct {
 	topology                  *secureMeshTopology
 	coverage                  *configurationCoverageCollector
 	manualVoterReconciliation bool
+	compactSnapshots          bool
+}
+
+type secureMeshHarnessOptions struct {
+	manualVoterReconciliation bool
+	compactSnapshots          bool
 }
 
 type secureMeshCheckpointOrigin struct {
@@ -581,12 +588,21 @@ func secureMeshCredentialAuthorizationPayload(
 }
 
 func newSecureMeshHarness(t *testing.T) *secureMeshHarness {
-	return newSecureMeshHarnessWithManualReconciliation(t, false)
+	return newSecureMeshHarnessWithOptions(t, secureMeshHarnessOptions{})
 }
 
 func newSecureMeshHarnessWithManualReconciliation(
 	t *testing.T,
 	manual bool,
+) *secureMeshHarness {
+	return newSecureMeshHarnessWithOptions(t, secureMeshHarnessOptions{
+		manualVoterReconciliation: manual,
+	})
+}
+
+func newSecureMeshHarnessWithOptions(
+	t *testing.T,
+	options secureMeshHarnessOptions,
 ) *secureMeshHarness {
 	t.Helper()
 	root := t.TempDir()
@@ -619,6 +635,11 @@ func newSecureMeshHarnessWithManualReconciliation(
 					index+3,
 					index+7,
 				)),
+				domain.UUIDv7(fmt.Sprintf(
+					"018f47de-89ab-7def-a%d23-%d123456789ab",
+					index+3,
+					index+7,
+				)),
 			},
 		}
 		for _, bootID := range identities[index].bootIDs {
@@ -634,7 +655,8 @@ func newSecureMeshHarnessWithManualReconciliation(
 	harness := &secureMeshHarness{
 		topology:                  newSecureMeshTopology(),
 		resolver:                  make(secureMeshResolver, len(identities)),
-		manualVoterReconciliation: manual,
+		manualVoterReconciliation: options.manualVoterReconciliation,
+		compactSnapshots:          options.compactSnapshots,
 	}
 	coverageKeys := make(
 		map[domain.DeviceID]ed25519.PrivateKey,
@@ -766,6 +788,22 @@ func (harness *secureMeshHarness) startNode(
 			return store.Signature(signature), nil
 		},
 	}
+	snapshotSigner := RaftSnapshotSignerAdapter{
+		SignerDeviceID:  candidate.identity.deviceID,
+		SignerPublicKey: bytes.Clone(candidate.identity.public),
+		Sign: func(
+			ctx context.Context,
+			unsigned logicalsnapshot.UnsignedRoot,
+		) (logicalsnapshot.Root, error) {
+			if err := ctx.Err(); err != nil {
+				return logicalsnapshot.Root{}, err
+			}
+			return logicalsnapshot.SignRoot(
+				unsigned,
+				candidate.identity.private,
+			)
+		},
+	}
 	activationSigner := VoterActivationSignerAdapter{
 		SignerDeviceID: candidate.identity.deviceID,
 		SignProof: func(
@@ -873,7 +911,7 @@ func (harness *secureMeshHarness) startNode(
 			transport.ConsensusNetworkTransportOptions{
 				Stream:               stream,
 				LocalServerID:        raft.ServerID(candidate.identity.deviceID),
-				Timeout:              2 * time.Second,
+				Timeout:              transport.ConsensusRaftOperationTimeout,
 				Logger:               hclog.NewNullLogger(),
 				AuthorizeReplication: gate.AuthorizeReplication,
 				AuthorizeCommitProbe: authorizeCommitProbe,
@@ -909,12 +947,13 @@ func (harness *secureMeshHarness) startNode(
 		BootstrapConfiguration:      bootstrap,
 		CanonicalCoverage:           harness.coverage,
 		CheckpointSigner:            checkpointSigner,
+		RaftSnapshotSigner:          snapshotSigner,
 		VoterActivationSigner:       activationSigner,
 		CredentialEndorsementSigner: credentialSigner,
 		CheckpointOrigin:            checkpointOrigin,
 		DisableVoterReconciliation:  true,
 		Clock:                       nodeTestClock(),
-		RaftConfig:                  secureMeshRaftConfig(),
+		RaftConfig:                  harness.secureMeshRaftConfig(),
 	})
 	if err != nil {
 		_ = listener.Close()
@@ -1745,6 +1784,14 @@ func assertMeshViewsConverged(
 			)
 		}
 	}
+}
+
+func (harness *secureMeshHarness) secureMeshRaftConfig() *raft.Config {
+	config := secureMeshRaftConfig()
+	if harness != nil && harness.compactSnapshots {
+		config.TrailingLogs = 0
+	}
+	return config
 }
 
 func secureMeshRaftConfig() *raft.Config {

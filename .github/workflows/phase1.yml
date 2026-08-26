@@ -94,7 +94,7 @@ jobs:
             -coverpkg=./internal/consensus,./internal/transport \
             -coverprofile="$RUNNER_TEMP/phase3-mesh.cover" \
             ./internal/consensus \
-            -run '^(TestSecureThreeVoterConsensusMesh|TestSecureThreeVoterColdCommitRecovery|TestSecureMeshVoterReconciliationTransitions|TestSecureMeshIsolatedMinorityCannotEscalate|TestSecureMeshFollowerForwardsOnlyToObservedLeader)$'
+            -run '^(TestSecureThreeVoterConsensusMesh|TestSecureThreeVoterColdCommitRecovery|TestSecureMeshVoterReconciliationTransitions|TestSecureMeshIsolatedMinorityCannotEscalate|TestSecureMeshFollowerForwardsOnlyToObservedLeader|TestSecureMeshCompactedSnapshotCatchupAndPromotion)$'
           go tool cover -func="$RUNNER_TEMP/phase3-mesh.cover" \
             | tee "$RUNNER_TEMP/phase3-mesh-coverage.txt"
           total="$(awk '/^total:/ {gsub(/%/, "", $3); print $3}' "$RUNNER_TEMP/phase3-mesh-coverage.txt")"

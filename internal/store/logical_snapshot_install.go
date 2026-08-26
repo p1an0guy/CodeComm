@@ -44,6 +44,41 @@ type StandaloneLogicalSnapshotInstallOptions struct {
 	MonotonicNowNS int64
 }
 
+// RaftLogicalSnapshotInstallResult names one metadata-bound snapshot cut.
+type RaftLogicalSnapshotInstallResult struct {
+	Heads             ApplyHeads
+	Cut               LogicalSnapshotCut
+	AttestationID     string
+	SnapshotID        string
+	AdmissionRevision uint64
+}
+
+// RaftLogicalSnapshotInstallOptions contains only receiver-local Raft
+// metadata already matched to the bounded payload envelope by consensus.
+// SourceServerID is the identity-signed logical-root signer.
+type RaftLogicalSnapshotInstallOptions struct {
+	VerifiedAt     domain.Timestamp
+	OriginBootID   domain.UUIDv7
+	InstalledAt    domain.Timestamp
+	MonotonicNowNS int64
+
+	SourceServerID          domain.DeviceID
+	SnapshotID              string
+	SnapshotIndex           uint64
+	SnapshotTerm            uint64
+	ConfigurationIndex      uint64
+	ConfigurationJSON       []byte
+	ConfigurationDigest     Digest
+	PayloadDigest           Digest
+	BaselineCommandLogIndex *uint64
+	BaselineCommandTerm     *uint64
+}
+
+type logicalSnapshotInstallModeOptions struct {
+	StandaloneLogicalSnapshotInstallOptions
+	raft *RaftLogicalSnapshotInstallOptions
+}
+
 type recoveryBoundaryAuditTimes struct {
 	first domain.Timestamp
 	last  domain.Timestamp
@@ -83,6 +118,54 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 	ctx context.Context,
 	stage *LogicalSnapshotStage,
 	options StandaloneLogicalSnapshotInstallOptions,
+) (StandaloneLogicalSnapshotInstallResult, error) {
+	return store.installLogicalSnapshot(
+		ctx,
+		stage,
+		logicalSnapshotInstallModeOptions{
+			StandaloneLogicalSnapshotInstallOptions: options,
+		},
+	)
+}
+
+// InstallRaftLogicalSnapshot atomically replaces authoritative state from a
+// signed-root-verified stage and records the receiver-local InstallSnapshot
+// baseline. Imported commands never acquire foreign per-entry provenance.
+func (store *Store) InstallRaftLogicalSnapshot(
+	ctx context.Context,
+	stage *LogicalSnapshotStage,
+	options RaftLogicalSnapshotInstallOptions,
+) (RaftLogicalSnapshotInstallResult, error) {
+	shared := StandaloneLogicalSnapshotInstallOptions{
+		VerifiedAt:     options.VerifiedAt,
+		OriginBootID:   options.OriginBootID,
+		InstalledAt:    options.InstalledAt,
+		MonotonicNowNS: options.MonotonicNowNS,
+	}
+	result, err := store.installLogicalSnapshot(
+		ctx,
+		stage,
+		logicalSnapshotInstallModeOptions{
+			StandaloneLogicalSnapshotInstallOptions: shared,
+			raft:                                    &options,
+		},
+	)
+	if err != nil {
+		return RaftLogicalSnapshotInstallResult{}, err
+	}
+	return RaftLogicalSnapshotInstallResult{
+		Heads:             result.Heads,
+		Cut:               result.Cut,
+		AttestationID:     result.AttestationID,
+		SnapshotID:        options.SnapshotID,
+		AdmissionRevision: result.AdmissionRevision,
+	}, nil
+}
+
+func (store *Store) installLogicalSnapshot(
+	ctx context.Context,
+	stage *LogicalSnapshotStage,
+	options logicalSnapshotInstallModeOptions,
 ) (StandaloneLogicalSnapshotInstallResult, error) {
 	if ctx == nil ||
 		!options.VerifiedAt.Valid() ||
@@ -133,6 +216,14 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 	cut, err := logicalSnapshotCutFromRoot(root)
 	if err != nil {
 		return StandaloneLogicalSnapshotInstallResult{}, err
+	}
+	if options.raft != nil {
+		if err := validateRaftLogicalSnapshotInstallOptions(
+			*options.raft,
+			root,
+		); err != nil {
+			return StandaloneLogicalSnapshotInstallResult{}, err
+		}
 	}
 	attestationID := logicalSnapshotAttestationID(root)
 	if attestationID == "" {
@@ -215,6 +306,7 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 					destination,
 					sourceState,
 					cut,
+					options.raft,
 				)
 			if err != nil {
 				return err
@@ -320,13 +412,6 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 			); err != nil {
 				return err
 			}
-			if err := writeStandaloneSettledNonvoterState(
-				destination,
-				cut,
-				options.VerifiedAt,
-			); err != nil {
-				return err
-			}
 			if err := verifyLogicalSnapshotStageConnection(
 				destination,
 				cut,
@@ -338,6 +423,21 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 					err,
 				)
 			}
+			if options.raft == nil {
+				if err := writeStandaloneSettledNonvoterState(
+					destination,
+					cut,
+					options.VerifiedAt,
+				); err != nil {
+					return err
+				}
+			} else if err := writeRaftLogicalSnapshotEvidence(
+				destination,
+				cut,
+				*options.raft,
+			); err != nil {
+				return err
+			}
 			state, found, err := readConsensusState(destination)
 			if err != nil {
 				return err
@@ -348,23 +448,33 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 					nil,
 				)
 			}
-			settled, found, err := readSettledNonvoterState(destination)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return logicalSnapshotInstallError(
-					"installed settled-nonvoter evidence is missing",
-					nil,
-				)
-			}
-			if err := verifySettledNonvoterEvidence(
+			if options.raft == nil {
+				settled, found, err := readSettledNonvoterState(destination)
+				if err != nil {
+					return err
+				}
+				if !found {
+					return logicalSnapshotInstallError(
+						"installed settled-nonvoter evidence is missing",
+						nil,
+					)
+				}
+				if err := verifySettledNonvoterEvidence(
+					destination,
+					state,
+					settled,
+				); err != nil {
+					return logicalSnapshotInstallError(
+						"verify installed replication evidence",
+						err,
+					)
+				}
+			} else if err := verifyRaftSnapshotInstallEvidence(
 				destination,
 				state,
-				settled,
 			); err != nil {
 				return logicalSnapshotInstallError(
-					"verify installed replication evidence",
+					"verify installed Raft snapshot evidence",
 					err,
 				)
 			}
@@ -377,10 +487,12 @@ func (store *Store) InstallStandaloneLogicalSnapshot(
 					err,
 				)
 			}
-			if err := requireNoStandaloneSnapshotRaftEvidence(
-				destination,
-			); err != nil {
-				return err
+			if options.raft == nil {
+				if err := requireNoStandaloneSnapshotRaftEvidence(
+					destination,
+				); err != nil {
+					return err
+				}
 			}
 			if err := checkForeignKeys(destination); err != nil {
 				return err
@@ -461,6 +573,7 @@ func verifyLogicalSnapshotInstallDestination(
 	destination *sqlite.Conn,
 	sourceState consensusState,
 	cut LogicalSnapshotCut,
+	raftOptions *RaftLogicalSnapshotInstallOptions,
 ) (bool, error) {
 	destinationState, found, err := readConsensusState(destination)
 	if err != nil {
@@ -473,7 +586,7 @@ func verifyLogicalSnapshotInstallDestination(
 	if err != nil {
 		return false, err
 	}
-	if !found {
+	if !found && raftOptions == nil {
 		return false, logicalSnapshotInstallError(
 			"destination is not a settled nonvoter",
 			nil,
@@ -509,15 +622,34 @@ func verifyLogicalSnapshotInstallDestination(
 			err,
 		)
 	}
-	if err := verifySettledNonvoterEvidence(
+	if found {
+		if err := verifySettledNonvoterEvidence(
+			destination,
+			destinationState,
+			settled,
+		); err != nil {
+			return false, logicalSnapshotInstallError(
+				"verify destination settled evidence",
+				err,
+			)
+		}
+	} else if err := verifyRaftCommandLedger(
 		destination,
 		destinationState,
-		settled,
 	); err != nil {
 		return false, logicalSnapshotInstallError(
-			"verify destination settled evidence",
+			"verify destination Raft evidence",
 			err,
 		)
+	}
+	if raftOptions != nil {
+		if err := verifyRaftSnapshotDestinationPosition(
+			destination,
+			destinationState,
+			*raftOptions,
+		); err != nil {
+			return false, err
+		}
 	}
 	destinationWorkspace, err := activeWorkspaceID(
 		destination,
@@ -655,6 +787,40 @@ func verifyLogicalSnapshotInstallDestination(
 	}
 	return destinationState.recoveryGeneration <
 		sourceState.recoveryGeneration, nil
+}
+
+func verifyRaftSnapshotDestinationPosition(
+	conn *sqlite.Conn,
+	state consensusState,
+	options RaftLogicalSnapshotInstallOptions,
+) error {
+	if state.lastAppliedLogIndex != 0 {
+		if options.SnapshotIndex < state.lastAppliedLogIndex ||
+			options.SnapshotIndex == state.lastAppliedLogIndex &&
+				options.SnapshotTerm != state.currentTerm ||
+			options.SnapshotIndex > state.lastAppliedLogIndex &&
+				options.SnapshotTerm < state.currentTerm {
+			return logicalSnapshotInstallError(
+				"snapshot metadata regresses the destination command position",
+				nil,
+			)
+		}
+	}
+	configuration, found, err := readRaftConfigurationRecord(conn)
+	if err != nil {
+		return err
+	}
+	if found &&
+		(options.ConfigurationIndex < configuration.LogIndex ||
+			options.ConfigurationIndex == configuration.LogIndex &&
+				options.ConfigurationDigest !=
+					configuration.ConfigurationDigest) {
+		return logicalSnapshotInstallError(
+			"snapshot metadata regresses the destination configuration",
+			nil,
+		)
+	}
+	return nil
 }
 
 func logicalSnapshotSourceGenerationState(
@@ -1819,13 +1985,28 @@ func verifyLogicalSnapshotBaseline(
 	settled settledNonvoterState,
 	attestation storedLogicalSnapshotAttestation,
 ) error {
+	return verifyLogicalSnapshotAttestationBaseline(
+		conn,
+		state,
+		settled.workspaceID,
+		settled.baselineHeads,
+		attestation,
+	)
+}
+
+func verifyLogicalSnapshotAttestationBaseline(
+	conn *sqlite.Conn,
+	state consensusState,
+	workspaceID domain.UUIDv4,
+	baseline ApplyHeads,
+	attestation storedLogicalSnapshotAttestation,
+) error {
 	cut, err := logicalSnapshotCutFromRoot(attestation.root)
 	if err != nil {
 		return err
 	}
-	baseline := settled.baselineHeads
 	if attestation.sessionID != state.sessionID ||
-		attestation.workspaceID != settled.workspaceID ||
+		attestation.workspaceID != workspaceID ||
 		attestation.recoveryGeneration != state.recoveryGeneration ||
 		attestation.signerDeviceID != cut.SignerDeviceID ||
 		attestation.authorityVersion != cut.AuthorityVersion ||
@@ -1839,7 +2020,7 @@ func verifyLogicalSnapshotBaseline(
 			cut.ProjectionStateDigest ||
 		attestation.checkpointEventID != cut.CheckpointEventID ||
 		cut.SessionID != state.sessionID ||
-		cut.WorkspaceID != settled.workspaceID ||
+		cut.WorkspaceID != workspaceID ||
 		cut.RecoveryGeneration != state.recoveryGeneration ||
 		cut.ResultIndex > state.resultIndex ||
 		cut.ChainIndex > state.chainIndex ||

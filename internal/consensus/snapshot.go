@@ -85,6 +85,16 @@ func (fsm *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		}
 		return nil, fsm.haltSnapshot(err)
 	}
+	if fsm.snapshotSigner != nil {
+		snapshot, err := fsm.captureLogicalRaftSnapshot(view, tail)
+		if err != nil {
+			if errors.Is(err, raft.ErrNothingNewToSnapshot) {
+				return nil, err
+			}
+			return nil, fsm.haltSnapshot(err)
+		}
+		return snapshot, nil
+	}
 	encoded, err := encodeSnapshotAnchor(view, tail)
 	if err != nil {
 		return nil, fsm.haltSnapshot(err)
@@ -96,9 +106,6 @@ func (fsm *FSM) haltSnapshot(cause error) error {
 	return fsm.halt(nil, fmt.Errorf("snapshot integrity: %w", cause)).Err
 }
 
-// Restore rejects requests until the transferable snapshot format exists. The
-// current anchor cannot replace SQLite, so accepting InstallSnapshot would
-// advance Raft without restoring state.
 func (fsm *FSM) Restore(reader io.ReadCloser) error {
 	if fsm == nil || reader == nil {
 		return ErrInvalidFSMOptions
@@ -106,7 +113,22 @@ func (fsm *FSM) Restore(reader io.ReadCloser) error {
 	if err := fsm.HaltError(); err != nil {
 		return err
 	}
-	return ErrSnapshotRestoreUnsupported
+	metadata, err := raftSnapshotMetadataFromReader(reader)
+	if err != nil {
+		return ErrSnapshotRestoreUnsupported
+	}
+	if fsm.snapshotDir == "" {
+		return ErrSnapshotRestoreUnsupported
+	}
+	if err := fsm.restoreLogicalRaftSnapshot(reader, metadata); err != nil {
+		closeErr := reader.Close()
+		var rejectErr error
+		if metadata.Reject != nil {
+			rejectErr = metadata.Reject()
+		}
+		return fsm.haltSnapshot(errors.Join(err, closeErr, rejectErr))
+	}
+	return nil
 }
 
 type fsmSnapshot struct {
@@ -159,7 +181,29 @@ func (fsm *FSM) captureSnapshotRaftTail(
 	}
 	appliedIndex := *view.LastRaftAppliedLogIndex
 	if lastIndex < appliedIndex {
-		return nil, ErrInvalidSnapshotAnchor
+		if fsm.snapshotSigner == nil {
+			return nil, ErrInvalidSnapshotAnchor
+		}
+		// Raft compaction can remove the command baseline after a verified
+		// local or installed snapshot. Startup already proved that coverage;
+		// captureLogicalRaftSnapshot will decline the repeated request until a
+		// newer checkpoint command is retained.
+		return tail, nil
+	}
+	if fsm.snapshotSigner != nil {
+		var baseline raft.Log
+		if err := fsm.logStore.GetLog(appliedIndex, &baseline); err != nil {
+			if errors.Is(err, raft.ErrLogNotFound) {
+				// A restored snapshot may have compacted the command baseline
+				// while retaining newer entries after SnapshotMeta.Index.
+				return tail, nil
+			}
+			return nil, fmt.Errorf(
+				"consensus: read Raft snapshot baseline at %d: %w",
+				appliedIndex,
+				err,
+			)
+		}
 	}
 	for index := appliedIndex + 1; index <= lastIndex; index++ {
 		var entry raft.Log

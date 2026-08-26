@@ -26,6 +26,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/pairingservice"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -411,6 +412,24 @@ func runDaemon(
 				meshPreflight.bootstrapVoterIDs...,
 			),
 			CheckpointSigner: checkpointSigner,
+			RaftSnapshotSigner: consensus.RaftSnapshotSignerAdapter{
+				SignerDeviceID: deviceID,
+				SignerPublicKey: ed25519.PublicKey(
+					identityPublicKey,
+				),
+				Sign: func(
+					signContext context.Context,
+					unsigned logicalsnapshot.UnsignedRoot,
+				) (logicalsnapshot.Root, error) {
+					if err := signContext.Err(); err != nil {
+						return logicalsnapshot.Root{}, err
+					}
+					return logicalsnapshot.SignRoot(
+						unsigned,
+						identityPrivateKey,
+					)
+				},
+			},
 			VoterActivationSigner: newDaemonVoterActivationSigner(
 				deviceID,
 				identityPrivateKey,

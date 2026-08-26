@@ -67,29 +67,60 @@ func verifySettledNonvoterEvidence(
 	}
 	baselineAttestationCount := int64(0)
 	if hasSnapshot {
-		if settled.frozenCurrentTerm != 0 ||
-			settled.frozenLastRaftAppliedLogIndex != 0 {
+		_, hasRaftSnapshot, err := readRaftSnapshotInstallRecord(conn)
+		if err != nil {
 			return replicationEvidenceError(
-				"standalone snapshot baseline carries a frozen Raft watermark",
-				nil,
-			)
-		}
-		if err := verifyLogicalSnapshotBaseline(
-			conn,
-			state,
-			settled,
-			snapshot,
-		); err != nil {
-			return replicationEvidenceError(
-				"verify settled snapshot baseline",
+				"read installed Raft snapshot baseline",
 				err,
 			)
 		}
-		if err := requireNoStandaloneSnapshotRaftEvidence(conn); err != nil {
-			return replicationEvidenceError(
-				"snapshot baseline has local Raft evidence",
-				err,
-			)
+		if hasRaftSnapshot {
+			if err := verifyRaftSnapshotInstallEvidence(
+				conn,
+				state,
+			); err != nil {
+				return replicationEvidenceError(
+					"verify installed Raft snapshot baseline",
+					err,
+				)
+			}
+			if err := verifyRaftCommandLedgerThrough(
+				conn,
+				state,
+				settled.baselineHeads.ResultIndex,
+			); err != nil {
+				return replicationEvidenceError(
+					"verify settled Raft baseline",
+					err,
+				)
+			}
+		} else {
+			if settled.frozenCurrentTerm != 0 ||
+				settled.frozenLastRaftAppliedLogIndex != 0 {
+				return replicationEvidenceError(
+					"standalone snapshot baseline carries a frozen Raft watermark",
+					nil,
+				)
+			}
+			if err := verifyLogicalSnapshotBaseline(
+				conn,
+				state,
+				settled,
+				snapshot,
+			); err != nil {
+				return replicationEvidenceError(
+					"verify settled snapshot baseline",
+					err,
+				)
+			}
+			if err := requireNoStandaloneSnapshotRaftEvidence(
+				conn,
+			); err != nil {
+				return replicationEvidenceError(
+					"snapshot baseline has local Raft evidence",
+					err,
+				)
+			}
 		}
 		baselineAttestationCount = 1
 	} else if err := verifyRaftCommandLedgerThrough(

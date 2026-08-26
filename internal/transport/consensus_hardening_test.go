@@ -652,7 +652,7 @@ func newConsensusTestNetworkTransport(
 		ConsensusNetworkTransportOptions{
 			Stream:               stream,
 			LocalServerID:        raft.ServerID(localDeviceID),
-			Timeout:              time.Second,
+			Timeout:              ConsensusRaftOperationTimeout,
 			Logger:               hclog.NewNullLogger(),
 			AuthorizeReplication: authorizer,
 			AuthorizeCommitProbe: ConsensusCommitProbeAuthorizer(authorizer),

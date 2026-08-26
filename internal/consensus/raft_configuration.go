@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/codec"
@@ -46,6 +47,23 @@ func (configuration committedRaftConfiguration) contains(
 func encodeRaftConfiguration(
 	configuration raft.Configuration,
 ) ([]byte, error) {
+	if err := validateDeviceAddressedSnapshotConfiguration(
+		configuration,
+	); err != nil {
+		return nil, ErrInvalidRaftTopology
+	}
+	configuration = configuration.Clone()
+	sort.Slice(configuration.Servers, func(left, right int) bool {
+		leftServer := configuration.Servers[left]
+		rightServer := configuration.Servers[right]
+		if leftServer.ID != rightServer.ID {
+			return leftServer.ID < rightServer.ID
+		}
+		if leftServer.Address != rightServer.Address {
+			return leftServer.Address < rightServer.Address
+		}
+		return leftServer.Suffrage < rightServer.Suffrage
+	})
 	wire := raftConfigurationWire{
 		Servers: make([]raftServerWire, len(configuration.Servers)),
 	}
@@ -114,6 +132,10 @@ func decodeRaftConfigurationJSON(
 			ID:       raft.ServerID(server.ID),
 			Address:  raft.ServerAddress(server.Address),
 		}
+	}
+	normalized, err := encodeRaftConfiguration(configuration)
+	if err != nil || !bytes.Equal(normalized, encoded) {
+		return raft.Configuration{}, ErrInvalidRaftTopology
 	}
 	return configuration, nil
 }

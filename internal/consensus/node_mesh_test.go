@@ -81,6 +81,19 @@ func TestOpenNodeUsesInjectedDeviceAddressedTransport(t *testing.T) {
 		}) {
 		t.Fatalf("configuration = %#v", configuration)
 	}
+	adapter, ok := node.snapshots.(*raftSnapshotStore)
+	if !ok {
+		t.Fatalf("node snapshot store = %T, want metadata adapter", node.snapshots)
+	}
+	if _, ok := adapter.delegate.(*raft.FileSnapshotStore); !ok {
+		t.Fatalf(
+			"snapshot adapter delegate = %T, want *raft.FileSnapshotStore",
+			adapter.delegate,
+		)
+	}
+	if adapter.reject == nil {
+		t.Fatal("snapshot adapter lacks finalized-snapshot rejection")
+	}
 	if err := node.Close(); err != nil {
 		t.Fatalf("Close(): %v", err)
 	}

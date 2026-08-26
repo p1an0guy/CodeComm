@@ -33,6 +33,36 @@ type configurationCoverageCollector struct {
 
 type configurationReadinessProvider struct{}
 
+func TestSameRaftConfigurationUsesExactOrderIndependentMembership(
+	t *testing.T,
+) {
+	firstID := meshTestDeviceID('1')
+	secondID := meshTestDeviceID('2')
+	first := raft.Server{
+		Suffrage: raft.Voter,
+		ID:       raft.ServerID(firstID),
+		Address:  raft.ServerAddress(firstID),
+	}
+	second := raft.Server{
+		Suffrage: raft.Nonvoter,
+		ID:       raft.ServerID(secondID),
+		Address:  raft.ServerAddress(secondID),
+	}
+	left := raft.Configuration{Servers: []raft.Server{first, second}}
+	right := raft.Configuration{Servers: []raft.Server{second, first}}
+	if !sameRaftConfiguration(left, right) {
+		t.Fatal("equivalent permuted configurations differ")
+	}
+	right.Servers[0].Address = raft.ServerAddress(firstID)
+	if sameRaftConfiguration(left, right) {
+		t.Fatal("configuration address mismatch was accepted")
+	}
+	right = raft.Configuration{Servers: []raft.Server{first, first}}
+	if sameRaftConfiguration(left, right) {
+		t.Fatal("duplicate server ID was accepted")
+	}
+}
+
 func (configurationReadinessProvider) CollectConfigurationReadiness(
 	ctx context.Context,
 	requirement ConfigurationReadinessRequirement,

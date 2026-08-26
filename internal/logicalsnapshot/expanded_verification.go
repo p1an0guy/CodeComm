@@ -55,6 +55,121 @@ type VerifiedExpandedArtifact struct {
 	valid          bool
 }
 
+// VerifyExpandedArtifact verifies one already-expanded record stream against
+// the signed root. It is used by transports, such as Raft snapshots, that
+// authenticate and digest one contiguous expanded payload instead of carrying
+// the descriptor-page/chunk representation.
+func VerifyExpandedArtifact(
+	ctx context.Context,
+	root Root,
+	expanded ExpandedArtifact,
+	sequenceScratch VerificationScratch,
+) (VerifiedExpandedArtifact, error) {
+	if ctx == nil ||
+		isNilArtifactScratch(expanded) ||
+		isNilArtifactScratch(sequenceScratch) ||
+		sameArtifactScratch(expanded, sequenceScratch) {
+		return VerifiedExpandedArtifact{}, ErrInvalidArtifactReplay
+	}
+	if err := ctx.Err(); err != nil {
+		return VerifiedExpandedArtifact{}, err
+	}
+	if err := root.validate(); err != nil {
+		return VerifiedExpandedArtifact{}, err
+	}
+	if err := resetArtifactVerificationScratch(sequenceScratch); err != nil {
+		return VerifiedExpandedArtifact{}, fmt.Errorf(
+			"%w: reset sequence scratch: %v",
+			ErrExpandedArtifactIntegrity,
+			err,
+		)
+	}
+	if _, err := expanded.Seek(0, io.SeekStart); err != nil {
+		return VerifiedExpandedArtifact{}, fmt.Errorf(
+			"%w: rewind expanded artifact: %v",
+			ErrExpandedArtifactIntegrity,
+			err,
+		)
+	}
+
+	input := root.Unsigned().Input()
+	limited := &io.LimitedReader{
+		R: expanded,
+		N: int64(input.ExpandedBytes),
+	}
+	hasher := sha256.New()
+	records := NewRecordReader(io.TeeReader(limited, hasher))
+	sequence, err := NewSequenceValidator(root, sequenceScratch)
+	if err != nil {
+		return VerifiedExpandedArtifact{}, fmt.Errorf(
+			"%w: construct sequence validator: %v",
+			ErrExpandedArtifactIntegrity,
+			err,
+		)
+	}
+	var recordCount uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return VerifiedExpandedArtifact{}, err
+		}
+		record, err := records.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return VerifiedExpandedArtifact{}, fmt.Errorf(
+				"%w: decode record %d: %v",
+				ErrExpandedArtifactIntegrity,
+				recordCount,
+				err,
+			)
+		}
+		if recordCount >= input.RecordCount {
+			return VerifiedExpandedArtifact{}, fmt.Errorf(
+				"%w: record count exceeds signed root",
+				ErrExpandedArtifactIntegrity,
+			)
+		}
+		if err := sequence.Consume(record); err != nil {
+			return VerifiedExpandedArtifact{}, fmt.Errorf(
+				"%w: validate record %d: %v",
+				ErrExpandedArtifactIntegrity,
+				recordCount,
+				err,
+			)
+		}
+		recordCount++
+	}
+	if err := sequence.Finish(); err != nil {
+		return VerifiedExpandedArtifact{}, fmt.Errorf(
+			"%w: finish record sequence: %v",
+			ErrExpandedArtifactIntegrity,
+			err,
+		)
+	}
+	var trailing [1]byte
+	trailingBytes, trailingErr := expanded.Read(trailing[:])
+	var artifactDigest chain.Digest
+	copy(artifactDigest[:], hasher.Sum(nil))
+	if limited.N != 0 ||
+		recordCount != input.RecordCount ||
+		artifactDigest != input.ArtifactDigest ||
+		trailingBytes != 0 ||
+		!errors.Is(trailingErr, io.EOF) {
+		return VerifiedExpandedArtifact{}, fmt.Errorf(
+			"%w: expanded stream differs from signed root",
+			ErrExpandedArtifactIntegrity,
+		)
+	}
+	return VerifiedExpandedArtifact{
+		rootDigest:     sha256.Sum256(root.CanonicalBytes()),
+		artifactDigest: artifactDigest,
+		expandedBytes:  input.ExpandedBytes,
+		recordCount:    recordCount,
+		valid:          true,
+	}, nil
+}
+
 // VerifyAndExpandArtifact verifies every descriptor page and transmitted
 // chunk, reconstructs the exact expanded stream in quarantine, and returns a
 // root-bound proof only after all structural commitments match. Root signer

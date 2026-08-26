@@ -15,6 +15,10 @@ import (
 const (
 	ConsensusRaftConnectionPoolMax = 3
 	ConsensusRaftRPCsInFlightMax   = 2
+	// ConsensusRaftOperationTimeout keeps HashiCorp Raft's aggregate
+	// snapshot upload, restore, and response deadline no shorter than the
+	// maintained stream's no-progress bound.
+	ConsensusRaftOperationTimeout = consensusStreamProgress
 )
 
 var (
@@ -67,7 +71,7 @@ func NewConsensusNetworkTransport(
 		return nil, err
 	}
 	if options.Stream == nil ||
-		options.Timeout <= 0 ||
+		options.Timeout < ConsensusRaftOperationTimeout ||
 		options.AuthorizeReplication == nil ||
 		options.AuthorizeCommitProbe == nil {
 		return nil, ErrInvalidConsensusRaftTransport

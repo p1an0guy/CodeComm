@@ -339,12 +339,21 @@ func sameRaftConfiguration(left, right raft.Configuration) bool {
 	if len(left.Servers) != len(right.Servers) {
 		return false
 	}
-	for index := range left.Servers {
-		if left.Servers[index] != right.Servers[index] {
+	servers := make(map[raft.ServerID]raft.Server, len(left.Servers))
+	for _, server := range left.Servers {
+		if _, duplicate := servers[server.ID]; duplicate {
 			return false
 		}
+		servers[server.ID] = server
 	}
-	return true
+	for _, server := range right.Servers {
+		expected, exists := servers[server.ID]
+		if !exists || expected != server {
+			return false
+		}
+		delete(servers, server.ID)
+	}
+	return len(servers) == 0
 }
 
 func (node *SingleNode) canonicalCoverageState(

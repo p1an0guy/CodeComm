@@ -390,15 +390,17 @@ func TestVerifyAndStageLogicalSnapshotRejectsBoundarySubstitution(
 }
 
 type logicalSnapshotImportFixture struct {
-	snapshot   snapshotbuilder.Snapshot
-	artifact   *os.File
-	pages      [][]byte
-	chunks     [][]byte
-	initial    store.InitialState
-	sourceView store.StateView
-	batch      replication.Batch
-	signerID   domain.DeviceID
-	signerKey  ed25519.PublicKey
+	snapshot      snapshotbuilder.Snapshot
+	artifact      *os.File
+	pages         [][]byte
+	chunks        [][]byte
+	initial       store.InitialState
+	sourceView    store.StateView
+	batch         replication.Batch
+	signerID      domain.DeviceID
+	signerKey     ed25519.PublicKey
+	signerPrivate ed25519.PrivateKey
+	source        *store.Store
 }
 
 func newLogicalSnapshotImportFixture(
@@ -525,15 +527,17 @@ func newLogicalSnapshotImportFixtureWithInitial(
 		privateKey,
 	)
 	return logicalSnapshotImportFixture{
-		snapshot:   snapshot,
-		artifact:   artifact,
-		pages:      pages,
-		chunks:     chunks,
-		initial:    initial,
-		sourceView: sourceView,
-		batch:      batch,
-		signerID:   deviceID,
-		signerKey:  publicKey,
+		snapshot:      snapshot,
+		artifact:      artifact,
+		pages:         pages,
+		chunks:        chunks,
+		initial:       initial,
+		sourceView:    sourceView,
+		batch:         batch,
+		signerID:      deviceID,
+		signerKey:     publicKey,
+		signerPrivate: bytes.Clone(privateKey),
+		source:        node.state,
 	}
 }
 
@@ -717,14 +721,16 @@ func buildLogicalSnapshotImportFixture(
 		t.Fatalf("snapshotbuilder.Build(%q): %v", artifactID, err)
 	}
 	return logicalSnapshotImportFixture{
-		snapshot:   snapshot,
-		artifact:   artifact,
-		pages:      pages,
-		chunks:     chunks,
-		initial:    initial,
-		sourceView: sourceView,
-		signerID:   deviceID,
-		signerKey:  publicKey,
+		snapshot:      snapshot,
+		artifact:      artifact,
+		pages:         pages,
+		chunks:        chunks,
+		initial:       initial,
+		sourceView:    sourceView,
+		signerID:      deviceID,
+		signerKey:     publicKey,
+		signerPrivate: bytes.Clone(privateKey),
+		source:        database,
 	}
 }
 
