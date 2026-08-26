@@ -141,6 +141,12 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   installs the quarantine, then continues the contiguous signed tail. A five-device production
   composition covers authority replacement, stale-cursor fallback, post-snapshot tail import, and
   cold restart.
+- Raft `InstallSnapshot` now carries the same signed logical state in a metadata-bound frame.
+  Receivers verify and stage it before atomically replacing SQLite, retain exact local install
+  provenance without fabricating per-command bindings, resume post-snapshot replication, survive
+  restart, and become promotion-eligible. Finalized-but-unbound inbound files are quarantined on
+  startup; exact retries rebind only identical evidence. Ineligible signers and already-compacted
+  baselines decline snapshot creation without halting the FSM.
 - Production-composition tests start three daemons through `runDaemon`, form a real TCP/mTLS
   cluster, establish and relay content state, rotate all credentials from epoch 1 to 2 under active
   HTTP/2 traffic, submit a task through a captured follower, complete two-sided SAS admission,
@@ -167,10 +173,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   evidence, mode-aware startup, and peer fetch/catch-up orchestration are implemented.
   Snapshot artifact transport, two-pass quarantine replay, and standalone settled installation are
   implemented, including automatic fallback selection and tail resumption. Multi-activation
-  integration coverage, SSE, and divergence recovery remain open. Promotion also remains blocked on
-  metadata-bound Raft `InstallSnapshot`; removal needs the reciprocal verified freeze before
-  restarting in settled mode. Neither transition may relabel imported results as local Raft
-  provenance.
+  integration coverage, SSE, and divergence recovery remain open. Removal needs the reciprocal
+  verified freeze before restarting in settled mode; it may not relabel imported results as local
+  Raft provenance.
 - Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
   voter changes that require a Raft configuration call stop at
   `object-coverage-degraded`; integration alone uses verified fixture repositories.
@@ -188,6 +193,7 @@ Primary tests:
 - `TestJoinerRealTLSPairingHTTPFlow`
 - `TestSecureThreeVoterConsensusMesh`
 - `TestSecureThreeVoterColdCommitRecovery`
+- `TestSecureMeshCompactedSnapshotCatchupAndPromotion`
 - `TestSecureMeshVoterReconciliationTransitions`
 - `TestSecureMeshIsolatedMinorityCannotEscalate`
 - `TestSecureMeshFollowerForwardsOnlyToObservedLeader`
@@ -201,6 +207,7 @@ Primary tests:
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
 - `TestVerifiedLogicalSnapshotStageInstallsSuccessorOverPredecessor`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
+- `TestFSMSemanticRaftSnapshotCaptureAndRestoreUsesCommandWatermark`
 
 Run:
 
