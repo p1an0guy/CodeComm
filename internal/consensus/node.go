@@ -169,7 +169,8 @@ type SingleNode struct {
 	stagingProofAttempt           *stagingVoterProofAttempt
 	voterActivationAttempt        *voterActivationAttempt
 
-	peerAdmissionChangesClaimed atomic.Bool
+	peerAdmissionChangesClaimed       atomic.Bool
+	snapshotPublicationChangesClaimed atomic.Bool
 
 	monitorStop chan struct{}
 	monitorDone chan struct{}
@@ -2961,6 +2962,20 @@ func (node *SingleNode) PeerAdmissionChanges() <-chan struct{} {
 		return closedChangeChannel()
 	}
 	return node.fsm.authorizationChanges.subscribe()
+}
+
+// SnapshotPublicationChanges claims a coalescing stream of committed
+// membership, credential-authorization, and Raft-configuration changes. It is
+// separate from peer-ingress invalidation so snapshot publication cannot
+// consume or delay admission refreshes.
+func (node *SingleNode) SnapshotPublicationChanges() <-chan struct{} {
+	if node == nil || node.fsm == nil {
+		return nil
+	}
+	if !node.snapshotPublicationChangesClaimed.CompareAndSwap(false, true) {
+		return closedChangeChannel()
+	}
+	return node.fsm.authorizationChanges.subscribeWithoutInitial()
 }
 
 // Status returns one durable coordination cut plus a nearby nonblocking Raft

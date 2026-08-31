@@ -35,9 +35,10 @@ func (daemonSnapshotRecordSourceStub) ExportLogicalSnapshotRecords(
 }
 
 type daemonSnapshotCheckpointSourceStub struct {
-	lookup store.AppliedCheckpointLookup
-	err    error
-	calls  int
+	lookup  store.AppliedCheckpointLookup
+	err     error
+	calls   int
+	changes <-chan struct{}
 }
 
 func (source *daemonSnapshotCheckpointSourceStub) ForceCheckpoint(
@@ -45,6 +46,10 @@ func (source *daemonSnapshotCheckpointSourceStub) ForceCheckpoint(
 ) (store.AppliedCheckpointLookup, error) {
 	source.calls++
 	return source.lookup, source.err
+}
+
+func (source *daemonSnapshotCheckpointSourceStub) SnapshotPublicationChanges() <-chan struct{} {
+	return source.changes
 }
 
 func TestDaemonLogicalSnapshotPublisherPersistsAndServesArtifact(

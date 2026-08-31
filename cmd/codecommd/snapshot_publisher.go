@@ -32,6 +32,7 @@ type daemonSnapshotCheckpointSource interface {
 	ForceCheckpoint(
 		context.Context,
 	) (store.AppliedCheckpointLookup, error)
+	SnapshotPublicationChanges() <-chan struct{}
 }
 
 type daemonSnapshotBuild func(
@@ -106,6 +107,7 @@ func newDaemonLogicalSnapshotPublisher(
 
 func (publisher *daemonLogicalSnapshotPublisher) run(ctx context.Context) {
 	defer close(publisher.done)
+	changes := publisher.checkpoints.SnapshotPublicationChanges()
 	delay := time.Duration(0)
 	for {
 		if delay > 0 {
@@ -116,6 +118,13 @@ func (publisher *daemonLogicalSnapshotPublisher) run(ctx context.Context) {
 					<-timer.C
 				}
 				return
+			case _, open := <-changes:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				if !open {
+					return
+				}
 			case <-timer.C:
 			}
 		}

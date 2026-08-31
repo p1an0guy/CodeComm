@@ -232,6 +232,46 @@ func TestPeerAdmissionChangesCloseOnNodeShutdown(t *testing.T) {
 	}
 }
 
+func TestSnapshotPublicationChangesAreIndependentAndCoalescing(
+	t *testing.T,
+) {
+	node, _, _ := openApplyAtGenerationTestNode(t)
+	admissionChanges := node.PeerAdmissionChanges()
+	awaitPeerAdmissionChange(t, admissionChanges, "initial publication")
+	snapshotChanges := node.SnapshotPublicationChanges()
+	select {
+	case <-snapshotChanges:
+		t.Fatal("snapshot publication subscription received an initial wake")
+	default:
+	}
+
+	node.fsm.authorizationChanges.signal()
+	awaitPeerAdmissionChange(t, admissionChanges, "admission update")
+	awaitPeerAdmissionChange(t, snapshotChanges, "snapshot update")
+
+	second := node.SnapshotPublicationChanges()
+	select {
+	case _, open := <-second:
+		if open {
+			t.Fatal("second snapshot publication subscription remained open")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second snapshot publication subscription did not fail closed")
+	}
+
+	if err := node.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	select {
+	case _, open := <-snapshotChanges:
+		if open {
+			t.Fatal("SnapshotPublicationChanges() remained open after Close")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SnapshotPublicationChanges() did not close with node")
+	}
+}
+
 func TestPeerAdmissionChangesCloseOnFatalNodeFailure(t *testing.T) {
 	node, _, _ := openApplyAtGenerationTestNode(t)
 	changes := node.PeerAdmissionChanges()

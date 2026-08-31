@@ -921,6 +921,32 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 	}
 
 	settled.stop(t)
+	installedSnapshotRoot := readDaemonSettledSnapshotBaseline(
+		t,
+		settled.statePath,
+	)
+	installedSnapshotInput := installedSnapshotRoot.Unsigned().Input()
+	if installedSnapshotInput.SessionID != snapshotInput.SessionID ||
+		installedSnapshotInput.WorkspaceID != snapshotInput.WorkspaceID ||
+		installedSnapshotInput.RecoveryGeneration !=
+			snapshotInput.RecoveryGeneration ||
+		installedSnapshotInput.SignerDeviceID != target.deviceID ||
+		installedSnapshotInput.AuthorityVersion !=
+			snapshotInput.AuthorityVersion ||
+		installedSnapshotInput.ResultIndex < snapshotInput.ResultIndex ||
+		installedSnapshotInput.ChainIndex < snapshotInput.ChainIndex {
+		t.Fatalf(
+			"installed snapshot cut is not the observed cut or a successor:\nobserved=%+v\ninstalled=%+v",
+			snapshotInput,
+			installedSnapshotInput,
+		)
+	}
+	if err := logicalsnapshot.VerifyRoot(
+		installedSnapshotRoot,
+		target.privateKey.Public().(ed25519.PublicKey),
+	); err != nil {
+		t.Fatalf("verify installed snapshot authority: %v", err)
+	}
 	settled.listener = listenDaemonMeshIntegrationEndpoint(
 		t,
 		settled.peerEndpoint,
@@ -952,6 +978,7 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		target,
 		settled,
 		snapshotRoot,
+		installedSnapshotRoot,
 	)
 }
 
@@ -1527,10 +1554,10 @@ func assertDaemonSettledReplicationDurableState(
 func assertDaemonSettledSnapshotFallbackDurableState(
 	t *testing.T,
 	source, settled *daemonMeshIntegrationNode,
-	snapshotRoot logicalsnapshot.Root,
+	observedSnapshotRoot, installedSnapshotRoot logicalsnapshot.Root,
 ) {
 	t.Helper()
-	snapshotInput := snapshotRoot.Unsigned().Input()
+	observedSnapshotInput := observedSnapshotRoot.Unsigned().Input()
 	sourceStore, err := store.Open(
 		context.Background(),
 		store.Options{Path: source.statePath},
@@ -1585,11 +1612,11 @@ func assertDaemonSettledSnapshotFallbackDurableState(
 			settledView.LastRaftAppliedLogIndex,
 		)
 	}
-	if settledView.Heads.ResultIndex <= snapshotInput.ResultIndex {
+	if settledView.Heads.ResultIndex <= observedSnapshotInput.ResultIndex {
 		t.Fatalf(
 			"settled result cursor %d did not include tail after snapshot %d",
 			settledView.Heads.ResultIndex,
-			snapshotInput.ResultIndex,
+			observedSnapshotInput.ResultIndex,
 		)
 	}
 	if err := sourceStore.VerifyCommitmentHistory(
@@ -1610,15 +1637,15 @@ func assertDaemonSettledSnapshotFallbackDurableState(
 		!hasSnapshot ||
 		!bytes.Equal(
 			storedRoot.CanonicalBytes(),
-			snapshotRoot.CanonicalBytes(),
+			installedSnapshotRoot.CanonicalBytes(),
 		) ||
-		storedRoot.Signature() != snapshotRoot.Signature() {
+		storedRoot.Signature() != installedSnapshotRoot.Signature() {
 		t.Fatalf(
 			"verified standalone snapshot baseline = (%x, %t, %v), want %x",
 			storedRoot.CanonicalBytes(),
 			hasSnapshot,
 			err,
-			snapshotRoot.CanonicalBytes(),
+			installedSnapshotRoot.CanonicalBytes(),
 		)
 	}
 	mode, err := settledStore.ReplicaEvidenceMode(context.Background())
@@ -1637,6 +1664,34 @@ func assertDaemonSettledSnapshotFallbackDurableState(
 	if _, err := os.Stat(settled.consensusDir); !os.IsNotExist(err) {
 		t.Fatalf("snapshot-restored runtime created Raft storage: %v", err)
 	}
+}
+
+func readDaemonSettledSnapshotBaseline(
+	t *testing.T,
+	statePath string,
+) logicalsnapshot.Root {
+	t.Helper()
+	database, err := store.Open(
+		context.Background(),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("open snapshot-restored settled store: %v", err)
+	}
+	root, found, baselineErr :=
+		database.VerifiedStandaloneLogicalSnapshotBaseline(
+			context.Background(),
+		)
+	closeErr := database.Close()
+	if baselineErr != nil || !found || closeErr != nil {
+		t.Fatalf(
+			"read installed standalone snapshot baseline = (found=%t, baseline_err=%v, close_err=%v)",
+			found,
+			baselineErr,
+			closeErr,
+		)
+	}
+	return root
 }
 
 type daemonSettledCoverageCollector struct {
