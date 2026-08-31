@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission, content credentials,
 endpoint and proposal relay, voter reconciliation, and revocation are production-composed; Phase 3
 exit gate remains open
-Last updated: 2026-08-25
+Last updated: 2026-08-31
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -42,6 +42,15 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   the complete immutable review subject and explicit declines are durable. Durable invite/attempt
   history is capped at 256 entries with deterministic oldest-first pruning that preserves active,
   finalizing, and pending-secret-deletion rows.
+- `codecomm join --state ABSOLUTE_PATH` now completes fresh-device pairing, committed-membership
+  proof, credential authorization, and verified settled-nonvoter snapshot installation. It follows
+  identity-signed leader redirects when an invite comes from a follower, pins lineage/member/
+  signer/credential cuts, and reopens the installed store before deleting its journal. A durable
+  nonsecret journal, native key storage, process lock, destination-ownership phase, and exact
+  baseline verification make every post-approval boundary retryable or fail closed; approval alone
+  never implies admission. Invite and confirmation input is bounded, cancellable, and no-echo where
+  secret. Windows rejects remote/reparse-backed state and untrusted DACLs and flushes directory
+  metadata where supported.
 - Quorum clock endorsement, leader authorization/forwarding, protected epoch-key storage,
   make-before-break certificate selection, renewal retry, content mTLS, `/v1/session`, `/v1/peers`,
   and direct endpoint-set exchange are composed. Applied revocation closes established access,
@@ -161,11 +170,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Open Exit Gates
 
-- The inviter is production-composed, but `pairingjoiner` has no shipped `codecomm join` caller and
-  the confirmed response does not yet install pinned membership/bootstrap state on the joining
-  device. Identity-preserving rebootstrap is explicitly unimplemented. Thus the daemon can admit
-  and serve a tested external joiner, but a second stock installation cannot yet complete the
-  documented end-to-end join workflow.
+- Fresh `new`-mode joining is production-composed. Identity-preserving `rebootstrap` and
+  post-recovery `readmission` remain unimplemented in the join command.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
@@ -176,20 +182,26 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   integration coverage, SSE, and divergence recovery remain open. Removal needs the reciprocal
   verified freeze before restarting in settled mode; it may not relabel imported results as local
   Raft provenance.
-- Phase 4 must supply the production local-Git canonical-coverage provider. Until then, production
-  voter changes that require a Raft configuration call stop at
-  `object-coverage-degraded`; integration alone uses verified fixture repositories.
+- Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
+  canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
+  production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
 - The full revocation transfer test, two-device degraded run, voter-placement prompt, and complete
   Phase 3 latency/security matrix remain outstanding.
 
-Phase 3 is not complete until every design §13 row is executable through production composition;
-package-level availability is not sufficient.
+Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
+to be proven with verified fixture repositories and fail closed in production, and committed proof
+that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
+production local-Git provider is not an exit requirement. The rebootstrap/readmission, listener,
+and test gaps above remain open.
 
 ## Evidence
 
 Primary tests:
 
 - `TestDaemonProductionMeshComposition`
+- `TestDecisionApprovedResumeRequiresCommittedAdmission`
+- `TestOpenJoinDestinationRecordsExclusiveOwnershipBeforeReuse`
+- `TestJoinLockExcludesAnotherProcessHandle`
 - `TestJoinerRealTLSPairingHTTPFlow`
 - `TestSecureThreeVoterConsensusMesh`
 - `TestSecureThreeVoterColdCommitRecovery`
