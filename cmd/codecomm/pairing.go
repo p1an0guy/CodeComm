@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -239,7 +237,12 @@ func runPeerInviteConfirm(
 			attempt.EpochKeyDigest,
 			attempt.RequestDigest,
 		)
-		confirmed, err = promptPairingDecision(input, errorOutput, prompt)
+		confirmed, err = promptPairingDecision(
+			ctx,
+			input,
+			errorOutput,
+			prompt,
+		)
 		if err != nil {
 			return err
 		}
@@ -252,6 +255,7 @@ func runPeerInviteConfirm(
 }
 
 func promptPairingDecision(
+	ctx context.Context,
 	input io.Reader,
 	output io.Writer,
 	prompt string,
@@ -259,14 +263,19 @@ func promptPairingDecision(
 	if _, err := io.WriteString(output, prompt); err != nil {
 		return false, err
 	}
-	line, err := bufio.NewReader(input).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	line, err := readContextLine(
+		ctx,
+		input,
+		maxDecisionInputBytes,
+		false,
+	)
+	if err != nil {
 		return false, err
 	}
 	if len(line) == 0 {
 		return false, fmt.Errorf("%w: pairing confirmation was not entered", errInvalidCLI)
 	}
-	switch strings.TrimSpace(line) {
+	switch strings.TrimSpace(string(line)) {
 	case "yes":
 		return true, nil
 	case "no":

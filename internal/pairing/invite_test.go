@@ -60,6 +60,39 @@ func TestInviteSignParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSignedInviteClearZeroesOwnedSecretAndCanonicalBytes(t *testing.T) {
+	t.Parallel()
+
+	value, _, privateKey := validInvite(t)
+	signed, err := SignInvite(value, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := signed.value.Secret[:]
+	canonical := signed.canonical
+	if len(canonical) == 0 {
+		t.Fatal("fixture has no canonical invite")
+	}
+	signed.Clear()
+	if signed.Code() != "" ||
+		signed.Validate() == nil ||
+		!allZero(secret) ||
+		!allZero(canonical) {
+		t.Fatal("Clear retained usable or nonzero invite material")
+	}
+	signed.Clear()
+	(*SignedInvite)(nil).Clear()
+}
+
+func allZero(value []byte) bool {
+	for _, item := range value {
+		if item != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestInviteGoldenVector(t *testing.T) {
 	t.Parallel()
 

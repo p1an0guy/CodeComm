@@ -50,6 +50,7 @@ func TestConfirmOperatorActionRequiresExactYes(t *testing.T) {
 	} {
 		var output bytes.Buffer
 		got, err := confirmOperatorAction(
+			t.Context(),
 			strings.NewReader(test.input),
 			&output,
 			"confirm: ",

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,11 +59,19 @@ func runCLI(
 		errorOutput == nil ||
 		len(args) == 0 {
 		return fmt.Errorf(
-			"%w: expected tui, status, cluster, or peer",
+			"%w: expected tui, status, join, cluster, or peer",
 			errInvalidCLI,
 		)
 	}
 	switch args[0] {
+	case "join":
+		return runJoin(
+			ctx,
+			args[1:],
+			input,
+			output,
+			errorOutput,
+		)
 	case "tui":
 		options, err := parseLocalClientOptions("tui", args[1:], errorOutput)
 		if err != nil {
@@ -267,7 +274,7 @@ func runSetVoters(
 			snapshot.Consensus.VoterSetVersion,
 			joinDeviceIDs(target),
 		)
-		ok, err := confirmOperatorAction(input, errorOutput, prompt)
+		ok, err := confirmOperatorAction(ctx, input, errorOutput, prompt)
 		if err != nil {
 			return err
 		}
@@ -380,7 +387,7 @@ func runPeerRevoke(
 			*reason,
 			joinDeviceIDs(target),
 		)
-		ok, err := confirmOperatorAction(input, errorOutput, prompt)
+		ok, err := confirmOperatorAction(ctx, input, errorOutput, prompt)
 		if err != nil {
 			return err
 		}
@@ -468,6 +475,7 @@ func joinDeviceIDs(values []domain.DeviceID) string {
 }
 
 func confirmOperatorAction(
+	ctx context.Context,
 	input io.Reader,
 	output io.Writer,
 	prompt string,
@@ -475,11 +483,16 @@ func confirmOperatorAction(
 	if _, err := io.WriteString(output, prompt); err != nil {
 		return false, err
 	}
-	line, err := bufio.NewReader(input).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	line, err := readContextLine(
+		ctx,
+		input,
+		maxDecisionInputBytes,
+		false,
+	)
+	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(line) == "yes", nil
+	return strings.TrimSpace(string(line)) == "yes", nil
 }
 
 func encodeCommandResult(

@@ -461,6 +461,7 @@ func TestPromptPairingDecisionRejectsAmbiguousAndReadFailure(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := promptPairingDecision(
+				t.Context(),
 				test.input,
 				io.Discard,
 				"confirm: ",

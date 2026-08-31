@@ -7,12 +7,12 @@ import (
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/codec"
@@ -182,17 +182,40 @@ func SignInvite(value Invite, identityPrivateKey []byte) (SignedInvite, error) {
 
 // ParseInviteCode verifies an exact prefixed, unpadded-base64url invite.
 func ParseInviteCode(code string) (SignedInvite, error) {
-	if len(code) > MaxPairingMessageBytes || !strings.HasPrefix(code, InviteCodePrefix) {
+	return ParseInviteCodeBytes([]byte(code))
+}
+
+// ParseInviteCodeBytes verifies an exact prefixed, unpadded-base64url invite
+// without creating an immutable secret-bearing string.
+func ParseInviteCodeBytes(code []byte) (SignedInvite, error) {
+	prefix := []byte(InviteCodePrefix)
+	if len(code) > MaxPairingMessageBytes ||
+		!bytes.HasPrefix(code, prefix) {
 		return SignedInvite{}, ErrInviteCode
 	}
-	canonical, err := codec.DecodeBase64URL(strings.TrimPrefix(code, InviteCodePrefix))
+	encoded := code[len(prefix):]
+	canonical := make(
+		[]byte,
+		base64.RawURLEncoding.DecodedLen(len(encoded)),
+	)
+	count, err := base64.RawURLEncoding.Strict().Decode(
+		canonical,
+		encoded,
+	)
 	if err != nil {
+		clear(canonical)
 		return SignedInvite{}, fmt.Errorf("%w: %v", ErrInviteCode, err)
 	}
+	canonical = canonical[:count]
+	defer clear(canonical)
 	if len(canonical) == 0 || len(canonical) > MaxPairingMessageBytes {
 		return SignedInvite{}, ErrInviteCode
 	}
-	if encoded := InviteCodePrefix + codec.EncodeBase64URL(canonical); encoded != code {
+	reencoded := make([]byte, 0, len(code))
+	reencoded = append(reencoded, prefix...)
+	reencoded = base64.RawURLEncoding.AppendEncode(reencoded, canonical)
+	defer clear(reencoded)
+	if !bytes.Equal(reencoded, code) {
 		return SignedInvite{}, ErrInviteCode
 	}
 	return parseSignedInvite(canonical)
@@ -257,6 +280,16 @@ func (value SignedInvite) Code() string {
 
 // Digest returns SHA-256 over the complete signed canonical invite.
 func (value SignedInvite) Digest() [sha256.Size]byte { return value.digest }
+
+// Clear zeroes the retained invite secret and canonical representation.
+func (value *SignedInvite) Clear() {
+	if value == nil {
+		return
+	}
+	clear(value.value.Secret[:])
+	clear(value.canonical)
+	*value = SignedInvite{}
+}
 
 // Validate re-verifies the retained canonical invite without materializing its share code.
 func (value SignedInvite) Validate() error {

@@ -380,7 +380,7 @@ func (joiner *Joiner) Begin(ctx context.Context) (ReviewSubject, error) {
 	}
 	joiner.client = client
 	joiner.review = review
-	joiner.invite = pairing.SignedInvite{}
+	joiner.invite.Clear()
 	joiner.state = stateReview
 	joiner.mu.Unlock()
 	return review.clone(), nil
@@ -630,7 +630,7 @@ func (joiner *Joiner) teardownDuringOperation() error {
 	joiner.client = nil
 	tlsConfig := joiner.tlsConfig
 	joiner.tlsConfig = nil
-	joiner.invite = pairing.SignedInvite{}
+	joiner.invite.Clear()
 	clear(joiner.inviteValue.Secret[:])
 	joiner.inviteValue = pairing.Invite{}
 	joiner.core = pairing.CanonicalRequestCore{}
