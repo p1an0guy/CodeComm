@@ -108,7 +108,8 @@ func newDaemonPairingRuntime(
 	finalizer, err := pairingservice.NewDurableFinalizer(
 		pairingservice.DurableFinalizerOptions{
 			State: localState, Consensus: node,
-			Rebootstrap:       daemonRebootstrapUnavailable{},
+			Rebootstrap:       daemonRebootstrapFinalizer{state: localState},
+			Nonvoters:         node,
 			IdentityPublicKey: identityPublicKey,
 		},
 	)
@@ -245,14 +246,48 @@ func compareDaemonPairingEndpoints(left, right pairing.Endpoint) int {
 	return int(left.Port) - int(right.Port)
 }
 
-type daemonRebootstrapUnavailable struct{}
+type daemonRebootstrapState interface {
+	RevalidateRebootstrapEligibility(
+		context.Context,
+		store.PairingInviteRecord,
+		pairing.RequestCore,
+	) error
+}
 
-func (daemonRebootstrapUnavailable) FinalizeRebootstrap(
-	context.Context,
-	pairingservice.AttemptDetails,
+type daemonRebootstrapFinalizer struct {
+	state daemonRebootstrapState
+}
+
+func (finalizer daemonRebootstrapFinalizer) FinalizeRebootstrap(
+	ctx context.Context,
+	details pairingservice.AttemptDetails,
 ) error {
-	return fmt.Errorf(
-		"%w: rebootstrap installation is not implemented",
-		pairingservice.ErrFinalizationRejected,
+	if finalizer.state == nil || ctx == nil {
+		return pairingservice.ErrInvalidDurableFinalizer
+	}
+	err := finalizer.state.RevalidateRebootstrapEligibility(
+		ctx,
+		details.Invite,
+		details.Core,
 	)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrPairingEligibility):
+		return fmt.Errorf(
+			"%w: retained member is no longer eligible",
+			pairingservice.ErrFinalizationRejected,
+		)
+	case errors.Is(err, store.ErrPairingStateIntegrity),
+		errors.Is(err, store.ErrLocalStateIntegrity),
+		errors.Is(err, store.ErrIntegrityCheck),
+		errors.Is(err, store.ErrCorrupt):
+		return fmt.Errorf(
+			"%w: rebootstrap eligibility: %v",
+			pairingservice.ErrFinalizationIntegrity,
+			err,
+		)
+	default:
+		return fmt.Errorf("codecommd: revalidate rebootstrap: %w", err)
+	}
 }

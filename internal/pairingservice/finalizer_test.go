@@ -149,6 +149,7 @@ func TestDurableFinalizerReopensAfterCommittedAdmission(t *testing.T) {
 		State:             local,
 		Consensus:         first,
 		Rebootstrap:       &recordingRebootstrapDelegate{},
+		Nonvoters:         noOpNonvoterGuard{},
 		IdentityPublicKey: ownerKey.Public().(ed25519.PublicKey),
 	})
 	if err != nil {
@@ -202,6 +203,7 @@ func TestDurableFinalizerReopensAfterCommittedAdmission(t *testing.T) {
 		State:             reopenedLocal,
 		Consensus:         second,
 		Rebootstrap:       &recordingRebootstrapDelegate{},
+		Nonvoters:         noOpNonvoterGuard{},
 		IdentityPublicKey: ownerKey.Public().(ed25519.PublicKey),
 	})
 	if err != nil {
@@ -550,9 +552,50 @@ func TestDurableFinalizerRequiresAndUsesRebootstrapDelegate(t *testing.T) {
 	if _, err := NewDurableFinalizer(DurableFinalizerOptions{
 		State:             fixture.state,
 		Consensus:         applier,
+		Nonvoters:         noOpNonvoterGuard{},
 		IdentityPublicKey: invite.InviterIdentityPublicKey[:],
 	}); !errors.Is(err, ErrInvalidDurableFinalizer) {
 		t.Fatalf("NewDurableFinalizer(nil delegate) error = %v", err)
+	}
+}
+
+func TestDurableFinalizerRetriesRebootstrapConfigurationGuardFailure(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture, details := pendingFinalization(t, pairing.ModeRebootstrap)
+	applier := &recordingGenerationApplier{}
+	delegate := &recordingRebootstrapDelegate{}
+	guardErr := consensus.ErrPairingSubjectConfigured
+	guard := &controlledNonvoterGuard{err: guardErr}
+	invite := fixture.invite.Invite()
+	defer clear(invite.Secret[:])
+	finalizer, err := NewDurableFinalizer(DurableFinalizerOptions{
+		State:             fixture.state,
+		Consensus:         applier,
+		Rebootstrap:       delegate,
+		Nonvoters:         guard,
+		IdentityPublicKey: invite.InviterIdentityPublicKey[:],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = finalizer.FinalizePairing(context.Background(), details)
+	if !errors.Is(err, guardErr) ||
+		errors.Is(err, ErrFinalizationRejected) ||
+		errors.Is(err, ErrFinalizationIntegrity) {
+		t.Fatalf("FinalizePairing() error = %v, want retryable %v", err, guardErr)
+	}
+	if calls := delegate.snapshot(); len(calls) != 0 {
+		t.Fatalf("guarded rebootstrap made %d delegate calls", len(calls))
+	}
+	if gates := applier.gateSnapshot(); len(gates) != 0 {
+		t.Fatalf("guarded rebootstrap entered %d lineage gates", len(gates))
+	}
+	if calls, releases := guard.counts(); calls != 1 || releases != 0 {
+		t.Fatalf("guard counts = (%d, %d), want (1, 0)", calls, releases)
 	}
 }
 
@@ -697,6 +740,7 @@ func newTestDurableFinalizer(
 		State:             state,
 		Consensus:         applier,
 		Rebootstrap:       rebootstrap,
+		Nonvoters:         noOpNonvoterGuard{},
 		IdentityPublicKey: invite.InviterIdentityPublicKey[:],
 	})
 	if err != nil {

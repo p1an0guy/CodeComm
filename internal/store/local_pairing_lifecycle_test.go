@@ -162,6 +162,190 @@ func TestRebootstrapAcceptsExactSuccessorCredentialEpoch(t *testing.T) {
 	}
 }
 
+func TestRebootstrapFinalizationRevalidatesConsumedAuthorization(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*testing.T, pairingLifecycleFixture, PairingInviteRecord)
+		wantErr error
+	}{
+		{
+			name: "issuer loses owner role",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE devices SET role = 'editor' WHERE device_id = ?1;",
+					string(fixture.ownerID),
+				)
+			},
+			wantErr: ErrPairingEligibility,
+		},
+		{
+			name: "subject status changes",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE devices SET status = 'requires_readmission' WHERE device_id = ?1;",
+					string(fixture.subjectID),
+				)
+			},
+			wantErr: ErrPairingEligibility,
+		},
+		{
+			name: "subject role changes",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE devices SET role = 'owner' WHERE device_id = ?1;",
+					string(fixture.subjectID),
+				)
+			},
+			wantErr: ErrPairingEligibility,
+		},
+		{
+			name: "subject enters voter target",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				encoded, err := json.Marshal([]domain.DeviceID{fixture.subjectID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE voter_set SET voter_device_ids_json = ?1;",
+					string(encoded),
+				)
+			},
+			wantErr: ErrPairingEligibility,
+		},
+		{
+			name: "credential epoch advances",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				insertPairingCredentialAuthorization(t, fixture, 1)
+			},
+			wantErr: ErrPairingEligibility,
+		},
+		{
+			name: "subject key row is corrupt",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				_ PairingInviteRecord,
+			) {
+				other := testPairingPrivateKey(72)
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE devices SET identity_public_key = ?1 WHERE device_id = ?2;",
+					[]byte(other.Public().(ed25519.PublicKey)),
+					string(fixture.subjectID),
+				)
+			},
+			wantErr: ErrLocalStateIntegrity,
+		},
+		{
+			name: "consumed invite row changes",
+			mutate: func(
+				t *testing.T,
+				fixture pairingLifecycleFixture,
+				record PairingInviteRecord,
+			) {
+				execPairingSQL(
+					t,
+					fixture.state,
+					"UPDATE pairing_invites SET proof_failures = 1 WHERE invite_id = ?1;",
+					string(record.InviteID),
+				)
+			},
+			wantErr: ErrPairingStateIntegrity,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, record, core := consumedRebootstrapAuthorization(t)
+			if err := fixture.state.RevalidateRebootstrapEligibility(
+				context.Background(),
+				record,
+				core,
+			); err != nil {
+				t.Fatalf("baseline revalidation error = %v", err)
+			}
+
+			test.mutate(t, fixture, record)
+			err := fixture.state.RevalidateRebootstrapEligibility(
+				context.Background(),
+				record,
+				core,
+			)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf(
+					"RevalidateRebootstrapEligibility() error = %v, want %v",
+					err,
+					test.wantErr,
+				)
+			}
+		})
+	}
+}
+
+func consumedRebootstrapAuthorization(
+	t *testing.T,
+) (pairingLifecycleFixture, PairingInviteRecord, pairing.RequestCore) {
+	t.Helper()
+
+	fixture := newPairingLifecycleFixture(t, true, device.StatusActive, false)
+	invite := fixture.invite(
+		t,
+		pairingTestUUID(402),
+		pairing.ModeRebootstrap,
+		1,
+		0,
+	)
+	inviteValue := invite.Invite()
+	inviteID := inviteValue.InviteID
+	clear(inviteValue.Secret[:])
+	reserveAndActivatePairingInvite(t, fixture.state, invite)
+	verified := fixture.verifiedRequest(t, invite, pairingTestUUID(403))
+	if _, _, err := fixture.state.ConsumePairingInvite(
+		context.Background(),
+		verified,
+		"2026-08-13T12:01:00Z",
+	); err != nil {
+		t.Fatalf("ConsumePairingInvite() error = %v", err)
+	}
+	record, found, err := fixture.state.PairingInvite(
+		context.Background(),
+		inviteID,
+	)
+	if err != nil || !found {
+		t.Fatalf("PairingInvite() = (%+v, %t, %v)", record, found, err)
+	}
+	return fixture, record, verified.Core().Value()
+}
+
 func TestPairingInviteCapEagerlyExpiresStaleRows(t *testing.T) {
 	fixture := newPairingLifecycleFixture(t, false, "", false)
 	var first domain.UUIDv7

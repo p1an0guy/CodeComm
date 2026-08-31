@@ -55,10 +55,10 @@ type GenerationCoordinator interface {
 	) error
 }
 
-// RebootstrapDelegate durably installs the retained member's replacement
-// local state. It must be idempotent and must not reenter the generation
-// coordinator while called. A deterministic refusal wraps
-// ErrFinalizationRejected; availability errors remain retryable.
+// RebootstrapDelegate revalidates the exact retained-member authorization
+// while the finalizer holds live-configuration and lineage exclusion. It must
+// be idempotent and must not reenter either guard. A deterministic refusal
+// wraps ErrFinalizationRejected; availability errors remain retryable.
 type RebootstrapDelegate interface {
 	FinalizeRebootstrap(context.Context, AttemptDetails) error
 }
@@ -70,6 +70,7 @@ type DurableFinalizerOptions struct {
 	State             FinalizationCommandState
 	Consensus         GenerationCoordinator
 	Rebootstrap       RebootstrapDelegate
+	Nonvoters         SettledNonvoterGuard
 	IdentityPublicKey []byte
 }
 
@@ -78,6 +79,7 @@ type DurableFinalizer struct {
 	state       FinalizationCommandState
 	consensus   GenerationCoordinator
 	rebootstrap RebootstrapDelegate
+	nonvoters   SettledNonvoterGuard
 	publicKey   ed25519.PublicKey
 	deviceID    domain.DeviceID
 }
@@ -90,6 +92,7 @@ func NewDurableFinalizer(
 	if options.State == nil ||
 		options.Consensus == nil ||
 		options.Rebootstrap == nil ||
+		options.Nonvoters == nil ||
 		len(options.IdentityPublicKey) != ed25519.PublicKeySize {
 		return nil, ErrInvalidDurableFinalizer
 	}
@@ -101,6 +104,7 @@ func NewDurableFinalizer(
 		state:       options.State,
 		consensus:   options.Consensus,
 		rebootstrap: options.Rebootstrap,
+		nonvoters:   options.Nonvoters,
 		publicKey:   append(ed25519.PublicKey(nil), options.IdentityPublicKey...),
 		deviceID:    deviceID,
 	}, nil
@@ -116,6 +120,7 @@ func (finalizer *DurableFinalizer) FinalizePairing(
 		finalizer.state == nil ||
 		finalizer.consensus == nil ||
 		finalizer.rebootstrap == nil ||
+		finalizer.nonvoters == nil ||
 		ctx == nil {
 		return ErrInvalidDurableFinalizer
 	}
@@ -127,6 +132,20 @@ func (finalizer *DurableFinalizer) FinalizePairing(
 	}
 	switch details.Invite.Mode {
 	case pairing.ModeRebootstrap:
+		release, err := finalizer.nonvoters.AcquireSettledNonvoter(
+			ctx,
+			details.Core.JoinerDeviceID,
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("acquire rebootstrap configuration guard: %w", err)
+		}
+		if release == nil {
+			return ErrInvalidDurableFinalizer
+		}
+		defer release()
 		return finalizer.consensus.RunAtGeneration(
 			ctx,
 			details.Invite.SessionID,

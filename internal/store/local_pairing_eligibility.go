@@ -2,12 +2,53 @@ package store
 
 import (
 	"bytes"
+	"context"
 
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"zombiezen.com/go/sqlite"
 )
+
+// RevalidateRebootstrapEligibility rechecks the exact consumed invite and all
+// committed-state eligibility immediately before inviter-side finalization.
+// The caller separately holds live Raft-configuration exclusion.
+func (state LocalState) RevalidateRebootstrapEligibility(
+	ctx context.Context,
+	expected PairingInviteRecord,
+	core pairing.RequestCore,
+) error {
+	if expected.validate() != nil ||
+		expected.Mode != pairing.ModeRebootstrap ||
+		expected.State != PairingInviteConsumed ||
+		expected.ConsumedAttemptID != core.AttemptID {
+		return ErrInvalidPairingState
+	}
+	if _, err := pairing.NewRequestCore(core); err != nil {
+		return ErrInvalidPairingState
+	}
+	return state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		current, found, err := readPairingInvite(conn, expected.InviteID)
+		if err != nil {
+			return err
+		}
+		if !found ||
+			!samePairingInvite(current, expected) ||
+			current.State != PairingInviteConsumed ||
+			current.ProofFailures != expected.ProofFailures ||
+			current.ConsumedAttemptID != expected.ConsumedAttemptID ||
+			current.TerminalAt != expected.TerminalAt {
+			return ErrPairingStateIntegrity
+		}
+		if err := requirePairingRecordLineage(conn, current); err != nil {
+			return err
+		}
+		if !pairingCoreMatchesInvite(core, current) {
+			return ErrPairingStateIntegrity
+		}
+		return requirePairingEligibility(conn, current, core)
+	})
+}
 
 // requirePairingEligibility rechecks every committed-state precondition in the
 // same transaction that consumes an invite. Live Raft configuration exclusion
