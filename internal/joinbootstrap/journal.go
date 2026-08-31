@@ -436,7 +436,8 @@ func (journal pendingJournal) validate() error {
 	case pairing.ModeRebootstrap:
 		if journal.SubjectDeviceID == nil ||
 			*journal.SubjectDeviceID != journal.LocalDeviceID ||
-			journal.ExpectedEntityVersion != nil {
+			journal.ExpectedEntityVersion != nil ||
+			journal.CredentialEpoch != journal.InitialCredentialEpoch {
 			return ErrInvalidJournal
 		}
 	case pairing.ModeReadmission:
@@ -444,6 +445,7 @@ func (journal pendingJournal) validate() error {
 			*journal.SubjectDeviceID != journal.LocalDeviceID ||
 			journal.ExpectedEntityVersion == nil ||
 			*journal.ExpectedEntityVersion < 1 ||
+			*journal.ExpectedEntityVersion >= domain.MaxSafeInteger ||
 			!domain.ValidUnsignedInteger(*journal.ExpectedEntityVersion) ||
 			journal.InitialCredentialEpoch != 1 {
 			return ErrInvalidJournal

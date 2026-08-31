@@ -21,7 +21,9 @@ import (
 	codecommcrypto "github.com/ijonahch/codecomm/internal/crypto"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
+	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
+	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -233,7 +235,8 @@ func validateJoinConsensusStatus(
 		requester.Role != journal.ApprovedRole ||
 		requester.DaemonVersion != journal.ApprovedDaemonVersion ||
 		requester.MaxApplyLevel != journal.ApprovedMaxApplyLevel ||
-		requester.EntityVersion != 1 ||
+		requester.Status != device.StatusActive ||
+		!joinEntityVersionMatches(journal, requester.EntityVersion) ||
 		!bytes.Equal(
 			requester.IdentityPublicKey,
 			journal.LocalIdentityPublicKey[:],
@@ -287,28 +290,45 @@ func selectJoinCredential(
 		return nil, credential.Binding{}, ErrBootstrapMismatch
 	}
 	currentEpoch := status.RequesterMembership.CurrentCredentialEpoch
-	targetEpoch := currentEpoch
+	current := status.RequesterCredentialAuthorization
 	if currentEpoch == 0 {
-		targetEpoch = journal.InitialCredentialEpoch
-		if targetEpoch != 1 ||
-			status.RequesterCredentialAuthorization != nil {
+		if current != nil {
 			return nil, credential.Binding{}, ErrBootstrapMismatch
 		}
 	} else {
-		current := status.RequesterCredentialAuthorization
 		if current == nil || current.Epoch != currentEpoch {
 			return nil, credential.Binding{}, ErrBootstrapMismatch
 		}
-		expired, err := credentialAuthorizationExpiredAt(*current, now)
-		if err != nil {
-			return nil, credential.Binding{}, err
+	}
+
+	targetEpoch := currentEpoch
+	switch journal.Mode {
+	case pairing.ModeRebootstrap:
+		targetEpoch = journal.InitialCredentialEpoch
+		if currentEpoch != targetEpoch &&
+			(targetEpoch < 1 || currentEpoch != targetEpoch-1) {
+			return nil, credential.Binding{}, ErrBootstrapMismatch
 		}
-		if expired {
-			if currentEpoch == domain.MaxSafeInteger {
+	case pairing.ModeNew, pairing.ModeReadmission:
+		if currentEpoch == 0 {
+			targetEpoch = journal.InitialCredentialEpoch
+			if targetEpoch != 1 {
 				return nil, credential.Binding{}, ErrBootstrapMismatch
 			}
-			targetEpoch = currentEpoch + 1
+		} else {
+			expired, err := credentialAuthorizationExpiredAt(*current, now)
+			if err != nil {
+				return nil, credential.Binding{}, err
+			}
+			if expired {
+				if currentEpoch == domain.MaxSafeInteger {
+					return nil, credential.Binding{}, ErrBootstrapMismatch
+				}
+				targetEpoch = currentEpoch + 1
+			}
 		}
+	default:
+		return nil, credential.Binding{}, ErrBootstrapMismatch
 	}
 
 	selectedPrivate := loadedEpochPrivate

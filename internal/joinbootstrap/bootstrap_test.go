@@ -19,6 +19,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
+	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
 )
@@ -261,6 +262,78 @@ func TestSelectJoinCredentialReusesUnexpiredCommittedEpoch(
 	}
 }
 
+func TestSelectRebootstrapCredentialUsesInviteSuccessorEpoch(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	journal, _, identityPrivate := joinJournalFixture(t)
+	journal.Mode = pairing.ModeRebootstrap
+	subject := journal.LocalDeviceID
+	journal.SubjectDeviceID = &subject
+	journal.InitialCredentialEpoch = 2
+	journal.CredentialEpoch = 2
+	successorPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x46}, ed25519.SeedSize),
+	)
+	defer clear(successorPrivate)
+	copy(
+		journal.LocalEpochPublicKey[:],
+		successorPrivate.Public().(ed25519.PublicKey),
+	)
+	currentPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0x33}, ed25519.SeedSize),
+	)
+	defer clear(currentPrivate)
+	now := time.Date(2026, 8, 1, 12, 5, 0, 0, time.UTC)
+	current := joinCredentialAuthorization(
+		t,
+		journal,
+		1,
+		currentPrivate,
+		now.Add(-time.Minute),
+	)
+	options := normalizeOptions(Options{
+		StatePath: filepath.Join(t.TempDir(), "join", "state.db"),
+		Credentials: &joinTestCredentialStore{
+			values: make(map[credentialstore.Reference][]byte),
+		},
+		Now: func() time.Time { return now },
+		generateKeyPair: func() ([]byte, []byte, error) {
+			t.Fatal("rebootstrap generated a different epoch key")
+			return nil, nil, errors.New("unreachable")
+		},
+	})
+
+	selected, binding, err := selectJoinCredential(
+		t.Context(),
+		options,
+		&journal,
+		consensus.ConsensusStatusResult{
+			RequesterMembership: consensus.ConsensusStatusMember{
+				CurrentCredentialEpoch: 1,
+			},
+			RequesterCredentialAuthorization: &current,
+		},
+		identityPrivate,
+		successorPrivate,
+	)
+	if err != nil {
+		t.Fatalf("selectJoinCredential(): %v", err)
+	}
+	defer clear(selected)
+	if binding.Epoch != 2 ||
+		journal.CredentialEpoch != 2 ||
+		!bytes.Equal(selected, successorPrivate) {
+		t.Fatalf(
+			"rebootstrap selection = (epoch %d, journal %d, key match %t)",
+			binding.Epoch,
+			journal.CredentialEpoch,
+			bytes.Equal(selected, successorPrivate),
+		)
+	}
+}
+
 func TestOpenJoinDestinationRecordsExclusiveOwnershipBeforeReuse(
 	t *testing.T,
 ) {
@@ -482,6 +555,33 @@ func TestValidateJoinConsensusStatusCountsInviterAsContactedPeer(
 		peer,
 	); err != nil {
 		t.Fatalf("validateJoinConsensusStatus(): %v", err)
+	}
+}
+
+func TestJoinEntityVersionMatchesPairingMode(t *testing.T) {
+	t.Parallel()
+
+	journal, _, _ := joinJournalFixture(t)
+	if !joinEntityVersionMatches(journal, 1) ||
+		joinEntityVersionMatches(journal, 2) {
+		t.Fatal("new-member entity version rule changed")
+	}
+
+	journal.Mode = pairing.ModeRebootstrap
+	subject := journal.LocalDeviceID
+	journal.SubjectDeviceID = &subject
+	if !joinEntityVersionMatches(journal, 1) ||
+		!joinEntityVersionMatches(journal, 9) {
+		t.Fatal("rebootstrap rejected an existing valid entity version")
+	}
+
+	journal.Mode = pairing.ModeReadmission
+	expected := uint64(9)
+	journal.ExpectedEntityVersion = &expected
+	if !joinEntityVersionMatches(journal, 10) ||
+		joinEntityVersionMatches(journal, 9) ||
+		joinEntityVersionMatches(journal, 11) {
+		t.Fatal("readmission entity version rule changed")
 	}
 }
 

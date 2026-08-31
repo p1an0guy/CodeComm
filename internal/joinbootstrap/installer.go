@@ -275,18 +275,25 @@ func prepareNewJoin(
 ) (pendingJournal, error) {
 	invite := options.Invite.Invite()
 	defer clear(invite.Secret[:])
-	if invite.Mode != pairing.ModeNew {
-		return pendingJournal{}, fmt.Errorf(
-			"%w: only new-device pairing is implemented",
-			ErrInvalidOptions,
+	var identityPrivate, identityPublic []byte
+	var err error
+	switch invite.Mode {
+	case pairing.ModeNew:
+		identityPrivate, identityPublic, err = loadOrCreateKey(
+			ctx,
+			options.Credentials,
+			credentialstore.IdentityReference(),
+			options.generateKeyPair,
 		)
+	case pairing.ModeRebootstrap, pairing.ModeReadmission:
+		identityPrivate, identityPublic, err = loadRetainedIdentity(
+			ctx,
+			options.Credentials,
+			invite.SubjectDeviceID,
+		)
+	default:
+		err = ErrInvalidOptions
 	}
-	identityPrivate, identityPublic, err := loadOrCreateKey(
-		ctx,
-		options.Credentials,
-		credentialstore.IdentityReference(),
-		options.generateKeyPair,
-	)
 	if err != nil {
 		return pendingJournal{}, err
 	}
@@ -342,6 +349,13 @@ func prepareNewJoin(
 			len(invite.Endpoints),
 		),
 	}
+	if invite.SubjectDeviceID != nil {
+		subject := *invite.SubjectDeviceID
+		journal.SubjectDeviceID = &subject
+	}
+	journal.ExpectedEntityVersion = cloneJournalUint64(
+		invite.ExpectedEntityVersion,
+	)
 	copy(journal.LocalIdentityPublicKey[:], identityPublic)
 	copy(journal.LocalEpochPublicKey[:], epochPublic)
 	for index, endpoint := range invite.Endpoints {
@@ -351,6 +365,48 @@ func prepareNewJoin(
 		)
 	}
 	return journal, nil
+}
+
+func loadRetainedIdentity(
+	ctx context.Context,
+	secrets CredentialStore,
+	subject *domain.DeviceID,
+) ([]byte, []byte, error) {
+	if ctx == nil || secrets == nil || subject == nil || !subject.Valid() {
+		return nil, nil, ErrInvalidOptions
+	}
+	privateKey, err := secrets.Get(
+		ctx,
+		credentialstore.IdentityReference(),
+	)
+	if err != nil {
+		if errors.Is(err, credentialstore.ErrNotFound) {
+			return nil, nil, fmt.Errorf(
+				"%w: retained installation identity is unavailable",
+				ErrStateConflict,
+			)
+		}
+		return nil, nil, err
+	}
+	publicKey, err :=
+		codecommcrypto.Ed25519PublicKeyFromPrivateKey(privateKey)
+	if err != nil {
+		clear(privateKey)
+		return nil, nil, fmt.Errorf(
+			"%w: retained installation identity is invalid",
+			ErrStateConflict,
+		)
+	}
+	deviceID, err := device.DeriveID(publicKey)
+	if err != nil || deviceID != *subject {
+		clear(publicKey)
+		clear(privateKey)
+		return nil, nil, fmt.Errorf(
+			"%w: retained installation identity does not match invite subject",
+			ErrStateConflict,
+		)
+	}
+	return privateKey, publicKey, nil
 }
 
 func requireUnusedDestination(statePath string) error {
@@ -680,7 +736,8 @@ func verifyCompletedState(
 		local.Role != journal.ApprovedRole ||
 		local.DaemonVersion != journal.ApprovedDaemonVersion ||
 		local.MaxApplyLevel != journal.ApprovedMaxApplyLevel ||
-		local.EntityVersion != 1 ||
+		local.Status != device.StatusActive ||
+		!joinEntityVersionMatches(journal, local.EntityVersion) ||
 		!bytes.Equal(
 			local.IdentityPublicKey,
 			journal.LocalIdentityPublicKey[:],
@@ -704,6 +761,27 @@ func verifyCompletedState(
 		return false, errors.Join(ErrStateConflict, closeErr)
 	}
 	return true, closeErr
+}
+
+func joinEntityVersionMatches(
+	journal pendingJournal,
+	entityVersion uint64,
+) bool {
+	if entityVersion < 1 || !domain.ValidUnsignedInteger(entityVersion) {
+		return false
+	}
+	switch journal.Mode {
+	case pairing.ModeNew:
+		return entityVersion == 1
+	case pairing.ModeRebootstrap:
+		return true
+	case pairing.ModeReadmission:
+		return journal.ExpectedEntityVersion != nil &&
+			*journal.ExpectedEntityVersion < domain.MaxSafeInteger &&
+			entityVersion == *journal.ExpectedEntityVersion+1
+	default:
+		return false
+	}
 }
 
 func journalResult(
