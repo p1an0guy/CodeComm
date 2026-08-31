@@ -17,6 +17,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/pairing"
 )
 
 func TestPendingJournalRoundTripIsCanonicalAndContainsNoSecrets(
@@ -111,6 +112,13 @@ func TestPendingJournalRejectsMutationAndNoncanonicalForms(t *testing.T) {
 		"phase": func(candidate *pendingJournal) {
 			candidate.Phase = "prepared"
 		},
+		"mode": func(candidate *pendingJournal) {
+			candidate.Mode = "unknown"
+		},
+		"new mode subject": func(candidate *pendingJournal) {
+			subject := candidate.LocalDeviceID
+			candidate.SubjectDeviceID = &subject
+		},
 		"credential epoch regresses": func(candidate *pendingJournal) {
 			candidate.CredentialEpoch = 0
 		},
@@ -142,6 +150,40 @@ func TestPendingJournalRejectsMutationAndNoncanonicalForms(t *testing.T) {
 				candidate,
 			); !errors.Is(err, ErrInvalidJournal) {
 				t.Fatalf("encode error = %v", err)
+			}
+		})
+	}
+}
+
+func TestPendingJournalRoundTripsClosedPairingModes(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []pairing.Mode{
+		pairing.ModeNew,
+		pairing.ModeRebootstrap,
+		pairing.ModeReadmission,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			journal, _, _ := joinJournalFixture(t)
+			journal.Mode = mode
+			if mode != pairing.ModeNew {
+				subject := journal.LocalDeviceID
+				journal.SubjectDeviceID = &subject
+			}
+			if mode == pairing.ModeReadmission {
+				version := uint64(7)
+				journal.ExpectedEntityVersion = &version
+			}
+			encoded, err := encodePendingJournal(journal)
+			if err != nil {
+				t.Fatalf("encodePendingJournal(): %v", err)
+			}
+			decoded, err := decodePendingJournal(encoded)
+			if err != nil {
+				t.Fatalf("decodePendingJournal(): %v", err)
+			}
+			if !reflect.DeepEqual(decoded, journal) {
+				t.Fatalf("decoded journal = %#v, want %#v", decoded, journal)
 			}
 		})
 	}
@@ -259,6 +301,7 @@ func joinJournalFixture(
 		RecoveryGeneration:     0,
 		InviterDeviceID:        inviterID,
 		SignedGenesisDigest:    sha256.Sum256([]byte("genesis")),
+		Mode:                   pairing.ModeNew,
 		InitialCredentialEpoch: 1,
 		CredentialEpoch:        1,
 		LocalDeviceID:          localID,

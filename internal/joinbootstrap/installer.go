@@ -330,6 +330,7 @@ func prepareNewJoin(
 		InviterDeviceID:          invite.InviterDeviceID,
 		InviterIdentityPublicKey: invite.InviterIdentityPublicKey,
 		SignedGenesisDigest:      invite.SignedGenesisDigest,
+		Mode:                     invite.Mode,
 		InitialCredentialEpoch:   invite.InitialCredentialEpoch,
 		CredentialEpoch:          invite.InitialCredentialEpoch,
 		LocalDeviceID:            localDeviceID,
@@ -524,6 +525,15 @@ func reviewMatchesJournal(
 		review.InviterIdentityPublicKey ==
 			journal.InviterIdentityPublicKey &&
 		review.SignedGenesisDigest == journal.SignedGenesisDigest &&
+		review.Mode == journal.Mode &&
+		equalJournalDeviceID(
+			review.SubjectDeviceID,
+			journal.SubjectDeviceID,
+		) &&
+		equalJournalUint64(
+			review.ExpectedEntityVersion,
+			journal.ExpectedEntityVersion,
+		) &&
 		review.Core.JoinerDeviceID == journal.LocalDeviceID &&
 		review.Core.JoinerIdentityPublicKey ==
 			journal.LocalIdentityPublicKey &&
@@ -537,6 +547,16 @@ func reviewMatchesJournal(
 		review.Role == journal.ApprovedRole &&
 		review.Core.DaemonVersion == journal.ApprovedDaemonVersion &&
 		review.Core.MaxApplyLevel == journal.ApprovedMaxApplyLevel
+}
+
+func equalJournalDeviceID(left, right *domain.DeviceID) bool {
+	return left == nil && right == nil ||
+		left != nil && right != nil && *left == *right
+}
+
+func equalJournalUint64(left, right *uint64) bool {
+	return left == nil && right == nil ||
+		left != nil && right != nil && *left == *right
 }
 
 func terminalPairingStatus(status pairing.ConfirmationStatus) bool {

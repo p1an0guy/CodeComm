@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	journalSchemaVersion uint64 = 3
+	journalSchemaVersion uint64 = 4
 	journalSuffix               = ".join"
 )
 
@@ -49,6 +49,9 @@ type pendingJournal struct {
 	InviterDeviceID          domain.DeviceID
 	InviterIdentityPublicKey [ed25519.PublicKeySize]byte
 	SignedGenesisDigest      [sha256.Size]byte
+	Mode                     pairing.Mode
+	SubjectDeviceID          *domain.DeviceID
+	ExpectedEntityVersion    *uint64
 	InitialCredentialEpoch   uint64
 	CredentialEpoch          uint64
 	LocalDeviceID            domain.DeviceID
@@ -77,6 +80,9 @@ type pendingJournalWire struct {
 	InviterDeviceID          string   `json:"inviter_device_id"`
 	InviterIdentityPublicKey string   `json:"inviter_identity_public_key"`
 	SignedGenesisDigest      string   `json:"signed_genesis_digest"`
+	Mode                     string   `json:"mode"`
+	SubjectDeviceID          *string  `json:"subject_device_id"`
+	ExpectedEntityVersion    *uint64  `json:"expected_entity_version"`
 	InitialCredentialEpoch   uint64   `json:"initial_credential_epoch"`
 	CredentialEpoch          uint64   `json:"credential_epoch"`
 	LocalDeviceID            string   `json:"local_device_id"`
@@ -249,6 +255,9 @@ func encodePendingJournal(journal pendingJournal) ([]byte, error) {
 		InviterDeviceID:          string(journal.InviterDeviceID),
 		InviterIdentityPublicKey: codec.EncodeBase64URL(journal.InviterIdentityPublicKey[:]),
 		SignedGenesisDigest:      codec.EncodeBase64URL(journal.SignedGenesisDigest[:]),
+		Mode:                     string(journal.Mode),
+		SubjectDeviceID:          journalDeviceIDWire(journal.SubjectDeviceID),
+		ExpectedEntityVersion:    cloneJournalUint64(journal.ExpectedEntityVersion),
 		InitialCredentialEpoch:   journal.InitialCredentialEpoch,
 		CredentialEpoch:          journal.CredentialEpoch,
 		LocalDeviceID:            string(journal.LocalDeviceID),
@@ -348,6 +357,7 @@ func decodePendingJournal(encoded []byte) (pendingJournal, error) {
 		WorkspaceID:             domain.UUIDv4(wire.WorkspaceID),
 		RecoveryGeneration:      wire.RecoveryGeneration,
 		InviterDeviceID:         domain.DeviceID(wire.InviterDeviceID),
+		Mode:                    pairing.Mode(wire.Mode),
 		InitialCredentialEpoch:  wire.InitialCredentialEpoch,
 		CredentialEpoch:         wire.CredentialEpoch,
 		LocalDeviceID:           domain.DeviceID(wire.LocalDeviceID),
@@ -359,6 +369,13 @@ func decodePendingJournal(encoded []byte) (pendingJournal, error) {
 		MinimumAuthorizationCut: wire.MinimumAuthorizationCut,
 		Endpoints:               make([]netip.AddrPort, len(wire.Endpoints)),
 	}
+	if wire.SubjectDeviceID != nil {
+		subject := domain.DeviceID(*wire.SubjectDeviceID)
+		journal.SubjectDeviceID = &subject
+	}
+	journal.ExpectedEntityVersion = cloneJournalUint64(
+		wire.ExpectedEntityVersion,
+	)
 	copy(journal.InviteDigest[:], inviteDigest)
 	copy(journal.InviterIdentityPublicKey[:], inviterKey)
 	copy(journal.SignedGenesisDigest[:], genesisDigest)
@@ -394,6 +411,7 @@ func (journal pendingJournal) validate() error {
 		!journal.WorkspaceID.Valid() ||
 		!domain.ValidUnsignedInteger(journal.RecoveryGeneration) ||
 		!journal.InviterDeviceID.Valid() ||
+		!journal.Mode.Valid() ||
 		journal.InitialCredentialEpoch < 1 ||
 		!domain.ValidUnsignedInteger(journal.InitialCredentialEpoch) ||
 		journal.CredentialEpoch < journal.InitialCredentialEpoch ||
@@ -406,6 +424,31 @@ func (journal pendingJournal) validate() error {
 		journal.ApprovedRequestDigest == [sha256.Size]byte{} ||
 		len(journal.Endpoints) == 0 ||
 		len(journal.Endpoints) > pairing.MaxInviteEndpoints {
+		return ErrInvalidJournal
+	}
+	switch journal.Mode {
+	case pairing.ModeNew:
+		if journal.SubjectDeviceID != nil ||
+			journal.ExpectedEntityVersion != nil ||
+			journal.InitialCredentialEpoch != 1 {
+			return ErrInvalidJournal
+		}
+	case pairing.ModeRebootstrap:
+		if journal.SubjectDeviceID == nil ||
+			*journal.SubjectDeviceID != journal.LocalDeviceID ||
+			journal.ExpectedEntityVersion != nil {
+			return ErrInvalidJournal
+		}
+	case pairing.ModeReadmission:
+		if journal.SubjectDeviceID == nil ||
+			*journal.SubjectDeviceID != journal.LocalDeviceID ||
+			journal.ExpectedEntityVersion == nil ||
+			*journal.ExpectedEntityVersion < 1 ||
+			!domain.ValidUnsignedInteger(*journal.ExpectedEntityVersion) ||
+			journal.InitialCredentialEpoch != 1 {
+			return ErrInvalidJournal
+		}
+	default:
 		return ErrInvalidJournal
 	}
 	inviterID, inviterErr := device.DeriveID(
@@ -471,4 +514,20 @@ func (journal pendingJournal) validate() error {
 		}
 	}
 	return nil
+}
+
+func journalDeviceIDWire(value *domain.DeviceID) *string {
+	if value == nil {
+		return nil
+	}
+	encoded := string(*value)
+	return &encoded
+}
+
+func cloneJournalUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
