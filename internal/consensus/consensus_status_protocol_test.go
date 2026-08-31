@@ -3,15 +3,23 @@ package consensus
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/netip"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
+	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
@@ -52,16 +60,41 @@ func TestConsensusStatusResponseIsCanonicalBoundedAndClosed(
 		decoded.LocalTerm != status.LocalTerm ||
 		decoded.LeaderDeviceID == nil ||
 		*decoded.LeaderDeviceID != *status.LeaderDeviceID ||
+		len(decoded.LeaderEndpointSet) != 0 ||
+		decoded.AdvertisementIntervalSeconds !=
+			status.AdvertisementIntervalSeconds ||
 		decoded.QuorumRequired != status.QuorumRequired ||
 		decoded.LastRaftAppliedLogIndex == nil ||
 		*decoded.LastRaftAppliedLogIndex !=
 			*status.LastRaftAppliedLogIndex ||
+		decoded.MembershipAppliedChainIndex !=
+			status.MembershipAppliedChainIndex ||
+		!sameConsensusStatusMember(
+			decoded.RequesterMembership,
+			status.RequesterMembership,
+		) ||
+		len(decoded.ActiveRoster) != len(status.ActiveRoster) ||
+		decoded.RequesterCredentialAuthorization == nil ||
+		!credentialRenewalAuthorizationsEqual(
+			*decoded.RequesterCredentialAuthorization,
+			*status.RequesterCredentialAuthorization,
+		) ||
 		decoded.CredentialAuthority.VoterSetVersion !=
 			status.CredentialAuthority.VoterSetVersion ||
 		!credentialRenewalAuthorizationsEqual(
 			decoded.ContentCredentialAuthorization,
 			status.ContentCredentialAuthorization,
-		) {
+		) ||
+		decoded.GenerationZeroState.SessionID !=
+			status.GenerationZeroState.SessionID ||
+		decoded.GenerationZeroState.ProjectionStateDigest !=
+			status.GenerationZeroState.ProjectionStateDigest ||
+		!bytes.Equal(
+			decoded.GenerationZeroState.GenesisJSON,
+			status.GenerationZeroState.GenesisJSON,
+		) ||
+		len(decoded.GenerationZeroState.ProjectionRows) !=
+			len(status.GenerationZeroState.ProjectionRows) {
 		t.Fatalf("decoded status = %#v", decoded)
 	}
 
@@ -171,6 +204,11 @@ func TestConsensusStatusClientRejectsMismatchedOrUnusableMetadata(
 			value := "not-a-device"
 			wire.LeaderDeviceID = &value
 		},
+		"invalid advertisement interval": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.AdvertisementIntervalSeconds = 0
+		},
 		"impossible quorum": func(wire *consensusStatusResponseWire) {
 			wire.QuorumRequired = 6
 		},
@@ -184,6 +222,26 @@ func TestConsensusStatusClientRejectsMismatchedOrUnusableMetadata(
 			wire.ContentCredentialAuthorization.DeviceID =
 				string(otherDeviceID)
 		},
+		"requester membership identity mismatch": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.RequesterMembership.DeviceID = string(otherDeviceID)
+		},
+		"requester authorization epoch mismatch": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.RequesterMembership.CurrentCredentialEpoch++
+		},
+		"requester authorization beyond cut": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.MembershipAppliedChainIndex = 1
+		},
+		"empty active roster": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.ActiveRoster = nil
+		},
 		"authorization lineage mismatch": func(
 			wire *consensusStatusResponseWire,
 		) {
@@ -194,6 +252,18 @@ func TestConsensusStatusClientRejectsMismatchedOrUnusableMetadata(
 			wire *consensusStatusResponseWire,
 		) {
 			wire.ContentCredentialAuthorization.ValiditySeconds = 1
+		},
+		"bootstrap state digest": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.GenerationZeroState.ProjectionStateDigest =
+				codec.EncodeBase64URL(make([]byte, 32))
+		},
+		"bootstrap workspace mismatch": func(
+			wire *consensusStatusResponseWire,
+		) {
+			wire.GenerationZeroState.WorkspaceID =
+				"550e8400-e29b-41d4-a716-446655440001"
 		},
 	}
 	for name, mutate := range tests {
@@ -207,6 +277,106 @@ func TestConsensusStatusClientRejectsMismatchedOrUnusableMetadata(
 				t.Fatal("mutated status was accepted")
 			}
 		})
+	}
+}
+
+func TestConsensusStatusAuthenticatesRemoteLeaderEndpointSet(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	status, now := consensusStatusProtocolFixture(t)
+	leaderPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xd0}, ed25519.SeedSize),
+	)
+	t.Cleanup(func() { clear(leaderPrivate) })
+	leaderID, err := device.DeriveID(
+		leaderPrivate.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status.LeaderDeviceID = &leaderID
+	status.ActiveRoster = append(
+		status.ActiveRoster,
+		ConsensusStatusMember{
+			Device: device.Device{
+				ID:                leaderID,
+				Role:              device.RoleOwner,
+				IdentityPublicKey: bytes.Clone(leaderPrivate.Public().(ed25519.PublicKey)),
+				DaemonVersion:     "0.1.0",
+				MaxApplyLevel:     1,
+				Status:            device.StatusActive,
+				EntityVersion:     1,
+			},
+		},
+	)
+	sort.Slice(status.ActiveRoster, func(left, right int) bool {
+		return status.ActiveRoster[left].Device.ID <
+			status.ActiveRoster[right].Device.ID
+	})
+	address := netip.MustParseAddr("192.0.2.10")
+	interval := time.Duration(
+		status.AdvertisementIntervalSeconds,
+	) * time.Second
+	signer, err := discovery.NewEndpointSigner(
+		interval,
+		47831,
+		[]netip.Addr{address},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuedAt := now.UTC().Truncate(time.Second)
+	status.LeaderEndpointSet, err = signer.Sign(
+		discovery.EndpointSet{
+			SessionID:          status.SessionID,
+			WorkspaceID:        status.WorkspaceID,
+			RecoveryGeneration: status.RecoveryGeneration,
+			DeviceID:           leaderID,
+			EndpointSequence:   1,
+			IssuedAt: domain.WholeSecondTimestamp(
+				issuedAt.Format(time.RFC3339),
+			),
+			ExpiresAt: domain.WholeSecondTimestamp(
+				issuedAt.Add(
+					discovery.EndpointHintTTLIntervals * interval,
+				).Format(time.RFC3339),
+			),
+			Endpoints: []discovery.Endpoint{{
+				IP: address, Port: 47831,
+			}},
+		},
+		leaderPrivate,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeConsensusStatusResponse(status, now)
+	if err != nil {
+		t.Fatalf("encode remote leader status: %v", err)
+	}
+	decoded, err := decodeConsensusStatusResponse(
+		encoded,
+		status.ServerDeviceID,
+		now,
+	)
+	if err != nil ||
+		decoded.LeaderDeviceID == nil ||
+		*decoded.LeaderDeviceID != leaderID ||
+		!bytes.Equal(
+			decoded.LeaderEndpointSet,
+			status.LeaderEndpointSet,
+		) {
+		t.Fatalf("remote leader status = (%+v, %v)", decoded, err)
+	}
+
+	status.LeaderEndpointSet[len(status.LeaderEndpointSet)-1] ^= 1
+	if _, err := encodeConsensusStatusResponse(
+		status,
+		now,
+	); !errors.Is(err, ErrConsensusStatusMismatch) {
+		t.Fatalf("tampered leader endpoint-set error = %v", err)
 	}
 }
 
@@ -277,24 +447,49 @@ func TestRequestConsensusStatusUsesOnePeerPinnedRequest(
 }
 
 func consensusStatusProtocolFixture(
-	t testing.TB,
+	t *testing.T,
 ) (ConsensusStatusResult, time.Time) {
 	t.Helper()
 	binding := credentialRenewalTestBinding(t, 1)
 	authorization := credentialRenewalTestAuthorization(t, binding)
 	authorization.AuthorityVoterSetVersion = 1
 	now := time.Date(2026, 8, 18, 12, 1, 0, 0, time.UTC)
-	leader := credentialRenewalTestDeviceID(t, 0xd0)
+	leader := authorization.DeviceID
 	applied := uint64(23)
+	generationZero := consensusStatusBootstrapFixture(t)
+	identityPrivate := ed25519.NewKeyFromSeed(
+		bytes.Repeat([]byte{0xa1}, ed25519.SeedSize),
+	)
+	t.Cleanup(func() { clear(identityPrivate) })
+	member := ConsensusStatusMember{
+		Device: device.Device{
+			ID:   authorization.DeviceID,
+			Role: device.RoleEditor,
+			IdentityPublicKey: bytes.Clone(
+				identityPrivate.Public().(ed25519.PublicKey),
+			),
+			DaemonVersion: "0.1.0",
+			MaxApplyLevel: 1,
+			Status:        device.StatusActive,
+			EntityVersion: 1,
+		},
+		CurrentCredentialEpoch: authorization.Epoch,
+	}
+	requesterAuthorization := authorization.Clone()
 	return ConsensusStatusResult{
-		SessionID:               authorization.SessionID,
-		WorkspaceID:             nodeTestWorkspaceID,
-		RecoveryGeneration:      2,
-		ServerDeviceID:          authorization.DeviceID,
-		LocalTerm:               7,
-		LeaderDeviceID:          &leader,
-		QuorumRequired:          2,
-		LastRaftAppliedLogIndex: &applied,
+		SessionID:                        authorization.SessionID,
+		WorkspaceID:                      nodeTestWorkspaceID,
+		RecoveryGeneration:               2,
+		ServerDeviceID:                   authorization.DeviceID,
+		LocalTerm:                        7,
+		LeaderDeviceID:                   &leader,
+		AdvertisementIntervalSeconds:     policy.DefaultAdvertisementIntervalSeconds,
+		QuorumRequired:                   2,
+		LastRaftAppliedLogIndex:          &applied,
+		MembershipAppliedChainIndex:      applied,
+		RequesterMembership:              member,
+		ActiveRoster:                     []ConsensusStatusMember{member},
+		RequesterCredentialAuthorization: &requesterAuthorization,
 		CredentialAuthority: credentialauthority.Authority{
 			SessionID:        authorization.SessionID,
 			VoterDeviceIDs:   []domain.DeviceID{authorization.DeviceID},
@@ -302,7 +497,37 @@ func consensusStatusProtocolFixture(
 			ActivationSource: credentialauthority.ActivationGenesis,
 		},
 		ContentCredentialAuthorization: authorization,
+		GenerationZeroState:            generationZero,
 	}, now
+}
+
+func consensusStatusBootstrapFixture(t *testing.T) store.StateView {
+	t.Helper()
+	initial, _, _ := nodeTestInitialState(t)
+	database, err := store.Open(
+		context.Background(),
+		store.Options{
+			Path: filepath.Join(
+				t.TempDir(),
+				"consensus-status-bootstrap",
+				"state.db",
+			),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if _, err := database.Initialize(context.Background(), initial); err != nil {
+		t.Fatal(err)
+	}
+	view, err := database.VerifiedGenerationZeroView(
+		context.Background(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
 }
 
 func mutateConsensusStatusWire(

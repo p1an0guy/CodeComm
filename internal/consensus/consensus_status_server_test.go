@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
@@ -51,8 +52,20 @@ func TestConsensusStatusServerReturnsOnlyLocalActiveAuthorization(
 		decoded.LocalTerm < 1 ||
 		decoded.LeaderDeviceID == nil ||
 		*decoded.LeaderDeviceID != fixture.ownerDeviceID ||
+		len(decoded.LeaderEndpointSet) != 0 ||
+		decoded.AdvertisementIntervalSeconds !=
+			policy.DefaultAdvertisementIntervalSeconds ||
 		decoded.QuorumRequired != 1 ||
 		decoded.LastRaftAppliedLogIndex == nil ||
+		decoded.MembershipAppliedChainIndex != 1 ||
+		decoded.RequesterMembership.Device.ID != peer.DeviceID ||
+		decoded.RequesterMembership.CurrentCredentialEpoch != 0 ||
+		decoded.RequesterCredentialAuthorization != nil ||
+		len(decoded.ActiveRoster) != 2 ||
+		decoded.GenerationZeroState.SessionID != nodeTestSessionID ||
+		decoded.GenerationZeroState.RecoveryGeneration != 0 ||
+		decoded.GenerationZeroState.Heads.ChainIndex != 0 ||
+		len(decoded.GenerationZeroState.ProjectionRows) == 0 ||
 		!credentialRenewalAuthorizationsEqual(
 			decoded.ContentCredentialAuthorization,
 			authorization,

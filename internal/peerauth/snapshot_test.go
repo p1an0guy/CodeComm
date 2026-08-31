@@ -150,6 +150,64 @@ func TestSnapshotAuthorizationByEpochDigest(t *testing.T) {
 	}
 }
 
+func TestSnapshotActiveRosterIsSortedBoundAndDefensive(t *testing.T) {
+	t.Parallel()
+
+	fixture := newSnapshotFixture(t, 1)
+	secondKey := snapshotPrivateKey(12)
+	secondID, err := device.DeriveID(
+		secondKey.Public().(ed25519.PublicKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.input.Devices[secondID] = device.Device{
+		ID:                secondID,
+		Role:              device.RoleEditor,
+		IdentityPublicKey: bytes.Clone(secondKey.Public().(ed25519.PublicKey)),
+		DaemonVersion:     "0.1.0",
+		MaxApplyLevel:     1,
+		Status:            device.StatusActive,
+		EntityVersion:     1,
+	}
+	fixture.input.AuditCounters[secondID] = auditcounter.Counter{
+		DeviceID: secondID,
+	}
+	snapshot, err := NewSnapshot(fixture.input)
+	if err != nil {
+		t.Fatalf("NewSnapshot(): %v", err)
+	}
+	roster, valid := snapshot.ActiveRoster()
+	if !valid ||
+		len(roster) != 2 ||
+		roster[0].Device.ID >= roster[1].Device.ID {
+		t.Fatalf("ActiveRoster() = (%#v, %t)", roster, valid)
+	}
+	for _, member := range roster {
+		want := uint64(0)
+		if member.Device.ID == fixture.deviceID {
+			want = 1
+		}
+		if member.CurrentCredentialEpoch != want {
+			t.Fatalf(
+				"member %s epoch = %d, want %d",
+				member.Device.ID,
+				member.CurrentCredentialEpoch,
+				want,
+			)
+		}
+	}
+	roster[0].Device.IdentityPublicKey[0] ^= 0xff
+	again, valid := snapshot.ActiveRoster()
+	if !valid ||
+		bytes.Equal(
+			roster[0].Device.IdentityPublicKey,
+			again[0].Device.IdentityPublicKey,
+		) {
+		t.Fatal("mutating ActiveRoster result changed snapshot state")
+	}
+}
+
 func TestSnapshotAuthorizationByEpochDigestRejectsAmbiguity(t *testing.T) {
 	t.Parallel()
 

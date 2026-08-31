@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,17 +12,23 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
+	"github.com/ijonahch/codecomm/internal/credential"
+	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
+	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
 const (
-	consensusStatusPath                 = "/v1/consensus/status"
-	consensusStatusSchemaVersion uint64 = 1
+	consensusStatusPath                    = "/v1/consensus/status"
+	consensusStatusSchemaVersion    uint64 = 4
+	consensusStatusBootstrapRowsMax        = 1_024
 )
 
 var (
@@ -40,17 +47,35 @@ var (
 )
 
 type consensusStatusResponseWire struct {
-	SchemaVersion                  uint64                        `json:"schema_version"`
-	SessionID                      string                        `json:"session_id"`
-	WorkspaceID                    string                        `json:"workspace_id"`
-	RecoveryGeneration             uint64                        `json:"recovery_generation"`
-	ServerDeviceID                 string                        `json:"server_device_id"`
-	LocalTerm                      uint64                        `json:"local_term"`
-	LeaderDeviceID                 *string                       `json:"leader_device_id"`
-	QuorumRequired                 uint64                        `json:"quorum_required"`
-	LastRaftAppliedLogIndex        *uint64                       `json:"last_raft_applied_log_index"`
-	CredentialAuthority            consensusStatusAuthorityWire  `json:"credential_authority"`
-	ContentCredentialAuthorization credentialRenewalResponseWire `json:"content_credential_authorization"`
+	SchemaVersion                    uint64                         `json:"schema_version"`
+	SessionID                        string                         `json:"session_id"`
+	WorkspaceID                      string                         `json:"workspace_id"`
+	RecoveryGeneration               uint64                         `json:"recovery_generation"`
+	ServerDeviceID                   string                         `json:"server_device_id"`
+	LocalTerm                        uint64                         `json:"local_term"`
+	LeaderDeviceID                   *string                        `json:"leader_device_id"`
+	LeaderEndpointSet                *string                        `json:"leader_endpoint_set"`
+	AdvertisementIntervalSeconds     int64                          `json:"advertisement_interval_seconds"`
+	QuorumRequired                   uint64                         `json:"quorum_required"`
+	LastRaftAppliedLogIndex          *uint64                        `json:"last_raft_applied_log_index"`
+	MembershipAppliedChainIndex      uint64                         `json:"membership_applied_chain_index"`
+	RequesterMembership              consensusStatusMemberWire      `json:"requester_membership"`
+	ActiveRoster                     []consensusStatusMemberWire    `json:"active_roster"`
+	RequesterCredentialAuthorization *credentialRenewalResponseWire `json:"requester_credential_authorization"`
+	CredentialAuthority              consensusStatusAuthorityWire   `json:"credential_authority"`
+	ContentCredentialAuthorization   credentialRenewalResponseWire  `json:"content_credential_authorization"`
+	GenerationZeroState              consensusStatusBootstrapWire   `json:"generation_zero_state"`
+}
+
+type consensusStatusMemberWire struct {
+	DeviceID               string `json:"device_id"`
+	Role                   string `json:"role"`
+	IdentityPublicKey      string `json:"identity_public_key"`
+	DaemonVersion          string `json:"daemon_version"`
+	MaxApplyLevel          uint64 `json:"max_apply_level"`
+	Status                 string `json:"status"`
+	EntityVersion          uint64 `json:"entity_version"`
+	CurrentCredentialEpoch uint64 `json:"current_credential_epoch"`
 }
 
 type consensusStatusAuthorityWire struct {
@@ -64,20 +89,50 @@ type consensusStatusAuthorityWire struct {
 	PriorAuthorityHandoff       *string           `json:"prior_authority_handoff"`
 }
 
+type consensusStatusBootstrapWire struct {
+	SessionID               string                            `json:"session_id"`
+	WorkspaceID             string                            `json:"workspace_id"`
+	GenesisJSON             string                            `json:"genesis_json"`
+	DigestVersion           uint64                            `json:"digest_version"`
+	ProjectionSchemaVersion uint64                            `json:"projection_schema_version"`
+	ProjectionStateDigest   string                            `json:"projection_state_digest"`
+	ProjectionRows          []consensusStatusBootstrapRowWire `json:"projection_rows"`
+}
+
+type consensusStatusBootstrapRowWire struct {
+	Table      string `json:"table"`
+	PrimaryKey string `json:"primary_key"`
+	Row        string `json:"row"`
+}
+
 // ConsensusStatusResult is one peer-pinned identity-plane bootstrap cut.
 // The caller still verifies any authority handoff and authorization signatures
 // against its own applied state before provisional use.
 type ConsensusStatusResult struct {
-	SessionID                      domain.UUIDv7
-	WorkspaceID                    domain.UUIDv4
-	RecoveryGeneration             uint64
-	ServerDeviceID                 domain.DeviceID
-	LocalTerm                      uint64
-	LeaderDeviceID                 *domain.DeviceID
-	QuorumRequired                 uint64
-	LastRaftAppliedLogIndex        *uint64
-	CredentialAuthority            credentialauthority.Authority
-	ContentCredentialAuthorization credentialauthorization.Authorization
+	SessionID                        domain.UUIDv7
+	WorkspaceID                      domain.UUIDv4
+	RecoveryGeneration               uint64
+	ServerDeviceID                   domain.DeviceID
+	LocalTerm                        uint64
+	LeaderDeviceID                   *domain.DeviceID
+	LeaderEndpointSet                []byte
+	AdvertisementIntervalSeconds     int64
+	QuorumRequired                   uint64
+	LastRaftAppliedLogIndex          *uint64
+	MembershipAppliedChainIndex      uint64
+	RequesterMembership              ConsensusStatusMember
+	ActiveRoster                     []ConsensusStatusMember
+	RequesterCredentialAuthorization *credentialauthorization.Authorization
+	CredentialAuthority              credentialauthority.Authority
+	ContentCredentialAuthorization   credentialauthorization.Authorization
+	GenerationZeroState              store.StateView
+}
+
+// ConsensusStatusMember binds one active membership row to its current
+// credential counter at the response's applied-chain cut.
+type ConsensusStatusMember struct {
+	Device                 device.Device
+	CurrentCredentialEpoch uint64
 }
 
 // ConsensusStatusRequester sends the bodyless identity-authenticated request.
@@ -208,18 +263,57 @@ func encodeConsensusStatusResponseForUse(
 	if err != nil {
 		return nil, ErrInvalidConsensusStatus
 	}
+	bootstrap, err := consensusStatusBootstrapToWire(
+		status.GenerationZeroState,
+	)
+	if err != nil {
+		return nil, ErrInvalidConsensusStatus
+	}
+	requester, err := consensusStatusMemberToWire(
+		status.RequesterMembership,
+	)
+	if err != nil {
+		return nil, ErrInvalidConsensusStatus
+	}
+	roster := make(
+		[]consensusStatusMemberWire,
+		len(status.ActiveRoster),
+	)
+	for index, member := range status.ActiveRoster {
+		roster[index], err = consensusStatusMemberToWire(member)
+		if err != nil {
+			return nil, ErrInvalidConsensusStatus
+		}
+	}
+	var requesterAuthorization *credentialRenewalResponseWire
+	if status.RequesterCredentialAuthorization != nil {
+		encoded, encodeErr := credentialAuthorizationToWire(
+			*status.RequesterCredentialAuthorization,
+		)
+		if encodeErr != nil {
+			return nil, ErrInvalidConsensusStatus
+		}
+		requesterAuthorization = &encoded
+	}
 	wire := consensusStatusResponseWire{
-		SchemaVersion:                  consensusStatusSchemaVersion,
-		SessionID:                      string(status.SessionID),
-		WorkspaceID:                    string(status.WorkspaceID),
-		RecoveryGeneration:             status.RecoveryGeneration,
-		ServerDeviceID:                 string(status.ServerDeviceID),
-		LocalTerm:                      status.LocalTerm,
-		LeaderDeviceID:                 encodeOptionalDeviceID(status.LeaderDeviceID),
-		QuorumRequired:                 status.QuorumRequired,
-		LastRaftAppliedLogIndex:        cloneOptionalUint64(status.LastRaftAppliedLogIndex),
-		CredentialAuthority:            authority,
-		ContentCredentialAuthorization: authorization,
+		SchemaVersion:                    consensusStatusSchemaVersion,
+		SessionID:                        string(status.SessionID),
+		WorkspaceID:                      string(status.WorkspaceID),
+		RecoveryGeneration:               status.RecoveryGeneration,
+		ServerDeviceID:                   string(status.ServerDeviceID),
+		LocalTerm:                        status.LocalTerm,
+		LeaderDeviceID:                   encodeOptionalDeviceID(status.LeaderDeviceID),
+		LeaderEndpointSet:                encodeOptionalBytes(status.LeaderEndpointSet),
+		AdvertisementIntervalSeconds:     status.AdvertisementIntervalSeconds,
+		QuorumRequired:                   status.QuorumRequired,
+		LastRaftAppliedLogIndex:          cloneOptionalUint64(status.LastRaftAppliedLogIndex),
+		MembershipAppliedChainIndex:      status.MembershipAppliedChainIndex,
+		RequesterMembership:              requester,
+		ActiveRoster:                     roster,
+		RequesterCredentialAuthorization: requesterAuthorization,
+		CredentialAuthority:              authority,
+		ContentCredentialAuthorization:   authorization,
+		GenerationZeroState:              bootstrap,
 	}
 	encoded, err := json.Marshal(wire)
 	if err != nil {
@@ -255,17 +349,60 @@ func decodeConsensusStatusResponse(
 	if err != nil {
 		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
 	}
+	bootstrap, err := consensusStatusBootstrapFromWire(
+		wire.GenerationZeroState,
+	)
+	if err != nil {
+		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+	}
+	requester, err := consensusStatusMemberFromWire(
+		wire.RequesterMembership,
+	)
+	if err != nil {
+		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+	}
+	roster := make([]ConsensusStatusMember, len(wire.ActiveRoster))
+	for index, encoded := range wire.ActiveRoster {
+		roster[index], err = consensusStatusMemberFromWire(encoded)
+		if err != nil {
+			return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+		}
+	}
+	var requesterAuthorization *credentialauthorization.Authorization
+	if wire.RequesterCredentialAuthorization != nil {
+		value, decodeErr := credentialAuthorizationFromWire(
+			*wire.RequesterCredentialAuthorization,
+		)
+		if decodeErr != nil {
+			return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+		}
+		requesterAuthorization = &value
+	}
+	leaderEndpointSet, err := decodeOptionalBytes(
+		wire.LeaderEndpointSet,
+		discovery.MaxEndpointSetBytes,
+	)
+	if err != nil {
+		return ConsensusStatusResult{}, ErrInvalidConsensusStatus
+	}
 	status := ConsensusStatusResult{
-		SessionID:                      domain.UUIDv7(wire.SessionID),
-		WorkspaceID:                    domain.UUIDv4(wire.WorkspaceID),
-		RecoveryGeneration:             wire.RecoveryGeneration,
-		ServerDeviceID:                 domain.DeviceID(wire.ServerDeviceID),
-		LocalTerm:                      wire.LocalTerm,
-		LeaderDeviceID:                 decodeOptionalDeviceID(wire.LeaderDeviceID),
-		QuorumRequired:                 wire.QuorumRequired,
-		LastRaftAppliedLogIndex:        cloneOptionalUint64(wire.LastRaftAppliedLogIndex),
-		CredentialAuthority:            authority,
-		ContentCredentialAuthorization: authorization,
+		SessionID:                        domain.UUIDv7(wire.SessionID),
+		WorkspaceID:                      domain.UUIDv4(wire.WorkspaceID),
+		RecoveryGeneration:               wire.RecoveryGeneration,
+		ServerDeviceID:                   domain.DeviceID(wire.ServerDeviceID),
+		LocalTerm:                        wire.LocalTerm,
+		LeaderDeviceID:                   decodeOptionalDeviceID(wire.LeaderDeviceID),
+		LeaderEndpointSet:                leaderEndpointSet,
+		AdvertisementIntervalSeconds:     wire.AdvertisementIntervalSeconds,
+		QuorumRequired:                   wire.QuorumRequired,
+		LastRaftAppliedLogIndex:          cloneOptionalUint64(wire.LastRaftAppliedLogIndex),
+		MembershipAppliedChainIndex:      wire.MembershipAppliedChainIndex,
+		RequesterMembership:              requester,
+		ActiveRoster:                     roster,
+		RequesterCredentialAuthorization: requesterAuthorization,
+		CredentialAuthority:              authority,
+		ContentCredentialAuthorization:   authorization,
+		GenerationZeroState:              bootstrap,
 	}
 	if err := validateConsensusStatusResult(
 		status,
@@ -293,6 +430,9 @@ func validateConsensusStatusResult(
 	serverActive bool,
 ) error {
 	maximumQuorum := uint64(policy.MaxMemberDevices/2 + 1)
+	advertisementInterval := time.Duration(
+		status.AdvertisementIntervalSeconds,
+	) * time.Second
 	if !expectedServerDeviceID.Valid() ||
 		!status.SessionID.Valid() ||
 		!status.WorkspaceID.Valid() ||
@@ -304,6 +444,10 @@ func validateConsensusStatusResult(
 		status.QuorumRequired > maximumQuorum ||
 		status.LeaderDeviceID != nil &&
 			!(*status.LeaderDeviceID).Valid() ||
+		status.AdvertisementIntervalSeconds <
+			policy.MinAdvertisementIntervalSeconds ||
+		status.AdvertisementIntervalSeconds >
+			policy.MaxAdvertisementIntervalSeconds ||
 		status.LastRaftAppliedLogIndex != nil &&
 			(*status.LastRaftAppliedLogIndex < 1 ||
 				!domain.ValidUnsignedInteger(
@@ -314,6 +458,13 @@ func validateConsensusStatusResult(
 	authority := status.CredentialAuthority
 	if authority.Validate() != nil ||
 		authority.SessionID != status.SessionID {
+		return ErrConsensusStatusMismatch
+	}
+	if !validConsensusStatusMembership(
+		status,
+		advertisementInterval,
+		now,
+	) {
 		return ErrConsensusStatusMismatch
 	}
 	authorization := status.ContentCredentialAuthorization
@@ -328,6 +479,366 @@ func validateConsensusStatusResult(
 			serverActive,
 		) {
 		return ErrConsensusStatusMismatch
+	}
+	if err := validateConsensusStatusBootstrap(
+		status.GenerationZeroState,
+	); err != nil ||
+		status.GenerationZeroState.WorkspaceID != status.WorkspaceID ||
+		status.RecoveryGeneration == 0 &&
+			status.GenerationZeroState.SessionID != status.SessionID {
+		return ErrConsensusStatusMismatch
+	}
+	return nil
+}
+
+func validConsensusStatusMembership(
+	status ConsensusStatusResult,
+	advertisementInterval time.Duration,
+	now time.Time,
+) bool {
+	if !domain.ValidUnsignedInteger(status.MembershipAppliedChainIndex) ||
+		len(status.ActiveRoster) < 1 ||
+		len(status.ActiveRoster) > int(policy.MaxMemberDevices) ||
+		!validConsensusStatusMember(status.RequesterMembership) {
+		return false
+	}
+	var (
+		requesterFound bool
+		server         *ConsensusStatusMember
+		leader         *ConsensusStatusMember
+		authorityFound = make(
+			map[domain.DeviceID]bool,
+			len(status.CredentialAuthority.VoterDeviceIDs),
+		)
+	)
+	for index, member := range status.ActiveRoster {
+		if !validConsensusStatusMember(member) ||
+			index > 0 &&
+				status.ActiveRoster[index-1].Device.ID >=
+					member.Device.ID {
+			return false
+		}
+		if member.Device.ID == status.RequesterMembership.Device.ID {
+			if !sameConsensusStatusMember(
+				member,
+				status.RequesterMembership,
+			) {
+				return false
+			}
+			requesterFound = true
+		}
+		if member.Device.ID == status.ServerDeviceID {
+			value := member
+			server = &value
+		}
+		if status.LeaderDeviceID != nil &&
+			member.Device.ID == *status.LeaderDeviceID {
+			value := member
+			leader = &value
+		}
+		if status.CredentialAuthority.Contains(member.Device.ID) {
+			authorityFound[member.Device.ID] = true
+		}
+	}
+	if !requesterFound || server == nil {
+		return false
+	}
+	switch {
+	case status.LeaderDeviceID == nil:
+		if len(status.LeaderEndpointSet) != 0 {
+			return false
+		}
+	case leader == nil:
+		return false
+	case *status.LeaderDeviceID == status.ServerDeviceID:
+		if len(status.LeaderEndpointSet) != 0 {
+			return false
+		}
+	default:
+		if len(status.LeaderEndpointSet) == 0 {
+			return false
+		}
+		if _, err := discovery.ValidateEndpointSet(
+			status.LeaderEndpointSet,
+			discovery.EndpointSetExpectation{
+				SessionID:             status.SessionID,
+				WorkspaceID:           status.WorkspaceID,
+				RecoveryGeneration:    status.RecoveryGeneration,
+				Member:                leader.Device,
+				AdvertisementInterval: advertisementInterval,
+				Now:                   now,
+			},
+		); err != nil {
+			return false
+		}
+	}
+	for _, voterID := range status.CredentialAuthority.VoterDeviceIDs {
+		if !authorityFound[voterID] {
+			return false
+		}
+	}
+	requesterEpoch := status.RequesterMembership.CurrentCredentialEpoch
+	switch {
+	case requesterEpoch == 0:
+		if status.RequesterCredentialAuthorization != nil {
+			return false
+		}
+	case status.RequesterCredentialAuthorization == nil:
+		return false
+	default:
+		authorization := *status.RequesterCredentialAuthorization
+		if !consensusStatusAuthorizationMatchesMember(
+			authorization,
+			status.RequesterMembership,
+			status.SessionID,
+			status.MembershipAppliedChainIndex,
+		) || authorization.Epoch != requesterEpoch ||
+			authorization.AuthorityVoterSetVersion >
+				status.CredentialAuthority.VoterSetVersion {
+			return false
+		}
+	}
+	serverAuthorization := status.ContentCredentialAuthorization
+	if !consensusStatusAuthorizationMatchesMember(
+		serverAuthorization,
+		*server,
+		status.SessionID,
+		status.MembershipAppliedChainIndex,
+	) ||
+		serverAuthorization.Epoch > server.CurrentCredentialEpoch ||
+		server.CurrentCredentialEpoch-serverAuthorization.Epoch > 1 {
+		return false
+	}
+	return true
+}
+
+func validConsensusStatusMember(member ConsensusStatusMember) bool {
+	return member.Device.Validate() == nil &&
+		member.Device.Status == device.StatusActive &&
+		domain.ValidUnsignedInteger(member.CurrentCredentialEpoch)
+}
+
+func sameConsensusStatusMember(
+	left ConsensusStatusMember,
+	right ConsensusStatusMember,
+) bool {
+	return left.CurrentCredentialEpoch == right.CurrentCredentialEpoch &&
+		left.Device.ID == right.Device.ID &&
+		left.Device.Role == right.Device.Role &&
+		bytes.Equal(
+			left.Device.IdentityPublicKey,
+			right.Device.IdentityPublicKey,
+		) &&
+		left.Device.DaemonVersion == right.Device.DaemonVersion &&
+		left.Device.MaxApplyLevel == right.Device.MaxApplyLevel &&
+		left.Device.Status == right.Device.Status &&
+		left.Device.EntityVersion == right.Device.EntityVersion
+}
+
+func consensusStatusAuthorizationMatchesMember(
+	authorization credentialauthorization.Authorization,
+	member ConsensusStatusMember,
+	sessionID domain.UUIDv7,
+	appliedChainIndex uint64,
+) bool {
+	if authorization.Validate() != nil ||
+		authorization.SessionID != sessionID ||
+		authorization.DeviceID != member.Device.ID ||
+		authorization.AuthorizationChainIndex > appliedChainIndex {
+		return false
+	}
+	binding := credential.Binding{
+		SessionID:      authorization.SessionID,
+		DeviceID:       authorization.DeviceID,
+		Epoch:          authorization.Epoch,
+		EpochPublicKey: authorization.EpochPublicKey,
+		KeyDigest:      authorization.KeyDigest,
+		Signature:      authorization.BindingSignature,
+	}
+	return binding.Validate(member.Device.IdentityPublicKey) == nil
+}
+
+func consensusStatusMemberToWire(
+	member ConsensusStatusMember,
+) (consensusStatusMemberWire, error) {
+	if !validConsensusStatusMember(member) {
+		return consensusStatusMemberWire{}, ErrInvalidConsensusStatus
+	}
+	return consensusStatusMemberWire{
+		DeviceID:               string(member.Device.ID),
+		Role:                   string(member.Device.Role),
+		IdentityPublicKey:      codec.EncodeBase64URL(member.Device.IdentityPublicKey),
+		DaemonVersion:          member.Device.DaemonVersion,
+		MaxApplyLevel:          member.Device.MaxApplyLevel,
+		Status:                 string(member.Device.Status),
+		EntityVersion:          member.Device.EntityVersion,
+		CurrentCredentialEpoch: member.CurrentCredentialEpoch,
+	}, nil
+}
+
+func consensusStatusMemberFromWire(
+	wire consensusStatusMemberWire,
+) (ConsensusStatusMember, error) {
+	publicKey, err := codec.DecodeBase64URLExact(
+		wire.IdentityPublicKey,
+		ed25519.PublicKeySize,
+	)
+	if err != nil {
+		return ConsensusStatusMember{}, ErrInvalidConsensusStatus
+	}
+	member := ConsensusStatusMember{
+		Device: device.Device{
+			ID:                domain.DeviceID(wire.DeviceID),
+			Role:              device.Role(wire.Role),
+			IdentityPublicKey: ed25519.PublicKey(publicKey),
+			DaemonVersion:     wire.DaemonVersion,
+			MaxApplyLevel:     wire.MaxApplyLevel,
+			Status:            device.Status(wire.Status),
+			EntityVersion:     wire.EntityVersion,
+		},
+		CurrentCredentialEpoch: wire.CurrentCredentialEpoch,
+	}
+	if !validConsensusStatusMember(member) {
+		return ConsensusStatusMember{}, ErrInvalidConsensusStatus
+	}
+	return member, nil
+}
+
+func consensusStatusBootstrapToWire(
+	view store.StateView,
+) (consensusStatusBootstrapWire, error) {
+	if err := validateConsensusStatusBootstrap(view); err != nil {
+		return consensusStatusBootstrapWire{}, err
+	}
+	rows := make(
+		[]consensusStatusBootstrapRowWire,
+		len(view.ProjectionRows),
+	)
+	for index, row := range view.ProjectionRows {
+		rows[index] = consensusStatusBootstrapRowWire{
+			Table:      row.Table,
+			PrimaryKey: codec.EncodeBase64URL(row.PrimaryKey),
+			Row:        codec.EncodeBase64URL(row.Row),
+		}
+	}
+	return consensusStatusBootstrapWire{
+		SessionID:               string(view.SessionID),
+		WorkspaceID:             string(view.WorkspaceID),
+		GenesisJSON:             codec.EncodeBase64URL(view.GenesisJSON),
+		DigestVersion:           view.Heads.DigestVersion,
+		ProjectionSchemaVersion: view.Heads.ProjectionSchemaVersion,
+		ProjectionStateDigest: codec.EncodeBase64URL(
+			view.ProjectionStateDigest[:],
+		),
+		ProjectionRows: rows,
+	}, nil
+}
+
+func consensusStatusBootstrapFromWire(
+	wire consensusStatusBootstrapWire,
+) (store.StateView, error) {
+	if len(wire.ProjectionRows) > consensusStatusBootstrapRowsMax {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	genesisJSON, genesisErr := codec.DecodeBase64URL(wire.GenesisJSON)
+	stateDigest, digestErr := codec.DecodeBase64URLExact(
+		wire.ProjectionStateDigest,
+		sha256.Size,
+	)
+	if genesisErr != nil || digestErr != nil {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	rows := make([]chain.LogicalRow, len(wire.ProjectionRows))
+	for index, encoded := range wire.ProjectionRows {
+		primaryKey, primaryErr := codec.DecodeBase64URL(
+			encoded.PrimaryKey,
+		)
+		row, rowErr := codec.DecodeBase64URL(encoded.Row)
+		if primaryErr != nil || rowErr != nil {
+			return store.StateView{}, ErrInvalidConsensusStatus
+		}
+		rows[index] = chain.LogicalRow{
+			Table:      encoded.Table,
+			PrimaryKey: primaryKey,
+			Row:        row,
+		}
+	}
+	genesisDigest, err := chain.GenesisDigest(genesisJSON)
+	if err != nil {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	eventSeed, err := chain.EventSeed(
+		chain.Boundary{Genesis: genesisDigest},
+	)
+	if err != nil {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	resultSeed, err := chain.ResultSeed(
+		chain.Boundary{Genesis: genesisDigest},
+	)
+	if err != nil {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	var projectionDigest store.Digest
+	copy(projectionDigest[:], stateDigest)
+	accumulator := chain.AccumulatorSeedInitial(
+		genesisDigest,
+		chain.Digest(projectionDigest),
+	)
+	view := store.StateView{
+		SessionID:          domain.UUIDv7(wire.SessionID),
+		WorkspaceID:        domain.UUIDv4(wire.WorkspaceID),
+		RecoveryGeneration: 0,
+		GenesisJSON:        genesisJSON,
+		Heads: store.ApplyHeads{
+			ChainHash:               store.Digest(eventSeed),
+			ResultHash:              store.Digest(resultSeed),
+			ProjectionAccumulator:   store.Digest(accumulator),
+			DigestVersion:           wire.DigestVersion,
+			ProjectionSchemaVersion: wire.ProjectionSchemaVersion,
+		},
+		ProjectionStateDigest: projectionDigest,
+		ProjectionRows:        rows,
+	}
+	if err := validateConsensusStatusBootstrap(view); err != nil {
+		return store.StateView{}, ErrInvalidConsensusStatus
+	}
+	return view, nil
+}
+
+func validateConsensusStatusBootstrap(view store.StateView) error {
+	if view.RecoveryGeneration != 0 ||
+		view.AdmissionRevision != 0 ||
+		view.CurrentTerm != nil ||
+		view.LastRaftAppliedLogIndex != nil ||
+		view.Heads.ChainIndex != 0 ||
+		view.Heads.ResultIndex != 0 ||
+		len(view.ProjectionRows) > consensusStatusBootstrapRowsMax {
+		return ErrInvalidConsensusStatus
+	}
+	if _, _, err := decodeReducerStateView(view); err != nil {
+		return ErrInvalidConsensusStatus
+	}
+	genesisDigest, err := chain.GenesisDigest(view.GenesisJSON)
+	if err != nil {
+		return ErrInvalidConsensusStatus
+	}
+	eventSeed, eventErr := chain.EventSeed(
+		chain.Boundary{Genesis: genesisDigest},
+	)
+	resultSeed, resultErr := chain.ResultSeed(
+		chain.Boundary{Genesis: genesisDigest},
+	)
+	accumulator := chain.AccumulatorSeedInitial(
+		genesisDigest,
+		chain.Digest(view.ProjectionStateDigest),
+	)
+	if eventErr != nil ||
+		resultErr != nil ||
+		view.Heads.ChainHash != store.Digest(eventSeed) ||
+		view.Heads.ResultHash != store.Digest(resultSeed) ||
+		view.Heads.ProjectionAccumulator != store.Digest(accumulator) {
+		return ErrInvalidConsensusStatus
 	}
 	return nil
 }
@@ -565,6 +1076,28 @@ func decodeOptionalDeviceID(value *string) *domain.DeviceID {
 	return &decoded
 }
 
+func encodeOptionalBytes(value []byte) *string {
+	if len(value) == 0 {
+		return nil
+	}
+	encoded := codec.EncodeBase64URL(value)
+	return &encoded
+}
+
+func decodeOptionalBytes(value *string, maximum int) ([]byte, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if *value == "" {
+		return nil, ErrInvalidConsensusStatus
+	}
+	decoded, err := codec.DecodeBase64URL(*value)
+	if err != nil || len(decoded) == 0 || len(decoded) > maximum {
+		return nil, ErrInvalidConsensusStatus
+	}
+	return decoded, nil
+}
+
 func cloneOptionalUint64(value *uint64) *uint64 {
 	if value == nil {
 		return nil
@@ -581,11 +1114,60 @@ func cloneConsensusStatusResult(
 		leader := *status.LeaderDeviceID
 		result.LeaderDeviceID = &leader
 	}
+	result.LeaderEndpointSet = bytes.Clone(status.LeaderEndpointSet)
 	result.LastRaftAppliedLogIndex = cloneOptionalUint64(
 		status.LastRaftAppliedLogIndex,
 	)
+	result.RequesterMembership = cloneConsensusStatusMember(
+		status.RequesterMembership,
+	)
+	result.ActiveRoster = make(
+		[]ConsensusStatusMember,
+		len(status.ActiveRoster),
+	)
+	for index, member := range status.ActiveRoster {
+		result.ActiveRoster[index] = cloneConsensusStatusMember(member)
+	}
+	if status.RequesterCredentialAuthorization != nil {
+		value := status.RequesterCredentialAuthorization.Clone()
+		result.RequesterCredentialAuthorization = &value
+	}
 	result.CredentialAuthority = status.CredentialAuthority.Clone()
 	result.ContentCredentialAuthorization =
 		status.ContentCredentialAuthorization.Clone()
+	result.GenerationZeroState = cloneConsensusStatusBootstrap(
+		status.GenerationZeroState,
+	)
+	return result
+}
+
+func cloneConsensusStatusMember(
+	member ConsensusStatusMember,
+) ConsensusStatusMember {
+	result := member
+	result.Device.IdentityPublicKey = bytes.Clone(
+		member.Device.IdentityPublicKey,
+	)
+	return result
+}
+
+func cloneConsensusStatusBootstrap(view store.StateView) store.StateView {
+	result := view
+	result.GenesisJSON = bytes.Clone(view.GenesisJSON)
+	result.CurrentTerm = cloneOptionalUint64(view.CurrentTerm)
+	result.LastRaftAppliedLogIndex = cloneOptionalUint64(
+		view.LastRaftAppliedLogIndex,
+	)
+	result.ProjectionRows = make(
+		[]chain.LogicalRow,
+		len(view.ProjectionRows),
+	)
+	for index, row := range view.ProjectionRows {
+		result.ProjectionRows[index] = chain.LogicalRow{
+			Table:      row.Table,
+			PrimaryKey: bytes.Clone(row.PrimaryKey),
+			Row:        bytes.Clone(row.Row),
+		}
+	}
 	return result
 }

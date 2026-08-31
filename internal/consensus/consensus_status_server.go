@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -174,6 +175,11 @@ func (node *SingleNode) consensusStatusResult(
 		return ConsensusStatusResult{}, time.Time{},
 			ErrConsensusAuthorizationUnavailable
 	}
+	generationZero, err := node.state.VerifiedGenerationZeroView(ctx)
+	if err != nil {
+		return ConsensusStatusResult{}, time.Time{},
+			ErrConsensusAuthorizationUnavailable
+	}
 
 	for range consensusAuthorizationReadAttempts {
 		before := node.consensusStatusAdmissionPublication()
@@ -183,6 +189,11 @@ func (node *SingleNode) consensusStatusResult(
 		view, err := node.state.View(ctx)
 		if err != nil {
 			return ConsensusStatusResult{}, time.Time{}, err
+		}
+		reducerSnapshot, _, err := decodeReducerStateView(view)
+		if err != nil {
+			return ConsensusStatusResult{}, time.Time{},
+				ErrConsensusAuthorizationUnavailable
 		}
 		configuration := node.effectiveConsensusStatusConfiguration()
 		termBefore, err := raftTerm(node.raft.Stats())
@@ -246,6 +257,43 @@ func (node *SingleNode) consensusStatusResult(
 			return ConsensusStatusResult{}, time.Time{},
 				ErrConsensusAuthorizationUnavailable
 		}
+		appliedChainIndex, chainIndexValid :=
+			before.snapshot.AppliedChainIndex()
+		requesterEpoch, requesterEpochExists :=
+			before.snapshot.CurrentCredentialEpoch(peer.DeviceID)
+		roster, rosterValid := before.snapshot.ActiveRoster()
+		if !chainIndexValid ||
+			!requesterEpochExists ||
+			!rosterValid ||
+			len(roster) > int(policy.MaxMemberDevices) {
+			return ConsensusStatusResult{}, time.Time{},
+				ErrConsensusAuthorizationUnavailable
+		}
+		var requesterAuthorization *credentialauthorization.Authorization
+		if requesterEpoch != 0 {
+			value, authorizationExists := before.snapshot.Authorization(
+				credentialauthorization.Key{
+					SessionID: sessionID,
+					DeviceID:  peer.DeviceID,
+					Epoch:     requesterEpoch,
+				},
+			)
+			if !authorizationExists {
+				return ConsensusStatusResult{}, time.Time{},
+					ErrConsensusAuthorizationUnavailable
+			}
+			requesterAuthorization = &value
+		}
+		activeRoster := make(
+			[]ConsensusStatusMember,
+			len(roster),
+		)
+		for index, member := range roster {
+			activeRoster[index] = ConsensusStatusMember{
+				Device:                 member.Device,
+				CurrentCredentialEpoch: member.CurrentCredentialEpoch,
+			}
+		}
 		quorum, leader, err := consensusStatusConfiguration(
 			configuration,
 			localDeviceID,
@@ -259,17 +307,37 @@ func (node *SingleNode) consensusStatusResult(
 		if view.CurrentTerm != nil && *view.CurrentTerm > termAfter {
 			continue
 		}
+		leaderEndpointSet, err := node.consensusStatusLeaderEndpointSet(
+			ctx,
+			localDeviceID,
+			leader,
+			now,
+		)
+		if err != nil {
+			return ConsensusStatusResult{}, time.Time{},
+				ErrConsensusAuthorizationUnavailable
+		}
 		result := ConsensusStatusResult{
-			SessionID:                      sessionID,
-			WorkspaceID:                    view.WorkspaceID,
-			RecoveryGeneration:             recoveryGeneration,
-			ServerDeviceID:                 localDeviceID,
-			LocalTerm:                      termAfter,
-			LeaderDeviceID:                 leader,
-			QuorumRequired:                 quorum,
-			LastRaftAppliedLogIndex:        cloneOptionalUint64(view.LastRaftAppliedLogIndex),
-			CredentialAuthority:            authority,
-			ContentCredentialAuthorization: authorization,
+			SessionID:                    sessionID,
+			WorkspaceID:                  view.WorkspaceID,
+			RecoveryGeneration:           recoveryGeneration,
+			ServerDeviceID:               localDeviceID,
+			LocalTerm:                    termAfter,
+			LeaderDeviceID:               leader,
+			LeaderEndpointSet:            leaderEndpointSet,
+			AdvertisementIntervalSeconds: reducerSnapshot.SessionPolicy.Values.AdvertisementIntervalSeconds,
+			QuorumRequired:               quorum,
+			LastRaftAppliedLogIndex:      cloneOptionalUint64(view.LastRaftAppliedLogIndex),
+			MembershipAppliedChainIndex:  appliedChainIndex,
+			RequesterMembership: ConsensusStatusMember{
+				Device:                 requester,
+				CurrentCredentialEpoch: requesterEpoch,
+			},
+			ActiveRoster:                     activeRoster,
+			RequesterCredentialAuthorization: requesterAuthorization,
+			CredentialAuthority:              authority,
+			ContentCredentialAuthorization:   authorization,
+			GenerationZeroState:              generationZero,
 		}
 		if err := validateConsensusStatusResult(
 			result,
@@ -284,6 +352,41 @@ func (node *SingleNode) consensusStatusResult(
 	}
 	return ConsensusStatusResult{}, time.Time{},
 		ErrConsensusAuthorizationUnavailable
+}
+
+func (node *SingleNode) consensusStatusLeaderEndpointSet(
+	ctx context.Context,
+	localDeviceID domain.DeviceID,
+	leaderDeviceID *domain.DeviceID,
+	now time.Time,
+) ([]byte, error) {
+	if node == nil ||
+		node.state == nil ||
+		ctx == nil ||
+		!localDeviceID.Valid() ||
+		now.IsZero() {
+		return nil, ErrConsensusAuthorizationUnavailable
+	}
+	if leaderDeviceID == nil || *leaderDeviceID == localDeviceID {
+		return nil, nil
+	}
+	observedAt, err := domain.ParseTimestamp(
+		now.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return nil, ErrConsensusAuthorizationUnavailable
+	}
+	endpointSets, err := node.state.LocalState().
+		ListMemberSignedEndpointSets(ctx, observedAt)
+	if err != nil {
+		return nil, err
+	}
+	for _, endpointSet := range endpointSets {
+		if endpointSet.DeviceID == *leaderDeviceID {
+			return endpointSet.EndpointSetJSON, nil
+		}
+	}
+	return nil, ErrConsensusAuthorizationUnavailable
 }
 
 func (node *SingleNode) consensusStatusAdmissionPublication() (

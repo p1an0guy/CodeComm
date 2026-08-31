@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
@@ -641,7 +643,8 @@ func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch(
 	requester := &daemonConsensusStatusRequesterStub{
 		response: daemonContentPeerConsensusStatusResponse(
 			t,
-			peer.ID,
+			local,
+			peer,
 			third,
 			0,
 		),
@@ -1007,12 +1010,14 @@ func daemonContentPeerSignedAuthorization(
 }
 
 func daemonContentPeerConsensusStatusResponse(
-	t testing.TB,
-	serverDeviceID domain.DeviceID,
+	t *testing.T,
+	requester device.Device,
+	server device.Device,
 	authorization credentialauthorization.Authorization,
 	recoveryGeneration uint64,
 ) transport.ConsensusControlResponse {
 	t.Helper()
+	generationZero := daemonContentPeerGenerationZeroView(t)
 	endorsements := make(
 		[]map[string]any,
 		len(authorization.ClockEndorsements),
@@ -1025,19 +1030,76 @@ func daemonContentPeerConsensusStatusResponse(
 			),
 		}
 	}
-	encoded, err := json.Marshal(map[string]any{
+	authorizationWire := map[string]any{
 		"schema_version":              uint64(1),
-		"session_id":                  string(daemonTestSessionID),
-		"workspace_id":                string(daemonTestWorkspaceID),
-		"recovery_generation":         recoveryGeneration,
-		"server_device_id":            string(serverDeviceID),
-		"local_term":                  uint64(1),
-		"leader_device_id":            string(serverDeviceID),
-		"quorum_required":             uint64(1),
-		"last_raft_applied_log_index": uint64(1),
+		"session_id":                  string(authorization.SessionID),
+		"device_id":                   string(authorization.DeviceID),
+		"epoch":                       authorization.Epoch,
+		"epoch_public_key":            codec.EncodeBase64URL(authorization.EpochPublicKey[:]),
+		"key_digest":                  codec.EncodeBase64URL(authorization.KeyDigest[:]),
+		"role":                        string(authorization.Role),
+		"issued_at":                   string(authorization.IssuedAt),
+		"not_before":                  string(authorization.NotBefore),
+		"validity_seconds":            authorization.ValiditySeconds,
+		"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
+		"clock_endorsements":          endorsements,
+		"binding_signature": codec.EncodeBase64URL(
+			authorization.BindingSignature[:],
+		),
+		"authorization_chain_index": authorization.AuthorizationChainIndex,
+	}
+	memberWire := func(
+		member device.Device,
+		currentCredentialEpoch uint64,
+	) map[string]any {
+		return map[string]any{
+			"device_id":                string(member.ID),
+			"role":                     string(member.Role),
+			"identity_public_key":      codec.EncodeBase64URL(member.IdentityPublicKey),
+			"daemon_version":           member.DaemonVersion,
+			"max_apply_level":          member.MaxApplyLevel,
+			"status":                   string(member.Status),
+			"entity_version":           member.EntityVersion,
+			"current_credential_epoch": currentCredentialEpoch,
+		}
+	}
+	roster := []map[string]any{
+		memberWire(requester, 0),
+		memberWire(server, authorization.Epoch),
+	}
+	if requester.ID > server.ID {
+		roster[0], roster[1] = roster[1], roster[0]
+	}
+	projectionRows := make(
+		[]map[string]any,
+		len(generationZero.ProjectionRows),
+	)
+	for index, row := range generationZero.ProjectionRows {
+		projectionRows[index] = map[string]any{
+			"table":       row.Table,
+			"primary_key": codec.EncodeBase64URL(row.PrimaryKey),
+			"row":         codec.EncodeBase64URL(row.Row),
+		}
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"schema_version":                     uint64(4),
+		"session_id":                         string(daemonTestSessionID),
+		"workspace_id":                       string(daemonTestWorkspaceID),
+		"recovery_generation":                recoveryGeneration,
+		"server_device_id":                   string(server.ID),
+		"local_term":                         uint64(1),
+		"leader_device_id":                   string(server.ID),
+		"leader_endpoint_set":                nil,
+		"advertisement_interval_seconds":     policy.DefaultAdvertisementIntervalSeconds,
+		"quorum_required":                    uint64(1),
+		"last_raft_applied_log_index":        authorization.AuthorizationChainIndex,
+		"membership_applied_chain_index":     authorization.AuthorizationChainIndex,
+		"requester_membership":               memberWire(requester, 0),
+		"active_roster":                      roster,
+		"requester_credential_authorization": nil,
 		"credential_authority": map[string]any{
 			"session_id":                     string(daemonTestSessionID),
-			"voter_device_ids":               []string{string(serverDeviceID)},
+			"voter_device_ids":               []string{string(server.ID)},
 			"voter_set_version":              uint64(1),
 			"activation_source":              "genesis",
 			"activation_checkpoint_event_id": nil,
@@ -1045,23 +1107,17 @@ func daemonContentPeerConsensusStatusResponse(
 			"prior_authority_signer":         nil,
 			"prior_authority_handoff":        nil,
 		},
-		"content_credential_authorization": map[string]any{
-			"schema_version":              uint64(1),
-			"session_id":                  string(authorization.SessionID),
-			"device_id":                   string(authorization.DeviceID),
-			"epoch":                       authorization.Epoch,
-			"epoch_public_key":            codec.EncodeBase64URL(authorization.EpochPublicKey[:]),
-			"key_digest":                  codec.EncodeBase64URL(authorization.KeyDigest[:]),
-			"role":                        string(authorization.Role),
-			"issued_at":                   string(authorization.IssuedAt),
-			"not_before":                  string(authorization.NotBefore),
-			"validity_seconds":            authorization.ValiditySeconds,
-			"authority_voter_set_version": authorization.AuthorityVoterSetVersion,
-			"clock_endorsements":          endorsements,
-			"binding_signature": codec.EncodeBase64URL(
-				authorization.BindingSignature[:],
+		"content_credential_authorization": authorizationWire,
+		"generation_zero_state": map[string]any{
+			"session_id":                string(generationZero.SessionID),
+			"workspace_id":              string(generationZero.WorkspaceID),
+			"genesis_json":              codec.EncodeBase64URL(generationZero.GenesisJSON),
+			"digest_version":            generationZero.Heads.DigestVersion,
+			"projection_schema_version": generationZero.Heads.ProjectionSchemaVersion,
+			"projection_state_digest": codec.EncodeBase64URL(
+				generationZero.ProjectionStateDigest[:],
 			),
-			"authorization_chain_index": authorization.AuthorizationChainIndex,
+			"projection_rows": projectionRows,
 		},
 	})
 	if err != nil {
@@ -1076,4 +1132,31 @@ func daemonContentPeerConsensusStatusResponse(
 		MediaType:  "application/json",
 		Body:       canonical,
 	}
+}
+
+func daemonContentPeerGenerationZeroView(t *testing.T) store.StateView {
+	t.Helper()
+	initial, _, _ := daemonTestInitialState(t)
+	database, err := store.Open(
+		context.Background(),
+		store.Options{
+			Path: filepath.Join(
+				t.TempDir(),
+				"generation-zero",
+				"state.db",
+			),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Initialize(context.Background(), initial); err != nil {
+		t.Fatal(err)
+	}
+	view, err := database.VerifiedGenerationZeroView(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view
 }

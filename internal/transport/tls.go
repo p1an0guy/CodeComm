@@ -374,6 +374,13 @@ func clearTLSCertificate(certificate *tls.Certificate) {
 	if certificate == nil {
 		return
 	}
+	for index := range certificate.Certificate {
+		clear(certificate.Certificate[index])
+	}
+	clear(certificate.OCSPStaple)
+	for index := range certificate.SignedCertificateTimestamps {
+		clear(certificate.SignedCertificateTimestamps[index])
+	}
 	if privateKey, ok := certificate.PrivateKey.(ed25519.PrivateKey); ok {
 		clear(privateKey)
 	}

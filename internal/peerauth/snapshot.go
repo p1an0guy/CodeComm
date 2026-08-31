@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -52,6 +53,13 @@ type Snapshot struct {
 	credentialAuthority credentialauthority.Authority
 	authorizations      map[credentialauthorization.Key]credentialauthorization.Authorization
 	valid               bool
+}
+
+// RosterMember is one active member and its latest committed credential
+// epoch from the same immutable admission cut.
+type RosterMember struct {
+	Device                 device.Device
+	CurrentCredentialEpoch uint64
 }
 
 // NewSnapshot validates and copies one complete applied-state cut.
@@ -222,6 +230,39 @@ func (snapshot *Snapshot) Member(
 	}
 	member.IdentityPublicKey = bytes.Clone(member.IdentityPublicKey)
 	return member, true
+}
+
+// ActiveRoster returns the complete active roster in device-ID order.
+func (snapshot *Snapshot) ActiveRoster() ([]RosterMember, bool) {
+	if snapshot == nil || !snapshot.valid {
+		return nil, false
+	}
+	roster := make([]RosterMember, 0, len(snapshot.devices))
+	for id, member := range snapshot.devices {
+		if member.Status != device.StatusActive {
+			continue
+		}
+		epoch, exists := snapshot.credentialEpochs[id]
+		if !exists {
+			return nil, false
+		}
+		member.IdentityPublicKey = bytes.Clone(member.IdentityPublicKey)
+		roster = append(roster, RosterMember{
+			Device:                 member,
+			CurrentCredentialEpoch: epoch,
+		})
+	}
+	slices.SortFunc(roster, func(left, right RosterMember) int {
+		switch {
+		case left.Device.ID < right.Device.ID:
+			return -1
+		case left.Device.ID > right.Device.ID:
+			return 1
+		default:
+			return 0
+		}
+	})
+	return roster, len(roster) != 0
 }
 
 // CurrentCredentialEpoch returns the latest committed epoch for one member.
