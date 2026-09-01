@@ -39,6 +39,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/ui"
+	"github.com/ijonahch/codecomm/internal/workspacelock"
 )
 
 const (
@@ -214,6 +215,13 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 		)
 	}()
 	waitForDaemonTestStatusOrExit(t, endpoint, runDone)
+	_, err = workspacelock.Acquire(statePath)
+	var held *workspacelock.HeldError
+	if !errors.Is(err, workspacelock.ErrHeld) ||
+		!errors.As(err, &held) ||
+		held.PID != os.Getpid() {
+		t.Fatalf("workspace lock while daemon runs = %#v", err)
+	}
 	cancel()
 	select {
 	case err := <-runDone:
@@ -222,6 +230,13 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("runDaemon() did not complete graceful shutdown")
+	}
+	released, err := workspacelock.Acquire(statePath)
+	if err != nil {
+		t.Fatalf("workspace lock after daemon shutdown: %v", err)
+	}
+	if err := released.Close(); err != nil {
+		t.Fatalf("close reacquired workspace lock: %v", err)
 	}
 
 	reopened, err := consensus.OpenSingleNode(

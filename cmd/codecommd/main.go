@@ -32,6 +32,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/ui"
+	"github.com/ijonahch/codecomm/internal/workspacelock"
 )
 
 const fatalPollInterval = 100 * time.Millisecond
@@ -264,6 +265,16 @@ func runDaemon(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	workspaceLock, err := workspacelock.Acquire(options.statePath)
+	if err != nil {
+		return fmt.Errorf(
+			"codecommd: acquire workspace ownership: %w",
+			err,
+		)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, workspaceLock.Close())
+	}()
 	credentialNow := dependencies.credentialNow
 	if credentialNow == nil {
 		credentialNow = time.Now

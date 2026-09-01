@@ -2,59 +2,27 @@ package joinbootstrap
 
 import (
 	"errors"
-	"fmt"
-	"os"
+
+	"github.com/ijonahch/codecomm/internal/workspacelock"
 )
 
-const joinLockSuffix = ".join.lock"
-
 type joinLock struct {
-	file *os.File
+	workspace *workspacelock.Lock
 }
 
 func acquireJoinLock(statePath string) (*joinLock, error) {
-	path, err := journalPath(statePath)
+	lock, err := workspacelock.Acquire(statePath)
 	if err != nil {
-		return nil, err
-	}
-	path = path[:len(path)-len(journalSuffix)] + joinLockSuffix
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("%w: open join lock: %v", ErrStateConflict, err)
-	}
-	locked := false
-	defer func() {
-		if !locked {
-			_ = file.Close()
-		}
-	}()
-	info, err := file.Stat()
-	if err != nil ||
-		!info.Mode().IsRegular() {
-		return nil, ErrStateConflict
-	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil ||
-		pathInfo.Mode()&os.ModeSymlink != 0 ||
-		!os.SameFile(info, pathInfo) {
-		return nil, ErrStateConflict
-	}
-	if err := validateJournalFile(path, info); err != nil {
 		return nil, errors.Join(ErrStateConflict, err)
 	}
-	if err := lockJoinFile(file); err != nil {
-		return nil, err
-	}
-	locked = true
-	return &joinLock{file: file}, nil
+	return &joinLock{workspace: lock}, nil
 }
 
 func (lock *joinLock) Close() error {
-	if lock == nil || lock.file == nil {
+	if lock == nil || lock.workspace == nil {
 		return nil
 	}
-	unlockErr := unlockJoinFile(lock.file)
-	closeErr := lock.file.Close()
-	lock.file = nil
-	return errors.Join(unlockErr, closeErr)
+	err := lock.workspace.Close()
+	lock.workspace = nil
+	return err
 }
