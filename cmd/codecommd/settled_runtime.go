@@ -276,6 +276,9 @@ func runSettledDaemon(
 		if err != nil {
 			return err
 		}
+		if dependencies.observeContentPeers != nil {
+			dependencies.observeContentPeers(contentPeerRuntime)
+		}
 		if err := commandConsensus.setPeer(contentPeerRuntime); err != nil {
 			return err
 		}
@@ -306,8 +309,9 @@ func runSettledDaemon(
 	}
 	meshFactory.ClearIdentityCertificate()
 
-	operatorService, err := ui.NewReadOnlyOperatorService(
+	operatorService, err := ui.NewMutationOperatorService(
 		replica,
+		bootOrigin,
 		options.sessionID,
 		options.workspaceID,
 	)

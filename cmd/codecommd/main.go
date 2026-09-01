@@ -82,11 +82,12 @@ type daemonDependencies struct {
 		context.Context,
 		netip.AddrPort,
 	) (net.Listener, error)
-	openMulticast     daemonMulticastOpener
-	listInterfaces    daemonInterfaceLister
-	interfaceAddrs    daemonInterfaceAddressProvider
-	credentialNow     func() time.Time
-	canonicalCoverage canonicalcoverage.ReceiptCollector
+	openMulticast       daemonMulticastOpener
+	listInterfaces      daemonInterfaceLister
+	interfaceAddrs      daemonInterfaceAddressProvider
+	credentialNow       func() time.Time
+	canonicalCoverage   canonicalcoverage.ReceiptCollector
+	observeContentPeers func(*daemonContentPeerRuntime)
 }
 
 func main() {
@@ -681,6 +682,9 @@ func runDaemon(
 		)
 		if err != nil {
 			return err
+		}
+		if dependencies.observeContentPeers != nil {
+			dependencies.observeContentPeers(contentPeerRuntime)
 		}
 		if err := proposalForwarder.set(contentPeerRuntime); err != nil {
 			return err

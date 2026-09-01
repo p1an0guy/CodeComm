@@ -187,6 +187,7 @@ type daemonMeshIntegrationNode struct {
 	meshCapture   *daemonMeshIntegrationFactoryCapture
 	credentialNow func() time.Time
 	coverage      canonicalcoverage.ReceiptCollector
+	contentPeers  atomic.Pointer[daemonContentPeerRuntime]
 
 	listener net.Listener
 	cancel   context.CancelFunc
@@ -1478,6 +1479,7 @@ func (node *daemonMeshIntegrationNode) start(
 	node.exitErr = nil
 	node.running = true
 	node.meshCapture.reset()
+	node.contentPeers.Store(nil)
 	go func() {
 		productionDependencies := productionDaemonDependencies()
 		node.exitErr = runDaemon(
@@ -1513,6 +1515,9 @@ func (node *daemonMeshIntegrationNode) start(
 				interfaceAddrs:    productionDependencies.interfaceAddrs,
 				credentialNow:     node.credentialNow,
 				canonicalCoverage: node.coverage,
+				observeContentPeers: func(runtime *daemonContentPeerRuntime) {
+					node.contentPeers.Store(runtime)
+				},
 			},
 		)
 		close(node.exited)
@@ -1812,23 +1817,25 @@ func waitForDaemonMeshIntegrationCluster(
 	for _, node := range nodes {
 		stage, ready := node.meshCapture.lifecycleState()
 		state := fmt.Sprintf(
-			"%s(running=%t, stage=%q, ready=%t, fatal=%v)",
+			"%s(running=%t, stage=%q, ready=%t, fatal=%v, content=%s)",
 			node.deviceID,
 			node.running,
 			stage,
 			ready,
 			node.meshCapture.fatalError(),
+			daemonMeshIntegrationContentDiagnostics(node),
 		)
 		select {
 		case <-node.exited:
 			state = fmt.Sprintf(
-				"%s(running=%t, exited=%v, stage=%q, ready=%t, fatal=%v)",
+				"%s(running=%t, exited=%v, stage=%q, ready=%t, fatal=%v, content=%s)",
 				node.deviceID,
 				node.running,
 				node.exitErr,
 				stage,
 				ready,
 				node.meshCapture.fatalError(),
+				daemonMeshIntegrationContentDiagnostics(node),
 			)
 		default:
 		}
@@ -1843,6 +1850,23 @@ func waitForDaemonMeshIntegrationCluster(
 		strings.Join(states, ", "),
 	)
 	return nil
+}
+
+func daemonMeshIntegrationContentDiagnostics(
+	node *daemonMeshIntegrationNode,
+) string {
+	if node == nil {
+		return "<nil>"
+	}
+	runtime := node.contentPeers.Load()
+	if runtime == nil {
+		return "<unavailable>"
+	}
+	return fmt.Sprintf(
+		"fatal=%v, transient=%+v",
+		runtime.FatalError(),
+		runtime.transientPeerErrors(),
+	)
 }
 
 func daemonMeshIntegrationStatusSummary(statuses []ui.Snapshot) string {

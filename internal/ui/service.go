@@ -95,6 +95,28 @@ func NewReadOnlyOperatorService(
 	}, nil
 }
 
+// NewMutationOperatorService serves status and human commands without
+// exposing pairing operations.
+func NewMutationOperatorService(
+	source StatusSource,
+	submitter operatorcommand.Submitter,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+) (*OperatorService, error) {
+	if source == nil ||
+		submitter == nil ||
+		!sessionID.Valid() ||
+		!workspaceID.Valid() {
+		return nil, ErrInvalidOperatorOptions
+	}
+	return &OperatorService{
+		source:      source,
+		submitter:   submitter,
+		sessionID:   sessionID,
+		workspaceID: workspaceID,
+	}, nil
+}
+
 // Bind implements ipc.Binder without constructing event authority.
 func (service *OperatorService) Bind(
 	ctx context.Context,

@@ -168,6 +168,44 @@ func TestReadOnlyOperatorServiceServesStatusAndRefusesMutations(
 	}
 }
 
+func TestMutationOperatorServiceKeepsPairingUnavailable(t *testing.T) {
+	snapshot := uiTestStatusSnapshot(t)
+	source := statusSourceFunc(
+		func(context.Context) (coordstatus.Snapshot, error) {
+			return snapshot, nil
+		},
+	)
+	submitter := successfulOperatorSubmitter()
+	service, err := NewMutationOperatorService(
+		source,
+		submitter,
+		uiTestSessionID,
+		uiTestWorkspaceID,
+	)
+	if err != nil {
+		t.Fatalf("NewMutationOperatorService(): %v", err)
+	}
+	if service.submitter == nil || service.pairing != nil {
+		t.Fatalf("mutation-only service = %+v", service)
+	}
+	for _, invalid := range []struct {
+		source    StatusSource
+		submitter operatorcommand.Submitter
+	}{
+		{submitter: submitter},
+		{source: source},
+	} {
+		if _, err := NewMutationOperatorService(
+			invalid.source,
+			invalid.submitter,
+			uiTestSessionID,
+			uiTestWorkspaceID,
+		); !errors.Is(err, ErrInvalidOperatorOptions) {
+			t.Fatalf("invalid mutation service error = %v", err)
+		}
+	}
+}
+
 func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 	source := uiTestStatusSnapshot(t)
 	handler := newOperatorHandler(statusSourceFunc(

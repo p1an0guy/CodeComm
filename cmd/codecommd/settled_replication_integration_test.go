@@ -40,6 +40,12 @@ const (
 	daemonSettledReplicationChildMarker = "CODECOMM_TEST_SETTLED_REPLICATION_CHILD"
 	daemonSettledSnapshotChildMarker    = "CODECOMM_TEST_SETTLED_SNAPSHOT_CHILD"
 	daemonSettledSnapshotProcessTimeout = 10 * time.Minute
+	daemonTwoDeviceRecoveryEventID      = domain.UUIDv7(
+		"018f47de-89ab-7def-8123-e123456789ab",
+	)
+	daemonTwoDeviceRecoveryTaskID = domain.UUIDv7(
+		"018f47de-89ab-7def-8123-f123456789ab",
+	)
 )
 
 func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart(
@@ -102,7 +108,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 
 	settledMember := device.Device{
 		ID:   settled.deviceID,
-		Role: device.RoleEditor,
+		Role: device.RoleOwner,
 		IdentityPublicKey: bytes.Clone(
 			settled.privateKey.Public().(ed25519.PublicKey),
 		),
@@ -167,6 +173,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		leader,
 		settled,
 		credentialClock.Now(),
+		credentialauthorization.RoleOwner,
 	)
 	bootstrapResultIndex := bootstrapDaemonSettledReplica(
 		t,
@@ -340,7 +347,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		settled.peerEndpoint,
 	)
 	settled.start(t, allNodes)
-	waitForDaemonMeshIntegrationCluster(
+	twoDeviceStatuses := waitForDaemonMeshIntegrationCluster(
 		t,
 		[]*daemonMeshIntegrationNode{settled, target},
 		func(statuses []ui.Snapshot) bool {
@@ -358,6 +365,16 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				)
 		},
 	)
+	exerciseDaemonTwoDeviceDegradedRun(
+		t,
+		allNodes,
+		target,
+		settled,
+		credentialClock,
+		twoDeviceStatuses,
+		targetIDs,
+		authorityOneTaskID,
+	)
 
 	stopDaemonMeshIntegrationNodes(t, target, settled)
 	assertDaemonSettledReplicationDurableState(
@@ -367,6 +384,271 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		leader.deviceID,
 		target.deviceID,
 	)
+}
+
+func exerciseDaemonTwoDeviceDegradedRun(
+	t *testing.T,
+	allNodes []*daemonMeshIntegrationNode,
+	voter, settled *daemonMeshIntegrationNode,
+	clock *daemonMeshIntegrationCredentialClock,
+	baseline []ui.Snapshot,
+	voterIDs []domain.DeviceID,
+	authorityOneTaskID domain.UUIDv7,
+) {
+	t.Helper()
+	if len(allNodes) < 2 ||
+		voter == nil ||
+		settled == nil ||
+		clock == nil ||
+		len(baseline) != 2 ||
+		len(voterIDs) != 1 ||
+		voterIDs[0] != voter.deviceID {
+		t.Fatal("invalid two-device degraded-run fixture")
+	}
+	var revoked *daemonMeshIntegrationNode
+	for _, candidate := range allNodes {
+		if candidate != voter && candidate != settled {
+			revoked = candidate
+			break
+		}
+	}
+	if revoked == nil {
+		t.Fatal("two-device degraded run has no removed nonvoter")
+	}
+	before, err := readDaemonMeshIntegrationStatus(settled.localEndpoint)
+	if err != nil {
+		t.Fatalf("read settled baseline: %v", err)
+	}
+	provider, _, ready := voter.meshCapture.snapshot()
+	if !ready || provider == nil {
+		t.Fatal("sole voter content credential provider is unavailable")
+	}
+	certificate, err := provider()
+	if err != nil || len(certificate.Certificate) != 1 {
+		clearDaemonTLSCertificate(&certificate)
+		t.Fatalf("read sole voter content credential: %v", err)
+	}
+	parsed, err := transport.ParseContentCertificate(
+		certificate.Certificate[0],
+	)
+	clearDaemonTLSCertificate(&certificate)
+	if err != nil || parsed.Binding.DeviceID != voter.deviceID {
+		t.Fatalf("parse sole voter content credential: %v", err)
+	}
+
+	stopDaemonMeshIntegrationNodes(t, voter, settled)
+	clock.Set(parsed.NotAfter.Add(time.Second))
+	settled.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		settled.peerEndpoint,
+	)
+	settled.start(t, allNodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{settled},
+		func(statuses []ui.Snapshot) bool {
+			if len(statuses) != 1 {
+				return false
+			}
+			status := statuses[0]
+			return status.Consensus.State == "settled" &&
+				status.Consensus.Role == "nonvoter" &&
+				status.Consensus.StrongWrites == "waiting" &&
+				status.Consensus.LeaderDeviceID == nil &&
+				status.Session.AppliedRaftIndex == nil &&
+				status.Session.EventChainIndex ==
+					before.Session.EventChainIndex &&
+				status.Session.ResultIndex ==
+					before.Session.ResultIndex &&
+				daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+	waitForDaemonMeshContentCredentialUnavailable(t, settled)
+
+	operator := dialDaemonMeshIntegrationOperator(t, settled.localEndpoint)
+	proposalContext, cancelProposal := context.WithTimeout(
+		context.Background(),
+		2*time.Second,
+	)
+	_, proposalErr := operator.RevokePeer(
+		proposalContext,
+		ui.RevokePeerRequest{
+			DeviceID:                revoked.deviceID,
+			ExpectedEntityVersion:   1,
+			ExpectedVoterSetVersion: 2,
+			VoterDeviceIDs:          voterIDs,
+			Reason:                  "removed device retired during degraded run",
+		},
+	)
+	cancelProposal()
+	if closeErr := operator.Close(); closeErr != nil {
+		t.Fatalf("close isolated settled operator: %v", closeErr)
+	}
+	if proposalErr == nil {
+		t.Fatal("settled nonvoter committed while its sole voter was offline")
+	}
+	queued := waitForDaemonSettledOutboxCount(t, settled, 1)
+	if queued[0].Kind != event.KindMembershipDeviceRevoked ||
+		queued[0].OriginDeviceID != settled.deviceID {
+		t.Fatalf("isolated settled outbox = %+v", queued[0])
+	}
+	isolated, err := readDaemonMeshIntegrationStatus(settled.localEndpoint)
+	if err != nil {
+		t.Fatalf("read isolated settled status: %v", err)
+	}
+	if isolated.Session.EventChainIndex != before.Session.EventChainIndex ||
+		isolated.Session.ResultIndex != before.Session.ResultIndex ||
+		isolated.Consensus.StrongWrites != "waiting" ||
+		isolated.Consensus.LeaderDeviceID != nil {
+		t.Fatalf("isolated settled status changed authority: %+v", isolated)
+	}
+
+	voter.listener = listenDaemonMeshIntegrationEndpoint(t, voter.peerEndpoint)
+	voter.start(t, allNodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{voter, settled},
+		func(statuses []ui.Snapshot) bool {
+			return len(statuses) == 2 &&
+				statuses[0].Consensus.State == "ready" &&
+				statuses[0].Consensus.Role == "leader" &&
+				statuses[0].Consensus.StrongWrites == "available" &&
+				statuses[1].Consensus.State == "settled" &&
+				statuses[1].Consensus.Role == "nonvoter" &&
+				statuses[1].Consensus.StrongWrites == "waiting" &&
+				daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+				daemonMeshIntegrationMemberStatus(
+					statuses,
+					revoked.deviceID,
+					device.StatusRevoked,
+					2,
+				) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+	waitForDaemonMeshContentCredentialEpoch(
+		t,
+		[]*daemonMeshIntegrationNode{voter, settled},
+		parsed.Binding.Epoch+1,
+	)
+	waitForDaemonSettledOutboxCount(t, settled, 0)
+	_, settledState, ready := settled.meshCapture.snapshot()
+	if !ready {
+		t.Fatal("recovered settled local state is unavailable")
+	}
+	resolved, found, err := settledState.LookupRequest(
+		context.Background(),
+		queued[0].ClientInstanceID,
+		queued[0].RequestID,
+	)
+	if err != nil ||
+		!found ||
+		resolved.State != store.LocalRequestResolved ||
+		resolved.Outcome == nil ||
+		resolved.Outcome.Status != store.OutcomeAccepted ||
+		resolved.Outcome.Code != "accepted" {
+		t.Fatalf("recovered queued command = (%+v, %t, %v)", resolved, found, err)
+	}
+	connection := openReadyDaemonMeshPeersClient(t, settled, voter, clock.Now)
+	if err := connection.Close(); err != nil {
+		t.Fatalf("close recovered two-device content client: %v", err)
+	}
+
+	recoveryEvent := daemonSettledTaskEventAtSequence(
+		t,
+		voter.privateKey,
+		voter.deviceID,
+		daemonTwoDeviceRecoveryEventID,
+		daemonTwoDeviceRecoveryTaskID,
+		"commit after sole voter returns",
+		2,
+	)
+	applyContext, cancelApply := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	result, err := applyDaemonSettledEventWithLeaderRetry(
+		applyContext,
+		[]*daemonMeshIntegrationNode{voter},
+		recoveryEvent,
+	)
+	cancelApply()
+	if err != nil ||
+		result.Outcome.Status != store.OutcomeAccepted ||
+		result.Outcome.Code != "accepted" {
+		t.Fatalf("post-recovery task apply = (%+v, %v)", result, err)
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{voter, settled},
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+					daemonTwoDeviceRecoveryTaskID,
+				)
+		},
+	)
+}
+
+func waitForDaemonMeshContentCredentialUnavailable(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+) {
+	t.Helper()
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	for time.Now().Before(deadline) {
+		if _, err := daemonMeshContentCredentialEpoch(node); err != nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("content credential remained available on %s", node.deviceID)
+}
+
+func waitForDaemonSettledOutboxCount(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+	want int,
+) []store.OutboxRecord {
+	t.Helper()
+	if node == nil || want < 0 {
+		t.Fatal("invalid settled outbox wait")
+	}
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	var (
+		last    []store.OutboxRecord
+		lastErr error
+	)
+	for time.Now().Before(deadline) {
+		_, local, ready := node.meshCapture.snapshot()
+		if ready {
+			last, lastErr = local.OutboxRecords(context.Background())
+			if lastErr == nil && len(last) == want {
+				return last
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf(
+		"settled outbox count on %s = %d, want %d: %v",
+		node.deviceID,
+		len(last),
+		want,
+		lastErr,
+	)
+	return nil
 }
 
 func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
@@ -541,6 +823,7 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		leader,
 		settled,
 		credentialClock.Now(),
+		credentialauthorization.RoleEditor,
 	)
 	defer clearDaemonTLSCertificate(&settledCertificate)
 	bootstrapResultIndex := bootstrapDaemonSettledReplica(
@@ -1232,6 +1515,7 @@ func authorizeDaemonSettledCredential(
 	voters []*daemonMeshIntegrationNode,
 	leader, settled *daemonMeshIntegrationNode,
 	now time.Time,
+	expectedRole credentialauthorization.Role,
 ) tls.Certificate {
 	t.Helper()
 	if len(voters) == 0 || leader == nil || settled == nil || now.IsZero() {
@@ -1283,7 +1567,7 @@ func authorizeDaemonSettledCredential(
 	}
 	if authorization.DeviceID != settled.deviceID ||
 		authorization.Epoch != 1 ||
-		authorization.Role != credentialauthorization.RoleEditor ||
+		authorization.Role != expectedRole ||
 		authorization.AuthorityVoterSetVersion != 1 {
 		t.Fatalf("settled credential authorization = %+v", authorization)
 	}
