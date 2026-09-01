@@ -444,6 +444,119 @@ func (state LocalState) UpsertManualEndpoint(
 	return state.upsertPeerEndpointCandidate(ctx, record, false)
 }
 
+// ListManualEndpoints returns every operator-configured endpoint ordered by
+// device ID and canonical endpoint address.
+func (state LocalState) ListManualEndpoints(
+	ctx context.Context,
+) ([]PeerEndpointRecord, error) {
+	var result []PeerEndpointRecord
+	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		rows, err := readAllPeerEndpointRows(conn)
+		if err != nil {
+			return err
+		}
+		if err := validatePeerEndpointRowCaps(rows); err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if row.record.SourceKind != PeerEndpointManual {
+				continue
+			}
+			result = append(
+				result,
+				clonePeerEndpointRecord(row.record),
+			)
+		}
+		sort.Slice(result, func(left, right int) bool {
+			if result[left].DeviceID != result[right].DeviceID {
+				return result[left].DeviceID < result[right].DeviceID
+			}
+			return comparePeerEndpoints(
+				result[left].Endpoint,
+				result[right].Endpoint,
+			) < 0
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RemoveManualEndpoint removes exactly one operator-configured endpoint.
+// The boolean reports whether a matching row existed; a miss is idempotent.
+func (state LocalState) RemoveManualEndpoint(
+	ctx context.Context,
+	deviceID domain.DeviceID,
+	endpoint netip.AddrPort,
+) (bool, error) {
+	if !deviceID.Valid() ||
+		validatePeerEndpointAddress(endpoint, true) != nil {
+		return false, ErrInvalidPeerEndpoint
+	}
+
+	removed := false
+	err := state.withImmediate(ctx, func(conn *sqlite.Conn) error {
+		rows, err := readAllPeerEndpointRows(conn)
+		if err != nil {
+			return err
+		}
+		if err := validatePeerEndpointRowCaps(rows); err != nil {
+			return err
+		}
+		found := false
+		for _, row := range rows {
+			if row.record.DeviceID == deviceID &&
+				row.record.SourceKind == PeerEndpointManual &&
+				row.record.Endpoint == endpoint {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		if err := execute(
+			conn,
+			`DELETE FROM peer_endpoints
+			  WHERE device_id = ?1
+			    AND source_kind = 'manual'
+			    AND transport = 'tcp'
+			    AND host = ?2
+			    AND port = ?3;`,
+			string(deviceID),
+			endpoint.Addr().String(),
+			uint64(endpoint.Port()),
+		); err != nil {
+			return err
+		}
+		var changed int64
+		if err := queryOne(
+			conn,
+			"SELECT changes();",
+			func(stmt *sqlite.Stmt) {
+				if stmt.ColumnType(0) != sqlite.TypeInteger {
+					changed = -1
+					return
+				}
+				changed = stmt.ColumnInt64(0)
+			},
+		); err != nil {
+			return err
+		}
+		if changed != 1 {
+			return ErrPeerEndpointIntegrity
+		}
+		removed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return removed, nil
+}
+
 func (state LocalState) upsertPeerEndpointCandidate(
 	ctx context.Context,
 	record PeerEndpointRecord,
@@ -1453,6 +1566,10 @@ func validatePeerEndpointCaps(conn *sqlite.Conn) error {
 	if err != nil {
 		return err
 	}
+	return validatePeerEndpointRowCaps(rows)
+}
+
+func validatePeerEndpointRowCaps(rows []storedPeerEndpoint) error {
 	nonmanualByMember := make(map[domain.DeviceID]int)
 	manualByMember := make(map[domain.DeviceID]int)
 	nonmanualSession := 0
