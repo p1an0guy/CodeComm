@@ -216,6 +216,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   Add requires an active expected peer, all mutations preserve source isolation and fail closed on
   malformed/cap-exceeding state, and each successful change immediately reconciles the live route
   table and triggers reconnect recovery. Peer identity remains pinned before application traffic.
+- Operator status reports multicast as disabled, locally available, or degraded, with selected
+  addresses and the manual-endpoint count. Degraded errors are bounded and control-free; the TUI
+  names `peer endpoint add` as the recovery action without weakening peer authentication.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -227,7 +230,7 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   production `codecomm cluster recover-quorum` and its full recovery/readmission E2E belong to
   Phase 6 and are not Phase 3 exit requirements.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
-  rebinding and operator-visible multicast-degraded status remain missing.
+  rebinding remains missing.
 - Result export, serving, scratch replay/import, terminal authority authorization, durable batch
   evidence, mode-aware startup, and peer fetch/catch-up orchestration are implemented.
   Snapshot artifact transport, two-pass quarantine replay, and standalone settled installation are
@@ -238,9 +241,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- Automatic listener rebinding, multicast-degraded status, multi-activation catch-up, SSE,
-  divergence recovery, and the remaining Phase 3 fault/performance matrix are outstanding. Final
-  §14 benchmark confirmation remains a Phase 6 exit gate.
+- Automatic listener rebinding, multi-activation catch-up, SSE, divergence recovery, and the
+  remaining Phase 3 fault/performance matrix are outstanding. Final §14 benchmark confirmation
+  remains a Phase 6 exit gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -307,6 +310,9 @@ Primary tests:
 - `TestOperatorClientManagesManualEndpoints`
 - `TestDaemonDiscoveryManualEndpointChangeReconcilesRoutesImmediately`
 - `TestManualEndpointManagementFailsClosedOnCorruption`
+- `TestOperatorStatusIncludesLocalNetworkState`
+- `TestDaemonOperatorStatusSourceReportsNetworkModes`
+- `TestModelRendersMulticastDegradedRecoveryAction`
 - `TestSnapshotClientRoundTripBindsRootAndArtifact`
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
