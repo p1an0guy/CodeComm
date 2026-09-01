@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,8 @@ import (
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
 	"github.com/ijonahch/codecomm/internal/operatorcommand"
 	"github.com/ijonahch/codecomm/internal/pairing"
@@ -61,6 +64,9 @@ type cliPairingOperator struct {
 	confirmDecision bool
 	confirmResult   pairingservice.AttemptDetails
 	confirmCalls    int
+
+	status    coordstatus.Snapshot
+	submitter *cliOperatorSubmitter
 }
 
 func (operator *cliPairingOperator) CreateInvite(
@@ -153,13 +159,26 @@ func (function cliStatusSourceFunc) Member(
 	return coordstatus.MemberSummary{}, false, nil
 }
 
-type cliOperatorSubmitter struct{}
+type cliOperatorSubmitter struct {
+	mu       sync.Mutex
+	requests []operatorcommand.Request
+}
 
-func (cliOperatorSubmitter) SubmitOperatorCommand(
-	context.Context,
-	operatorcommand.Request,
+func (submitter *cliOperatorSubmitter) SubmitOperatorCommand(
+	_ context.Context,
+	request operatorcommand.Request,
 ) (operatorcommand.Result, error) {
-	return operatorcommand.Result{}, nil
+	submitter.mu.Lock()
+	submitter.requests = append(submitter.requests, request)
+	submitter.mu.Unlock()
+	return operatorcommand.Result{
+		EventID: domain.UUIDv7("018f47de-89ab-7def-8123-b123456789ab"),
+		Outcome: store.CommandOutcome{
+			Status: store.OutcomeAccepted,
+			Code:   "accepted",
+			JSON:   []byte(`{"code":"accepted","status":"accepted"}`),
+		},
+	}, nil
 }
 
 func TestPeerInviteCLIEndToEnd(t *testing.T) {
@@ -329,6 +348,44 @@ func TestPeerInviteCLIEndToEnd(t *testing.T) {
 				t.Fatalf("prompt omits reviewed fields: %q", prompt)
 			}
 		})
+	}
+
+	output, prompt := runCLIPairingCommand(
+		t,
+		append(
+			append([]string{"peer", "invite", "confirm"}, common...),
+			"--attempt", string(cliPairingAttemptID),
+			"--yes",
+		),
+		"joined\nyes\n",
+	)
+	var placed ui.PairingAttemptStatus
+	decodeCLIResult(t, output, &placed)
+	operator.submitter.mu.Lock()
+	placementRequests := append(
+		[]operatorcommand.Request(nil),
+		operator.submitter.requests...,
+	)
+	operator.submitter.mu.Unlock()
+	if len(placementRequests) != 1 {
+		t.Fatalf("placement command count = %d", len(placementRequests))
+	}
+	placement := placementRequests[0].Command
+	if placement.Operation != operatorcommand.OperationSetVoters ||
+		placement.Command.Kind != event.KindMembershipVoterSetChanged ||
+		placement.Command.ExpectedEntityVersion == nil ||
+		*placement.Command.ExpectedEntityVersion != 1 ||
+		!bytes.Contains(
+			placement.Command.Payload,
+			[]byte(details.Core.JoinerDeviceID),
+		) ||
+		!strings.Contains(prompt, "Choose the sole voter") ||
+		!strings.Contains(prompt, "Set voter target at version 1") {
+		t.Fatalf(
+			"placement request/prompt = (%+v, %q)",
+			placement,
+			prompt,
+		)
 	}
 
 	operator.mu.Lock()
@@ -547,8 +604,84 @@ func newCLIPairingFixture(
 	operator := &cliPairingOperator{
 		attemptResult: details,
 		confirmResult: details,
+		submitter:     &cliOperatorSubmitter{},
 	}
+	operator.status = cliPairingStatusSnapshot(
+		t,
+		inviterPrivate,
+		details,
+	)
 	return operator, inviterPrivate, inviterID, details
+}
+
+func cliPairingStatusSnapshot(
+	t *testing.T,
+	inviterPrivate ed25519.PrivateKey,
+	details pairingservice.AttemptDetails,
+) coordstatus.Snapshot {
+	t.Helper()
+	inviterID := details.Invite.IssuerDeviceID
+	joinerID := details.Core.JoinerDeviceID
+	target, err := voterset.New(
+		cliPairingSessionID,
+		[]domain.DeviceID{inviterID},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("voterset.New(): %v", err)
+	}
+	local := device.Device{
+		ID: inviterID, Role: device.RoleOwner,
+		IdentityPublicKey: bytes.Clone(
+			inviterPrivate.Public().(ed25519.PublicKey),
+		),
+		DaemonVersion: "1.2.3", MaxApplyLevel: 1,
+		Status: device.StatusActive, EntityVersion: 1,
+	}
+	members := []coordstatus.MemberSummary{
+		{
+			ID: inviterID, Role: device.RoleOwner,
+			Status: device.StatusActive, EntityVersion: 1,
+		},
+		{
+			ID: joinerID, Role: details.Invite.Role,
+			Status: device.StatusActive, EntityVersion: 1,
+		},
+	}
+	sort.Slice(members, func(left, right int) bool {
+		return members[left].ID < members[right].ID
+	})
+	term, applied := uint64(1), uint64(3)
+	snapshot := coordstatus.Snapshot{
+		Durable: coordstatus.DurableSnapshot{
+			SessionID: cliPairingSessionID, WorkspaceID: cliPairingWorkspaceID,
+			Heads: coordstatus.AppliedHeads{
+				CurrentTerm: &term, LastRaftAppliedLogIndex: &applied,
+				ChainIndex: 1, ResultIndex: 1, DigestVersion: 1,
+				ProjectionSchemaVersion: 1,
+			},
+			Member: local, Members: members, MemberTotal: 2,
+			VoterSet: target, CredentialAuthority: target,
+		},
+		Runtime: coordstatus.RuntimeSnapshot{
+			State: coordstatus.ConsensusReady, Role: coordstatus.RoleLeader,
+			LocalDeviceID: inviterID, LeaderDeviceID: inviterID,
+			LiveConfigurationSource: coordstatus.LiveConfigurationLocal,
+			LiveVoterDeviceIDs:      []domain.DeviceID{inviterID},
+			LiveNonvoterDeviceIDs:   []domain.DeviceID{},
+			QuorumRequired:          1, StrongWrites: coordstatus.StrongWritesAvailable,
+			ReplicaCurrency:         coordstatus.ReplicaCurrencyRaft,
+			ObservedAuthorityIDs:    []domain.DeviceID{},
+			ConfigurationReconciled: true,
+			ReconciliationState:     coordstatus.ReconciliationStable,
+			ReconciliationStep:      coordstatus.ReconciliationStepComplete,
+			ReconciliationBlocker:   coordstatus.ReconciliationBlockerNone,
+		},
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("pairing status snapshot: %v", err)
+	}
+	return snapshot
 }
 
 func cliIssuedInvite(
@@ -596,15 +729,17 @@ func cliIssuedInvite(
 
 func startCLIPairingServer(
 	t *testing.T,
-	operator ui.PairingOperator,
+	operator *cliPairingOperator,
 ) (ipc.Endpoint, func()) {
 	t.Helper()
 	endpoint := cliPairingTestEndpoint(t)
 	service, err := ui.NewOperatorService(ui.OperatorServiceOptions{
 		Source: cliStatusSourceFunc(func(context.Context) (coordstatus.Snapshot, error) {
-			return coordstatus.Snapshot{}, errors.New("status unused")
+			operator.mu.Lock()
+			defer operator.mu.Unlock()
+			return operator.status, nil
 		}),
-		Submitter:   cliOperatorSubmitter{},
+		Submitter:   operator.submitter,
 		Pairing:     operator,
 		SessionID:   cliPairingSessionID,
 		WorkspaceID: cliPairingWorkspaceID,

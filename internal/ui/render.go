@@ -219,16 +219,22 @@ func (model Model) View() string {
 			lines = append(lines, narrowAppliedLines(snapshot)...)
 		}
 	}
-	if snapshot.Consensus.LiveConfigurationSource !=
-		string(coordstatus.LiveConfigurationUnknown) &&
-		len(snapshot.Consensus.LiveVoterDeviceIDs) < 3 {
+	degradedVoters := len(snapshot.Consensus.LiveVoterDeviceIDs)
+	degradedLabel := "voter"
+	if snapshot.Consensus.LiveConfigurationSource ==
+		string(coordstatus.LiveConfigurationUnknown) {
+		degradedVoters = len(snapshot.Consensus.TargetVoterDeviceIDs)
+		degradedLabel = "target voter"
+	}
+	if degradedVoters < 3 {
 		lines = append(
 			lines,
 			wrapLine(
 				fmt.Sprintf(
-					"DEGRADED: %d voter%s; no voter loss tolerated",
-					len(snapshot.Consensus.LiveVoterDeviceIDs),
-					pluralSuffix(len(snapshot.Consensus.LiveVoterDeviceIDs)),
+					"DEGRADED: %d %s%s; no voter loss tolerated",
+					degradedVoters,
+					degradedLabel,
+					pluralSuffix(degradedVoters),
 				),
 				width,
 			)...,

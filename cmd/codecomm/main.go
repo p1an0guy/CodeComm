@@ -241,17 +241,19 @@ func runSetVoters(
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("%w: %v", errInvalidCLI, err)
 	}
-	if flags.NArg() != 0 || len(voters) == 0 {
+	if flags.NArg() != 0 {
 		return fmt.Errorf(
-			"%w: at least one --voter and no positional arguments are required",
+			"%w: no positional arguments are allowed",
+			errInvalidCLI,
+		)
+	}
+	if len(voters) == 0 && *confirmed {
+		return fmt.Errorf(
+			"%w: --yes requires an explicit --voter target",
 			errInvalidCLI,
 		)
 	}
 	options, err := localFlags.options()
-	if err != nil {
-		return err
-	}
-	target, err := parseVoterTarget(voters)
 	if err != nil {
 		return err
 	}
@@ -264,6 +266,23 @@ func runSetVoters(
 		return err
 	}
 	defer func() { _ = client.Close() }()
+	if len(voters) == 0 {
+		changed, result, err := runGuidedVoterPlacement(
+			ctx,
+			client,
+			"",
+			input,
+			errorOutput,
+		)
+		if err != nil || !changed {
+			return err
+		}
+		return encodeCommandResult(output, result)
+	}
+	target, err := parseVoterTarget(voters)
+	if err != nil {
+		return err
+	}
 	snapshot, err := client.Status(ctx)
 	if err != nil {
 		return err

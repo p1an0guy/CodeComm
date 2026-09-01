@@ -12,6 +12,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/pairingservice"
+	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/ui"
 )
 
@@ -251,7 +252,43 @@ func runPeerInviteConfirm(
 	if err != nil {
 		return err
 	}
-	return encodePairingResult(output, result)
+	if err := encodePairingResult(output, result); err != nil {
+		return err
+	}
+	if !confirmed || result.Mode != string(pairing.ModeNew) {
+		return nil
+	}
+	switch store.PairingAttemptState(result.State) {
+	case store.PairingAttemptFinalizing:
+		_, err := io.WriteString(
+			errorOutput,
+			"Pairing is finalizing; after it completes, run codecomm cluster set-voters without --voter to choose the sole voter.\n",
+		)
+		return err
+	case store.PairingAttemptCompleted:
+		changed, placement, err := runGuidedVoterPlacement(
+			ctx,
+			client,
+			domain.DeviceID(result.JoinerDeviceID),
+			input,
+			errorOutput,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"codecomm: pairing completed but voter placement did not: %w; rerun codecomm cluster set-voters without --voter",
+				err,
+			)
+		}
+		if changed {
+			_, err = fmt.Fprintf(
+				errorOutput,
+				"Voter target change accepted as event %s.\n",
+				placement.EventID,
+			)
+			return err
+		}
+	}
+	return nil
 }
 
 func promptPairingDecision(

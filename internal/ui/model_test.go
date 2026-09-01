@@ -200,16 +200,16 @@ func TestModelViewLabelsSettledUnknownConfiguration(t *testing.T) {
 				"Replica UNKNOWN",
 				"Live configuration UNKNOWN",
 				"Strong writes waiting",
+				"DEGRADED: 1 target voter",
+				"no voter loss",
+				"tolerated",
 				"Voter reconciliation UNKNOWN",
 			} {
 				if !strings.Contains(view, expected) {
 					t.Fatalf("view omitted %q:\n%s", expected, view)
 				}
 			}
-			for _, forbidden := range []string{
-				"DEGRADED:",
-				"Voter transition UNKNOWN",
-			} {
+			for _, forbidden := range []string{"Voter transition UNKNOWN"} {
 				if strings.Contains(view, forbidden) {
 					t.Fatalf("view included %q:\n%s", forbidden, view)
 				}
