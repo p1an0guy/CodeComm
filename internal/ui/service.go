@@ -352,7 +352,20 @@ func (handler *operatorHandler) status(
 		)
 		return
 	}
+	network := disabledNetworkStatus()
+	if networkSource, ok := handler.source.(NetworkStatusSource); ok {
+		network, err = networkSource.NetworkStatus(request.Context())
+		if err != nil || network.validate() != nil {
+			writeOperatorError(
+				writer,
+				http.StatusServiceUnavailable,
+				"status_unavailable",
+			)
+			return
+		}
+	}
 	snapshot := snapshotFromCoordination(source)
+	snapshot.Network = network
 	if err := snapshot.Validate(); err != nil {
 		writeOperatorError(
 			writer,
@@ -539,6 +552,7 @@ func snapshotFromCoordination(source coordstatus.Snapshot) Snapshot {
 			ReconciliationBlocker:   string(runtime.ReconciliationBlocker),
 			ReconciliationDeviceID:  reconciliationDevice,
 		},
+		Network:          disabledNetworkStatus(),
 		Members:          members,
 		Agents:           agents,
 		Tasks:            tasks,

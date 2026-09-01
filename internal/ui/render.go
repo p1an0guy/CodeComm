@@ -107,6 +107,20 @@ func (model Model) View() string {
 			width,
 		))
 	}
+	if snapshot.Network.MulticastState == string(MulticastDegraded) {
+		detail := "multicast unavailable"
+		if snapshot.Network.MulticastError != nil {
+			detail = sanitizeTerminalText(*snapshot.Network.MulticastError)
+		}
+		lines = append(
+			lines,
+			wrapLine("Discovery DEGRADED: "+detail, width)...,
+		)
+		lines = append(lines, wrapLine(
+			"Configure a manual route with codecomm peer endpoint add.",
+			width,
+		)...)
+	}
 	switch snapshot.Consensus.LiveConfigurationSource {
 	case string(coordstatus.LiveConfigurationUnknown):
 		lines = append(lines, fitLine(

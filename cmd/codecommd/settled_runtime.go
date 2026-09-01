@@ -321,17 +321,25 @@ func runSettledDaemon(
 	}
 	meshFactory.ClearIdentityCertificate()
 
+	operatorStatusSource, err := newDaemonOperatorStatusSource(
+		replica,
+		localState,
+		discoveryRuntime,
+	)
+	if err != nil {
+		return err
+	}
 	var operatorService *ui.OperatorService
 	if manualEndpoints == nil {
 		operatorService, err = ui.NewMutationOperatorService(
-			replica,
+			operatorStatusSource,
 			bootOrigin,
 			options.sessionID,
 			options.workspaceID,
 		)
 	} else {
 		operatorService, err = ui.NewMutationOperatorServiceWithEndpoints(
-			replica,
+			operatorStatusSource,
 			bootOrigin,
 			manualEndpoints,
 			options.sessionID,

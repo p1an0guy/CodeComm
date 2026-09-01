@@ -716,8 +716,16 @@ func runDaemon(
 	}
 	meshFactory.ClearIdentityCertificate()
 
+	operatorStatusSource, err := newDaemonOperatorStatusSource(
+		node,
+		localState,
+		discoveryRuntime,
+	)
+	if err != nil {
+		return err
+	}
 	operatorService, err := ui.NewOperatorService(ui.OperatorServiceOptions{
-		Source:      node,
+		Source:      operatorStatusSource,
 		Submitter:   bootOrigin,
 		Pairing:     pairingRuntime.operator,
 		Endpoints:   manualEndpoints,

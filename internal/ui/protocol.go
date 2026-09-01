@@ -17,6 +17,7 @@ import (
 type Snapshot struct {
 	Session          SessionStatus   `json:"session"`
 	Consensus        ConsensusStatus `json:"consensus"`
+	Network          NetworkStatus   `json:"network"`
 	Members          []MemberStatus  `json:"members"`
 	Agents           []AgentStatus   `json:"agents"`
 	Tasks            []TaskStatus    `json:"tasks"`
@@ -105,6 +106,9 @@ func (snapshot Snapshot) Validate() error {
 		snapshot.Session.LocalDeviceID,
 		snapshot.Session.ResultIndex,
 	); err != nil {
+		return err
+	}
+	if err := snapshot.Network.validate(); err != nil {
 		return err
 	}
 	if len(snapshot.Members) < 1 ||
