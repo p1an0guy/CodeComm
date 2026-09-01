@@ -125,10 +125,14 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Daemon startup now selects Raft or settled mode from verified durable evidence. A settled daemon
   opens no Raft state, renews credentials over identity mTLS, keeps content links alive at equal
   cursors, forwards local and initial-hop proposals to current authority peers, imports bounded
-  signed tails through one serialized gate, and exposes read-only operator status. Status labels
-  live topology and reconciliation unknown rather than presenting the frozen pre-transition Raft
-  configuration as current; replica currency remains unknown without direct live exact-cut
-  observations from the complete current authority.
+  signed tails through one serialized gate, and exposes status plus durable owner mutations through
+  local IPC. Mutations queue while authority is unavailable and resolve only after their exact
+  signed result imports. Status labels live topology and reconciliation unknown rather than
+  presenting the frozen pre-transition Raft configuration as current; replica currency remains
+  unknown without direct live exact-cut observations from the complete current authority.
+- Late-wake content bootstrap validates identity-plane status with the same captured credential
+  clock used for certificate selection and verification. The provisional authorization remains
+  peer-pinned and outbound-only; ingress still requires applied membership and authorization.
 - Logical-snapshot roots, descriptor-page chains, record framing, semantic payload codecs, and the
   streaming record-order validator are implemented. The validator checks complete successor
   genesis lineage, both chains, accepted-event identity, projection accumulator/state, and the
@@ -197,6 +201,17 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   installed snapshot, then proves the stale tail reaches exact current currency and both sessions
   are durably crash-reaped before IPC. It also proves no second admission or membership-version
   drift, clears the marker, and creates no Raft state.
+- The settled production path now also runs the documented two-device mode after a 3-to-1 authority
+  handoff. With the sole voter offline and both content credentials expired, the owner nonvoter
+  remains readable, exposes no leader or strong-write authority, and durably queues a reviewed
+  revocation. Returning the voter renews both peers over identity mTLS, commits the command,
+  preserves voter-target and authority version while revoking the active nonvoter, imports the
+  exact signed result, resolves the outbox, restores content, and converges a subsequent task.
+- Fresh two-device admission prompts the inviter to keep the current voter, move the sole-voter
+  target to the joined device, or defer. The prompt recommends the device likelier to remain awake,
+  states the exact degraded consequence, and binds a move to a fresh voter-set CAS. The guided
+  `cluster set-voters` fallback is independently callable, and every TUI status with fewer than
+  three known live or durable target voters carries the persistent no-loss-tolerated warning.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -220,8 +235,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The full revocation transfer test, two-device degraded run, voter-placement prompt, and complete
-  Phase 3 latency/security matrix remain outstanding.
+- Automatic listener rebinding, operator-managed manual endpoints, multicast-degraded status,
+  multi-activation catch-up, SSE, divergence recovery, and the remaining Phase 3 fault/performance
+  matrix are outstanding. Final §14 benchmark confirmation remains a Phase 6 exit gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -279,6 +295,11 @@ Primary tests:
 - `TestSettledReplicaImportsAndReopensAuthorityHandoff`
 - `TestSettledReplicaCoherentLocalRewriteLatchesFatalState`
 - `TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart`
+- `TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart`
+- `TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch`
+- `TestGuidedVoterPlacementBindsChoiceToFreshCAS`
+- `TestGuidedVoterPlacementRequiresOwnerAndStableTwoDeviceTopology`
+- `TestPeerInviteCLIEndToEnd`
 - `TestSnapshotClientRoundTripBindsRootAndArtifact`
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
