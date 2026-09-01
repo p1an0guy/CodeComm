@@ -139,6 +139,38 @@ func (runtime *daemonSettledReplication) release() {
 	<-runtime.gate
 }
 
+// withFence runs operation while no settled import pass can start. It waits
+// for an in-flight pass to finish before entering the callback.
+func (runtime *daemonSettledReplication) withFence(
+	ctx context.Context,
+	operation func(context.Context) error,
+) error {
+	if runtime == nil ||
+		runtime.replica == nil ||
+		ctx == nil ||
+		operation == nil {
+		return errDaemonSettledReplication
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := runtime.acquire(ctx); err != nil {
+		return err
+	}
+	defer runtime.release()
+	if fatal := runtime.fatalError(); fatal != nil {
+		return fatal
+	}
+	if fatal := runtime.replica.FatalError(); fatal != nil {
+		return fmt.Errorf(
+			"%w: settled replica: %w",
+			errDaemonContentPeerState,
+			fatal,
+		)
+	}
+	return operation(ctx)
+}
+
 // Sync fetches and imports a bounded contiguous tail from one authenticated
 // relay while holding the process-wide settled-import turn.
 func (runtime *daemonSettledReplication) Sync(

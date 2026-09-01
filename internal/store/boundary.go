@@ -866,6 +866,7 @@ func clearGenerationLocalState(conn *sqlite.Conn) error {
 		"lease_deadlines",
 		"replication_cursors",
 		"replication_watermark_observations",
+		"rebootstrap_install_marker",
 		"settled_nonvoter_state",
 		"raft_committed_configuration",
 		"outbox",

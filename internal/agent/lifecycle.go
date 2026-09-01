@@ -73,7 +73,8 @@ func (service *Service) submitDaemonEnd(
 	expectedVersion uint64,
 ) (store.CommandOutcome, error) {
 	if !agentSessionID.Valid() ||
-		reason != agentsession.EndReasonDisconnectTimeout ||
+		reason != agentsession.EndReasonDisconnectTimeout &&
+			reason != agentsession.EndReasonCrashReap ||
 		expectedVersion < 1 ||
 		!domain.ValidUnsignedInteger(expectedVersion) {
 		return store.CommandOutcome{}, ErrInvalidOptions
@@ -92,6 +93,157 @@ func (service *Service) submitDaemonEnd(
 		payload,
 		map[string]any{"end_reason": reason},
 	)
+}
+
+// CrashReap synchronously ends every imported nonterminal session owned by
+// this device before normal agent recovery exposes local launch or resume.
+func (service *Service) CrashReap(ctx context.Context) error {
+	if err := service.available(); err != nil {
+		return err
+	}
+	if ctx == nil {
+		return ErrInvalidOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	service.recoverMu.Lock()
+	defer service.recoverMu.Unlock()
+	if service.recovered {
+		return ErrInvalidOptions
+	}
+	if err := service.bootOrigin.Recover(ctx); err != nil {
+		return err
+	}
+	if err := service.drainPendingAgentSessionCommands(ctx); err != nil {
+		return err
+	}
+
+	for {
+		sessions, err := service.local.NonterminalAgentSessions(ctx)
+		if err != nil {
+			return err
+		}
+		owned := false
+		for _, session := range sessions {
+			if session.DeviceID != service.deviceID {
+				continue
+			}
+			owned = true
+			current := session
+			for {
+				outcome, err := service.submitDaemonEnd(
+					ctx,
+					current.ID,
+					agentsession.EndReasonCrashReap,
+					current.EntityVersion,
+				)
+				if err != nil {
+					return err
+				}
+				if outcome.Status == store.OutcomeAccepted {
+					break
+				}
+				latest, found, err := service.local.AgentSession(
+					ctx,
+					current.ID,
+				)
+				if err != nil {
+					return err
+				}
+				if !found || latest.State == agentsession.StateEnded {
+					break
+				}
+				if latest.DeviceID != service.deviceID ||
+					latest.EntityVersion == current.EntityVersion {
+					return fmt.Errorf(
+						"%w: crash reap %s: %s",
+						ErrCommandRejected,
+						current.ID,
+						outcome.Code,
+					)
+				}
+				current = latest
+			}
+		}
+		if !owned {
+			return nil
+		}
+	}
+}
+
+func (service *Service) drainPendingAgentSessionCommands(
+	ctx context.Context,
+) error {
+	for {
+		records, err := service.local.OutboxRecords(ctx)
+		if err != nil {
+			return err
+		}
+		pending := false
+		for _, record := range records {
+			switch record.Kind {
+			case event.KindAgentSessionStarted,
+				event.KindAgentSessionStateChanged,
+				event.KindAgentSessionEnded:
+				pending = true
+				service.wakeScope(store.OutboxScope{
+					OriginDeviceID:  record.OriginDeviceID,
+					OriginScopeKind: record.OriginScopeKind,
+					OriginScopeID:   record.OriginScopeID,
+				})
+			}
+		}
+		if !pending {
+			return nil
+		}
+		if err := service.FatalError(); err != nil {
+			return err
+		}
+		timer := time.NewTimer(outboxRetryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-service.ctx.Done():
+			timer.Stop()
+			if err := service.FatalError(); err != nil {
+				return err
+			}
+			return ErrClosed
+		}
+	}
+}
+
+// CrashReapPending reports whether this device still owns a nonterminal
+// imported session. Callers use it while settled replication is fenced before
+// clearing the rebootstrap recovery marker.
+func (service *Service) CrashReapPending(ctx context.Context) (bool, error) {
+	if err := service.available(); err != nil {
+		return false, err
+	}
+	if ctx == nil {
+		return false, ErrInvalidOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	service.recoverMu.Lock()
+	defer service.recoverMu.Unlock()
+	if service.recovered {
+		return false, ErrInvalidOptions
+	}
+	sessions, err := service.local.NonterminalAgentSessions(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, session := range sessions {
+		if session.DeviceID == service.deviceID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (service *Service) submitDaemonLifecycle(

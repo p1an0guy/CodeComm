@@ -38,10 +38,11 @@ type StandaloneLogicalSnapshotInstallResult struct {
 // replacement transaction. Lease timers are reconstructed from replicated
 // active leases at InstalledAt; quarantine timer rows are never trusted.
 type StandaloneLogicalSnapshotInstallOptions struct {
-	VerifiedAt     domain.Timestamp
-	OriginBootID   domain.UUIDv7
-	InstalledAt    domain.Timestamp
-	MonotonicNowNS int64
+	VerifiedAt          domain.Timestamp
+	OriginBootID        domain.UUIDv7
+	InstalledAt         domain.Timestamp
+	MonotonicNowNS      int64
+	RebootstrapDeviceID domain.DeviceID
 }
 
 // RaftLogicalSnapshotInstallResult names one metadata-bound snapshot cut.
@@ -171,7 +172,9 @@ func (store *Store) installLogicalSnapshot(
 		!options.VerifiedAt.Valid() ||
 		!options.OriginBootID.Valid() ||
 		!options.InstalledAt.Valid() ||
-		options.MonotonicNowNS < 0 {
+		options.MonotonicNowNS < 0 ||
+		options.RebootstrapDeviceID != "" &&
+			(!options.RebootstrapDeviceID.Valid() || options.raft != nil) {
 		return StandaloneLogicalSnapshotInstallResult{},
 			logicalSnapshotInstallError("invalid context or verification time", nil)
 	}
@@ -311,6 +314,32 @@ func (store *Store) installLogicalSnapshot(
 			if err != nil {
 				return err
 			}
+			preservedMarker, markerFound, err := readRebootstrapInstallMarker(
+				destination,
+			)
+			if err != nil {
+				return err
+			}
+			if markerFound {
+				if options.raft != nil ||
+					options.RebootstrapDeviceID != "" ||
+					generationChanged ||
+					preservedMarker.SessionID != cut.SessionID ||
+					preservedMarker.WorkspaceID != cut.WorkspaceID ||
+					preservedMarker.RecoveryGeneration !=
+						cut.RecoveryGeneration {
+					return logicalSnapshotInstallError(
+						"rebootstrap marker cannot cross this snapshot transition",
+						ErrRebootstrapInstallMarker,
+					)
+				}
+				if err := deleteRebootstrapInstallMarker(
+					destination,
+					preservedMarker,
+				); err != nil {
+					return err
+				}
+			}
 			preservedRecoveryTimes, err :=
 				readRecoveryBoundaryAuditTimes(destination)
 			if err != nil {
@@ -430,6 +459,28 @@ func (store *Store) installLogicalSnapshot(
 					options.VerifiedAt,
 				); err != nil {
 					return err
+				}
+				if options.RebootstrapDeviceID != "" {
+					if err := writeRebootstrapInstallMarker(
+						destination,
+						cut,
+						options.RebootstrapDeviceID,
+						attestationID,
+						options.InstalledAt,
+					); err != nil {
+						return err
+					}
+				} else if markerFound {
+					preservedMarker.SnapshotAttestationID =
+						attestationID
+					preservedMarker.InstalledAt =
+						options.InstalledAt
+					if err := insertRebootstrapInstallMarker(
+						destination,
+						preservedMarker,
+					); err != nil {
+						return err
+					}
 				}
 			} else if err := writeRaftLogicalSnapshotEvidence(
 				destination,
@@ -582,15 +633,9 @@ func verifyLogicalSnapshotInstallDestination(
 	if !found {
 		return false, requireEmptyLogicalSnapshotDestination(destination)
 	}
-	settled, found, err := readSettledNonvoterState(destination)
+	settled, isSettled, err := readSettledNonvoterState(destination)
 	if err != nil {
 		return false, err
-	}
-	if !found && raftOptions == nil {
-		return false, logicalSnapshotInstallError(
-			"destination is not a settled nonvoter",
-			nil,
-		)
 	}
 	if err := verifyCompleteLogicalSnapshotHistory(
 		destination,
@@ -622,7 +667,7 @@ func verifyLogicalSnapshotInstallDestination(
 			err,
 		)
 	}
-	if found {
+	if isSettled {
 		if err := verifySettledNonvoterEvidence(
 			destination,
 			destinationState,
@@ -785,8 +830,15 @@ func verifyLogicalSnapshotInstallDestination(
 			)
 		}
 	}
-	return destinationState.recoveryGeneration <
-		sourceState.recoveryGeneration, nil
+	generationChanged := destinationState.recoveryGeneration <
+		sourceState.recoveryGeneration
+	if !isSettled && raftOptions == nil && !generationChanged {
+		return false, logicalSnapshotInstallError(
+			"Raft destination can enter settled mode only through a successor generation",
+			nil,
+		)
+	}
+	return generationChanged, nil
 }
 
 func verifyRaftSnapshotDestinationPosition(
@@ -1034,6 +1086,7 @@ func requireLogicalSnapshotInstallSourceLocalState(conn *sqlite.Conn) error {
 		"pairing_secret_deletions",
 		"peer_acks",
 		"peer_endpoints",
+		"rebootstrap_install_marker",
 		"raft_committed_configuration",
 		"replication_cursors",
 		"replication_watermark_observations",

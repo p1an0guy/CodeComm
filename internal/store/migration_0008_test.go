@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/chain"
@@ -273,8 +274,9 @@ func TestMigrationPolicyRequiresReviewOrVerifiedBackup(t *testing.T) {
 	); err != nil {
 		t.Fatalf("apply current migrations: %v", err)
 	}
+	nextVersion := int64(len(embeddedMigrations) + 1)
 	unclassified := migrationFromText(
-		9,
+		nextVersion,
 		"unclassified",
 		"CREATE TABLE unclassified_migration(value INTEGER) STRICT;",
 	)
@@ -285,10 +287,15 @@ func TestMigrationPolicyRequiresReviewOrVerifiedBackup(t *testing.T) {
 	); !errors.Is(err, errMigrationUnclassified) {
 		t.Fatalf("unclassified migration error = %v", err)
 	}
-	assertMigrationTableAbsent(t, conn, "unclassified_migration")
+	assertMigrationTableAbsent(
+		t,
+		conn,
+		"unclassified_migration",
+		nextVersion,
+	)
 
 	irreversible := migrationFromText(
-		9,
+		nextVersion,
 		"irreversible",
 		"CREATE TABLE backed_up_migration(value INTEGER) STRICT;",
 	)
@@ -301,7 +308,12 @@ func TestMigrationPolicyRequiresReviewOrVerifiedBackup(t *testing.T) {
 	); !errors.Is(err, errMigrationBackupRequired) {
 		t.Fatalf("migration without backup error = %v", err)
 	}
-	assertMigrationTableAbsent(t, conn, "backed_up_migration")
+	assertMigrationTableAbsent(
+		t,
+		conn,
+		"backed_up_migration",
+		nextVersion,
+	)
 
 	backupErr := errors.New("backup verification failed")
 	if err := applyMigrationsWithBackup(
@@ -315,7 +327,12 @@ func TestMigrationPolicyRequiresReviewOrVerifiedBackup(t *testing.T) {
 		!errors.Is(err, backupErr) {
 		t.Fatalf("failed backup verification error = %v", err)
 	}
-	assertMigrationTableAbsent(t, conn, "backed_up_migration")
+	assertMigrationTableAbsent(
+		t,
+		conn,
+		"backed_up_migration",
+		nextVersion,
+	)
 
 	var verified migration
 	if err := applyMigrationsWithBackup(
@@ -337,7 +354,8 @@ func TestMigrationPolicyRequiresReviewOrVerifiedBackup(t *testing.T) {
 	assertIntQuery(
 		t,
 		conn,
-		"SELECT count(*) FROM schema_migrations WHERE version = 9;",
+		"SELECT count(*) FROM schema_migrations WHERE version = "+
+			strconv.FormatInt(nextVersion, 10)+";",
 		1,
 	)
 }
@@ -575,6 +593,7 @@ func assertMigrationTableAbsent(
 	t *testing.T,
 	conn *sqlite.Conn,
 	name string,
+	version int64,
 ) {
 	t.Helper()
 	exists, err := tableExists(conn, name)
@@ -587,7 +606,8 @@ func assertMigrationTableAbsent(
 	assertIntQuery(
 		t,
 		conn,
-		"SELECT count(*) FROM schema_migrations WHERE version = 9;",
+		"SELECT count(*) FROM schema_migrations WHERE version = "+
+			strconv.FormatInt(version, 10)+";",
 		0,
 	)
 }

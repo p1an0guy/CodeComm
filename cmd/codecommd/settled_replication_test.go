@@ -390,6 +390,70 @@ func TestDaemonSettledReplicationCancellation(
 	}
 }
 
+func TestDaemonSettledReplicationFenceExcludesImportPass(t *testing.T) {
+	replica := &daemonSettledReplicaStub{}
+	runtime := newDaemonSettledReplicationTestRuntime(t, replica)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- runtime.withFence(
+			t.Context(),
+			func(context.Context) error {
+				close(entered)
+				<-release
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("replication fence did not enter")
+	}
+
+	client := &daemonReplicationClientStub{}
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- runtime.Sync(
+			t.Context(),
+			daemonContentTestDeviceID(t, 0xd8),
+			client,
+		)
+	}()
+	select {
+	case err := <-syncDone:
+		t.Fatalf("Sync completed inside fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	client.mu.Lock()
+	requestsInsideFence := len(client.after)
+	client.mu.Unlock()
+	if requestsInsideFence != 0 {
+		t.Fatalf(
+			"replication requests inside fence = %d",
+			requestsInsideFence,
+		)
+	}
+
+	close(release)
+	if err := <-fenceDone; err != nil {
+		t.Fatalf("withFence(): %v", err)
+	}
+	if err := <-syncDone; err != nil {
+		t.Fatalf("Sync(after fence): %v", err)
+	}
+	client.mu.Lock()
+	requestsAfterFence := len(client.after)
+	client.mu.Unlock()
+	if requestsAfterFence != 1 {
+		t.Fatalf(
+			"replication requests after fence = %d",
+			requestsAfterFence,
+		)
+	}
+}
+
 func newDaemonSettledReplicationTestRuntime(
 	t *testing.T,
 	replica daemonSettledReplica,

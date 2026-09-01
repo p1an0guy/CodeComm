@@ -5,14 +5,18 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
+	"github.com/ijonahch/codecomm/internal/store"
 )
 
 func TestPrepareJoinUsesRetainedIdentityForTargetedModes(t *testing.T) {
@@ -153,6 +157,171 @@ func TestPrepareTargetedJoinNeverGeneratesMissingOrMismatchedIdentity(
 				)
 			}
 		})
+	}
+}
+
+func TestReadmissionDestinationRequiresExactPredecessorLineage(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	journal, _, _ := joinJournalFixture(t)
+	successorSessionID := domain.UUIDv7(
+		"018f47de-89ab-7def-8123-4123456789ab",
+	)
+	statePath := filepath.Join(t.TempDir(), "predecessor", "state.db")
+	database, err := store.Open(
+		t.Context(),
+		store.Options{Path: statePath, RequireNew: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := codec.CanonicalizeSignedObject([]byte(fmt.Sprintf(
+		`{"recovery_generation":0,"session_id":%q,"workspace_id":%q}`,
+		journal.SessionID,
+		journal.WorkspaceID,
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Initialize(t.Context(), store.InitialState{
+		SessionID:               journal.SessionID,
+		WorkspaceID:             journal.WorkspaceID,
+		GenesisJSON:             genesis,
+		DigestVersion:           1,
+		ProjectionSchemaVersion: 1,
+	}); err != nil {
+		t.Fatalf("Initialize(predecessor): %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := requireReadmissionDestination(
+		t.Context(),
+		statePath,
+		successorSessionID,
+		journal.WorkspaceID,
+		1,
+	); err != nil {
+		t.Fatalf("exact predecessor rejected: %v", err)
+	}
+	for name, candidate := range map[string]struct {
+		sessionID  domain.UUIDv7
+		workspace  domain.UUIDv4
+		generation uint64
+	}{
+		"other workspace": {
+			sessionID:  successorSessionID,
+			workspace:  "550e8400-e29b-41d4-a716-446655440001",
+			generation: 1,
+		},
+		"same generation": {
+			sessionID:  successorSessionID,
+			workspace:  journal.WorkspaceID,
+			generation: 0,
+		},
+		"generation gap": {
+			sessionID:  successorSessionID,
+			workspace:  journal.WorkspaceID,
+			generation: 2,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := requireReadmissionDestination(
+				t.Context(),
+				statePath,
+				candidate.sessionID,
+				candidate.workspace,
+				candidate.generation,
+			); !errors.Is(err, ErrStateConflict) {
+				t.Fatalf("destination error = %v, want %v", err, ErrStateConflict)
+			}
+		})
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "unused", "state.db")
+	if err := requireReadmissionDestination(
+		t.Context(),
+		missingPath,
+		successorSessionID,
+		journal.WorkspaceID,
+		1,
+	); err != nil {
+		t.Fatalf("unused destination rejected: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(missingPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(missingPath+"-wal", []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireReadmissionDestination(
+		t.Context(),
+		missingPath,
+		successorSessionID,
+		journal.WorkspaceID,
+		1,
+	); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale sidecar error = %v, want %v", err, ErrStateConflict)
+	}
+}
+
+func TestJoinCompletionRequiresModeSpecificRebootstrapMarker(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	journal, _, _ := joinJournalFixture(t)
+	journal.Mode = pairing.ModeRebootstrap
+	subject := journal.LocalDeviceID
+	journal.SubjectDeviceID = &subject
+	marker := store.RebootstrapInstallMarker{
+		SessionID:          journal.SessionID,
+		WorkspaceID:        journal.WorkspaceID,
+		RecoveryGeneration: journal.RecoveryGeneration,
+		DeviceID:           journal.LocalDeviceID,
+	}
+	if err := validateJoinCompletionMarker(
+		journal,
+		marker,
+		true,
+	); err != nil {
+		t.Fatalf("exact rebootstrap marker rejected: %v", err)
+	}
+	if err := validateJoinCompletionMarker(
+		journal,
+		store.RebootstrapInstallMarker{},
+		false,
+	); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("missing rebootstrap marker error = %v", err)
+	}
+	changed := marker
+	changed.RecoveryGeneration++
+	if err := validateJoinCompletionMarker(
+		journal,
+		changed,
+		true,
+	); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("changed rebootstrap marker error = %v", err)
+	}
+
+	journal.Mode = pairing.ModeNew
+	journal.SubjectDeviceID = nil
+	if err := validateJoinCompletionMarker(
+		journal,
+		store.RebootstrapInstallMarker{},
+		false,
+	); err != nil {
+		t.Fatalf("marker-free new join rejected: %v", err)
+	}
+	if err := validateJoinCompletionMarker(
+		journal,
+		marker,
+		true,
+	); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("unexpected new-join marker error = %v", err)
 	}
 }
 

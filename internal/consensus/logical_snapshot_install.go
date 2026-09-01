@@ -18,6 +18,41 @@ func (verified *VerifiedLogicalSnapshotStage) InstallStandalone(
 	destination *store.Store,
 	verifiedAt domain.Timestamp,
 ) (store.StandaloneLogicalSnapshotInstallResult, error) {
+	return verified.installStandalone(
+		ctx,
+		destination,
+		verifiedAt,
+		"",
+	)
+}
+
+// InstallStandaloneRebootstrap atomically installs the verified quarantine and
+// records that the retained device's imported sessions must be crash-reaped
+// before local agent recovery.
+func (verified *VerifiedLogicalSnapshotStage) InstallStandaloneRebootstrap(
+	ctx context.Context,
+	destination *store.Store,
+	verifiedAt domain.Timestamp,
+	deviceID domain.DeviceID,
+) (store.StandaloneLogicalSnapshotInstallResult, error) {
+	if !deviceID.Valid() {
+		return store.StandaloneLogicalSnapshotInstallResult{},
+			ErrInvalidLogicalSnapshotImport
+	}
+	return verified.installStandalone(
+		ctx,
+		destination,
+		verifiedAt,
+		deviceID,
+	)
+}
+
+func (verified *VerifiedLogicalSnapshotStage) installStandalone(
+	ctx context.Context,
+	destination *store.Store,
+	verifiedAt domain.Timestamp,
+	rebootstrapDeviceID domain.DeviceID,
+) (store.StandaloneLogicalSnapshotInstallResult, error) {
 	if verified == nil ||
 		verified.stage == nil ||
 		destination == nil ||
@@ -38,10 +73,11 @@ func (verified *VerifiedLogicalSnapshotStage) InstallStandalone(
 		ctx,
 		verified.stage,
 		store.StandaloneLogicalSnapshotInstallOptions{
-			VerifiedAt:     verifiedAt,
-			OriginBootID:   verified.originBootID,
-			InstalledAt:    installedAt,
-			MonotonicNowNS: monotonicNow,
+			VerifiedAt:          verifiedAt,
+			OriginBootID:        verified.originBootID,
+			InstalledAt:         installedAt,
+			MonotonicNowNS:      monotonicNow,
+			RebootstrapDeviceID: rebootstrapDeviceID,
 		},
 	)
 }

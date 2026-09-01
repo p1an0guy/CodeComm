@@ -99,7 +99,150 @@ func TestVerifiedLogicalSnapshotStageInstallsStandalone(t *testing.T) {
 	}
 }
 
-func TestVerifiedLogicalSnapshotStageInstallsSuccessorOverPredecessor(
+func TestVerifiedLogicalSnapshotStageRejectsSameGenerationRaftConversion(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newLogicalSnapshotImportFixture(t)
+	verified := verifyLogicalSnapshotFixture(t, fixture)
+	destination, err := store.Open(
+		context.Background(),
+		store.Options{
+			Path: filepath.Join(t.TempDir(), "raft-predecessor", "state.db"),
+		},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(): %v", err)
+	}
+	t.Cleanup(func() { _ = destination.Close() })
+	if _, err := destination.Initialize(
+		context.Background(),
+		fixture.initial,
+	); err != nil {
+		t.Fatalf("Initialize(destination): %v", err)
+	}
+
+	if _, err := verified.InstallStandalone(
+		context.Background(),
+		destination,
+		"2026-08-21T17:00:00Z",
+	); !errors.Is(err, store.ErrLogicalSnapshotInstall) {
+		t.Fatalf(
+			"same-generation Raft conversion error = %v, want %v",
+			err,
+			store.ErrLogicalSnapshotInstall,
+		)
+	}
+	mode, err := destination.ReplicaEvidenceMode(context.Background())
+	if err != nil || mode != store.ReplicaEvidenceRaft {
+		t.Fatalf("destination evidence after rejection = (%q, %v)", mode, err)
+	}
+}
+
+func TestVerifiedLogicalSnapshotStageAtomicallyMarksRebootstrap(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	retained := settledReplicaTestMember(t)
+	fixture := newLogicalSnapshotImportFixtureWithInitial(
+		t,
+		func(initial *store.InitialState) {
+			addSettledReplicaTestMember(initial, retained)
+		},
+	)
+	verified := verifyLogicalSnapshotFixture(t, fixture)
+	destination, err := store.Open(
+		t.Context(),
+		store.Options{
+			Path: filepath.Join(t.TempDir(), "rebootstrap", "state.db"),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = destination.Close() })
+
+	installed, err := verified.InstallStandaloneRebootstrap(
+		t.Context(),
+		destination,
+		"2026-08-21T17:00:00Z",
+		retained.ID,
+	)
+	if err != nil {
+		t.Fatalf("InstallStandaloneRebootstrap(): %v", err)
+	}
+	local := destination.LocalState()
+	marker, found, err := local.RebootstrapInstallMarker(t.Context())
+	if err != nil || !found ||
+		marker.SessionID != fixture.sourceView.SessionID ||
+		marker.WorkspaceID != fixture.sourceView.WorkspaceID ||
+		marker.RecoveryGeneration != fixture.sourceView.RecoveryGeneration ||
+		marker.DeviceID != retained.ID ||
+		marker.SnapshotAttestationID != installed.AttestationID {
+		t.Fatalf(
+			"RebootstrapInstallMarker() = (%+v, %t, %v)",
+			marker,
+			found,
+			err,
+		)
+	}
+	if err := local.ClearRebootstrapInstallMarker(
+		t.Context(),
+		marker,
+	); err != nil {
+		t.Fatalf("ClearRebootstrapInstallMarker(): %v", err)
+	}
+	if marker, found, err = local.RebootstrapInstallMarker(
+		t.Context(),
+	); err != nil || found {
+		t.Fatalf(
+			"marker after clear = (%+v, %t, %v)",
+			marker,
+			found,
+			err,
+		)
+	}
+}
+
+func TestVerifiedLogicalSnapshotStageRejectsRebootstrapForAuthority(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newLogicalSnapshotImportFixture(t)
+	verified := verifyLogicalSnapshotFixture(t, fixture)
+	destination, err := store.Open(
+		t.Context(),
+		store.Options{
+			Path: filepath.Join(t.TempDir(), "rebootstrap-voter", "state.db"),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = destination.Close() })
+
+	if _, err := verified.InstallStandaloneRebootstrap(
+		t.Context(),
+		destination,
+		"2026-08-21T17:00:00Z",
+		fixture.signerID,
+	); !errors.Is(err, store.ErrRebootstrapInstallMarker) {
+		t.Fatalf(
+			"InstallStandaloneRebootstrap(authority) error = %v, want %v",
+			err,
+			store.ErrRebootstrapInstallMarker,
+		)
+	}
+	if _, found, err := destination.LocalState().
+		RebootstrapInstallMarker(t.Context()); err != nil || found {
+		t.Fatalf("rolled-back marker = (found %t, err %v)", found, err)
+	}
+}
+
+func TestVerifiedLogicalSnapshotStageInstallsSuccessorOverRaftPredecessor(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -167,13 +310,6 @@ func TestVerifiedLogicalSnapshotStageInstallsSuccessorOverPredecessor(
 			predecessor,
 		)
 	}
-	if _, err := destination.EnterSettledNonvoter(
-		context.Background(),
-		"2026-08-21T16:59:00Z",
-	); err != nil {
-		t.Fatalf("EnterSettledNonvoter(): %v", err)
-	}
-
 	installed, err := verified.InstallStandalone(
 		context.Background(),
 		destination,

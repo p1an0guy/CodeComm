@@ -135,7 +135,18 @@ func Run(
 	case errors.Is(err, ErrNoPendingJoin) && options.Resume:
 		return Result{}, ErrNoPendingJoin
 	case errors.Is(err, ErrNoPendingJoin):
-		if err := requireUnusedDestination(options.StatePath); err != nil {
+		invite := options.Invite.Invite()
+		mode, workspaceID, recoveryGeneration :=
+			invite.Mode, invite.WorkspaceID, invite.RecoveryGeneration
+		clear(invite.Secret[:])
+		if err := requireJoinDestination(
+			ctx,
+			options.StatePath,
+			mode,
+			invite.SessionID,
+			workspaceID,
+			recoveryGeneration,
+		); err != nil {
 			return Result{}, err
 		}
 		journal, err = prepareNewJoin(ctx, options)
@@ -149,7 +160,14 @@ func Run(
 		(journal.Phase == journalPhaseDecisionApproved ||
 			journal.Phase == journalPhaseConfirmed ||
 			journal.Phase == journalPhaseInstalling) {
-		if err := requireUnusedDestination(options.StatePath); err != nil {
+		if err := requireJoinDestination(
+			ctx,
+			options.StatePath,
+			journal.Mode,
+			journal.SessionID,
+			journal.WorkspaceID,
+			journal.RecoveryGeneration,
+		); err != nil {
 			return Result{}, err
 		}
 	}
@@ -429,6 +447,80 @@ func requireUnusedDestination(statePath string) error {
 	return nil
 }
 
+func requireJoinDestination(
+	ctx context.Context,
+	statePath string,
+	mode pairing.Mode,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	recoveryGeneration uint64,
+) error {
+	switch mode {
+	case pairing.ModeNew, pairing.ModeRebootstrap:
+		return requireUnusedDestination(statePath)
+	case pairing.ModeReadmission:
+		return requireReadmissionDestination(
+			ctx,
+			statePath,
+			sessionID,
+			workspaceID,
+			recoveryGeneration,
+		)
+	default:
+		return ErrStateConflict
+	}
+}
+
+func requireReadmissionDestination(
+	ctx context.Context,
+	statePath string,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+	recoveryGeneration uint64,
+) error {
+	if ctx == nil ||
+		!sessionID.Valid() ||
+		!workspaceID.Valid() ||
+		recoveryGeneration < 1 ||
+		!domain.ValidUnsignedInteger(recoveryGeneration) {
+		return ErrStateConflict
+	}
+	info, err := os.Lstat(statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return requireUnusedDestination(statePath)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrStateConflict
+	}
+	if err := validateJournalFile(statePath, info); err != nil {
+		return errors.Join(ErrStateConflict, err)
+	}
+	database, err := store.Open(ctx, store.Options{Path: statePath})
+	if err != nil {
+		return errors.Join(ErrStateConflict, err)
+	}
+	historyErr := database.VerifyCommitmentHistory(ctx)
+	view, viewErr := database.View(ctx)
+	closeErr := database.Close()
+	if historyErr != nil || viewErr != nil || closeErr != nil {
+		return errors.Join(
+			ErrStateConflict,
+			historyErr,
+			viewErr,
+			closeErr,
+		)
+	}
+	if view.WorkspaceID != workspaceID ||
+		view.RecoveryGeneration >= recoveryGeneration ||
+		view.RecoveryGeneration+1 != recoveryGeneration {
+		return ErrStateConflict
+	}
+	return nil
+}
+
 func loadOrCreateKey(
 	ctx context.Context,
 	secrets CredentialStore,
@@ -555,6 +647,12 @@ func completePairing(
 	}
 	result, err := joiner.Decide(ctx, confirmed)
 	if err != nil {
+		if confirmed && journal.Mode == pairing.ModeRebootstrap {
+			return abandonAmbiguousRebootstrap(
+				options.StatePath,
+				err,
+			)
+		}
 		return err
 	}
 	if result.Confirmation.Status != pairing.StatusConfirmed {
@@ -565,6 +663,18 @@ func completePairing(
 	}
 	journal.Phase = journalPhaseConfirmed
 	return writePendingJournal(options.StatePath, *journal)
+}
+
+func abandonAmbiguousRebootstrap(statePath string, cause error) error {
+	incomplete := fmt.Errorf(
+		"%w: rebootstrap confirmation cannot be recovered; a fresh invite is required",
+		ErrJoinIncomplete,
+	)
+	return errors.Join(
+		incomplete,
+		cause,
+		removePendingJournal(statePath),
+	)
 }
 
 func reviewMatchesJournal(
@@ -653,14 +763,31 @@ func verifyCompletedState(
 	baseline, baselineFound, baselineErr :=
 		database.VerifiedStandaloneLogicalSnapshotBaseline(ctx)
 	historyErr := database.VerifyCommitmentHistory(ctx)
+	marker, markerFound, markerErr := database.LocalState().
+		RebootstrapInstallMarker(ctx)
 	closeErr := database.Close()
 	if modeErr != nil {
 		if errors.Is(modeErr, store.ErrReplicaEvidenceMode) {
-			return false, errors.Join(closeErr, baselineErr, historyErr)
+			return false, errors.Join(
+				closeErr,
+				baselineErr,
+				historyErr,
+				markerErr,
+			)
 		}
 		return false, errors.Join(modeErr, closeErr)
 	}
 	if mode != store.ReplicaEvidenceSettledNonvoter {
+		return false, errors.Join(ErrStateConflict, closeErr)
+	}
+	if markerErr != nil {
+		return false, errors.Join(ErrStateConflict, markerErr, closeErr)
+	}
+	if err := validateJoinCompletionMarker(
+		journal,
+		marker,
+		markerFound,
+	); err != nil {
 		return false, errors.Join(ErrStateConflict, closeErr)
 	}
 	if baselineErr != nil ||
@@ -761,6 +888,30 @@ func verifyCompletedState(
 		return false, errors.Join(ErrStateConflict, closeErr)
 	}
 	return true, closeErr
+}
+
+func validateJoinCompletionMarker(
+	journal pendingJournal,
+	marker store.RebootstrapInstallMarker,
+	found bool,
+) error {
+	switch journal.Mode {
+	case pairing.ModeRebootstrap:
+		if !found ||
+			marker.SessionID != journal.SessionID ||
+			marker.WorkspaceID != journal.WorkspaceID ||
+			marker.RecoveryGeneration != journal.RecoveryGeneration ||
+			marker.DeviceID != journal.LocalDeviceID {
+			return ErrStateConflict
+		}
+	case pairing.ModeNew, pairing.ModeReadmission:
+		if found {
+			return ErrStateConflict
+		}
+	default:
+		return ErrStateConflict
+	}
+	return nil
 }
 
 func joinEntityVersionMatches(

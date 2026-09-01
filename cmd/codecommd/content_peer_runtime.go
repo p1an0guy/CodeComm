@@ -82,6 +82,10 @@ type daemonContentPeerReplication interface {
 	ForgetPeer(domain.DeviceID)
 }
 
+type daemonSettledReplicationFencer interface {
+	withFence(context.Context, func(context.Context) error) error
+}
+
 type daemonContentPeerRuntime struct {
 	sessionID     domain.UUIDv7
 	workspaceID   domain.UUIDv4
@@ -305,6 +309,20 @@ func newDaemonContentPeerRuntimeWithReplication(
 	}
 	go runtime.run()
 	return runtime, nil
+}
+
+func (runtime *daemonContentPeerRuntime) withSettledReplicationFence(
+	ctx context.Context,
+	operation func(context.Context) error,
+) error {
+	if runtime == nil || ctx == nil || operation == nil {
+		return errDaemonContentPeerConstruction
+	}
+	fencer, ok := runtime.replication.(daemonSettledReplicationFencer)
+	if !ok || fencer == nil {
+		return errDaemonContentPeerConstruction
+	}
+	return fencer.withFence(ctx, operation)
 }
 
 func (runtime *daemonContentPeerRuntime) run() {

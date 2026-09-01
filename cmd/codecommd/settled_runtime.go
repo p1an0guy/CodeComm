@@ -109,6 +109,17 @@ func runSettledDaemon(
 	if err != nil {
 		return err
 	}
+	rebootstrapMarker, err := inspectDaemonRebootstrapInstall(
+		ctx,
+		localState,
+		options.sessionID,
+		options.workspaceID,
+		view.RecoveryGeneration,
+		deviceID,
+	)
+	if err != nil {
+		return err
+	}
 	authority, err := event.NewLocalAuthority(deviceID, originBootID)
 	if err != nil {
 		return fmt.Errorf("codecommd: create settled local authority: %w", err)
@@ -269,11 +280,17 @@ func runSettledDaemon(
 			return err
 		}
 	}
-	if err := agentService.Recover(ctx); err != nil {
-		return fmt.Errorf(
-			"codecommd: recover settled local agent state: %w",
-			err,
-		)
+	if err := recoverSettledAgentState(
+		ctx,
+		localState,
+		rebootstrapMarker,
+		daemonRebootstrapCurrencyBarrier{
+			replica: replica,
+			peers:   contentPeerRuntime,
+		},
+		agentService,
+	); err != nil {
+		return err
 	}
 	peerIngress, err = meshFactory.NewIngress(
 		ctx,

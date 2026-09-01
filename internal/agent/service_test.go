@@ -40,8 +40,11 @@ const (
 	agentTestSessionID   = domain.UUIDv7("018f47de-89ab-7def-8123-0123456789ab")
 	agentTestWorkspaceID = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
 	agentTestBootID      = domain.UUIDv7("018f47de-89ab-7def-8123-1123456789ab")
+	agentTestRestartBoot = domain.UUIDv7("018f47de-89ab-7def-b123-1123456789ab")
 	agentTestSessionA    = domain.UUIDv7("018f47de-89ab-7def-8123-2123456789ab")
 	agentTestRootA       = domain.UUIDv7("018f47de-89ab-7def-8123-3123456789ab")
+	agentTestSessionB    = domain.UUIDv7("018f47de-89ab-7def-9123-2123456789ab")
+	agentTestRootB       = domain.UUIDv7("018f47de-89ab-7def-a123-3123456789ab")
 	agentTestTaskID      = domain.UUIDv7("018f47de-89ab-7def-8123-4123456789ab")
 	agentTestAdmissionID = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ac")
 	agentTestTrailingID  = domain.UUIDv7("018f47de-89ab-7def-8123-5123456789ad")
@@ -69,6 +72,120 @@ type recoveryBlockingConsensus struct {
 	entered  chan struct{}
 	release  chan struct{}
 	once     sync.Once
+}
+
+type checkpointAgentConsensus interface {
+	CheckpointConsensus
+	Consensus
+}
+
+type interruptAfterRemoteCommitConsensus struct {
+	mu               sync.Mutex
+	delegate         checkpointAgentConsensus
+	remainingImports int
+	committed        map[domain.UUIDv7][]byte
+	commitCount      int
+	duplicateCount   int
+	importDuplicates bool
+	err              error
+	failed           chan struct{}
+	once             sync.Once
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) ApplyAtGeneration(
+	ctx context.Context,
+	sessionID domain.UUIDv7,
+	generation uint64,
+	signed event.SignedEvent,
+) (store.ApplyResult, error) {
+	runtime.mu.Lock()
+	delegate := runtime.delegate
+	eventID := signed.Proposal().EventID
+	canonical := signed.CanonicalBytes()
+	if prior, found := runtime.committed[eventID]; found {
+		if !bytes.Equal(prior, canonical) {
+			runtime.mu.Unlock()
+			return store.ApplyResult{}, store.ErrIdempotencyConflict
+		}
+		if !runtime.importDuplicates {
+			err := runtime.err
+			runtime.mu.Unlock()
+			return store.ApplyResult{}, err
+		}
+		runtime.duplicateCount++
+		runtime.mu.Unlock()
+		return delegate.ApplyAtGeneration(
+			ctx,
+			sessionID,
+			generation,
+			signed,
+		)
+	}
+	runtime.committed[eventID] = bytes.Clone(canonical)
+	runtime.commitCount++
+	if runtime.remainingImports == 0 {
+		err := runtime.err
+		runtime.mu.Unlock()
+		runtime.once.Do(func() { close(runtime.failed) })
+		return store.ApplyResult{}, err
+	}
+	runtime.remainingImports--
+	runtime.mu.Unlock()
+	return delegate.ApplyAtGeneration(
+		ctx,
+		sessionID,
+		generation,
+		signed,
+	)
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) IsLeader() bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.delegate.IsLeader()
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) FatalError() error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.delegate.FatalError()
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) VerifyCheckpointReplay(
+	ctx context.Context,
+	signed event.SignedEvent,
+	result store.ApplyResult,
+) error {
+	runtime.mu.Lock()
+	delegate := runtime.delegate
+	runtime.mu.Unlock()
+	return delegate.VerifyCheckpointReplay(ctx, signed, result)
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) LocalTime() (
+	domain.Timestamp,
+	int64,
+	error,
+) {
+	runtime.mu.Lock()
+	delegate := runtime.delegate
+	runtime.mu.Unlock()
+	return delegate.LocalTime()
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) replaceDelegate(
+	delegate checkpointAgentConsensus,
+) {
+	runtime.mu.Lock()
+	runtime.delegate = delegate
+	runtime.importDuplicates = true
+	runtime.mu.Unlock()
+}
+
+func (runtime *interruptAfterRemoteCommitConsensus) counts() (int, int) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.commitCount, runtime.duplicateCount
 }
 
 func (runtime *cancellationBlockingConsensus) ApplyAtGeneration(
@@ -1408,6 +1525,307 @@ func TestRecoverDisconnectsAndReapsLiveAgent(t *testing.T) {
 	if session.EndReason != agentsession.EndReasonDisconnectTimeout ||
 		session.EntityVersion != 3 {
 		t.Fatalf("reaped session = %#v", session)
+	}
+}
+
+func TestCrashReapEndsAllImportedSessionsBeforeRecovery(t *testing.T) {
+	harness := newAgentTestHarness(t, []agentsession.Session{
+		{
+			ID:            agentTestSessionA,
+			DeviceID:      "",
+			ClientKind:    agentsession.ClientKindCodex,
+			State:         agentsession.StateWorking,
+			WorkingRootID: agentTestRootA,
+			EntityVersion: 1,
+		},
+		{
+			ID:            agentTestSessionB,
+			DeviceID:      "",
+			ClientKind:    agentsession.ClientKindClaude,
+			State:         agentsession.StateStarting,
+			WorkingRootID: agentTestRootB,
+			EntityVersion: 1,
+		},
+	})
+	assertAgentSessionDevice(t, harness, agentTestSessionA)
+	assertAgentSessionDevice(t, harness, agentTestSessionB)
+
+	if err := harness.service.CrashReap(testAgentContext(t)); err != nil {
+		t.Fatalf("CrashReap(): %v", err)
+	}
+	for _, id := range []domain.UUIDv7{
+		agentTestSessionA,
+		agentTestSessionB,
+	} {
+		session := waitForAgentState(
+			t,
+			harness,
+			id,
+			agentsession.StateEnded,
+		)
+		if session.EndReason != agentsession.EndReasonCrashReap ||
+			session.EntityVersion != 2 {
+			t.Fatalf("crash-reaped session %s = %#v", id, session)
+		}
+	}
+	if err := harness.service.Recover(testAgentContext(t)); err != nil {
+		t.Fatalf("Recover(after crash reap): %v", err)
+	}
+	if err := harness.service.CrashReap(
+		testAgentContext(t),
+	); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("CrashReap(after recovery) error = %v", err)
+	}
+}
+
+func TestCrashReapResumesPartialMultiSessionWorkAfterRestart(
+	t *testing.T,
+) {
+	harness := newAgentTestHarness(t, []agentsession.Session{
+		{
+			ID:            agentTestSessionA,
+			ClientKind:    agentsession.ClientKindCodex,
+			State:         agentsession.StateWorking,
+			WorkingRootID: agentTestRootA,
+			EntityVersion: 1,
+		},
+		{
+			ID:            agentTestSessionB,
+			ClientKind:    agentsession.ClientKindClaude,
+			State:         agentsession.StateStarting,
+			WorkingRootID: agentTestRootB,
+			EntityVersion: 1,
+		},
+	})
+	failure := errors.New("injected forwarding interruption")
+	interrupted := &interruptAfterRemoteCommitConsensus{
+		delegate:         harness.consensus,
+		remainingImports: 1,
+		committed:        make(map[domain.UUIDv7][]byte),
+		err:              failure,
+		failed:           make(chan struct{}),
+	}
+	harness.boot.consensus = interrupted
+
+	ctx, cancel := context.WithCancel(t.Context())
+	reapResult := make(chan error, 1)
+	go func() {
+		reapResult <- harness.service.CrashReap(ctx)
+	}()
+	select {
+	case <-interrupted.failed:
+		cancel()
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("crash reap did not reach the injected interruption")
+	}
+	if err := <-reapResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted CrashReap() error = %v", err)
+	}
+	if commits, duplicates := interrupted.counts(); commits != 2 ||
+		duplicates != 0 {
+		t.Fatalf(
+			"remote commits before restart = (%d, duplicates %d)",
+			commits,
+			duplicates,
+		)
+	}
+	first := waitForAgentState(
+		t,
+		harness,
+		agentTestSessionA,
+		agentsession.StateEnded,
+	)
+	second, found, err := harness.local.AgentSession(
+		testAgentContext(t),
+		agentTestSessionB,
+	)
+	if first.EndReason != agentsession.EndReasonCrashReap ||
+		!found ||
+		err != nil ||
+		second.State == agentsession.StateEnded {
+		t.Fatalf(
+			"partial crash reap = first(%+v) second(%+v,%t,%v)",
+			first,
+			second,
+			found,
+			err,
+		)
+	}
+	stranded, err := harness.local.OutboxRecords(testAgentContext(t))
+	if err != nil ||
+		len(stranded) != 1 ||
+		stranded[0].OriginScopeID != agentTestBootID ||
+		stranded[0].State != "forwarding" {
+		t.Fatalf("stranded old-boot outbox = (%+v, %v)", stranded, err)
+	}
+	statePath := harness.state.Path()
+	if err := harness.service.Close(); err != nil {
+		t.Fatalf("close interrupted service: %v", err)
+	}
+	if err := harness.boot.Close(); err != nil {
+		t.Fatalf("close interrupted boot origin: %v", err)
+	}
+	if err := harness.state.Close(); err != nil {
+		t.Fatalf("close interrupted store: %v", err)
+	}
+
+	reopened, err := store.Open(
+		testAgentContext(t),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("reopen interrupted store: %v", err)
+	}
+	restartView, err := reopened.View(testAgentContext(t))
+	if err != nil ||
+		restartView.LastRaftAppliedLogIndex == nil {
+		_ = reopened.Close()
+		t.Fatalf("reopened view = (%+v, %v)", restartView, err)
+	}
+	restartedFSM, err := consensus.NewFSM(consensus.FSMOptions{
+		Store:        reopened,
+		OriginBootID: agentTestRestartBoot,
+		Clock:        harness.consensus.clock,
+	})
+	if err != nil {
+		_ = reopened.Close()
+		t.Fatalf("NewFSM(restart): %v", err)
+	}
+	restartedConsensus := &fsmConsensus{
+		fsm:   restartedFSM,
+		store: reopened,
+		clock: harness.consensus.clock,
+		index: *restartView.LastRaftAppliedLogIndex,
+	}
+	restartedConsensus.leader.Store(true)
+	interrupted.replaceDelegate(restartedConsensus)
+	harness.state = reopened
+	harness.local = reopened.LocalState()
+	harness.consensus = restartedConsensus
+
+	authority, err := event.NewLocalAuthority(
+		harness.deviceID,
+		agentTestRestartBoot,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemonBinding, err := authority.DaemonBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorBinding, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedBoot, err := NewBootOrigin(BootOriginOptions{
+		Consensus:          interrupted,
+		LocalState:         harness.local,
+		SessionID:          agentTestSessionID,
+		WorkspaceID:        agentTestWorkspaceID,
+		DeviceID:           harness.deviceID,
+		OriginBootID:       agentTestRestartBoot,
+		IdentityPrivateKey: harness.private,
+		DaemonOrigin:       daemonBinding,
+		OperatorOrigin:     operatorBinding,
+	})
+	if err != nil {
+		_ = reopened.Close()
+		t.Fatalf("NewBootOrigin(restart): %v", err)
+	}
+	restarted, err := New(Options{
+		Consensus:          interrupted,
+		LocalState:         harness.local,
+		SessionID:          agentTestSessionID,
+		WorkspaceID:        agentTestWorkspaceID,
+		DeviceID:           harness.deviceID,
+		OriginBootID:       agentTestRestartBoot,
+		IdentityPrivateKey: harness.private,
+		LifecycleOrigin:    daemonBinding,
+		BootOrigin:         restartedBoot,
+	})
+	if err != nil {
+		_ = restartedBoot.Close()
+		_ = reopened.Close()
+		t.Fatalf("New(restart): %v", err)
+	}
+	if err := restarted.CrashReap(testAgentContext(t)); err != nil {
+		t.Fatalf("CrashReap(restart): %v", err)
+	}
+	if records, err := harness.local.OutboxRecords(
+		testAgentContext(t),
+	); err != nil || len(records) != 0 {
+		t.Fatalf("outbox after restarted crash reap = (%+v, %v)", records, err)
+	}
+	if commits, duplicates := interrupted.counts(); commits != 2 ||
+		duplicates != 1 {
+		t.Fatalf(
+			"remote commits after restart = (%d, duplicates %d)",
+			commits,
+			duplicates,
+		)
+	}
+	if err := restarted.Recover(testAgentContext(t)); err != nil {
+		t.Fatalf("Recover(restart): %v", err)
+	}
+	for _, id := range []domain.UUIDv7{
+		agentTestSessionA,
+		agentTestSessionB,
+	} {
+		session := waitForAgentState(
+			t,
+			harness,
+			id,
+			agentsession.StateEnded,
+		)
+		if session.EndReason != agentsession.EndReasonCrashReap {
+			t.Fatalf("restarted crash-reaped session %s = %+v", id, session)
+		}
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatalf("close restarted service: %v", err)
+	}
+	if err := restartedBoot.Close(); err != nil {
+		t.Fatalf("close restarted boot origin: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close recovered store: %v", err)
+	}
+
+	verified, err := store.Open(
+		testAgentContext(t),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("reopen recovered store: %v", err)
+	}
+	defer verified.Close()
+	for _, id := range []domain.UUIDv7{
+		agentTestSessionA,
+		agentTestSessionB,
+	} {
+		session, found, err := verified.LocalState().AgentSession(
+			testAgentContext(t),
+			id,
+		)
+		if err != nil ||
+			!found ||
+			session.State != agentsession.StateEnded ||
+			session.EndReason != agentsession.EndReasonCrashReap {
+			t.Fatalf(
+				"verified recovered session %s = (%+v, %t, %v)",
+				id,
+				session,
+				found,
+				err,
+			)
+		}
+	}
+	if records, err := verified.LocalState().OutboxRecords(
+		testAgentContext(t),
+	); err != nil || len(records) != 0 {
+		t.Fatalf("verified recovered outbox = (%+v, %v)", records, err)
 	}
 }
 

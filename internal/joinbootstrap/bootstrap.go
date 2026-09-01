@@ -783,11 +783,21 @@ func installLatestSnapshot(
 		_ = destination.Close()
 		return err
 	}
-	installed, err := verified.InstallStandalone(
-		ctx,
-		destination,
-		verifiedAt,
-	)
+	var installed store.StandaloneLogicalSnapshotInstallResult
+	if journal.Mode == pairing.ModeRebootstrap {
+		installed, err = verified.InstallStandaloneRebootstrap(
+			ctx,
+			destination,
+			verifiedAt,
+			journal.LocalDeviceID,
+		)
+	} else {
+		installed, err = verified.InstallStandalone(
+			ctx,
+			destination,
+			verifiedAt,
+		)
+	}
 	closeErr := destination.Close()
 	if err != nil || closeErr != nil {
 		return errors.Join(err, closeErr)
@@ -867,7 +877,14 @@ func openJoinDestination(
 	case journalPhaseDecisionApproved, journalPhaseConfirmed:
 		return nil, ErrStateConflict
 	case journalPhaseInstalling:
-		if err := requireUnusedDestination(statePath); err != nil {
+		if err := requireJoinDestination(
+			ctx,
+			statePath,
+			journal.Mode,
+			journal.SessionID,
+			journal.WorkspaceID,
+			journal.RecoveryGeneration,
+		); err != nil {
 			return nil, err
 		}
 		journal.Phase = journalPhaseInstallingOwned

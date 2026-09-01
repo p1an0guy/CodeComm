@@ -394,6 +394,7 @@ func downgradeTestReplicationEvidenceToV5(conn *sqlite.Conn) error {
 		"DROP TABLE initial_projection_rows;",
 		"DROP TABLE initial_projection_boundary;",
 		"DROP TABLE replication_watermark_observations;",
+		"DROP TABLE rebootstrap_install_marker;",
 		"DROP TABLE settled_nonvoter_state;",
 		"DROP INDEX replication_attestations_coverage;",
 		"DROP TABLE replication_attestations;",

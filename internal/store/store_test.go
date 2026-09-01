@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -65,6 +66,7 @@ var requiredTables = []string{
 	"raft_command_applications",
 	"raft_committed_configuration",
 	"raft_snapshot_installs",
+	"rebootstrap_install_marker",
 	"replication_attestations",
 	"replication_cursors",
 	"replication_watermark_observations",
@@ -152,6 +154,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"settled_nonvoter_replication",
 			"replication_watermark_observations",
 			"recovery_boundary_audit",
+			"rebootstrap_install_marker",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
@@ -252,8 +255,9 @@ func TestOpenIsIdempotentAndChecksMigrationChecksum(t *testing.T) {
 func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session", "state.db")
 	store := openTestStore(t, path, nil)
+	version := int64(len(embeddedMigrations) + 1)
 	broken := migrationFromText(
-		9,
+		version,
 		"broken",
 		"CREATE TABLE rolled_back(value TEXT) STRICT; INSERT INTO missing_table VALUES (1);",
 	)
@@ -272,7 +276,13 @@ func TestMigrationFailureRollsBackOneMigration(t *testing.T) {
 			"SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'rolled_back';",
 			0,
 		)
-		assertIntQuery(t, conn, "SELECT count(*) FROM schema_migrations WHERE version = 9;", 0)
+		assertIntQuery(
+			t,
+			conn,
+			"SELECT count(*) FROM schema_migrations WHERE version = "+
+				strconv.FormatInt(version, 10)+";",
+			0,
+		)
 		return nil
 	})
 	if err != nil {
@@ -400,6 +410,37 @@ func TestOpenDatabaseFileSyncsParentOnlyOnCreation(t *testing.T) {
 	}
 	if len(synced) != 0 {
 		t.Fatalf("second open synced directories = %v, want none", synced)
+	}
+}
+
+func TestOpenRejectsHardLinkedDatabase(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "session")
+	path := filepath.Join(directory, "state.db")
+	database, err := Open(
+		context.Background(),
+		Options{Path: path, RequireNew: true},
+	)
+	if err != nil {
+		t.Fatalf("Open(original): %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(original): %v", err)
+	}
+	alias := filepath.Join(directory, "state-alias.db")
+	if err := os.Link(path, alias); err != nil {
+		t.Fatalf("create database hard link: %v", err)
+	}
+	for _, candidate := range []string{path, alias} {
+		opened, err := Open(
+			context.Background(),
+			Options{Path: candidate},
+		)
+		if opened != nil {
+			_ = opened.Close()
+		}
+		if !errors.Is(err, ErrInsecurePath) {
+			t.Fatalf("Open(%q) error = %v", candidate, err)
+		}
 	}
 }
 

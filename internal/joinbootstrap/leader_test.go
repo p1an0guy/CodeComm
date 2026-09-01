@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/pairing"
 )
 
 func TestDecisionApprovedResumeRequiresCommittedAdmission(t *testing.T) {
@@ -99,5 +100,48 @@ func TestDecisionApprovedResumePersistsExactAdmissionProof(t *testing.T) {
 	persisted, err := loadPendingJournal(statePath)
 	if err != nil || persisted.Phase != journalPhaseConfirmed {
 		t.Fatalf("persisted phase = (%q, %v)", persisted.Phase, err)
+	}
+}
+
+func TestDecisionApprovedRebootstrapResumeRequiresFreshInvite(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	journal, _, _ := joinJournalFixture(t)
+	journal.Mode = pairing.ModeRebootstrap
+	subject := journal.LocalDeviceID
+	journal.SubjectDeviceID = &subject
+	statePath := filepath.Join(t.TempDir(), "join", "state.db")
+	if err := writePendingJournal(statePath, journal); err != nil {
+		t.Fatal(err)
+	}
+
+	leader, err := resolveDecisionApprovedBootstrapLeader(
+		t.Context(),
+		statePath,
+		&journal,
+		nil,
+		tls.Certificate{},
+		func(
+			context.Context,
+			pendingJournal,
+			*pinnedEndpoints,
+			tls.Certificate,
+		) (*bootstrapLeaderConnection, error) {
+			t.Fatal("ambiguous rebootstrap queried membership")
+			return nil, nil
+		},
+	)
+	if leader != nil || !errors.Is(err, ErrJoinIncomplete) {
+		t.Fatalf("resolution = (%#v, %v), want incomplete", leader, err)
+	}
+	if pending, pendingErr := HasPending(statePath); pendingErr != nil ||
+		pending {
+		t.Fatalf(
+			"pending journal after ambiguous rebootstrap = (%t, %v)",
+			pending,
+			pendingErr,
+		)
 	}
 }

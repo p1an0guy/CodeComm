@@ -202,6 +202,75 @@ func TestInstallStandaloneLogicalSnapshotPersistsEvidenceAndTail(
 	assertVerifiedStandaloneSnapshotBaseline(t, reopened, root)
 }
 
+func TestInstallStandaloneLogicalSnapshotPreservesRebootstrapMarker(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture, stage, _, cut := logicalSnapshotInstallFixture(t)
+	firstInstalledAt := domain.Timestamp("2026-08-20T01:00:00Z")
+	installed, err := fixture.target.InstallStandaloneLogicalSnapshot(
+		t.Context(),
+		stage,
+		logicalSnapshotInstallOptions(firstInstalledAt),
+	)
+	if err != nil {
+		t.Fatalf("InstallStandaloneLogicalSnapshot(initial): %v", err)
+	}
+	marker := RebootstrapInstallMarker{
+		SessionID:             cut.SessionID,
+		WorkspaceID:           cut.WorkspaceID,
+		RecoveryGeneration:    cut.RecoveryGeneration,
+		DeviceID:              cut.SignerDeviceID,
+		SnapshotAttestationID: installed.AttestationID,
+		InstalledAt:           firstInstalledAt,
+	}
+	if err := fixture.target.LocalState().withImmediate(
+		t.Context(),
+		func(conn *sqlite.Conn) error {
+			return insertRebootstrapInstallMarker(conn, marker)
+		},
+	); err != nil {
+		t.Fatalf("insert rebootstrap marker: %v", err)
+	}
+
+	replacement := openLogicalSnapshotTestStage(t)
+	rebuildLogicalSnapshotStage(t, replacement, fixture)
+	replacementRoot, artifact := logicalSnapshotTestRoot(t, fixture, cut)
+	if err := replacement.VerifyArtifact(
+		t.Context(),
+		replacementRoot,
+		logicalSnapshotTestProof(t, replacementRoot, artifact),
+	); err != nil {
+		t.Fatalf("VerifyArtifact(replacement): %v", err)
+	}
+	secondInstalledAt := domain.Timestamp("2026-08-20T01:01:00Z")
+	replaced, err := fixture.target.InstallStandaloneLogicalSnapshot(
+		t.Context(),
+		replacement,
+		logicalSnapshotInstallOptions(secondInstalledAt),
+	)
+	if err != nil {
+		t.Fatalf("InstallStandaloneLogicalSnapshot(replacement): %v", err)
+	}
+	marker.SnapshotAttestationID = replaced.AttestationID
+	marker.InstalledAt = secondInstalledAt
+	got, found, err := fixture.target.LocalState().
+		RebootstrapInstallMarker(t.Context())
+	if err != nil || !found || got != marker {
+		t.Fatalf(
+			"rebootstrap marker after replacement = (%+v, %t, %v), want %+v",
+			got,
+			found,
+			err,
+			marker,
+		)
+	}
+	if err := fixture.target.VerifyCommitmentHistory(t.Context()); err != nil {
+		t.Fatalf("VerifyCommitmentHistory(replacement): %v", err)
+	}
+}
+
 func assertVerifiedStandaloneSnapshotBaseline(
 	t *testing.T,
 	state *Store,

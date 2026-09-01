@@ -15,6 +15,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
+	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
@@ -77,6 +78,9 @@ func resolveDecisionApprovedBootstrapLeader(
 		journal.Phase != journalPhaseDecisionApproved ||
 		resolve == nil {
 		return nil, ErrBootstrapMismatch
+	}
+	if journal.Mode == pairing.ModeRebootstrap {
+		return nil, abandonAmbiguousRebootstrap(statePath, nil)
 	}
 	leader, err := resolve(
 		ctx,

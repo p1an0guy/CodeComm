@@ -159,6 +159,8 @@ func mustLoadMigrations() []migration {
 				retainInitialProjectionBoundaryMigrationDigest,
 				retainInitialProjectionBoundaryMigration,
 			)
+		case version == 9 && name == "rebootstrap_install_marker":
+			candidate.policy = migrationPolicyReviewedReversible
 		}
 		migrations = append(migrations, candidate)
 	}
