@@ -405,14 +405,14 @@ func TestRequestConsensusStatusUsesOnePeerPinnedRequest(
 			Body:       body,
 		}, nil
 	})
-	got, err := requestConsensusStatusAt(
+	got, err := RequestConsensusStatusAt(
 		t.Context(),
 		requester,
 		status.ServerDeviceID,
 		now,
 	)
 	if err != nil {
-		t.Fatalf("requestConsensusStatusAt(): %v", err)
+		t.Fatalf("RequestConsensusStatusAt(): %v", err)
 	}
 	if calls != 1 || got.ServerDeviceID != status.ServerDeviceID {
 		t.Fatalf("request result = (%#v, calls %d)", got, calls)
@@ -426,7 +426,7 @@ func TestRequestConsensusStatusUsesOnePeerPinnedRequest(
 		CorrelationID: "unavailable",
 		Retryable:     true,
 	})
-	_, err = requestConsensusStatusAt(
+	_, err = RequestConsensusStatusAt(
 		t.Context(),
 		consensusStatusRequesterFunc(func(
 			context.Context,

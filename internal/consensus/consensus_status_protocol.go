@@ -158,6 +158,23 @@ func RequestConsensusStatus(
 	)
 }
 
+// RequestConsensusStatusAt fetches and validates one peer status at the
+// caller's captured credential time. Long-running runtimes use the same clock
+// for certificate selection, verification, and this late-wake bootstrap cut.
+func RequestConsensusStatusAt(
+	ctx context.Context,
+	requester ConsensusStatusRequester,
+	peerDeviceID domain.DeviceID,
+	now time.Time,
+) (ConsensusStatusResult, error) {
+	return requestConsensusStatusAt(
+		ctx,
+		requester,
+		peerDeviceID,
+		now,
+	)
+}
+
 func requestConsensusStatusAt(
 	ctx context.Context,
 	requester ConsensusStatusRequester,

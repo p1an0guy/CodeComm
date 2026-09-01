@@ -511,7 +511,7 @@ func TestDaemonContentPeerRuntimeDetectsActiveRemoteSuccessor(t *testing.T) {
 func TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch(
 	t *testing.T,
 ) {
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Date(2035, 4, 5, 6, 7, 8, 0, time.UTC)
 	local := daemonContentPeerTestMember(t, 0xc1)
 	peerIdentity := ed25519.NewKeyFromSeed(
 		bytes.Repeat([]byte{0xc2}, ed25519.SeedSize),

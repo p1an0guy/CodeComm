@@ -848,10 +848,11 @@ func (runtime *daemonContentPeerRuntime) bootstrapPeerAuthorization(
 		daemonContentPeerBootstrapTimeout,
 	)
 	defer cancel()
-	status, err := consensus.RequestConsensusStatus(
+	status, err := consensus.RequestConsensusStatusAt(
 		requestContext,
 		runtime.status,
 		peerID,
+		now,
 	)
 	if err != nil {
 		return err
