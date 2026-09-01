@@ -122,6 +122,7 @@ func TestReadOnlyOperatorServiceServesStatusAndRefusesMutations(
 		),
 		nil,
 		nil,
+		nil,
 		uiTestClientID,
 	)
 	statusRecorder := httptest.NewRecorder()
@@ -212,7 +213,7 @@ func TestOperatorStatusHandlerReturnsClosedBoundedProjection(t *testing.T) {
 		func(context.Context) (coordstatus.Snapshot, error) {
 			return source, nil
 		},
-	), successfulOperatorSubmitter(), testPairingOperator{}, uiTestClientID)
+	), successfulOperatorSubmitter(), testPairingOperator{}, nil, uiTestClientID)
 	request := httptest.NewRequest(
 		http.MethodGet,
 		statusQueryPath,
@@ -271,6 +272,7 @@ func TestOperatorMemberHandlerQueriesBeyondBoundedRoster(t *testing.T) {
 		source,
 		successfulOperatorSubmitter(),
 		testPairingOperator{},
+		nil,
 		uiTestClientID,
 	)
 	recorder := httptest.NewRecorder()
@@ -324,7 +326,7 @@ func TestOperatorStatusHandlerFailsClosed(t *testing.T) {
 		func(context.Context) (coordstatus.Snapshot, error) {
 			return coordstatus.Snapshot{}, errors.New("store unavailable")
 		},
-	), successfulOperatorSubmitter(), testPairingOperator{}, uiTestClientID)
+	), successfulOperatorSubmitter(), testPairingOperator{}, nil, uiTestClientID)
 	for _, test := range []struct {
 		name    string
 		request *http.Request
@@ -434,6 +436,7 @@ func TestOperatorCommandHandlerRoutesOnlyAllowlistedHumanMutations(
 		}),
 		submitter,
 		testPairingOperator{},
+		nil,
 		uiTestClientID,
 	)
 	body, err := operatorCommandBody(

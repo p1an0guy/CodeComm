@@ -574,6 +574,28 @@ func (runtime *daemonDiscoveryRuntime) DiscoveryError() error {
 	return errors.Join(refreshErr, multicastErr)
 }
 
+func (runtime *daemonDiscoveryRuntime) reconcileManualEndpoints(
+	ctx context.Context,
+) error {
+	if runtime == nil ||
+		runtime.reconciler == nil ||
+		runtime.addresses == nil ||
+		runtime.connectivity == nil ||
+		ctx == nil {
+		return errDaemonDiscoveryConstruction
+	}
+	if err := runtime.reconciler.reconcile(
+		ctx,
+		runtime.addresses.selected(),
+		false,
+	); err != nil {
+		runtime.recordDiscoveryFailure(err)
+		return err
+	}
+	runtime.connectivity.NotifyConnectivityChange()
+	return nil
+}
+
 func resetDaemonDiscoveryTimer(timer *time.Timer, delay time.Duration) {
 	if !timer.Stop() {
 		select {

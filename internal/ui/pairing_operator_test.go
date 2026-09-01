@@ -131,7 +131,7 @@ func TestPairingOperatorHandlerRoutesClosedProtocol(t *testing.T) {
 		attemptResult:   details,
 		confirmResult:   details,
 	}
-	handler := newOperatorHandler(nil, nil, operator, uiTestClientID)
+	handler := newOperatorHandler(nil, nil, operator, nil, uiTestClientID)
 
 	createBody := `{"mode":"new","subject_device_id":null,` +
 		`"expected_entity_version":null,"role":"editor",` +
@@ -250,7 +250,7 @@ func TestPairingOperatorHandlerReturnsAcceptedWhileFinalizing(t *testing.T) {
 		codec.EncodeBase64URL(details.Attempt.RequestDigest[:]) +
 		`","confirmed":true}`
 	response := servePairingOperatorRequest(
-		newOperatorHandler(nil, nil, operator, uiTestClientID),
+		newOperatorHandler(nil, nil, operator, nil, uiTestClientID),
 		http.MethodPost,
 		pairingConfirmPath,
 		body,
@@ -267,7 +267,7 @@ func TestPairingOperatorHandlerReturnsAcceptedWhileFinalizing(t *testing.T) {
 
 func TestPairingOperatorHandlerRejectsMalformedBodiesAndRoutes(t *testing.T) {
 	operator := &recordingPairingOperator{}
-	handler := newOperatorHandler(nil, nil, operator, uiTestClientID)
+	handler := newOperatorHandler(nil, nil, operator, nil, uiTestClientID)
 	oversized := `{"attempt_id":"` +
 		strings.Repeat("x", maxPairingOperatorBodyBytes) + `"}`
 	tests := []struct {

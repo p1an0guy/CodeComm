@@ -227,6 +227,18 @@ func runSettledDaemon(
 		return err
 	}
 
+	var manualEndpoints ui.ManualEndpointOperator
+	if discoveryRuntime != nil {
+		manualEndpoints, err = newDaemonManualEndpointOperator(
+			deviceID,
+			localState,
+			discoveryRuntime,
+			time.Now,
+		)
+		if err != nil {
+			return err
+		}
+	}
 	var contentHandler transport.ConnectionHandler
 	if discoveryRuntime != nil {
 		snapshotRepository, err = openDaemonLogicalSnapshotRepository(
@@ -309,12 +321,23 @@ func runSettledDaemon(
 	}
 	meshFactory.ClearIdentityCertificate()
 
-	operatorService, err := ui.NewMutationOperatorService(
-		replica,
-		bootOrigin,
-		options.sessionID,
-		options.workspaceID,
-	)
+	var operatorService *ui.OperatorService
+	if manualEndpoints == nil {
+		operatorService, err = ui.NewMutationOperatorService(
+			replica,
+			bootOrigin,
+			options.sessionID,
+			options.workspaceID,
+		)
+	} else {
+		operatorService, err = ui.NewMutationOperatorServiceWithEndpoints(
+			replica,
+			bootOrigin,
+			manualEndpoints,
+			options.sessionID,
+			options.workspaceID,
+		)
+	}
 	if err != nil {
 		return err
 	}

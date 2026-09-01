@@ -19,13 +19,15 @@ import (
 )
 
 const (
-	statusQueryPath             = "/local/v1/query/status"
-	memberQueryPrefix           = "/local/v1/query/members/"
-	commandPath                 = "/local/v1/commands"
-	pairingInviteCollectionPath = "/local/v1/pairing/invites"
-	pairingInviteRevokePath     = "/local/v1/pairing/invites/revoke"
-	pairingAttemptPath          = "/local/v1/pairing/attempt"
-	pairingConfirmPath          = "/local/v1/pairing/confirm"
+	statusQueryPath              = "/local/v1/query/status"
+	memberQueryPrefix            = "/local/v1/query/members/"
+	commandPath                  = "/local/v1/commands"
+	pairingInviteCollectionPath  = "/local/v1/pairing/invites"
+	pairingInviteRevokePath      = "/local/v1/pairing/invites/revoke"
+	pairingAttemptPath           = "/local/v1/pairing/attempt"
+	pairingConfirmPath           = "/local/v1/pairing/confirm"
+	manualEndpointCollectionPath = "/local/v1/peer/endpoints"
+	manualEndpointRemovePath     = "/local/v1/peer/endpoints/remove"
 )
 
 var (
@@ -46,6 +48,7 @@ type OperatorServiceOptions struct {
 	Source      StatusSource
 	Submitter   operatorcommand.Submitter
 	Pairing     PairingOperator
+	Endpoints   ManualEndpointOperator
 	SessionID   domain.UUIDv7
 	WorkspaceID domain.UUIDv4
 }
@@ -55,6 +58,7 @@ type OperatorService struct {
 	source      StatusSource
 	submitter   operatorcommand.Submitter
 	pairing     PairingOperator
+	endpoints   ManualEndpointOperator
 	sessionID   domain.UUIDv7
 	workspaceID domain.UUIDv4
 }
@@ -73,6 +77,7 @@ func NewOperatorService(
 		source:      options.Source,
 		submitter:   options.Submitter,
 		pairing:     options.Pairing,
+		endpoints:   options.Endpoints,
 		sessionID:   options.SessionID,
 		workspaceID: options.WorkspaceID,
 	}, nil
@@ -117,6 +122,31 @@ func NewMutationOperatorService(
 	}, nil
 }
 
+// NewMutationOperatorServiceWithEndpoints additionally serves device-local
+// manual peer routing without exposing pairing operations.
+func NewMutationOperatorServiceWithEndpoints(
+	source StatusSource,
+	submitter operatorcommand.Submitter,
+	endpoints ManualEndpointOperator,
+	sessionID domain.UUIDv7,
+	workspaceID domain.UUIDv4,
+) (*OperatorService, error) {
+	if endpoints == nil {
+		return nil, ErrInvalidOperatorOptions
+	}
+	service, err := NewMutationOperatorService(
+		source,
+		submitter,
+		sessionID,
+		workspaceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	service.endpoints = endpoints
+	return service, nil
+}
+
 // Bind implements ipc.Binder without constructing event authority.
 func (service *OperatorService) Bind(
 	ctx context.Context,
@@ -140,6 +170,7 @@ func (service *OperatorService) Bind(
 			service.source,
 			service.submitter,
 			service.pairing,
+			service.endpoints,
 			request.ClientInstanceID,
 		),
 	})
@@ -159,6 +190,7 @@ type operatorHandler struct {
 	source           StatusSource
 	submitter        operatorcommand.Submitter
 	pairing          PairingOperator
+	endpoints        ManualEndpointOperator
 	clientInstanceID domain.UUIDv7
 }
 
@@ -166,12 +198,14 @@ func newOperatorHandler(
 	source StatusSource,
 	submitter operatorcommand.Submitter,
 	pairing PairingOperator,
+	endpoints ManualEndpointOperator,
 	clientInstanceID domain.UUIDv7,
 ) http.Handler {
 	return &operatorHandler{
 		source:           source,
 		submitter:        submitter,
 		pairing:          pairing,
+		endpoints:        endpoints,
 		clientInstanceID: clientInstanceID,
 	}
 }
@@ -208,6 +242,15 @@ func (handler *operatorHandler) ServeHTTP(
 	case request.Method == http.MethodPost &&
 		exactOperatorRoute(request, pairingConfirmPath):
 		handler.confirmPairing(writer, request)
+	case request.Method == http.MethodGet &&
+		exactOperatorRoute(request, manualEndpointCollectionPath):
+		handler.listManualEndpoints(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, manualEndpointCollectionPath):
+		handler.addManualEndpoint(writer, request)
+	case request.Method == http.MethodPost &&
+		exactOperatorRoute(request, manualEndpointRemovePath):
+		handler.removeManualEndpoint(writer, request)
 	default:
 		writeOperatorError(writer, http.StatusNotFound, "operation_not_found")
 	}

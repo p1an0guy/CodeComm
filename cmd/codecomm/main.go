@@ -145,9 +145,17 @@ func runCLI(
 				errorOutput,
 			)
 		}
+		if args[1] == "endpoint" {
+			return runPeerEndpoint(
+				ctx,
+				args[2:],
+				output,
+				errorOutput,
+			)
+		}
 		if args[1] != "revoke" {
 			return fmt.Errorf(
-				"%w: expected peer revoke or peer invite",
+				"%w: expected peer revoke, peer invite, or peer endpoint",
 				errInvalidCLI,
 			)
 		}

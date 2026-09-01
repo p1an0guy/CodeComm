@@ -75,7 +75,7 @@ func (handler *operatorHandler) createPairingInvite(
 		return
 	}
 	var input createPairingInviteWire
-	if decodeClosedPairingBody(
+	if decodeClosedOperatorBody(
 		request.Body,
 		&input,
 		"mode",
@@ -151,7 +151,7 @@ func (handler *operatorHandler) revokePairingInvite(
 		return
 	}
 	var input inviteIDWire
-	if decodeClosedPairingBody(request.Body, &input, "invite_id") != nil {
+	if decodeClosedOperatorBody(request.Body, &input, "invite_id") != nil {
 		writeOperatorError(writer, http.StatusBadRequest, "invalid_pairing_request")
 		return
 	}
@@ -183,7 +183,7 @@ func (handler *operatorHandler) pairingAttempt(
 		return
 	}
 	var input attemptIDWire
-	if decodeClosedPairingBody(request.Body, &input, "attempt_id") != nil {
+	if decodeClosedOperatorBody(request.Body, &input, "attempt_id") != nil {
 		writeOperatorError(writer, http.StatusBadRequest, "invalid_pairing_request")
 		return
 	}
@@ -212,7 +212,7 @@ func (handler *operatorHandler) confirmPairing(
 		return
 	}
 	var input confirmPairingWire
-	if decodeClosedPairingBody(
+	if decodeClosedOperatorBody(
 		request.Body,
 		&input,
 		"attempt_id",
@@ -255,7 +255,7 @@ func (handler *operatorHandler) confirmPairing(
 	writeOperatorJSON(writer, status, response)
 }
 
-func decodeClosedPairingBody(
+func decodeClosedOperatorBody(
 	body io.Reader,
 	target any,
 	fields ...string,

@@ -7,8 +7,11 @@ import (
 	"net/netip"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/discovery"
+	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
 )
 
@@ -299,6 +302,81 @@ func TestDaemonDiscoverySelectionChangeNotifiesCredentialRecovery(
 	if connectivity.calls != 2 {
 		t.Fatalf(
 			"address-change notifications = %d, want 2",
+			connectivity.calls,
+		)
+	}
+}
+
+func TestDaemonDiscoveryManualEndpointChangeReconcilesRoutesImmediately(
+	t *testing.T,
+) {
+	now := time.Date(2026, 9, 1, 12, 34, 56, 0, time.UTC)
+	localID := daemonEndpointRouteTestDeviceID('7')
+	peerID := daemonEndpointRouteTestDeviceID('8')
+	localAddress := netip.MustParseAddr("192.0.2.10")
+	manualAddress := netip.MustParseAddrPort("192.0.2.80:47831")
+	routes, err := transport.NewConsensusRouteTable(
+		[]netip.Addr{localAddress},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewConsensusRouteTable(): %v", err)
+	}
+	state := &daemonEndpointRouteStateStub{
+		snapshot: daemonEndpointRouteSnapshot(localID, peerID),
+		candidates: map[domain.DeviceID][]store.PeerEndpointRecord{
+			peerID: {{
+				DeviceID:   peerID,
+				SourceKind: store.PeerEndpointManual,
+				Endpoint:   manualAddress,
+				ObservedAt: daemonEndpointRouteTimestamp(now),
+			}},
+		},
+	}
+	reconciler, err := newDaemonEndpointRouteReconciler(
+		localID,
+		state,
+		routes,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("newDaemonEndpointRouteReconciler(): %v", err)
+	}
+	reconciler.now = func() time.Time { return now }
+	book := &daemonDiscoveryAddressBook{}
+	book.replace(nil, []netip.Addr{localAddress})
+	connectivity := &daemonConnectivityNotifierStub{}
+	runtime := &daemonDiscoveryRuntime{
+		reconciler:   reconciler,
+		addresses:    book,
+		connectivity: connectivity,
+	}
+	if err := runtime.reconcileManualEndpoints(t.Context()); err != nil {
+		t.Fatalf("reconcile add: %v", err)
+	}
+	endpoints, err := routes.ResolveConsensusEndpoints(t.Context(), peerID)
+	if err != nil ||
+		len(endpoints) != 1 ||
+		endpoints[0] != manualAddress ||
+		connectivity.calls != 1 {
+		t.Fatalf(
+			"manual add routes = (%v, %v), notifications %d",
+			endpoints,
+			err,
+			connectivity.calls,
+		)
+	}
+
+	state.candidates[peerID] = nil
+	if err := runtime.reconcileManualEndpoints(t.Context()); err != nil {
+		t.Fatalf("reconcile remove: %v", err)
+	}
+	endpoints, err = routes.ResolveConsensusEndpoints(t.Context(), peerID)
+	if err == nil || len(endpoints) != 0 || connectivity.calls != 2 {
+		t.Fatalf(
+			"manual removal routes = (%v, %v), notifications %d",
+			endpoints,
+			err,
 			connectivity.calls,
 		)
 	}

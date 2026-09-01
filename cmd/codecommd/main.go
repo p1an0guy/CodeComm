@@ -492,6 +492,7 @@ func runDaemon(
 		peerIngress        *transport.Ingress
 		discoveryRuntime   *daemonDiscoveryRuntime
 		contentPeerRuntime *daemonContentPeerRuntime
+		manualEndpoints    ui.ManualEndpointOperator
 		snapshotRepository *daemonLogicalSnapshotRepository
 		snapshotPublisher  *daemonLogicalSnapshotPublisher
 	)
@@ -629,6 +630,17 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
+	if discoveryRuntime != nil {
+		manualEndpoints, err = newDaemonManualEndpointOperator(
+			deviceID,
+			localState,
+			discoveryRuntime,
+			time.Now,
+		)
+		if err != nil {
+			return err
+		}
+	}
 	var contentHandler transport.ConnectionHandler
 	if discoveryRuntime != nil {
 		snapshotRepository, err = openDaemonLogicalSnapshotRepository(
@@ -708,6 +720,7 @@ func runDaemon(
 		Source:      node,
 		Submitter:   bootOrigin,
 		Pairing:     pairingRuntime.operator,
+		Endpoints:   manualEndpoints,
 		SessionID:   options.sessionID,
 		WorkspaceID: options.workspaceID,
 	})
