@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,12 +31,14 @@ import (
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
+	"github.com/ijonahch/codecomm/internal/domain/agentsession"
 	"github.com/ijonahch/codecomm/internal/domain/auditcounter"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthority"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/policy"
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
 	"github.com/ijonahch/codecomm/internal/joinbootstrap"
 	"github.com/ijonahch/codecomm/internal/pairing"
@@ -49,10 +52,27 @@ import (
 )
 
 const (
-	daemonMeshIntegrationTimeout        = 45 * time.Second
-	daemonMeshIntegrationProcessTimeout = 3 * time.Minute
+	daemonMeshIntegrationTimeout        = 90 * time.Second
+	daemonMeshIntegrationProcessTimeout = 5 * time.Minute
 	daemonMeshIntegrationChildMarker    = "CODECOMM_TEST_DAEMON_MESH_CHILD"
 	daemonMeshIntegrationRequired       = "CODECOMM_REQUIRE_DAEMON_MESH"
+	daemonIntegrationChildComplete      = "CODECOMM_TEST_CHILD_RESULT=complete"
+	daemonIntegrationChildSkip          = "CODECOMM_TEST_CHILD_RESULT=skip"
+	daemonMeshRebootstrapAgentSessionID = domain.UUIDv7(
+		"018f47de-89ab-7def-8123-7123456789ab",
+	)
+	daemonMeshRebootstrapWorkingRootID = domain.UUIDv7(
+		"018f47de-89ab-7def-8123-8123456789ab",
+	)
+	daemonMeshRebootstrapTailAgentSessionID = domain.UUIDv7(
+		"018f47de-89ab-7def-9123-7123456789ab",
+	)
+	daemonMeshRebootstrapTailWorkingRootID = domain.UUIDv7(
+		"018f47de-89ab-7def-a123-7123456789ab",
+	)
+	daemonMeshRebootstrapTailEventID = domain.UUIDv7(
+		"018f47de-89ab-7def-b123-7123456789ab",
+	)
 )
 
 type daemonTestCredentialStore struct {
@@ -207,17 +227,29 @@ type daemonMeshIntegrationPairedMember struct {
 	endpointSet []byte
 }
 
+type daemonMeshPairingJoinOptions struct {
+	request     pairingservice.CreateInviteRequest
+	credentials *daemonTestCredentialStore
+	statePath   string
+}
+
+type daemonMeshPairingJoinResult struct {
+	result joinbootstrap.Result
+	review pairingjoiner.ReviewSubject
+}
+
 func TestDaemonProductionMeshComposition(t *testing.T) {
 	if os.Getenv(daemonMeshIntegrationChildMarker) != "1" {
 		runDaemonMeshIntegrationChild(t)
 		return
 	}
+	registerDaemonIntegrationChildResult(t)
 	runDaemonProductionMeshComposition(t)
 }
 
 func runDaemonProductionMeshComposition(t *testing.T) {
 	t.Helper()
-	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 3)
+	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 4)
 	root := t.TempDir()
 	credentialBase := time.Now().UTC().Truncate(time.Second)
 	credentialClock := newDaemonMeshIntegrationCredentialClock(
@@ -227,18 +259,49 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		t,
 		root,
 		selectedAddress,
-		listeners,
+		listeners[:3],
+		credentialClock.Now,
+	)
+	retained := newDaemonMeshIntegrationRetainedNode(
+		t,
+		root,
+		selectedAddress,
+		listeners[3],
 		credentialClock.Now,
 	)
 	t.Cleanup(func() {
+		cleanupDaemonMeshIntegrationNodes(
+			t,
+			append(nodes, retained)...,
+		)
 		for _, node := range nodes {
-			node.cleanup(t)
 			clear(node.privateKey)
 		}
+		clear(retained.privateKey)
 	})
 
-	nonvoter := newDaemonMeshIntegrationNonvoter(t)
+	nonvoter := daemonMeshIntegrationRetainedMember(t, retained)
 	initial := daemonMeshIntegrationInitialState(t, nodes, nonvoter)
+	initial.Projections.OriginScopes = append(
+		initial.Projections.OriginScopes,
+		store.OriginScopeRow{
+			DeviceID:     nonvoter.ID,
+			ScopeKind:    store.OriginScopeKindAgent,
+			ScopeID:      daemonMeshRebootstrapAgentSessionID,
+			LastSequence: 1,
+		},
+	)
+	initial.Projections.AgentSessions = append(
+		initial.Projections.AgentSessions,
+		agentsession.Session{
+			ID:            daemonMeshRebootstrapAgentSessionID,
+			DeviceID:      nonvoter.ID,
+			ClientKind:    agentsession.ClientKindCodex,
+			State:         agentsession.StateWorking,
+			WorkingRootID: daemonMeshRebootstrapWorkingRootID,
+			EntityVersion: 1,
+		},
+	)
 	voterIDs := daemonMeshIntegrationDeviceIDs(nodes)
 	bootstrap := daemonMeshIntegrationBootstrap(nodes)
 	var bootstrapEntry []byte
@@ -285,6 +348,14 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		nodes,
 		credentialClock,
 		credentialBase,
+	)
+	exerciseDaemonMeshRebootstrap(
+		t,
+		nodes,
+		retained,
+		nonvoter,
+		selectedAddress,
+		credentialClock.Now,
 	)
 	statuses := exerciseDaemonFollowerProposalForwarding(t, nodes)
 	leaderID := domain.DeviceID(*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
@@ -444,9 +515,7 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		mutationResultIndex,
 	)
 
-	for _, node := range nodes {
-		node.stop(t)
-	}
+	stopDaemonMeshIntegrationNodes(t, nodes...)
 	assertDaemonMeshIntegrationDurableMutation(
 		t,
 		nodes,
@@ -456,6 +525,430 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		mutationChainIndex,
 		mutationResultIndex,
 	)
+}
+
+func exerciseDaemonMeshRebootstrap(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	retained *daemonMeshIntegrationNode,
+	member device.Device,
+	selectedAddress netip.Addr,
+	credentialNow func() time.Time,
+) {
+	t.Helper()
+	if len(nodes) != 3 ||
+		retained == nil ||
+		retained.running ||
+		member.ID != retained.deviceID ||
+		member.Role != device.RoleEditor ||
+		member.Status != device.StatusActive ||
+		member.EntityVersion != 1 ||
+		!selectedAddress.IsValid() ||
+		credentialNow == nil {
+		t.Fatal("invalid daemon rebootstrap fixture")
+	}
+	voterIDs := daemonMeshIntegrationDeviceIDs(nodes)
+	statuses := waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationTarget(statuses, 1, voterIDs) &&
+				daemonMeshIntegrationMemberStatus(
+					statuses,
+					member.ID,
+					device.StatusActive,
+					1,
+				) &&
+				daemonMeshIntegrationAgentStatus(
+					statuses,
+					daemonMeshRebootstrapAgentSessionID,
+					member.ID,
+					agentsession.StateWorking,
+					1,
+				)
+		},
+	)
+	leaderID := domain.DeviceID(
+		*statuses[daemonMeshIntegrationLeaderIndex(statuses)].
+			Consensus.LeaderDeviceID,
+	)
+	inviter := daemonMeshIntegrationFollower(t, nodes, leaderID)
+	operator := dialDaemonMeshIntegrationOperator(t, inviter.localEndpoint)
+	subject := member.ID
+	joined := completeDaemonMeshPairingJoin(
+		t,
+		inviter,
+		operator,
+		selectedAddress,
+		credentialNow,
+		daemonMeshPairingJoinOptions{
+			request: pairingservice.CreateInviteRequest{
+				Mode:                   pairing.ModeRebootstrap,
+				SubjectDeviceID:        &subject,
+				Role:                   device.RoleEditor,
+				InitialCredentialEpoch: 1,
+			},
+			credentials: retained.credentials,
+			statePath:   retained.statePath,
+		},
+	)
+	if err := operator.Close(); err != nil {
+		t.Fatalf("close rebootstrap operator client: %v", err)
+	}
+	if joined.result.DeviceID != retained.deviceID ||
+		joined.review.Core.JoinerDeviceID != retained.deviceID ||
+		joined.review.SubjectDeviceID == nil ||
+		*joined.review.SubjectDeviceID != retained.deviceID ||
+		joined.review.ExpectedEntityVersion != nil {
+		t.Fatalf("rebootstrap retained identity = %+v", joined)
+	}
+	assertDaemonMeshRebootstrapDurableState(
+		t,
+		retained,
+		true,
+		agentsession.StateWorking,
+		agentsession.EndReasonAbsent,
+		1,
+		false,
+	)
+	tailContext, cancelTail := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	tailResult, err := applyDaemonSettledEventWithLeaderRetry(
+		tailContext,
+		nodes,
+		daemonMeshRebootstrapTailAgentEvent(t, retained),
+	)
+	cancelTail()
+	if err != nil ||
+		tailResult.Outcome.Status != store.OutcomeAccepted ||
+		tailResult.Outcome.Code != "accepted" {
+		t.Fatalf(
+			"post-snapshot retained agent start = (%+v, %v)",
+			tailResult,
+			err,
+		)
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationAgentStatus(
+					statuses,
+					daemonMeshRebootstrapTailAgentSessionID,
+					member.ID,
+					agentsession.StateStarting,
+					1,
+				)
+		},
+	)
+	assertDaemonMeshRebootstrapDurableState(
+		t,
+		retained,
+		true,
+		agentsession.StateWorking,
+		agentsession.EndReasonAbsent,
+		1,
+		false,
+	)
+	if _, err := readDaemonMeshIntegrationStatus(
+		retained.localEndpoint,
+	); err == nil {
+		t.Fatal("rebootstrap IPC was available before daemon startup")
+	}
+
+	retained.start(t, nodes)
+	waitForDaemonMeshRebootstrapIPC(t, retained)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationTarget(statuses, 1, voterIDs) &&
+				daemonMeshIntegrationMemberStatus(
+					statuses,
+					member.ID,
+					device.StatusActive,
+					1,
+				) &&
+				daemonMeshIntegrationAgentAbsent(
+					statuses,
+					daemonMeshRebootstrapAgentSessionID,
+				) &&
+				daemonMeshIntegrationAgentAbsent(
+					statuses,
+					daemonMeshRebootstrapTailAgentSessionID,
+				) &&
+				daemonMeshIntegrationMutationConverged(statuses)
+		},
+	)
+	retained.stop(t)
+	assertDaemonMeshRebootstrapDurableState(
+		t,
+		retained,
+		false,
+		agentsession.StateEnded,
+		agentsession.EndReasonCrashReap,
+		2,
+		true,
+	)
+	if _, err := os.Stat(retained.consensusDir); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf(
+			"rebootstrap settled daemon created Raft state: %v",
+			err,
+		)
+	}
+}
+
+func waitForDaemonMeshRebootstrapIPC(
+	t *testing.T,
+	retained *daemonMeshIntegrationNode,
+) {
+	t.Helper()
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		select {
+		case <-retained.exited:
+			retained.running = false
+			t.Fatalf(
+				"rebootstrap daemon exited before IPC: %v",
+				retained.exitErr,
+			)
+		default:
+		}
+		status, err := readDaemonMeshIntegrationStatus(
+			retained.localEndpoint,
+		)
+		if err == nil {
+			if status.Session.LocalDeviceID != string(retained.deviceID) ||
+				status.Session.AppliedTerm != nil ||
+				status.Session.AppliedRaftIndex != nil ||
+				!daemonMeshIntegrationMemberStatus(
+					[]ui.Snapshot{status},
+					retained.deviceID,
+					device.StatusActive,
+					1,
+				) ||
+				!daemonMeshIntegrationAgentAbsent(
+					[]ui.Snapshot{status},
+					daemonMeshRebootstrapAgentSessionID,
+				) ||
+				!daemonMeshIntegrationAgentAbsent(
+					[]ui.Snapshot{status},
+					daemonMeshRebootstrapTailAgentSessionID,
+				) {
+				t.Fatalf(
+					"rebootstrap IPC became available before crash reap: %+v",
+					status,
+				)
+			}
+			assertDaemonMeshRebootstrapDurableState(
+				t,
+				retained,
+				false,
+				agentsession.StateEnded,
+				agentsession.EndReasonCrashReap,
+				2,
+				true,
+			)
+			return
+		}
+		lastErr = err
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("rebootstrap IPC did not become available: %v", lastErr)
+}
+
+func assertDaemonMeshRebootstrapDurableState(
+	t *testing.T,
+	retained *daemonMeshIntegrationNode,
+	wantMarker bool,
+	wantState agentsession.State,
+	wantReason agentsession.EndReason,
+	wantEntityVersion uint64,
+	wantTailSession bool,
+) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancel()
+	database, err := store.Open(
+		ctx,
+		store.Options{Path: retained.statePath},
+	)
+	if err != nil {
+		t.Fatalf("open rebootstrap state: %v", err)
+	}
+	defer func() { _ = database.Close() }()
+	if err := database.VerifyCommitmentHistory(ctx); err != nil {
+		t.Fatalf("verify rebootstrap commitments: %v", err)
+	}
+	mode, err := database.ReplicaEvidenceMode(ctx)
+	if err != nil || mode != store.ReplicaEvidenceSettledNonvoter {
+		t.Fatalf("rebootstrap evidence mode = (%q, %v)", mode, err)
+	}
+	marker, found, err := database.LocalState().
+		RebootstrapInstallMarker(ctx)
+	if err != nil || found != wantMarker {
+		t.Fatalf(
+			"rebootstrap marker = (%+v, found %t, err %v), want found %t",
+			marker,
+			found,
+			err,
+			wantMarker,
+		)
+	}
+	if found &&
+		(marker.SessionID != daemonTestSessionID ||
+			marker.WorkspaceID != daemonTestWorkspaceID ||
+			marker.RecoveryGeneration != 0 ||
+			marker.DeviceID != retained.deviceID ||
+			marker.SnapshotAttestationID == "" ||
+			!marker.InstalledAt.Valid()) {
+		t.Fatalf("invalid durable rebootstrap marker = %+v", marker)
+	}
+	session, found, err := database.LocalState().AgentSession(
+		ctx,
+		daemonMeshRebootstrapAgentSessionID,
+	)
+	if err != nil ||
+		!found ||
+		session.DeviceID != retained.deviceID ||
+		session.State != wantState ||
+		session.EndReason != wantReason ||
+		session.EntityVersion != wantEntityVersion {
+		t.Fatalf(
+			"durable rebootstrap agent = (%+v, found %t, err %v)",
+			session,
+			found,
+			err,
+		)
+	}
+	tail, tailFound, err := database.LocalState().AgentSession(
+		ctx,
+		daemonMeshRebootstrapTailAgentSessionID,
+	)
+	if err != nil {
+		t.Fatalf("read durable rebootstrap tail agent: %v", err)
+	}
+	if !wantTailSession {
+		if tailFound {
+			t.Fatalf(
+				"stale rebootstrap snapshot already contains tail agent = %+v",
+				tail,
+			)
+		}
+	} else if !tailFound ||
+		tail.DeviceID != retained.deviceID ||
+		tail.State != agentsession.StateEnded ||
+		tail.EndReason != agentsession.EndReasonCrashReap ||
+		tail.EntityVersion != 2 {
+		t.Fatalf(
+			"durable rebootstrap tail agent = (%+v, found %t)",
+			tail,
+			tailFound,
+		)
+	}
+	status, err := database.LocalState().StatusSnapshot(
+		ctx,
+		retained.deviceID,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("rebootstrap durable status: %v", err)
+	}
+	if status.VoterSet.VoterSetVersion != 1 ||
+		status.CredentialAuthority.VoterSetVersion != 1 {
+		t.Fatalf(
+			"rebootstrap changed membership versions: target=%d authority=%d",
+			status.VoterSet.VoterSetVersion,
+			status.CredentialAuthority.VoterSetVersion,
+		)
+	}
+	var localFound bool
+	for _, candidate := range status.Members {
+		if candidate.ID == retained.deviceID {
+			localFound = true
+			if candidate.Role != device.RoleEditor ||
+				candidate.Status != device.StatusActive ||
+				candidate.EntityVersion != 1 {
+				t.Fatalf(
+					"rebootstrap changed retained member = %+v",
+					candidate,
+				)
+			}
+			break
+		}
+	}
+	if !localFound {
+		t.Fatal("rebootstrap durable status omitted retained member")
+	}
+}
+
+func daemonMeshRebootstrapTailAgentEvent(
+	t *testing.T,
+	retained *daemonMeshIntegrationNode,
+) event.SignedEvent {
+	t.Helper()
+	if retained == nil ||
+		retained.deviceID == "" ||
+		len(retained.privateKey) != ed25519.PrivateKeySize {
+		t.Fatal("invalid retained agent-event fixture")
+	}
+	binding, err := event.NewMCPBinding(
+		retained.deviceID,
+		daemonMeshRebootstrapTailAgentSessionID,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewMCPBinding(rebootstrap tail): %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"client_kind":     agentsession.ClientKindClaude,
+		"working_root_id": daemonMeshRebootstrapTailWorkingRootID,
+	})
+	if err != nil {
+		t.Fatalf("marshal rebootstrap tail payload: %v", err)
+	}
+	proposal, err := event.BuildProposal(
+		event.Command{
+			Kind: event.KindAgentSessionStarted,
+			EntityID: event.StringEntityID(
+				string(daemonMeshRebootstrapTailAgentSessionID),
+			),
+			Actions: []event.Action{},
+			Payload: payload,
+			Redaction: event.Redaction{
+				Policy:        event.RedactionDefault,
+				FieldsRemoved: []event.RedactionField{},
+			},
+		},
+		binding,
+		event.BuildContext{
+			EventID:        daemonMeshRebootstrapTailEventID,
+			SessionID:      daemonTestSessionID,
+			WorkspaceID:    daemonTestWorkspaceID,
+			CreatedAt:      daemonTestTimestamp,
+			OriginSequence: 1,
+		},
+	)
+	if err != nil {
+		t.Fatalf("BuildProposal(rebootstrap tail): %v", err)
+	}
+	signed, err := event.Sign(proposal, retained.privateKey)
+	if err != nil {
+		t.Fatalf("Sign(rebootstrap tail): %v", err)
+	}
+	return signed
 }
 
 func exerciseDaemonNextDayCredentialRecovery(
@@ -472,9 +965,7 @@ func exerciseDaemonNextDayCredentialRecovery(
 	if len(nodes) != 3 || clock == nil || nextDay.IsZero() {
 		t.Fatal("invalid next-day credential recovery fixture")
 	}
-	for _, node := range nodes {
-		node.stop(t)
-	}
+	stopDaemonMeshIntegrationNodes(t, nodes...)
 	clock.Set(nextDay)
 
 	first := nodes[0]
@@ -774,25 +1265,77 @@ func daemonMeshIntegrationInitialState(
 	return initial
 }
 
-func newDaemonMeshIntegrationNonvoter(t *testing.T) device.Device {
+func newDaemonMeshIntegrationRetainedNode(
+	t *testing.T,
+	root string,
+	selectedAddress netip.Addr,
+	listener net.Listener,
+	credentialNow func() time.Time,
+) *daemonMeshIntegrationNode {
 	t.Helper()
+	if root == "" ||
+		!selectedAddress.IsValid() ||
+		listener == nil ||
+		credentialNow == nil {
+		t.Fatal("invalid retained daemon fixture")
+	}
 	privateKey := ed25519.NewKeyFromSeed(
 		bytes.Repeat([]byte{0xd1}, ed25519.SeedSize),
 	)
-	defer clear(privateKey)
-	publicKey := bytes.Clone(privateKey.Public().(ed25519.PublicKey))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
 	deviceID, err := device.DeriveID(publicKey)
 	if err != nil {
+		clear(privateKey)
 		t.Fatalf("derive nonvoter device ID: %v", err)
 	}
+	endpoint, err := netip.ParseAddrPort(listener.Addr().String())
+	if err != nil || endpoint.Addr() != selectedAddress {
+		clear(privateKey)
+		t.Fatalf("retained listener address = %q", listener.Addr())
+	}
+	credentials := newDaemonTestCredentialStore()
+	if err := credentials.Create(
+		t.Context(),
+		credentialstore.IdentityReference(),
+		privateKey,
+	); err != nil {
+		clear(privateKey)
+		t.Fatalf("retain nonvoter identity: %v", err)
+	}
+	return &daemonMeshIntegrationNode{
+		deviceID:      deviceID,
+		privateKey:    privateKey,
+		statePath:     filepath.Join(root, "retained", "state.db"),
+		consensusDir:  filepath.Join(root, "retained", "consensus"),
+		localEndpoint: daemonTestEndpoint(t),
+		peerEndpoint:  endpoint,
+		credentials:   credentials,
+		meshCapture:   &daemonMeshIntegrationFactoryCapture{},
+		credentialNow: credentialNow,
+		listener:      listener,
+	}
+}
+
+func daemonMeshIntegrationRetainedMember(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+) device.Device {
+	t.Helper()
+	if node == nil ||
+		!node.deviceID.Valid() ||
+		len(node.privateKey) != ed25519.PrivateKeySize {
+		t.Fatal("invalid retained member fixture")
+	}
 	return device.Device{
-		ID:                deviceID,
-		Role:              device.RoleEditor,
-		IdentityPublicKey: publicKey,
-		DaemonVersion:     "0.1.0",
-		MaxApplyLevel:     1,
-		Status:            device.StatusActive,
-		EntityVersion:     1,
+		ID:   node.deviceID,
+		Role: device.RoleEditor,
+		IdentityPublicKey: bytes.Clone(
+			node.privateKey.Public().(ed25519.PublicKey),
+		),
+		DaemonVersion: "0.1.0",
+		MaxApplyLevel: 1,
+		Status:        device.StatusActive,
+		EntityVersion: 1,
 	}
 }
 
@@ -978,48 +1521,249 @@ func (node *daemonMeshIntegrationNode) start(
 
 func (node *daemonMeshIntegrationNode) stop(t *testing.T) {
 	t.Helper()
-	if node == nil || !node.running || node.cancel == nil {
-		t.Fatal("daemon mesh test node is not running")
+	stopDaemonMeshIntegrationNodes(t, node)
+}
+
+func stopDaemonMeshIntegrationNodes(
+	t *testing.T,
+	nodes ...*daemonMeshIntegrationNode,
+) {
+	t.Helper()
+	seen := make(map[*daemonMeshIntegrationNode]struct{}, len(nodes))
+	for _, node := range nodes {
+		if node == nil || !node.running || node.cancel == nil {
+			t.Fatal("daemon mesh test node is not running")
+		}
+		if _, duplicate := seen[node]; duplicate {
+			t.Fatal("daemon mesh test node was selected more than once")
+		}
+		seen[node] = struct{}{}
 	}
-	node.cancel()
-	select {
-	case <-node.exited:
-	case <-time.After(daemonMeshIntegrationTimeout):
-		t.Fatalf("daemon %s did not shut down", node.deviceID)
+
+	for _, node := range nodes {
+		node.cancel()
 	}
-	node.running = false
-	node.cancel = nil
-	node.listener = nil
-	if node.exitErr != nil {
-		t.Fatalf("runDaemon(%s): %v", node.deviceID, node.exitErr)
+	for _, node := range nodes {
+		select {
+		case <-node.exited:
+		case <-time.After(daemonMeshIntegrationTimeout):
+			t.Fatalf("daemon %s did not shut down", node.deviceID)
+		}
+		node.running = false
+		node.cancel = nil
+		node.listener = nil
+		if node.exitErr != nil {
+			t.Fatalf("runDaemon(%s): %v", node.deviceID, node.exitErr)
+		}
 	}
 }
 
-func (node *daemonMeshIntegrationNode) cleanup(t *testing.T) {
+func TestStopDaemonMeshIntegrationNodesCancelsAllBeforeWaiting(t *testing.T) {
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	secondContext, cancelSecond := context.WithCancel(context.Background())
+	defer cancelFirst()
+	defer cancelSecond()
+
+	first := &daemonMeshIntegrationNode{
+		deviceID: "first",
+		cancel:   cancelFirst,
+		exited:   make(chan struct{}),
+		running:  true,
+	}
+	second := &daemonMeshIntegrationNode{
+		deviceID: "second",
+		cancel:   cancelSecond,
+		exited:   make(chan struct{}),
+		running:  true,
+	}
+	go func() {
+		<-firstContext.Done()
+		<-secondContext.Done()
+		close(first.exited)
+	}()
+	go func() {
+		<-secondContext.Done()
+		close(second.exited)
+	}()
+
+	stopDaemonMeshIntegrationNodes(t, first, second)
+	for _, node := range []*daemonMeshIntegrationNode{first, second} {
+		if node.running || node.cancel != nil || node.listener != nil {
+			t.Fatalf("stopped node retained runtime state: %+v", node)
+		}
+	}
+}
+
+func cleanupDaemonMeshIntegrationNodes(
+	t *testing.T,
+	nodes ...*daemonMeshIntegrationNode,
+) {
 	t.Helper()
-	if node == nil {
-		return
+	for _, node := range nodes {
+		if node != nil && node.running && node.cancel != nil {
+			node.cancel()
+		}
 	}
-	if node.running {
-		node.cancel()
-		select {
-		case <-node.exited:
-			if node.exitErr != nil {
-				t.Errorf("runDaemon(%s): %v", node.deviceID, node.exitErr)
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		if node.running {
+			if node.cancel == nil {
+				t.Errorf(
+					"daemon mesh test node %s has no cancellation function",
+					node.deviceID,
+				)
 			}
-		case <-time.After(daemonMeshIntegrationTimeout):
-			t.Errorf("daemon %s did not shut down", node.deviceID)
+			select {
+			case <-node.exited:
+				if node.exitErr != nil {
+					t.Errorf("runDaemon(%s): %v", node.deviceID, node.exitErr)
+				}
+			case <-time.After(daemonMeshIntegrationTimeout):
+				t.Errorf("daemon %s did not shut down", node.deviceID)
+			}
+			node.running = false
+			node.cancel = nil
 		}
-		node.running = false
-	}
-	if node.listener != nil {
-		if err := node.listener.Close(); err != nil &&
-			!strings.Contains(err.Error(), "closed network connection") {
-			t.Errorf("close reserved listener %s: %v", node.deviceID, err)
+		if node.listener != nil {
+			if err := node.listener.Close(); err != nil &&
+				!strings.Contains(err.Error(), "closed network connection") {
+				t.Errorf("close reserved listener %s: %v", node.deviceID, err)
+			}
+			node.listener = nil
 		}
-		node.listener = nil
+		node.credentials.wipe()
 	}
-	node.credentials.wipe()
+}
+
+type daemonIntegrationChildResult uint8
+
+const (
+	daemonIntegrationChildResultComplete daemonIntegrationChildResult = iota + 1
+	daemonIntegrationChildResultSkip
+)
+
+func registerDaemonIntegrationChildResult(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		switch {
+		case t.Skipped():
+			fmt.Fprintln(os.Stdout, daemonIntegrationChildSkip)
+		case !t.Failed():
+			fmt.Fprintln(os.Stdout, daemonIntegrationChildComplete)
+		}
+	})
+}
+
+func parseDaemonIntegrationChildResult(
+	output []byte,
+) (daemonIntegrationChildResult, error) {
+	var result daemonIntegrationChildResult
+	for _, line := range strings.Split(
+		strings.ReplaceAll(string(output), "\r\n", "\n"),
+		"\n",
+	) {
+		var candidate daemonIntegrationChildResult
+		switch line {
+		case daemonIntegrationChildComplete:
+			candidate = daemonIntegrationChildResultComplete
+		case daemonIntegrationChildSkip:
+			candidate = daemonIntegrationChildResultSkip
+		default:
+			continue
+		}
+		if result != 0 {
+			return 0, fmt.Errorf("multiple child result sentinels")
+		}
+		result = candidate
+	}
+	if result == 0 {
+		return 0, fmt.Errorf("child result sentinel is missing")
+	}
+	return result, nil
+}
+
+func requireDaemonIntegrationChildResult(
+	t *testing.T,
+	name string,
+	output []byte,
+	processErr error,
+) {
+	t.Helper()
+	if processErr != nil {
+		t.Fatalf("%s child failed: %v\n%s", name, processErr, output)
+	}
+	result, err := parseDaemonIntegrationChildResult(output)
+	if err != nil {
+		t.Fatalf("%s child result: %v\n%s", name, err, output)
+	}
+	if result == daemonIntegrationChildResultSkip {
+		t.Skipf("%s child skipped:\n%s", name, output)
+	}
+}
+
+func TestDaemonIntegrationChildResult(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		want    daemonIntegrationChildResult
+		wantErr bool
+	}{
+		{
+			name:   "complete",
+			output: "test output\n" + daemonIntegrationChildComplete + "\n",
+			want:   daemonIntegrationChildResultComplete,
+		},
+		{
+			name:   "skip",
+			output: daemonIntegrationChildSkip + "\n",
+			want:   daemonIntegrationChildResultSkip,
+		},
+		{
+			name:   "CRLF",
+			output: daemonIntegrationChildComplete + "\r\n",
+			want:   daemonIntegrationChildResultComplete,
+		},
+		{
+			name:    "missing",
+			output:  "ordinary child output\n",
+			wantErr: true,
+		},
+		{
+			name: "substring is not a sentinel",
+			output: "prefix " + daemonIntegrationChildComplete +
+				" suffix\n",
+			wantErr: true,
+		},
+		{
+			name: "conflicting sentinels",
+			output: daemonIntegrationChildComplete + "\n" +
+				daemonIntegrationChildSkip + "\n",
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseDaemonIntegrationChildResult(
+				[]byte(test.output),
+			)
+			if (err != nil) != test.wantErr {
+				t.Fatalf(
+					"parseDaemonIntegrationChildResult() error = %v, wantErr %t",
+					err,
+					test.wantErr,
+				)
+			}
+			if got != test.want {
+				t.Fatalf(
+					"parseDaemonIntegrationChildResult() = %d, want %d",
+					got,
+					test.want,
+				)
+			}
+		})
+	}
 }
 
 func waitForDaemonMeshIntegrationCluster(
@@ -1237,6 +1981,48 @@ func daemonMeshIntegrationMemberStatus(
 	return true
 }
 
+func daemonMeshIntegrationAgentStatus(
+	statuses []ui.Snapshot,
+	agentSessionID domain.UUIDv7,
+	deviceID domain.DeviceID,
+	state agentsession.State,
+	entityVersion uint64,
+) bool {
+	for _, snapshot := range statuses {
+		found := false
+		for _, agent := range snapshot.Agents {
+			if agent.AgentSessionID != string(agentSessionID) {
+				continue
+			}
+			if agent.DeviceID != string(deviceID) ||
+				agent.State != string(state) ||
+				agent.EntityVersion != entityVersion {
+				return false
+			}
+			found = true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func daemonMeshIntegrationAgentAbsent(
+	statuses []ui.Snapshot,
+	agentSessionID domain.UUIDv7,
+) bool {
+	for _, snapshot := range statuses {
+		for _, agent := range snapshot.Agents {
+			if agent.AgentSessionID == string(agentSessionID) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func daemonMeshIntegrationMutationConverged(
 	statuses []ui.Snapshot,
 ) bool {
@@ -1430,208 +2216,30 @@ func admitDaemonMeshPairingJoiner(
 		inviter.peerEndpoint.Addr() != selectedAddress {
 		t.Fatal("invalid daemon pairing fixture")
 	}
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		daemonMeshIntegrationTimeout,
-	)
-	defer cancel()
-
-	created, err := operator.CreatePairingInvite(
-		ctx,
-		pairingservice.CreateInviteRequest{
-			Mode:                   pairing.ModeNew,
-			Role:                   device.RoleEditor,
-			InitialCredentialEpoch: 1,
-		},
-	)
-	if err != nil {
-		t.Fatalf("CreatePairingInvite(): %v", err)
-	}
-	invite, err := pairing.ParseInviteCode(created.Code)
-	if err != nil {
-		t.Fatalf("ParseInviteCode(): %v", err)
-	}
-	inviteValue := invite.Invite()
-	defer clear(inviteValue.Secret[:])
-	if inviteValue.InviterDeviceID != inviter.deviceID ||
-		len(inviteValue.Endpoints) != 1 ||
-		inviteValue.Endpoints[0].IP != selectedAddress ||
-		inviteValue.Endpoints[0].Port != inviter.peerEndpoint.Port() {
-		t.Fatalf("issued invite endpoint or identity = %+v", inviteValue)
-	}
-
-	dialer := net.Dialer{
-		Timeout: 5 * time.Second,
-		LocalAddr: &net.TCPAddr{
-			IP: net.IP(selectedAddress.AsSlice()),
-		},
-	}
 	credentials := newDaemonTestCredentialStore()
 	t.Cleanup(credentials.wipe)
-	statePath := filepath.Join(t.TempDir(), "fresh-device", "state.db")
-	reviews := make(chan pairingjoiner.ReviewSubject, 1)
-	approvals := make(chan bool, 1)
-	type joinOutcome struct {
-		result joinbootstrap.Result
-		err    error
-	}
-	outcomes := make(chan joinOutcome, 1)
-	go func() {
-		result, runErr := joinbootstrap.Run(
-			ctx,
-			joinbootstrap.Options{
-				StatePath:   statePath,
-				Credentials: credentials,
-				Invite:      invite,
-				Confirm: func(
-					confirmContext context.Context,
-					review pairingjoiner.ReviewSubject,
-				) (bool, error) {
-					select {
-					case reviews <- review:
-					case <-confirmContext.Done():
-						return false, confirmContext.Err()
-					}
-					select {
-					case approved := <-approvals:
-						return approved, nil
-					case <-confirmContext.Done():
-						return false, confirmContext.Err()
-					}
-				},
-				Dial: dialer.DialContext,
-				Now:  credentialNow,
+	joinedPair := completeDaemonMeshPairingJoin(
+		t,
+		inviter,
+		operator,
+		selectedAddress,
+		credentialNow,
+		daemonMeshPairingJoinOptions{
+			request: pairingservice.CreateInviteRequest{
+				Mode:                   pairing.ModeNew,
+				Role:                   device.RoleEditor,
+				InitialCredentialEpoch: 1,
 			},
-		)
-		outcomes <- joinOutcome{result: result, err: runErr}
-	}()
-
-	var review pairingjoiner.ReviewSubject
-	select {
-	case review = <-reviews:
-	case outcome := <-outcomes:
-		t.Fatalf(
-			"joinbootstrap.Run() exited before local review: (%+v, %v)",
-			outcome.result,
-			outcome.err,
-		)
-	case <-ctx.Done():
-		t.Fatalf("wait for local join review: %v", ctx.Err())
-	}
-	if review.InviteID != inviteValue.InviteID ||
-		review.InviteDigest != invite.Digest() ||
-		review.SessionID != inviteValue.SessionID ||
-		review.WorkspaceID != inviteValue.WorkspaceID ||
-		review.RecoveryGeneration != inviteValue.RecoveryGeneration ||
-		review.Mode != pairing.ModeNew ||
-		review.SubjectDeviceID != nil ||
-		review.ExpectedEntityVersion != nil ||
-		review.Role != device.RoleEditor ||
-		review.InviterDeviceID != inviter.deviceID ||
-		review.InviterIdentityPublicKey !=
-			inviteValue.InviterIdentityPublicKey ||
-		review.SignedGenesisDigest != inviteValue.SignedGenesisDigest ||
-		review.ConnectedEndpoint != inviter.peerEndpoint ||
-		review.Core.JoinerDeviceID == inviter.deviceID ||
-		review.Core.DaemonVersion != joinbootstrap.CurrentDaemonVersion ||
-		review.Core.MaxApplyLevel != joinbootstrap.CurrentMaxApplyLevel ||
-		review.Core.InitialEpochBinding.Epoch != 1 ||
-		review.Core.InitialEpochBinding.DeviceID !=
-			review.Core.JoinerDeviceID ||
-		review.Core.InitialEpochBinding.SessionID !=
-			daemonTestSessionID ||
-		review.Core.InitialEpochBinding.Validate(
-			review.Core.JoinerIdentityPublicKey[:],
-		) != nil {
-		t.Fatalf("joiner local review = %+v", review)
-	}
-
-	attempt, err := operator.PairingAttempt(ctx, review.AttemptID)
-	if err != nil {
-		t.Fatalf("PairingAttempt(): %v", err)
-	}
-	if !daemonMeshPairingAttemptMatchesReview(attempt, review) ||
-		attempt.State != string(store.PairingAttemptAwaitingSAS) ||
-		attempt.RemoteConfirmed ||
-		attempt.LocalConfirmed {
-		t.Fatalf("pairing attempt before local approval = %+v", attempt)
-	}
-	select {
-	case approvals <- true:
-	case <-ctx.Done():
-		t.Fatalf("approve local join review: %v", ctx.Err())
-	}
-
-	for {
-		attempt, err = operator.PairingAttempt(ctx, review.AttemptID)
-		if err == nil {
-			if !daemonMeshPairingAttemptMatchesReview(attempt, review) {
-				t.Fatalf("pairing review changed after approval = %+v", attempt)
-			}
-			if attempt.RemoteConfirmed {
-				break
-			}
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf(
-				"wait for remote pairing confirmation: %v (last error: %v)",
-				ctx.Err(),
-				err,
-			)
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
-	if attempt.LocalConfirmed {
-		t.Fatalf("inviter was already locally confirmed = %+v", attempt)
-	}
-	localResult, err := operator.ConfirmPairing(ctx, attempt, true)
-	if err != nil {
-		t.Fatalf("ConfirmPairing(): %v", err)
-	}
-	if !daemonMeshPairingAttemptMatchesReview(localResult, review) ||
-		!localResult.RemoteConfirmed ||
-		!localResult.LocalConfirmed {
-		t.Fatalf("inviter pairing confirmation = %+v", localResult)
-	}
-
-	var outcome joinOutcome
-	select {
-	case outcome = <-outcomes:
-	case <-ctx.Done():
-		t.Fatalf("wait for fresh-device bootstrap: %v", ctx.Err())
-	}
-	if outcome.err != nil {
-		t.Fatalf("joinbootstrap.Run(): %v", outcome.err)
-	}
-	joined := outcome.result
-	if joined.SessionID != daemonTestSessionID ||
-		joined.WorkspaceID != daemonTestWorkspaceID ||
-		joined.RecoveryGeneration != inviteValue.RecoveryGeneration ||
-		joined.DeviceID != review.Core.JoinerDeviceID ||
-		joined.StatePath != statePath ||
-		joined.Resumed {
-		t.Fatalf("fresh-device join result = %+v", joined)
-	}
-	if pending, pendingErr := joinbootstrap.HasPending(statePath); pendingErr != nil ||
-		pending {
-		t.Fatalf(
-			"join pending journal after completion = (%t, %v)",
-			pending,
-			pendingErr,
-		)
-	}
-
-	completed, err := operator.PairingAttempt(ctx, review.AttemptID)
-	if err != nil {
-		t.Fatalf("PairingAttempt(completed): %v", err)
-	}
-	if !daemonMeshPairingAttemptMatchesReview(completed, review) ||
-		completed.State != string(store.PairingAttemptCompleted) ||
-		!completed.RemoteConfirmed ||
-		!completed.LocalConfirmed {
-		t.Fatalf("completed pairing attempt = %+v", completed)
-	}
+			credentials: credentials,
+			statePath: filepath.Join(
+				t.TempDir(),
+				"fresh-device",
+				"state.db",
+			),
+		},
+	)
+	joined := joinedPair.result
+	review := joinedPair.review
 
 	member, authorization, epochPrivateKey, identityPrivateKey :=
 		assertDaemonMeshFreshJoinDurableState(
@@ -1706,6 +2314,308 @@ func admitDaemonMeshPairingJoiner(
 	}
 }
 
+func completeDaemonMeshPairingJoin(
+	t *testing.T,
+	inviter *daemonMeshIntegrationNode,
+	operator *ui.OperatorClient,
+	selectedAddress netip.Addr,
+	credentialNow func() time.Time,
+	options daemonMeshPairingJoinOptions,
+) daemonMeshPairingJoinResult {
+	t.Helper()
+	if inviter == nil ||
+		operator == nil ||
+		!selectedAddress.IsValid() ||
+		credentialNow == nil ||
+		credentialNow().IsZero() ||
+		options.credentials == nil ||
+		options.statePath == "" ||
+		!filepath.IsAbs(options.statePath) ||
+		inviter.peerEndpoint.Addr() != selectedAddress {
+		t.Fatal("invalid daemon pairing join options")
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancel()
+
+	created, err := operator.CreatePairingInvite(ctx, options.request)
+	if err != nil {
+		t.Fatalf("CreatePairingInvite(%s): %v", options.request.Mode, err)
+	}
+	invite, err := pairing.ParseInviteCode(created.Code)
+	if err != nil {
+		t.Fatalf("ParseInviteCode(%s): %v", options.request.Mode, err)
+	}
+	inviteValue := invite.Invite()
+	defer clear(inviteValue.Secret[:])
+	if inviteValue.InviterDeviceID != inviter.deviceID ||
+		len(inviteValue.Endpoints) != 1 ||
+		inviteValue.Endpoints[0].IP != selectedAddress ||
+		inviteValue.Endpoints[0].Port != inviter.peerEndpoint.Port() ||
+		inviteValue.Mode != options.request.Mode ||
+		!sameDaemonMeshDeviceIDPointers(
+			inviteValue.SubjectDeviceID,
+			options.request.SubjectDeviceID,
+		) ||
+		!sameDaemonMeshUint64Pointers(
+			inviteValue.ExpectedEntityVersion,
+			options.request.ExpectedEntityVersion,
+		) ||
+		inviteValue.Role != options.request.Role ||
+		inviteValue.InitialCredentialEpoch !=
+			options.request.InitialCredentialEpoch {
+		t.Fatalf(
+			"issued %s invite differs from request: %+v",
+			options.request.Mode,
+			inviteValue,
+		)
+	}
+
+	dialer := net.Dialer{
+		Timeout: 5 * time.Second,
+		LocalAddr: &net.TCPAddr{
+			IP: net.IP(selectedAddress.AsSlice()),
+		},
+	}
+	reviews := make(chan pairingjoiner.ReviewSubject, 1)
+	approvals := make(chan bool, 1)
+	type joinOutcome struct {
+		result joinbootstrap.Result
+		err    error
+	}
+	outcomes := make(chan joinOutcome, 1)
+	go func() {
+		runOptions := joinbootstrap.Options{
+			StatePath:   options.statePath,
+			Credentials: options.credentials,
+			Confirm: func(
+				confirmContext context.Context,
+				review pairingjoiner.ReviewSubject,
+			) (bool, error) {
+				select {
+				case reviews <- review:
+				case <-confirmContext.Done():
+					return false, confirmContext.Err()
+				}
+				select {
+				case approved := <-approvals:
+					return approved, nil
+				case <-confirmContext.Done():
+					return false, confirmContext.Err()
+				}
+			},
+			Dial: dialer.DialContext,
+			Now:  credentialNow,
+		}
+		for {
+			attemptInvite, parseErr := pairing.ParseInviteCode(created.Code)
+			if parseErr != nil {
+				outcomes <- joinOutcome{err: parseErr}
+				return
+			}
+			runOptions.Invite = attemptInvite
+			result, runErr := joinbootstrap.Run(ctx, runOptions)
+			if !errors.Is(
+				runErr,
+				pairingjoiner.ErrEndpointsUnavailable,
+			) {
+				outcomes <- joinOutcome{result: result, err: runErr}
+				return
+			}
+			select {
+			case <-ctx.Done():
+				outcomes <- joinOutcome{err: ctx.Err()}
+				return
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+	}()
+
+	var review pairingjoiner.ReviewSubject
+	select {
+	case review = <-reviews:
+	case outcome := <-outcomes:
+		t.Fatalf(
+			"joinbootstrap.Run(%s) exited before local review: (%+v, %v)",
+			options.request.Mode,
+			outcome.result,
+			outcome.err,
+		)
+	case <-ctx.Done():
+		t.Fatalf(
+			"wait for %s local join review: %v",
+			options.request.Mode,
+			ctx.Err(),
+		)
+	}
+	if review.InviteID != inviteValue.InviteID ||
+		review.InviteDigest != invite.Digest() ||
+		review.SessionID != inviteValue.SessionID ||
+		review.WorkspaceID != inviteValue.WorkspaceID ||
+		review.RecoveryGeneration != inviteValue.RecoveryGeneration ||
+		review.Mode != options.request.Mode ||
+		!sameDaemonMeshDeviceIDPointers(
+			review.SubjectDeviceID,
+			options.request.SubjectDeviceID,
+		) ||
+		!sameDaemonMeshUint64Pointers(
+			review.ExpectedEntityVersion,
+			options.request.ExpectedEntityVersion,
+		) ||
+		review.Role != options.request.Role ||
+		review.InviterDeviceID != inviter.deviceID ||
+		review.InviterIdentityPublicKey !=
+			inviteValue.InviterIdentityPublicKey ||
+		review.SignedGenesisDigest != inviteValue.SignedGenesisDigest ||
+		review.ConnectedEndpoint != inviter.peerEndpoint ||
+		review.Core.JoinerDeviceID == inviter.deviceID ||
+		options.request.SubjectDeviceID != nil &&
+			review.Core.JoinerDeviceID !=
+				*options.request.SubjectDeviceID ||
+		review.Core.DaemonVersion != joinbootstrap.CurrentDaemonVersion ||
+		review.Core.MaxApplyLevel != joinbootstrap.CurrentMaxApplyLevel ||
+		review.Core.InitialEpochBinding.Epoch !=
+			options.request.InitialCredentialEpoch ||
+		review.Core.InitialEpochBinding.DeviceID !=
+			review.Core.JoinerDeviceID ||
+		review.Core.InitialEpochBinding.SessionID !=
+			daemonTestSessionID ||
+		review.Core.InitialEpochBinding.Validate(
+			review.Core.JoinerIdentityPublicKey[:],
+		) != nil {
+		t.Fatalf("%s joiner local review = %+v", options.request.Mode, review)
+	}
+
+	attempt, err := operator.PairingAttempt(ctx, review.AttemptID)
+	if err != nil {
+		t.Fatalf("PairingAttempt(%s): %v", options.request.Mode, err)
+	}
+	if !daemonMeshPairingAttemptMatchesReview(attempt, review) ||
+		attempt.State != string(store.PairingAttemptAwaitingSAS) ||
+		attempt.RemoteConfirmed ||
+		attempt.LocalConfirmed {
+		t.Fatalf(
+			"%s pairing attempt before local approval = %+v",
+			options.request.Mode,
+			attempt,
+		)
+	}
+	select {
+	case approvals <- true:
+	case <-ctx.Done():
+		t.Fatalf(
+			"approve %s local join review: %v",
+			options.request.Mode,
+			ctx.Err(),
+		)
+	}
+
+	for {
+		attempt, err = operator.PairingAttempt(ctx, review.AttemptID)
+		if err == nil {
+			if !daemonMeshPairingAttemptMatchesReview(attempt, review) {
+				t.Fatalf(
+					"%s pairing review changed after approval = %+v",
+					options.request.Mode,
+					attempt,
+				)
+			}
+			if attempt.RemoteConfirmed {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf(
+				"wait for %s remote pairing confirmation: %v (last error: %v)",
+				options.request.Mode,
+				ctx.Err(),
+				err,
+			)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if attempt.LocalConfirmed {
+		t.Fatalf(
+			"%s inviter was already locally confirmed = %+v",
+			options.request.Mode,
+			attempt,
+		)
+	}
+	localResult, err := operator.ConfirmPairing(ctx, attempt, true)
+	if err != nil {
+		t.Fatalf("ConfirmPairing(%s): %v", options.request.Mode, err)
+	}
+	if !daemonMeshPairingAttemptMatchesReview(localResult, review) ||
+		!localResult.RemoteConfirmed ||
+		!localResult.LocalConfirmed {
+		t.Fatalf(
+			"%s inviter pairing confirmation = %+v",
+			options.request.Mode,
+			localResult,
+		)
+	}
+
+	var outcome joinOutcome
+	select {
+	case outcome = <-outcomes:
+	case <-ctx.Done():
+		t.Fatalf(
+			"wait for %s bootstrap: %v",
+			options.request.Mode,
+			ctx.Err(),
+		)
+	}
+	if outcome.err != nil {
+		t.Fatalf(
+			"joinbootstrap.Run(%s): %v",
+			options.request.Mode,
+			outcome.err,
+		)
+	}
+	joined := outcome.result
+	if joined.SessionID != daemonTestSessionID ||
+		joined.WorkspaceID != daemonTestWorkspaceID ||
+		joined.RecoveryGeneration != inviteValue.RecoveryGeneration ||
+		joined.DeviceID != review.Core.JoinerDeviceID ||
+		joined.StatePath != options.statePath ||
+		joined.Resumed {
+		t.Fatalf("%s join result = %+v", options.request.Mode, joined)
+	}
+	if pending, pendingErr := joinbootstrap.HasPending(
+		options.statePath,
+	); pendingErr != nil || pending {
+		t.Fatalf(
+			"%s join pending journal after completion = (%t, %v)",
+			options.request.Mode,
+			pending,
+			pendingErr,
+		)
+	}
+
+	completed, err := operator.PairingAttempt(ctx, review.AttemptID)
+	if err != nil {
+		t.Fatalf(
+			"PairingAttempt(%s completed): %v",
+			options.request.Mode,
+			err,
+		)
+	}
+	if !daemonMeshPairingAttemptMatchesReview(completed, review) ||
+		completed.State != string(store.PairingAttemptCompleted) ||
+		!completed.RemoteConfirmed ||
+		!completed.LocalConfirmed {
+		t.Fatalf(
+			"%s completed pairing attempt = %+v",
+			options.request.Mode,
+			completed,
+		)
+	}
+	return daemonMeshPairingJoinResult{result: joined, review: review}
+}
+
 func daemonMeshPairingAttemptMatchesReview(
 	attempt ui.PairingAttemptStatus,
 	review pairingjoiner.ReviewSubject,
@@ -1723,8 +2633,10 @@ func daemonMeshPairingAttemptMatchesReview(
 		attempt.DaemonVersion == review.Core.DaemonVersion &&
 		attempt.MaxApplyLevel == review.Core.MaxApplyLevel &&
 		attempt.Role == string(review.Role) &&
-		attempt.ExpectedEntityVersion == nil &&
-		review.ExpectedEntityVersion == nil &&
+		sameDaemonMeshUint64Pointers(
+			attempt.ExpectedEntityVersion,
+			review.ExpectedEntityVersion,
+		) &&
 		attempt.InitialCredentialEpoch ==
 			review.Core.InitialEpochBinding.Epoch &&
 		attempt.EpochPublicKey == codec.EncodeBase64URL(
@@ -1734,6 +2646,22 @@ func daemonMeshPairingAttemptMatchesReview(
 			review.Core.InitialEpochBinding.KeyDigest[:],
 		) &&
 		attempt.SAS == review.SAS
+}
+
+func sameDaemonMeshDeviceIDPointers(
+	left, right *domain.DeviceID,
+) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameDaemonMeshUint64Pointers(left, right *uint64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func assertDaemonMeshFreshJoinDurableState(
@@ -2264,6 +3192,8 @@ func runDaemonMeshIntegrationChild(t *testing.T) {
 		)
 	}
 	if err != nil {
-		t.Fatalf("mesh integration child failed: %v\n%s", err, output)
+		requireDaemonIntegrationChildResult(t, "mesh integration", output, err)
+		return
 	}
+	requireDaemonIntegrationChildResult(t, "mesh integration", output, nil)
 }

@@ -1,9 +1,9 @@
 # Phase 3 Status
 
-Status: in progress; secure daemon mesh, discovery, pairing admission, content credentials,
-endpoint and proposal relay, voter reconciliation, and revocation are production-composed; Phase 3
-exit gate remains open
-Last updated: 2026-08-31
+Status: in progress; secure daemon mesh, discovery, pairing admission/rebootstrap, content
+credentials, endpoint and proposal relay, voter reconciliation, and revocation are
+production-composed; Phase 3 exit gate remains open
+Last updated: 2026-09-01
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -51,6 +51,35 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   never implies admission. Invite and confirmation input is bounded, cancellable, and no-echo where
   secret. Windows rejects remote/reparse-backed state and untrusted DACLs and flushes directory
   metadata where supported.
+- Join and daemon startup now contend on the same owner-only `<state>.join.lock`. The daemon acquires
+  it before opening identity or workspace state and retains it through shutdown; contention reports
+  a best-effort holder PID and clean shutdown clears it. The OS lock is authoritative after a crash;
+  stale metadata cannot block recovery through PID reuse. Unix and Windows reject unsafe
+  files/volumes and hard-linked SQLite aliases; cross-process tests retain interoperability with the
+  prior lock primitives.
+- Targeted `rebootstrap` retains the exact installation identity, skips a second admission, requires
+  an unused destination, and abandons an ambiguous post-confirmation resume in favor of a fresh
+  invite. Snapshot installation atomically writes a local crash gate bound to lineage, retained
+  device, snapshot attestation, and installation time; join completion requires that exact marker,
+  while `new` and `readmission` reject one.
+- Settled startup validates the rebootstrap marker, withholds ingress/IPC until direct exact-cut
+  observations from every current credential authority make replica currency `current`, then
+  synchronously commits `agent.session.ended(crash_reap)` for every imported nonterminal session
+  owned by the retained device. Before marker clear it fences all imports, revalidates `current`,
+  and rescans; a tail arriving after the first reap forces another cycle. Multi-session interruption
+  and authority-committed commands awaiting local import survive SQLite reopen. Snapshot fallback
+  atomically rebinds the gate to the newer verified attestation; later membership changes do not
+  prevent exact marker clear before ordinary recovery.
+- `readmission` join accepts an unused destination or a verified predecessor workspace exactly one
+  recovery generation behind. A verified successor snapshot may replace a legitimate Raft
+  predecessor only across that generation transition; same-generation Raft-to-settled conversion
+  fails closed.
+- Production readmission coverage synthesizes only the Phase 6 recovery command's successor
+  payload, proves it through the generation-zero and successor-boundary verifiers, then exercises
+  real TLS/SAS pairing, conditional admission, credential authorization, snapshot transfer,
+  Raft-predecessor replacement, settled startup, and reopen with the retained identity. This
+  production predecessor has no post-initial commands; a separate verified-install test covers a
+  nonempty Raft command ledger.
 - Quorum clock endorsement, leader authorization/forwarding, protected epoch-key storage,
   make-before-break certificate selection, renewal retry, content mTLS, `/v1/session`, `/v1/peers`,
   and direct endpoint-set exchange are composed. Applied revocation closes established access,
@@ -163,15 +192,21 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   established and fresh content denial without target/authority drift, and restart a follower.
   They then stop every voter past expiry, prove one awake voter elects and authorizes nothing, prove
   two voters restore quorum and epoch 3, catch up the third, restore content traffic, re-open every
-  store, and verify commitment history.
+  store, and verify commitment history. The same production path rebootstraps an active retained
+  nonvoter through owner-targeted SAS pairing, commits a second retained-device session after the
+  installed snapshot, then proves the stale tail reaches exact current currency and both sessions
+  are durably crash-reaped before IPC. It also proves no second admission or membership-version
+  drift, clears the marker, and creates no Raft state.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
 
 ## Open Exit Gates
 
-- Fresh `new`-mode joining is production-composed. Identity-preserving `rebootstrap` and
-  post-recovery `readmission` remain unimplemented in the join command.
+- Fresh `new`, identity-preserving `rebootstrap`, and post-recovery `readmission` joins are
+  production-composed. Readmission is covered from a verifier-approved synthesized successor;
+  production `codecomm cluster recover-quorum` and its full recovery/readmission E2E belong to
+  Phase 6 and are not Phase 3 exit requirements.
 - Listener selection is currently supplied as foreground daemon flags. Automatic address-change
   rebinding, an operator-managed manual-endpoint surface, and an operator-visible multicast-degraded
   status remain missing.
@@ -191,18 +226,47 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
 that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
-production local-Git provider is not an exit requirement. The rebootstrap/readmission, listener,
-and test gaps above remain open.
+production local-Git provider and Phase 6 quorum recovery are not exit requirements. Listener and
+Phase 3 test gaps above remain open.
 
 ## Evidence
 
 Primary tests:
 
 - `TestDaemonProductionMeshComposition`
+- `TestDaemonProductionReadmissionComposition`
 - `TestDecisionApprovedResumeRequiresCommittedAdmission`
+- `TestDecisionApprovedRebootstrapResumeRequiresFreshInvite`
 - `TestOpenJoinDestinationRecordsExclusiveOwnershipBeforeReuse`
 - `TestJoinLockExcludesAnotherProcessHandle`
 - `TestJoinerRealTLSPairingHTTPFlow`
+- `TestReadmissionDestinationRequiresExactPredecessorLineage`
+- `TestJoinCompletionRequiresModeSpecificRebootstrapMarker`
+- `TestCrashReapEndsAllImportedSessionsBeforeRecovery`
+- `TestCrashReapResumesPartialMultiSessionWorkAfterRestart`
+- `TestInspectDaemonRebootstrapInstallBindsLineageAndDevice`
+- `TestRebootstrapRecoveryWaitsForCurrentReplica`
+- `TestRecoverSettledAgentStateRetriesEveryCrashBoundary`
+- `TestRecoverSettledAgentStateResumesPartialMultiSessionCrashReap`
+- `TestRecoverSettledAgentStateRefreshesSnapshotFallbackMarker`
+- `TestRecoverSettledAgentStateRejectsInvalidFinalMarker`
+- `TestRecoverSettledAgentStateReapsTailArrivingBeforeFence`
+- `TestDaemonSettledReplicationFenceExcludesImportPass`
+- `TestJoinAndWorkspaceLockMutuallyExclude`
+- `TestAcquireReclaimsLockAfterOwnerProcessDies`
+- `TestAcquireInteroperatesWithLegacyOwnerProcess`
+- `TestLegacyUnixLockInteroperability` / `TestLegacyWindowsLockInteroperability`
+- `TestOpenRejectsHardLinkedDatabase`
+- `TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers`
+- `TestVerifiedLogicalSnapshotStageAtomicallyMarksRebootstrap`
+- `TestVerifiedLogicalSnapshotStageRejectsRebootstrapForAuthority`
+- `TestVerifiedLogicalSnapshotStageInstallsSuccessorOverRaftPredecessor`
+- `TestVerifiedLogicalSnapshotStageRejectsSameGenerationRaftConversion`
+- `TestRebootstrapInstallMarkerClearRequiresExactBinding`
+- `TestRebootstrapInstallMarkerRejectsCorrelatedStateCorruption`
+- `TestRebootstrapInstallMarkerCanClearAfterMembershipChanges`
+- `TestInstallStandaloneLogicalSnapshotPreservesRebootstrapMarker`
+- `TestMigration0009AddsEmptyRebootstrapCrashGate`
 - `TestSecureThreeVoterConsensusMesh`
 - `TestSecureThreeVoterColdCommitRecovery`
 - `TestSecureMeshCompactedSnapshotCatchupAndPromotion`
@@ -217,7 +281,6 @@ Primary tests:
 - `TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart`
 - `TestSnapshotClientRoundTripBindsRootAndArtifact`
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
-- `TestVerifiedLogicalSnapshotStageInstallsSuccessorOverPredecessor`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
 - `TestFSMSemanticRaftSnapshotCaptureAndRestoreUsesCommandWatermark`
 
@@ -243,5 +306,10 @@ go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 4. **Bounds:** routes, listeners, connections, streams, bodies, headers, sources, nonces, retries,
    and status views retain explicit ceilings. Unknown routes, peers, capabilities, and unavailable
    providers fail closed.
-5. **Coverage:** real Raft, SQLite, TCP, mTLS, HTTP/2, process restart, live connection loss,
-   revocation, reconciliation, and minority behavior are exercised without mocking their behavior.
+5. **Recovery interruption:** exact-current authority observations precede rebootstrap cleanup; the
+   import fence plus marker contract keep sessions inaccessible until every crash reap commits.
+   Crashes during multi-session reap, before clear, or before ordinary recovery retry the gate.
+6. **Coverage:** real Raft, SQLite, TCP, mTLS, HTTP/2, process restart, live connection loss,
+   revocation, reconciliation, minority behavior, and production-composed rebootstrap are exercised
+   without mocking their behavior. Full production quorum-recovery/readmission E2E is deferred to
+   Phase 6.

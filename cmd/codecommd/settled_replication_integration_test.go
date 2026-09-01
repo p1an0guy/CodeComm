@@ -49,6 +49,7 @@ func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart(
 		runDaemonSettledReplicationChild(t)
 		return
 	}
+	registerDaemonIntegrationChildResult(t)
 	runDaemonSettledReplicationIntegration(t)
 }
 
@@ -59,6 +60,7 @@ func TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart(
 		runDaemonSettledSnapshotFallbackChild(t)
 		return
 	}
+	registerDaemonIntegrationChildResult(t)
 	runDaemonSettledSnapshotFallbackIntegration(t)
 }
 
@@ -92,8 +94,8 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		voter.coverage = coverage
 	}
 	t.Cleanup(func() {
+		cleanupDaemonMeshIntegrationNodes(t, allNodes...)
 		for _, node := range allNodes {
-			node.cleanup(t)
 			clear(node.privateKey)
 		}
 	})
@@ -332,9 +334,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				)
 		},
 	)
-	for _, voter := range removedVoters {
-		voter.stop(t)
-	}
+	stopDaemonMeshIntegrationNodes(t, removedVoters...)
 	settled.listener = listenDaemonMeshIntegrationEndpoint(
 		t,
 		settled.peerEndpoint,
@@ -359,8 +359,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		},
 	)
 
-	target.stop(t)
-	settled.stop(t)
+	stopDaemonMeshIntegrationNodes(t, target, settled)
 	assertDaemonSettledReplicationDurableState(
 		t,
 		target,
@@ -425,8 +424,8 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		participant.coverage = coverage
 	}
 	t.Cleanup(func() {
+		cleanupDaemonMeshIntegrationNodes(t, allNodes...)
 		for _, node := range allNodes {
-			node.cleanup(t)
 			clear(node.privateKey)
 		}
 	})
@@ -781,9 +780,7 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 			backlogResultIndex,
 		)
 	}
-	for _, voter := range removedVoters {
-		voter.stop(t)
-	}
+	stopDaemonMeshIntegrationNodes(t, removedVoters...)
 
 	contentContext, cancelContent := context.WithTimeout(
 		context.Background(),
@@ -971,8 +968,7 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		},
 	)
 
-	settled.stop(t)
-	target.stop(t)
+	stopDaemonMeshIntegrationNodes(t, settled, target)
 	assertDaemonSettledSnapshotFallbackDurableState(
 		t,
 		target,
@@ -1263,7 +1259,24 @@ func authorizeDaemonSettledCredential(
 		context.Background(),
 		daemonMeshIntegrationTimeout,
 	)
-	authorization, err := node.RenewCredential(ctx, binding)
+	var authorization credentialauthorization.Authorization
+	for {
+		authorization, err = node.RenewCredential(ctx, binding)
+		if err == nil ||
+			!errors.Is(
+				err,
+				consensus.ErrCredentialAuthorizationUnavailable,
+			) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			err = errors.Join(ctx.Err(), err)
+		case <-time.After(25 * time.Millisecond):
+			continue
+		}
+		break
+	}
 	cancel()
 	if err != nil {
 		t.Fatalf("RenewCredential(settled): %v", err)
@@ -1805,9 +1818,12 @@ func runDaemonSettledReplicationChild(t *testing.T) {
 			output,
 		)
 	}
-	if err != nil {
-		t.Fatalf("settled replication child failed: %v\n%s", err, output)
-	}
+	requireDaemonIntegrationChildResult(
+		t,
+		"settled replication",
+		output,
+		err,
+	)
 }
 
 func runDaemonSettledSnapshotFallbackChild(t *testing.T) {
@@ -1838,9 +1854,7 @@ func runDaemonSettledSnapshotFallbackChild(t *testing.T) {
 			output,
 		)
 	}
-	if err != nil {
-		t.Fatalf("settled snapshot child failed: %v\n%s", err, output)
-	}
+	requireDaemonIntegrationChildResult(t, "settled snapshot", output, err)
 }
 
 var _ canonicalcoverage.ReceiptCollector = (*daemonSettledCoverageCollector)(nil)
