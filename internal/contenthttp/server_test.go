@@ -35,8 +35,10 @@ const contentTestTimeout = 5 * time.Second
 type contentTestService struct {
 	mu sync.Mutex
 
-	session SessionResponse
-	peers   PeersResponse
+	session          SessionResponse
+	peers            PeersResponse
+	watermark        EventWatermark
+	watermarkChanges chan struct{}
 
 	sessionCalls          int
 	peersCalls            int
@@ -112,9 +114,22 @@ func newContentTestService(
 	if err != nil {
 		t.Fatal(err)
 	}
+	watermark, err := NewEventWatermark(EventWatermarkInput{
+		SessionID:          testSessionID,
+		WorkspaceID:        testWorkspaceID,
+		RecoveryGeneration: 0,
+		ServerDeviceID:     serverDeviceID,
+		ResultIndex:        0,
+		ChainIndex:         0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &contentTestService{
 		session:          session,
 		peers:            peers,
+		watermark:        watermark,
+		watermarkChanges: make(chan struct{}, 1),
 		snapshotRootErr:  ErrSnapshotNotFound,
 		snapshotOpenErr:  ErrSnapshotNotFound,
 		snapshotPageErr:  ErrSnapshotNotFound,
@@ -165,6 +180,25 @@ func (service *contentTestService) Peers(
 	service.peersCalls++
 	service.peersSeen = append(service.peersSeen, peer)
 	return service.peers, nil
+}
+
+func (service *contentTestService) EventWatermark(
+	_ context.Context,
+) (EventWatermark, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.watermark, nil
+}
+
+func (service *contentTestService) EventWatermarkChanges(
+	ctx context.Context,
+) (<-chan struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.watermarkChanges, nil
 }
 
 func (service *contentTestService) ProposeEvent(

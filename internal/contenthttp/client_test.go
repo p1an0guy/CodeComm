@@ -484,6 +484,78 @@ func TestClientCancellationLeavesReusableConnection(t *testing.T) {
 	}
 }
 
+func TestClientReportsSuccessfulResponseBodyNoProgress(t *testing.T) {
+	fixture := newContentTLSFixture(t)
+	service := newContentTestService(t, fixture.serverDevice)
+	sessionBody, err := service.session.canonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	headersSent := make(chan struct{})
+	handler := http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		writer.Header().Set("Content-Type", contentJSONMediaType)
+		writer.Header().Set(
+			"Content-Length",
+			strconv.Itoa(len(sessionBody)),
+		)
+		writer.WriteHeader(http.StatusOK)
+		if err := http.NewResponseController(writer).Flush(); err != nil {
+			return
+		}
+		close(headersSent)
+		<-request.Context().Done()
+	})
+	harness := mustOpenScriptedContentClient(t, fixture, handler)
+	defer harness.stop(t)
+
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requestDone := make(chan error, 1)
+	go func() {
+		_, requestErr := harness.client.requestBoundedWithNoProgress(
+			parent,
+			http.MethodGet,
+			SessionPath,
+			nil,
+			nil,
+			ResponseMaxBytes,
+			100*time.Millisecond,
+		)
+		requestDone <- requestErr
+	}()
+	select {
+	case <-headersSent:
+	case err = <-requestDone:
+		t.Fatalf("request ended before its successful response body: %v", err)
+	case <-time.After(contentTestTimeout):
+		t.Fatal("request did not receive successful response headers")
+	}
+	select {
+	case err = <-requestDone:
+	case <-time.After(contentTestTimeout):
+		t.Fatal("response body watchdog did not end the stalled request")
+	}
+	if !errors.Is(err, ErrConnectionUnavailable) {
+		t.Fatalf(
+			"requestBoundedWithNoProgress() error = %v, want %v",
+			err,
+			ErrConnectionUnavailable,
+		)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("watchdog error collapsed to context cancellation: %v", err)
+	}
+	if !strings.Contains(err.Error(), "response no progress") {
+		t.Fatalf("watchdog error did not report its cause: %v", err)
+	}
+	if parent.Err() != nil {
+		t.Fatalf("watchdog canceled parent context: %v", parent.Err())
+	}
+}
+
 func TestClientCloseIsIdempotentAndInterruptsRequest(t *testing.T) {
 	fixture := newContentTLSFixture(t)
 	entered := make(chan struct{}, 1)

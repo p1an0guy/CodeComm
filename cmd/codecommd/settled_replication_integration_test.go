@@ -198,6 +198,11 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				daemonMeshIntegrationTarget(statuses, 1, voterIDs)
 		},
 	)
+	awaitDaemonSettledEventReplication(
+		t,
+		settled,
+		bootstrapResultIndex,
+	)
 	authorityOneTaskID := domain.UUIDv7(
 		"018f47de-89ab-7def-8123-7123456789ab",
 	)
@@ -247,22 +252,13 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 	)
 	authorityOneResultIndex := statuses[0].Session.ResultIndex
 	authorityOneChainIndex := statuses[0].Session.EventChainIndex
-	waitForDaemonMeshIntegrationCluster(
+	awaitDaemonSettledSSEConvergence(
 		t,
-		[]*daemonMeshIntegrationNode{settled},
-		func(statuses []ui.Snapshot) bool {
-			return len(statuses) == 1 &&
-				statuses[0].Session.ResultIndex ==
-					authorityOneResultIndex &&
-				statuses[0].Session.EventChainIndex ==
-					authorityOneChainIndex &&
-				statuses[0].Session.AppliedRaftIndex == nil &&
-				daemonMeshIntegrationTarget(statuses, 1, voterIDs) &&
-				daemonSettledTasksConverged(
-					statuses,
-					authorityOneTaskID,
-				)
-		},
+		settled,
+		authorityOneResultIndex,
+		authorityOneChainIndex,
+		voterIDs,
+		authorityOneTaskID,
 	)
 	settled.stop(t)
 
@@ -450,6 +446,93 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		target.deviceID,
 		authorityOneResultIndex,
 		3,
+	)
+}
+
+func awaitDaemonSettledEventReplication(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+	resultIndex uint64,
+) {
+	t.Helper()
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	for time.Now().Before(deadline) {
+		if daemonSettledEventReplicationReached(node, resultIndex) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf(
+		"settled SSE replication did not reach result %d",
+		resultIndex,
+	)
+}
+
+func daemonSettledEventReplicationReached(
+	node *daemonMeshIntegrationNode,
+	resultIndex uint64,
+) bool {
+	if node == nil {
+		return false
+	}
+	runtime := node.contentPeers.Load()
+	if runtime == nil {
+		return false
+	}
+	runtime.workersMu.Lock()
+	workers := make([]*daemonContentPeerWorker, 0, len(runtime.workers))
+	for _, worker := range runtime.workers {
+		workers = append(workers, worker)
+	}
+	runtime.workersMu.Unlock()
+	for _, worker := range workers {
+		if worker.eventStreamReplicatedResult.Load() >= resultIndex {
+			return true
+		}
+	}
+	return false
+}
+
+func awaitDaemonSettledSSEConvergence(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+	resultIndex uint64,
+	chainIndex uint64,
+	voterIDs []domain.DeviceID,
+	taskID domain.UUIDv7,
+) {
+	t.Helper()
+	deadline := time.Now().Add(
+		daemonContentPeerReplicationFallback / 2,
+	)
+	var (
+		lastStatus ui.Snapshot
+		lastErr    error
+	)
+	for time.Now().Before(deadline) {
+		if !daemonSettledEventReplicationReached(node, resultIndex) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		lastStatus, lastErr = readDaemonMeshIntegrationStatus(
+			node.localEndpoint,
+		)
+		statuses := []ui.Snapshot{lastStatus}
+		if lastErr == nil &&
+			lastStatus.Session.ResultIndex == resultIndex &&
+			lastStatus.Session.EventChainIndex == chainIndex &&
+			lastStatus.Session.AppliedRaftIndex == nil &&
+			daemonMeshIntegrationTarget(statuses, 1, voterIDs) &&
+			daemonSettledTasksConverged(statuses, taskID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf(
+		"settled SSE catch-up missed result %d before fallback: status=%s error=%v",
+		resultIndex,
+		daemonMeshIntegrationStatusSummary([]ui.Snapshot{lastStatus}),
+		lastErr,
 	)
 }
 

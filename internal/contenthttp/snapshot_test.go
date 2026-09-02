@@ -1202,8 +1202,8 @@ func TestSnapshotClientRejectsTruncatedAndOverlongBodies(t *testing.T) {
 			if _, err := readClientResponse(
 				context.Background(),
 				response,
-				connection,
 				4,
+				func() {},
 			); !errors.Is(err, ErrResponseProtocol) {
 				t.Fatalf("readClientResponse() error=%v", err)
 			}

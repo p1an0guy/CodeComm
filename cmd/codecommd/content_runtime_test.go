@@ -44,6 +44,10 @@ type daemonContentStateStub struct {
 	replicationWatermark store.ReplicationWatermark
 	watermarkErr         error
 	watermarkSigner      domain.DeviceID
+
+	resultHead        store.ResultHead
+	resultHeadErr     error
+	resultHeadChanges chan struct{}
 }
 
 func (state *daemonContentStateStub) StatusSnapshot(
@@ -100,6 +104,40 @@ func (state *daemonContentStateStub) ExportReplicationWatermark(
 		return store.ReplicationWatermark{}, state.watermarkErr
 	}
 	return state.replicationWatermark, nil
+}
+
+func (state *daemonContentStateStub) ResultHead(
+	_ context.Context,
+) (store.ResultHead, error) {
+	if state.resultHeadErr != nil {
+		return store.ResultHead{}, state.resultHeadErr
+	}
+	if state.resultHead.SessionID.Valid() {
+		return state.resultHead, nil
+	}
+	return store.ResultHead{
+		SessionID:          state.snapshot.SessionID,
+		WorkspaceID:        state.snapshot.WorkspaceID,
+		RecoveryGeneration: state.snapshot.RecoveryGeneration,
+		ChainIndex:         state.snapshot.Heads.ChainIndex,
+		ResultIndex:        state.snapshot.Heads.ResultIndex,
+	}, nil
+}
+
+func (state *daemonContentStateStub) SubscribeResultHeadChanges(
+	ctx context.Context,
+) (<-chan struct{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if state.resultHeadErr != nil {
+		return nil, state.resultHeadErr
+	}
+	if state.resultHeadChanges == nil {
+		state.resultHeadChanges = make(chan struct{}, 1)
+		state.resultHeadChanges <- struct{}{}
+	}
+	return state.resultHeadChanges, nil
 }
 
 type daemonEndpointSetSourceStub struct {
@@ -240,6 +278,60 @@ func TestDaemonContentServiceReturnsAppliedSessionAndExactEndpointSets(
 		remoteSet,
 	) {
 		t.Fatal("response retained caller-owned endpoint-set storage")
+	}
+}
+
+func TestDaemonContentServicePublishesDurableEventWatermark(t *testing.T) {
+	snapshot := daemonContentTestSnapshot(t)
+	changes := make(chan struct{}, 1)
+	changes <- struct{}{}
+	state := &daemonContentStateStub{
+		snapshot: snapshot,
+		resultHead: store.ResultHead{
+			SessionID:          snapshot.SessionID,
+			WorkspaceID:        snapshot.WorkspaceID,
+			RecoveryGeneration: snapshot.RecoveryGeneration,
+			ChainIndex:         17,
+			ResultIndex:        23,
+		},
+		resultHeadChanges: changes,
+	}
+	service, err := newDaemonContentService(
+		snapshot.SessionID,
+		snapshot.WorkspaceID,
+		snapshot.RecoveryGeneration,
+		snapshot.Member.ID,
+		state,
+		&daemonEndpointSetSourceStub{},
+		&daemonEventProposalConsensusStub{},
+		daemonContentTestBatchSigner(t),
+		time.Now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watermark, err := service.EventWatermark(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if watermark.SessionID() != snapshot.SessionID ||
+		watermark.WorkspaceID() != snapshot.WorkspaceID ||
+		watermark.RecoveryGeneration() != snapshot.RecoveryGeneration ||
+		watermark.ServerDeviceID() != snapshot.Member.ID ||
+		watermark.ChainIndex() != 17 ||
+		watermark.ResultIndex() != 23 {
+		t.Fatalf("event watermark = %+v", watermark)
+	}
+	gotChanges, err := service.EventWatermarkChanges(
+		context.Background(),
+	)
+	if err != nil || gotChanges != changes {
+		t.Fatalf(
+			"EventWatermarkChanges() = (%p, %v), want %p",
+			gotChanges,
+			err,
+			changes,
+		)
 	}
 }
 

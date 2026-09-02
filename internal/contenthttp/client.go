@@ -78,6 +78,7 @@ func (problem *RemoteError) Error() string {
 type Client struct {
 	operationMu sync.Mutex
 	mu          sync.Mutex
+	eventStream chan struct{}
 
 	http2       *http2.ClientConn
 	raw         *tls.Conn
@@ -237,6 +238,7 @@ func openClientForRole(
 		role:        role,
 		expiryTimer: expiryTimer,
 		expiryDone:  make(chan struct{}),
+		eventStream: make(chan struct{}, 1),
 	}
 	go client.watchExpiry()
 	timerOwned = false
@@ -433,6 +435,26 @@ func (client *Client) requestBounded(
 	configure func(http.Header),
 	responseLimit int64,
 ) ([]byte, error) {
+	return client.requestBoundedWithNoProgress(
+		ctx,
+		method,
+		path,
+		body,
+		configure,
+		responseLimit,
+		StreamNoProgress,
+	)
+}
+
+func (client *Client) requestBoundedWithNoProgress(
+	ctx context.Context,
+	method string,
+	path string,
+	body []byte,
+	configure func(http.Header),
+	responseLimit int64,
+	noProgress time.Duration,
+) ([]byte, error) {
 	batchReplicationRequest := validClientReplicationBatchTarget(path)
 	acknowledgementRequest :=
 		validClientReplicationAcknowledgementTarget(path)
@@ -462,7 +484,8 @@ func (client *Client) requestBounded(
 				responseLimit != snapshot.responseLimit()) ||
 		!replicationRequest &&
 			!snapshotRequest &&
-			responseLimit != ResponseMaxBytes {
+			responseLimit != ResponseMaxBytes ||
+		noProgress <= 0 {
 		return nil, ErrInvalidClient
 	}
 	if err := ctx.Err(); err != nil {
@@ -483,12 +506,17 @@ func (client *Client) requestBounded(
 	}
 	callContext, cancel := context.WithTimeout(ctx, HandlerTimeout)
 	defer cancel()
+	progressContext, watchdog := newStreamProgressContext(
+		callContext,
+		noProgress,
+	)
+	defer watchdog.stop()
 	var requestBody io.Reader
 	if len(body) != 0 {
 		requestBody = bytes.NewReader(body)
 	}
 	request, err := http.NewRequestWithContext(
-		callContext,
+		progressContext,
 		method,
 		"https://"+contentPeerAuthority+path,
 		requestBody,
@@ -506,19 +534,6 @@ func (client *Client) requestBounded(
 		configure(request.Header)
 	}
 
-	if err := connection.raw.SetReadDeadline(
-		time.Now().Add(StreamNoProgress),
-	); err != nil {
-		client.invalidate()
-		return nil, fmt.Errorf(
-			"%w: arm response deadline",
-			ErrConnectionUnavailable,
-		)
-	}
-	defer func() {
-		_ = connection.raw.SetReadDeadline(time.Time{})
-	}()
-
 	response, err := connection.http2.RoundTrip(request)
 	if err != nil {
 		if response != nil && response.Body != nil {
@@ -526,6 +541,16 @@ func (client *Client) requestBounded(
 		}
 		if callErr := callContext.Err(); callErr != nil {
 			return nil, callErr
+		}
+		if errors.Is(
+			context.Cause(progressContext),
+			errEventStreamNoProgress,
+		) {
+			client.invalidate()
+			return nil, fmt.Errorf(
+				"%w: response no progress",
+				ErrConnectionUnavailable,
+			)
 		}
 		if client.isClosed() {
 			return nil, ErrClientClosed
@@ -551,12 +576,26 @@ func (client *Client) requestBounded(
 		return nil, err
 	}
 	responseBody, err := readClientResponse(
-		callContext,
+		progressContext,
 		response,
-		connection.raw,
 		limit,
+		watchdog.reset,
 	)
 	if err != nil {
+		if callErr := callContext.Err(); callErr != nil {
+			return nil, callErr
+		}
+		if errors.Is(err, errEventStreamNoProgress) ||
+			errors.Is(
+				context.Cause(progressContext),
+				errEventStreamNoProgress,
+			) {
+			client.invalidate()
+			return nil, fmt.Errorf(
+				"%w: response no progress",
+				ErrConnectionUnavailable,
+			)
+		}
 		if errors.Is(err, context.Canceled) ||
 			errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
@@ -790,32 +829,39 @@ func exactMediaType(header http.Header, expected string) bool {
 func readClientResponse(
 	ctx context.Context,
 	response *http.Response,
-	connection *tls.Conn,
 	limit int64,
+	progress func(),
 ) ([]byte, error) {
 	if ctx == nil ||
 		response == nil ||
 		response.Body == nil ||
-		connection == nil ||
+		progress == nil ||
 		limit < 1 {
 		return nil, ErrResponseProtocol
 	}
+	return readClientResponseWithProgress(
+		ctx,
+		response,
+		limit,
+		progress,
+	)
+}
+
+func readClientResponseWithProgress(
+	ctx context.Context,
+	response *http.Response,
+	limit int64,
+	progress func(),
+) ([]byte, error) {
 	defer response.Body.Close()
-	refresh := func() error {
-		return connection.SetReadDeadline(
-			time.Now().Add(StreamNoProgress),
-		)
-	}
-	if err := refresh(); err != nil {
-		return nil, ErrConnectionUnavailable
-	}
+	progress()
 	body, err := io.ReadAll(&clientProgressReader{
-		reader:  io.LimitReader(response.Body, limit+1),
-		refresh: refresh,
+		reader:   io.LimitReader(response.Body, limit+1),
+		progress: progress,
 	})
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, cause
 		}
 		return nil, fmt.Errorf("%w: read body", ErrConnectionUnavailable)
 	}
@@ -831,21 +877,38 @@ func readClientResponse(
 }
 
 type clientProgressReader struct {
-	reader  io.Reader
-	refresh func() error
+	reader   io.Reader
+	progress func()
 }
 
 func (reader *clientProgressReader) Read(buffer []byte) (int, error) {
-	if reader == nil || reader.reader == nil || reader.refresh == nil {
+	if reader == nil || reader.reader == nil || reader.progress == nil {
 		return 0, ErrResponseProtocol
 	}
 	count, err := reader.reader.Read(buffer)
 	if count > 0 {
-		if refreshErr := reader.refresh(); err == nil && refreshErr != nil {
-			err = refreshErr
-		}
+		reader.progress()
 	}
 	return count, err
+}
+
+func (client *Client) acquireEventStream(ctx context.Context) error {
+	if client == nil || ctx == nil || client.eventStream == nil {
+		return ErrInvalidClient
+	}
+	select {
+	case client.eventStream <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (client *Client) releaseEventStream() {
+	if client == nil || client.eventStream == nil {
+		return
+	}
+	<-client.eventStream
 }
 
 func decodeSessionResponse(body []byte) (SessionResponse, error) {

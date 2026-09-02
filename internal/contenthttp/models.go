@@ -56,6 +56,15 @@ type Service interface {
 	) (EventResult, error)
 }
 
+// EventStreamService supplies current durable result/event positions and a
+// coalescing change signal. EventWatermarkChanges must register before
+// EventWatermark is read so a commit cannot be missed between the initial
+// snapshot and the wait.
+type EventStreamService interface {
+	EventWatermark(context.Context) (EventWatermark, error)
+	EventWatermarkChanges(context.Context) (<-chan struct{}, error)
+}
+
 // SessionResponseInput contains the values copied into a SessionResponse.
 type SessionResponseInput struct {
 	SessionID            domain.UUIDv7

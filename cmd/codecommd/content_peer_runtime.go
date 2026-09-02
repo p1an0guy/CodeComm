@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,14 +28,15 @@ import (
 )
 
 const (
-	daemonContentPeerRefreshInterval    = 2 * time.Second
-	daemonContentPeerDialTimeout        = 10 * time.Second
-	daemonContentPeerRequestTimeout     = 30 * time.Second
-	daemonContentPeerReplicationTimeout = 30 * time.Minute
-	daemonContentPeerBootstrapTimeout   = 3 * time.Second
-	daemonContentPeerRetryInitial       = 250 * time.Millisecond
-	daemonContentPeerRetryMaximum       = 30 * time.Second
-	daemonContentPeerDiagnosticMaxBytes = 1024
+	daemonContentPeerRefreshInterval     = 2 * time.Second
+	daemonContentPeerDialTimeout         = 10 * time.Second
+	daemonContentPeerRequestTimeout      = 30 * time.Second
+	daemonContentPeerReplicationTimeout  = 30 * time.Minute
+	daemonContentPeerReplicationFallback = 30 * time.Second
+	daemonContentPeerBootstrapTimeout    = 3 * time.Second
+	daemonContentPeerRetryInitial        = 250 * time.Millisecond
+	daemonContentPeerRetryMaximum        = 30 * time.Second
+	daemonContentPeerDiagnosticMaxBytes  = 1024
 )
 
 var errDaemonContentPeerConstruction = errors.New(
@@ -43,6 +45,10 @@ var errDaemonContentPeerConstruction = errors.New(
 
 var errDaemonContentPeerState = errors.New(
 	"codecommd: content peer local state failure",
+)
+
+var errDaemonContentPeerCredentialAdvanced = errors.New(
+	"codecommd: content peer credential advanced",
 )
 
 type daemonContentPeerState interface {
@@ -125,6 +131,8 @@ type daemonContentPeerWorker struct {
 
 	connectionMu sync.RWMutex
 	connection   *daemonContentPeerConnection
+
+	eventStreamReplicatedResult atomic.Uint64
 }
 
 type daemonContentPeerTransientErrorSnapshot struct {
@@ -459,16 +467,16 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			}
 			worker.setConnection(connection)
 		}
-		if runtime.localCredentialAdvanced(connection.localEpoch) ||
-			runtime.remoteCredentialAdvanced(
-				worker.deviceID,
-				connection.remoteEpoch,
-			) {
+		err := runtime.maintainPeer(ctx, worker.deviceID, connection)
+		if errors.Is(err, errDaemonContentPeerCredentialAdvanced) {
 			replacement, err := runtime.dialPeer(ctx, worker.deviceID)
 			if err == nil {
 				worker.setConnection(replacement)
 				_ = connection.Close()
 				connection = replacement
+				worker.clearTransientError()
+				retry = daemonContentPeerRetryInitial
+				continue
 			} else if errors.Is(err, errDaemonContentPeerState) &&
 				ctx.Err() == nil {
 				runtime.fail(err)
@@ -476,8 +484,15 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			} else if err != nil && ctx.Err() == nil {
 				worker.recordTransientError("dial", err)
 			}
+			if !runtime.waitWorker(
+				ctx,
+				daemonContentPeerRefreshInterval,
+			) {
+				return
+			}
+			continue
 		}
-		if err := runtime.syncPeer(ctx, worker.deviceID, connection); err != nil {
+		if err != nil {
 			if runtime.replication != nil {
 				runtime.replication.ForgetPeer(worker.deviceID)
 			}
@@ -498,11 +513,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			retry = min(retry*2, daemonContentPeerRetryMaximum)
 			continue
 		}
-		worker.clearTransientError()
-		retry = daemonContentPeerRetryInitial
-		if !runtime.waitWorker(ctx, daemonContentPeerRefreshInterval) {
-			return
-		}
+		return
 	}
 }
 
@@ -897,7 +908,127 @@ func (runtime *daemonContentPeerRuntime) bootstrapPeerAuthorization(
 	return nil
 }
 
-func (runtime *daemonContentPeerRuntime) syncPeer(
+func (runtime *daemonContentPeerRuntime) maintainPeer(
+	ctx context.Context,
+	peerID domain.DeviceID,
+	connection *daemonContentPeerConnection,
+) error {
+	if runtime == nil || ctx == nil || !peerID.Valid() ||
+		connection == nil || connection.client == nil {
+		return errDaemonContentPeerConstruction
+	}
+	streamContext, cancelStream := context.WithCancel(ctx)
+	streamWake := make(chan struct{}, 1)
+	streamDone := make(chan error, 1)
+	var streamResultIndex atomic.Uint64
+	go func() {
+		streamDone <- connection.WatchEventWatermarks(
+			streamContext,
+			func(watermark contenthttp.EventWatermark) error {
+				streamResultIndex.Store(watermark.ResultIndex())
+				select {
+				case streamWake <- struct{}{}:
+				default:
+				}
+				return nil
+			},
+		)
+	}()
+	streamObserved := false
+	defer func() {
+		cancelStream()
+		if !streamObserved {
+			<-streamDone
+		}
+	}()
+
+	if err := runtime.syncPeerMetadata(ctx, peerID, connection); err != nil {
+		return err
+	}
+	if err := runtime.syncPeerReplication(ctx, peerID, connection); err != nil {
+		return err
+	}
+
+	metadataTicker := time.NewTicker(daemonContentPeerRefreshInterval)
+	defer metadataTicker.Stop()
+	replicationTimer := time.NewTimer(
+		daemonContentPeerReplicationFallback,
+	)
+	defer replicationTimer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-streamDone:
+			streamObserved = true
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err == nil {
+				return contenthttp.ErrConnectionUnavailable
+			}
+			return err
+		case <-streamWake:
+			targetResultIndex := streamResultIndex.Load()
+			if err := runtime.syncPeerReplication(
+				ctx,
+				peerID,
+				connection,
+			); err != nil {
+				return err
+			}
+			worker := runtime.worker(peerID)
+			if worker != nil {
+				worker.eventStreamReplicatedResult.Store(
+					targetResultIndex,
+				)
+			}
+			resetDaemonContentPeerTimer(
+				replicationTimer,
+				daemonContentPeerReplicationFallback,
+			)
+		case <-replicationTimer.C:
+			if err := runtime.syncPeerReplication(
+				ctx,
+				peerID,
+				connection,
+			); err != nil {
+				return err
+			}
+			replicationTimer.Reset(
+				daemonContentPeerReplicationFallback,
+			)
+		case <-metadataTicker.C:
+			if runtime.localCredentialAdvanced(connection.localEpoch) ||
+				runtime.remoteCredentialAdvanced(
+					peerID,
+					connection.remoteEpoch,
+				) {
+				return errDaemonContentPeerCredentialAdvanced
+			}
+			if err := runtime.syncPeerMetadata(
+				ctx,
+				peerID,
+				connection,
+			); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (runtime *daemonContentPeerRuntime) worker(
+	peerID domain.DeviceID,
+) *daemonContentPeerWorker {
+	if runtime == nil || !peerID.Valid() {
+		return nil
+	}
+	runtime.workersMu.Lock()
+	defer runtime.workersMu.Unlock()
+	return runtime.workers[peerID]
+}
+
+func (runtime *daemonContentPeerRuntime) syncPeerMetadata(
 	ctx context.Context,
 	peerID domain.DeviceID,
 	connection *daemonContentPeerConnection,
@@ -959,21 +1090,44 @@ func (runtime *daemonContentPeerRuntime) syncPeer(
 			)
 		}
 	}
-	if runtime.replication != nil {
-		replicationContext, cancelReplication := context.WithTimeout(
-			ctx,
-			daemonContentPeerReplicationTimeout,
-		)
-		defer cancelReplication()
-		if err := runtime.replication.Sync(
-			replicationContext,
-			peerID,
-			connection,
-		); err != nil {
-			return err
+	return nil
+}
+
+func (runtime *daemonContentPeerRuntime) syncPeerReplication(
+	ctx context.Context,
+	peerID domain.DeviceID,
+	connection *daemonContentPeerConnection,
+) error {
+	if runtime == nil || ctx == nil || !peerID.Valid() ||
+		connection == nil || connection.client == nil {
+		return errDaemonContentPeerConstruction
+	}
+	if runtime.replication == nil {
+		return nil
+	}
+	replicationContext, cancel := context.WithTimeout(
+		ctx,
+		daemonContentPeerReplicationTimeout,
+	)
+	defer cancel()
+	return runtime.replication.Sync(
+		replicationContext,
+		peerID,
+		connection,
+	)
+}
+
+func resetDaemonContentPeerTimer(timer *time.Timer, delay time.Duration) {
+	if timer == nil || delay <= 0 {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
-	return nil
+	timer.Reset(delay)
 }
 
 // ForwardProposal sends an exact signed proposal only to the caller-selected
@@ -1350,6 +1504,22 @@ func (connection *daemonContentPeerConnection) Peers(
 		return contenthttp.PeersResponse{}, contenthttp.ErrClientClosed
 	}
 	return connection.client.Peers(ctx)
+}
+
+func (connection *daemonContentPeerConnection) WatchEventWatermarks(
+	ctx context.Context,
+	receive func(contenthttp.EventWatermark) error,
+) error {
+	if connection == nil || ctx == nil || receive == nil {
+		return errDaemonContentPeerConstruction
+	}
+	connection.mu.RLock()
+	client := connection.client
+	connection.mu.RUnlock()
+	if client == nil {
+		return contenthttp.ErrClientClosed
+	}
+	return client.WatchEventWatermarks(ctx, receive)
 }
 
 func (connection *daemonContentPeerConnection) ForwardProposal(

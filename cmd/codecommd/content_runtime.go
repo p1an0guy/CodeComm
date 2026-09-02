@@ -40,6 +40,10 @@ type daemonContentState interface {
 		context.Context,
 		domain.DeviceID,
 	) (store.ReplicationWatermark, error)
+	ResultHead(context.Context) (store.ResultHead, error)
+	SubscribeResultHeadChanges(
+		context.Context,
+	) (<-chan struct{}, error)
 }
 
 type daemonEndpointSetSource interface {
@@ -323,6 +327,68 @@ func (service *daemonContentService) Peers(
 	return response, nil
 }
 
+func (service *daemonContentService) EventWatermark(
+	ctx context.Context,
+) (contenthttp.EventWatermark, error) {
+	if service == nil || service.state == nil || ctx == nil {
+		return contenthttp.EventWatermark{}, errDaemonContentConstruction
+	}
+	head, err := service.state.ResultHead(ctx)
+	if err != nil {
+		return contenthttp.EventWatermark{}, fmt.Errorf(
+			"%w: read event watermark: %v",
+			errDaemonContentConstruction,
+			err,
+		)
+	}
+	if head.SessionID != service.sessionID ||
+		head.WorkspaceID != service.workspaceID ||
+		head.RecoveryGeneration != service.recoveryGeneration {
+		return contenthttp.EventWatermark{}, fmt.Errorf(
+			"%w: event watermark lineage mismatch",
+			errDaemonContentConstruction,
+		)
+	}
+	watermark, err := contenthttp.NewEventWatermark(
+		contenthttp.EventWatermarkInput{
+			SessionID:          head.SessionID,
+			WorkspaceID:        head.WorkspaceID,
+			RecoveryGeneration: head.RecoveryGeneration,
+			ServerDeviceID:     service.localDeviceID,
+			ResultIndex:        head.ResultIndex,
+			ChainIndex:         head.ChainIndex,
+		},
+	)
+	if err != nil {
+		return contenthttp.EventWatermark{}, fmt.Errorf(
+			"%w: encode event watermark: %v",
+			errDaemonContentConstruction,
+			err,
+		)
+	}
+	return watermark, nil
+}
+
+func (service *daemonContentService) EventWatermarkChanges(
+	ctx context.Context,
+) (<-chan struct{}, error) {
+	if service == nil || service.state == nil || ctx == nil {
+		return nil, errDaemonContentConstruction
+	}
+	changes, err := service.state.SubscribeResultHeadChanges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: subscribe event watermarks: %v",
+			errDaemonContentConstruction,
+			err,
+		)
+	}
+	if changes == nil {
+		return nil, errDaemonContentConstruction
+	}
+	return changes, nil
+}
+
 func (service *daemonContentService) ProposeEvent(
 	ctx context.Context,
 	senderDeviceID domain.DeviceID,
@@ -460,4 +526,5 @@ func (service *daemonContentService) OpenSnapshotTransfer(
 }
 
 var _ contenthttp.Service = (*daemonContentService)(nil)
+var _ contenthttp.EventStreamService = (*daemonContentService)(nil)
 var _ contenthttp.SnapshotService = (*daemonContentService)(nil)

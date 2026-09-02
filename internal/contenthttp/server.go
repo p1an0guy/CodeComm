@@ -40,6 +40,7 @@ const (
 	HandlerTimeout           = 120 * time.Second
 	ConnectionIdle           = 120 * time.Second
 	StreamNoProgress         = 30 * time.Second
+	EventStreamKeepalive     = 15 * time.Second
 	SnapshotTransferLifetime = 30 * time.Minute
 )
 
@@ -64,6 +65,7 @@ var (
 // Server serves the fixed inbound V1 content-control routes.
 type Server struct {
 	service                  Service
+	eventStreams             EventStreamService
 	snapshots                SnapshotService
 	http2                    *http2.Server
 	handlers                 chan struct{}
@@ -72,6 +74,7 @@ type Server struct {
 	headerTimeout            time.Duration
 	handlerTimeout           time.Duration
 	streamNoProgress         time.Duration
+	eventStreamKeepalive     time.Duration
 	snapshotTransferLifetime time.Duration
 }
 
@@ -90,10 +93,15 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 	if err != nil {
 		return nil, ErrInvalidOptions
 	}
+	eventStreams, _ := service.(EventStreamService)
+	if eventStreams == nil {
+		return nil, ErrInvalidOptions
+	}
 	snapshots, _ := service.(SnapshotService)
 	return &Server{
-		service:   service,
-		snapshots: snapshots,
+		service:      service,
+		eventStreams: eventStreams,
+		snapshots:    snapshots,
 		http2: &http2.Server{
 			MaxConcurrentStreams:         ControlStreamsMax,
 			MaxDecoderHeaderTableSize:    4 << 10,
@@ -112,6 +120,7 @@ func newServer(service Service, activeHandlers int) (*Server, error) {
 		headerTimeout:            RequestHeaderTimeout,
 		handlerTimeout:           HandlerTimeout,
 		streamNoProgress:         StreamNoProgress,
+		eventStreamKeepalive:     EventStreamKeepalive,
 		snapshotTransferLifetime: SnapshotTransferLifetime,
 	}, nil
 }
@@ -125,6 +134,7 @@ func (server *Server) ServeAuthenticatedConn(
 ) (resultErr error) {
 	if server == nil ||
 		server.service == nil ||
+		server.eventStreams == nil ||
 		server.http2 == nil ||
 		server.handlers == nil ||
 		server.replicationHandlers == nil ||
@@ -132,6 +142,7 @@ func (server *Server) ServeAuthenticatedConn(
 		server.headerTimeout <= 0 ||
 		server.handlerTimeout <= 0 ||
 		server.streamNoProgress <= 0 ||
+		server.eventStreamKeepalive <= 0 ||
 		server.snapshotTransferLifetime <= 0 ||
 		ctx == nil ||
 		connection == nil {
@@ -363,7 +374,8 @@ func (handler *connectionHandler) ServeHTTP(
 		request.URL.Path == ReplicationAcknowledgementPath:
 	case request.URL.Path == SessionPath,
 		request.URL.Path == PeersPath,
-		request.URL.Path == EventsPath:
+		request.URL.Path == EventsPath,
+		request.URL.Path == EventsStreamPath:
 		if !validRequestTarget(request) {
 			writeProblem(writer, http.StatusNotFound, problemRouteNotFound)
 			return
@@ -416,6 +428,8 @@ func (handler *connectionHandler) ServeHTTP(
 		handler.serveRead(writer, request)
 	case request.URL.Path == EventsPath:
 		handler.serveEvent(writer, request)
+	case request.URL.Path == EventsStreamPath:
+		handler.serveEventStream(writer, request)
 	case request.URL.Path == ReplicationPath:
 		handler.serveReplication(writer, request)
 	case request.URL.Path == ReplicationAcknowledgementPath:
@@ -839,7 +853,8 @@ func validNegotiation(header http.Header) bool {
 
 func validNegotiationFor(header http.Header, expected string) bool {
 	if expected != contentJSONMediaType &&
-		expected != snapshotChunkMediaType {
+		expected != snapshotChunkMediaType &&
+		expected != eventStreamMediaType {
 		return false
 	}
 	accept := header.Values("Accept")
