@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
+	"github.com/ijonahch/codecomm/internal/chain"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/contenthttp"
@@ -48,7 +49,7 @@ const (
 	)
 )
 
-func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart(
+func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart(
 	t *testing.T,
 ) {
 	if os.Getenv(daemonSettledReplicationChildMarker) != "1" {
@@ -160,6 +161,8 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 	target := daemonMeshIntegrationFollower(t, voters, leaderID)
 	targetNodes := []*daemonMeshIntegrationNode{target}
 	targetIDs := daemonMeshIntegrationDeviceIDs(targetNodes)
+	authorityTwoNodes := []*daemonMeshIntegrationNode{leader}
+	authorityTwoIDs := daemonMeshIntegrationDeviceIDs(authorityTwoNodes)
 	removedVoters := make([]*daemonMeshIntegrationNode, 0, 2)
 	for _, voter := range voters {
 		if voter != target {
@@ -272,7 +275,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		changeContext,
 		ui.SetVotersRequest{
 			ExpectedVoterSetVersion: 1,
-			VoterDeviceIDs:          targetIDs,
+			VoterDeviceIDs:          authorityTwoIDs,
 		},
 	)
 	cancelChange()
@@ -291,10 +294,13 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 
 	statuses = waitForDaemonMeshIntegrationCluster(
 		t,
-		targetNodes,
+		authorityTwoNodes,
 		func(statuses []ui.Snapshot) bool {
-			return daemonMeshIntegrationClusterReady(statuses, targetIDs) &&
-				daemonMeshIntegrationTarget(statuses, 2, targetIDs)
+			return daemonMeshIntegrationClusterReady(
+				statuses,
+				authorityTwoIDs,
+			) &&
+				daemonMeshIntegrationTarget(statuses, 2, authorityTwoIDs)
 		},
 	)
 	postHandoffLeaderID := domain.DeviceID(
@@ -303,7 +309,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 	)
 	postHandoffLeader := daemonMeshIntegrationNodeByID(
 		t,
-		targetNodes,
+		authorityTwoNodes,
 		postHandoffLeaderID,
 	)
 	postHandoffNode, ready := postHandoffLeader.meshCapture.consensusNode()
@@ -318,8 +324,8 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		taskContext,
 		daemonTestTaskEvent(
 			t,
-			postHandoffLeader.privateKey,
-			postHandoffLeader.deviceID,
+			target.privateKey,
+			target.deviceID,
 		),
 	)
 	cancelTask()
@@ -330,10 +336,17 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 	}
 	waitForDaemonMeshIntegrationCluster(
 		t,
-		targetNodes,
+		authorityTwoNodes,
 		func(statuses []ui.Snapshot) bool {
-			return daemonMeshIntegrationClusterReady(statuses, targetIDs) &&
-				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
+			return daemonMeshIntegrationClusterReady(
+				statuses,
+				authorityTwoIDs,
+			) &&
+				daemonMeshIntegrationTarget(
+					statuses,
+					2,
+					authorityTwoIDs,
+				) &&
 				daemonSettledTasksConverged(
 					statuses,
 					authorityOneTaskID,
@@ -341,6 +354,57 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				)
 		},
 	)
+
+	operator = dialDaemonMeshIntegrationOperator(
+		t,
+		postHandoffLeader.localEndpoint,
+	)
+	changeContext, cancelChange = context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	changeResult, err = operator.SetVoters(
+		changeContext,
+		ui.SetVotersRequest{
+			ExpectedVoterSetVersion: 2,
+			VoterDeviceIDs:          targetIDs,
+		},
+	)
+	cancelChange()
+	closeErr = operator.Close()
+	if err != nil {
+		t.Fatalf("SetVoters(second handoff): %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("close second set-voters client: %v", closeErr)
+	}
+	if changeResult.Status != store.OutcomeAccepted ||
+		changeResult.Code != "accepted" ||
+		changeResult.Duplicate {
+		t.Fatalf("SetVoters(second handoff) result = %+v", changeResult)
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		targetNodes,
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationClusterReady(statuses, targetIDs) &&
+				daemonMeshIntegrationTarget(statuses, 3, targetIDs) &&
+				daemonSettledTasksConverged(
+					statuses,
+					authorityOneTaskID,
+					daemonTestTaskID,
+				)
+		},
+	)
+	assertDaemonSettledRejectsPriorAuthoritySigner(
+		t,
+		target,
+		settled,
+		leader,
+		authorityOneResultIndex,
+		3,
+	)
+
 	stopDaemonMeshIntegrationNodes(t, removedVoters...)
 	settled.listener = listenDaemonMeshIntegrationEndpoint(
 		t,
@@ -357,7 +421,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 				statuses[0].Session.EventChainIndex ==
 					statuses[1].Session.EventChainIndex &&
 				statuses[0].Session.AppliedRaftIndex == nil &&
-				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
+				daemonMeshIntegrationTarget(statuses, 3, targetIDs) &&
 				daemonSettledTasksConverged(
 					statuses,
 					authorityOneTaskID,
@@ -374,6 +438,7 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		twoDeviceStatuses,
 		targetIDs,
 		authorityOneTaskID,
+		3,
 	)
 
 	stopDaemonMeshIntegrationNodes(t, target, settled)
@@ -383,6 +448,8 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		settled,
 		leader.deviceID,
 		target.deviceID,
+		authorityOneResultIndex,
+		3,
 	)
 }
 
@@ -394,6 +461,7 @@ func exerciseDaemonTwoDeviceDegradedRun(
 	baseline []ui.Snapshot,
 	voterIDs []domain.DeviceID,
 	authorityOneTaskID domain.UUIDv7,
+	authorityVersion uint64,
 ) {
 	t.Helper()
 	if len(allNodes) < 2 ||
@@ -402,7 +470,8 @@ func exerciseDaemonTwoDeviceDegradedRun(
 		clock == nil ||
 		len(baseline) != 2 ||
 		len(voterIDs) != 1 ||
-		voterIDs[0] != voter.deviceID {
+		voterIDs[0] != voter.deviceID ||
+		authorityVersion < 1 {
 		t.Fatal("invalid two-device degraded-run fixture")
 	}
 	var revoked *daemonMeshIntegrationNode
@@ -460,7 +529,11 @@ func exerciseDaemonTwoDeviceDegradedRun(
 					before.Session.EventChainIndex &&
 				status.Session.ResultIndex ==
 					before.Session.ResultIndex &&
-				daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+				daemonMeshIntegrationTarget(
+					statuses,
+					authorityVersion,
+					voterIDs,
+				) &&
 				daemonSettledTasksConverged(
 					statuses,
 					authorityOneTaskID,
@@ -480,7 +553,7 @@ func exerciseDaemonTwoDeviceDegradedRun(
 		ui.RevokePeerRequest{
 			DeviceID:                revoked.deviceID,
 			ExpectedEntityVersion:   1,
-			ExpectedVoterSetVersion: 2,
+			ExpectedVoterSetVersion: authorityVersion,
 			VoterDeviceIDs:          voterIDs,
 			Reason:                  "removed device retired during degraded run",
 		},
@@ -521,7 +594,11 @@ func exerciseDaemonTwoDeviceDegradedRun(
 				statuses[1].Consensus.State == "settled" &&
 				statuses[1].Consensus.Role == "nonvoter" &&
 				statuses[1].Consensus.StrongWrites == "waiting" &&
-				daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+				daemonMeshIntegrationTarget(
+					statuses,
+					authorityVersion,
+					voterIDs,
+				) &&
 				daemonMeshIntegrationMemberStatus(
 					statuses,
 					revoked.deviceID,
@@ -591,7 +668,11 @@ func exerciseDaemonTwoDeviceDegradedRun(
 		t,
 		[]*daemonMeshIntegrationNode{voter, settled},
 		func(statuses []ui.Snapshot) bool {
-			return daemonMeshIntegrationTarget(statuses, 2, voterIDs) &&
+			return daemonMeshIntegrationTarget(
+				statuses,
+				authorityVersion,
+				voterIDs,
+			) &&
 				daemonSettledTasksConverged(
 					statuses,
 					authorityOneTaskID,
@@ -1744,7 +1825,8 @@ func bootstrapDaemonSettledReplica(
 func assertDaemonSettledReplicationDurableState(
 	t *testing.T,
 	source, settled *daemonMeshIntegrationNode,
-	authorityOneSigner, authorityTwoSigner domain.DeviceID,
+	authorityOneSigner, terminalAuthoritySigner domain.DeviceID,
+	offlineResultIndex, terminalAuthorityVersion uint64,
 ) {
 	t.Helper()
 	sourceStore, err := store.Open(
@@ -1824,27 +1906,231 @@ func assertDaemonSettledReplicationDurableState(
 	if progress.Blocker != nil || progress.Heads != settledView.Heads {
 		t.Fatalf("settled progress = %+v", progress)
 	}
-	var sawAuthorityOne, sawAuthorityTwo bool
+	var sawAuthorityOne, sawTerminalAuthority bool
 	for _, observation := range progress.Observations {
 		switch {
 		case observation.SignerDeviceID == authorityOneSigner &&
 			observation.AuthorityVersion == 1:
 			sawAuthorityOne = true
-		case observation.SignerDeviceID == authorityTwoSigner &&
-			observation.AuthorityVersion == 2:
-			sawAuthorityTwo = true
+		case observation.SignerDeviceID == terminalAuthoritySigner &&
+			observation.AuthorityVersion == terminalAuthorityVersion:
+			sawTerminalAuthority = true
+		case observation.AuthorityVersion > 1 &&
+			observation.AuthorityVersion < terminalAuthorityVersion:
+			t.Fatalf(
+				"offline replica retained an intermediate-authority batch: %+v",
+				observation,
+			)
 		}
 	}
-	if !sawAuthorityOne || !sawAuthorityTwo {
+	if !sawAuthorityOne || !sawTerminalAuthority {
 		t.Fatalf(
-			"authority observations = %+v, want %s/v1 and %s/v2",
+			"authority observations = %+v, want %s/v1 and %s/v%d",
 			progress.Observations,
 			authorityOneSigner,
-			authorityTwoSigner,
+			terminalAuthoritySigner,
+			terminalAuthorityVersion,
+		)
+	}
+
+	exported, found, err := settledStore.ExportResultRange(
+		context.Background(),
+		store.ResultRangeOptions{
+			AfterResultIndex:          offlineResultIndex,
+			MaxResults:                replication.MaxBatchResults,
+			MaxBytes:                  replication.MaxBatchResultsBytes,
+			RequiredAuthorityDeviceID: terminalAuthoritySigner,
+		},
+	)
+	if err != nil || !found {
+		t.Fatalf(
+			"export multi-activation catch-up range = (found=%t, err=%v)",
+			found,
+			err,
+		)
+	}
+	if exported.FromResultIndex != offlineResultIndex+1 ||
+		exported.ToResultIndex != settledView.Heads.ResultIndex ||
+		exported.Authority.VoterSetVersion != terminalAuthorityVersion ||
+		!exported.Authority.Contains(terminalAuthoritySigner) {
+		t.Fatalf("multi-activation catch-up range = %+v", exported)
+	}
+	activationCount := uint64(0)
+	for index, encoded := range exported.Results {
+		result, err := chain.DecodeResult(encoded)
+		if err != nil {
+			t.Fatalf("decode catch-up result %d: %v", index, err)
+		}
+		var proposal struct {
+			Kind event.Kind `json:"kind"`
+		}
+		if err := json.Unmarshal(result.Proposal, &proposal); err != nil {
+			t.Fatalf("decode catch-up proposal %d: %v", index, err)
+		}
+		if proposal.Kind == event.KindMembershipVoterSetActivated {
+			activationCount++
+		}
+	}
+	if activationCount != terminalAuthorityVersion-1 {
+		t.Fatalf(
+			"catch-up activation count = %d, want %d",
+			activationCount,
+			terminalAuthorityVersion-1,
 		)
 	}
 	if _, err := os.Stat(settled.consensusDir); !os.IsNotExist(err) {
 		t.Fatalf("settled runtime created Raft storage: %v", err)
+	}
+}
+
+func assertDaemonSettledRejectsPriorAuthoritySigner(
+	t *testing.T,
+	source, settled, priorAuthority *daemonMeshIntegrationNode,
+	afterResultIndex, terminalAuthorityVersion uint64,
+) {
+	t.Helper()
+	if source == nil ||
+		settled == nil ||
+		priorAuthority == nil ||
+		afterResultIndex == domain.MaxSafeInteger ||
+		terminalAuthorityVersion < 2 {
+		t.Fatal("invalid prior-authority rejection fixture")
+	}
+	sourceStore, err := store.Open(
+		context.Background(),
+		store.Options{Path: source.statePath},
+	)
+	if err != nil {
+		t.Fatalf("open prior-authority rejection source: %v", err)
+	}
+	exported, found, exportErr := sourceStore.ExportResultRange(
+		context.Background(),
+		store.ResultRangeOptions{
+			AfterResultIndex:          afterResultIndex,
+			MaxResults:                replication.MaxBatchResults,
+			MaxBytes:                  replication.MaxBatchResultsBytes,
+			RequiredAuthorityDeviceID: source.deviceID,
+		},
+	)
+	closeErr := sourceStore.Close()
+	if exportErr != nil || !found || closeErr != nil {
+		t.Fatalf(
+			"export prior-authority rejection range = (found=%t, export_err=%v, close_err=%v)",
+			found,
+			exportErr,
+			closeErr,
+		)
+	}
+	if exported.Authority.VoterSetVersion != terminalAuthorityVersion ||
+		exported.Authority.Contains(priorAuthority.deviceID) {
+		t.Fatalf(
+			"prior-authority rejection terminal authority = %+v",
+			exported.Authority,
+		)
+	}
+	unsigned, err := replication.NewUnsignedBatch(
+		replication.BatchInput{
+			FromResultIndex: exported.FromResultIndex,
+			ToResultIndex:   exported.ToResultIndex,
+			StartResultHash: chain.Digest(exported.StartResultHash),
+			EndResultHash:   chain.Digest(exported.EndResultHash),
+			StartChainIndex: exported.StartChainIndex,
+			StartChainHash:  chain.Digest(exported.StartChainHash),
+			EndChainIndex:   exported.EndChainIndex,
+			EndChainHash:    chain.Digest(exported.EndChainHash),
+			StartProjectionAccumulator: chain.Digest(
+				exported.StartProjectionAccumulator,
+			),
+			EndProjectionAccumulator: chain.Digest(
+				exported.EndProjectionAccumulator,
+			),
+			StartProjectionStateDigest: chain.Digest(
+				exported.StartProjectionStateDigest,
+			),
+			EndProjectionStateDigest: chain.Digest(
+				exported.EndProjectionStateDigest,
+			),
+			Results:                  exported.Results,
+			SessionID:                exported.SessionID,
+			WorkspaceID:              exported.WorkspaceID,
+			RecoveryGeneration:       exported.RecoveryGeneration,
+			ServerDeviceID:           priorAuthority.deviceID,
+			ServerAppliedResultIndex: exported.ServerAppliedResultIndex,
+			ServerAuthorityVersion:   terminalAuthorityVersion,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build prior-authority signed batch: %v", err)
+	}
+	batch, err := replication.SignBatch(unsigned, priorAuthority.privateKey)
+	if err != nil {
+		t.Fatalf("sign prior-authority batch: %v", err)
+	}
+
+	replica, err := consensus.OpenSettledReplica(
+		context.Background(),
+		consensus.SettledReplicaOptions{
+			StatePath:     settled.statePath,
+			OriginBootID:  daemonTestVerifyBootID,
+			LocalDeviceID: settled.deviceID,
+			Clock:         consensus.NewSystemApplyClock(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("open settled replica for prior-authority rejection: %v", err)
+	}
+	before, err := replica.View(context.Background())
+	if err != nil {
+		_ = replica.Close()
+		t.Fatalf("read prior-authority rejection baseline: %v", err)
+	}
+	progressBefore, err := replica.ReplicationProgress(context.Background())
+	if err != nil {
+		_ = replica.Close()
+		t.Fatalf("read prior-authority rejection progress: %v", err)
+	}
+	_, importErr := replica.ImportResultBatch(
+		context.Background(),
+		priorAuthority.deviceID,
+		batch,
+	)
+	after, viewErr := replica.View(context.Background())
+	progressAfter, progressErr := replica.ReplicationProgress(
+		context.Background(),
+	)
+	fatalErr := replica.FatalError()
+	closeErr = replica.Close()
+	if !errors.Is(
+		importErr,
+		consensus.ErrReplicationSignerUnauthorized,
+	) {
+		t.Fatalf(
+			"prior-authority ImportResultBatch() error = %v, want %v",
+			importErr,
+			consensus.ErrReplicationSignerUnauthorized,
+		)
+	}
+	if viewErr != nil ||
+		progressErr != nil ||
+		fatalErr != nil ||
+		closeErr != nil {
+		t.Fatalf(
+			"prior-authority rejection follow-up = (view=%v, progress=%v, fatal=%v, close=%v)",
+			viewErr,
+			progressErr,
+			fatalErr,
+			closeErr,
+		)
+	}
+	if !reflect.DeepEqual(after, before) ||
+		!reflect.DeepEqual(progressAfter, progressBefore) {
+		t.Fatalf(
+			"prior-authority rejection changed durable cursors:\nbefore=%+v\nafter=%+v\nprogress_before=%+v\nprogress_after=%+v",
+			before,
+			after,
+			progressBefore,
+			progressAfter,
+		)
 	}
 }
 
@@ -2084,7 +2370,7 @@ func runDaemonSettledReplicationChild(t *testing.T) {
 	command := exec.CommandContext(
 		ctx,
 		os.Args[0],
-		"-test.run=^TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart$",
+		"-test.run=^TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart$",
 		"-test.count=1",
 		"-test.v",
 	)

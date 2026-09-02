@@ -201,12 +201,15 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   installed snapshot, then proves the stale tail reaches exact current currency and both sessions
   are durably crash-reaped before IPC. It also proves no second admission or membership-version
   drift, clears the marker, and creates no Raft state.
-- The settled production path now also runs the documented two-device mode after a 3-to-1 authority
-  handoff. With the sole voter offline and both content credentials expired, the owner nonvoter
-  remains readable, exposes no leader or strong-write authority, and durably queues a reviewed
-  revocation. Returning the voter renews both peers over identity mTLS, commits the command,
-  preserves voter-target and authority version while revoking the active nonvoter, imports the
-  exact signed result, resolves the outbox, restores content, and converges a subsequent task.
+- The settled production path now stays offline across consecutive 3-to-1 and 1-to-1 authority
+  handoffs. It rejects an identity-valid batch signed by the removed first authority after scratch
+  replay reaches authority v3, preserves its existing cursor, then imports one v3-signed range
+  containing both activations and reopens with equal heads, accumulator, and state digest. It then
+  runs the documented two-device mode: with the sole voter offline and both content credentials
+  expired, the owner nonvoter remains readable, exposes no leader or strong-write authority, and
+  durably queues a reviewed revocation. Returning the voter renews both peers over identity mTLS,
+  commits the command, preserves voter target and authority version, resolves the outbox, restores
+  content, and converges a subsequent task.
 - Fresh two-device admission prompts the inviter to keep the current voter, move the sole-voter
   target to the joined device, or defer. The prompt recommends the device likelier to remain awake,
   states the exact degraded consequence, and binds a move to a fresh voter-set CAS. The guided
@@ -244,9 +247,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- Multi-activation catch-up, SSE, divergence recovery, and the remaining Phase 3
-  fault/performance matrix are outstanding. Final §14 benchmark confirmation remains a Phase 6
-  exit gate.
+- SSE, divergence recovery, and the remaining Phase 3 fault/performance matrix are outstanding.
+  Final §14 benchmark confirmation remains a Phase 6 exit gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -304,7 +306,8 @@ Primary tests:
 - `TestSettledReplicaImportsAndReopensAuthorityHandoff`
 - `TestSettledReplicaCoherentLocalRewriteLatchesFatalState`
 - `TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart`
-- `TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffAndRestart`
+- `TestSettledReplicaFailedReplayLeavesDurableCutUnchanged`
+- `TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart`
 - `TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch`
 - `TestGuidedVoterPlacementBindsChoiceToFreshCAS`
 - `TestGuidedVoterPlacementRequiresOwnerAndStableTwoDeviceTopology`

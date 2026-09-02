@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"testing"
@@ -481,58 +482,118 @@ func TestSettledReplicaCurrencyRequiresEveryAuthorityAtExactCut(
 func TestSettledReplicaFailedReplayLeavesDurableCutUnchanged(
 	t *testing.T,
 ) {
-	fixture := newSettledReplicaImportFixture(t)
-	before, err := fixture.replica.View(testContext(t))
-	if err != nil {
-		t.Fatalf("View(before): %v", err)
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, settledReplicaImportFixture) replication.Batch
+		want   error
+	}{
+		{
+			name: "outcome mismatch",
+			mutate: func(
+				t *testing.T,
+				fixture settledReplicaImportFixture,
+			) replication.Batch {
+				input := fixture.batch.Unsigned().Input()
+				first, err := chain.DecodeResult(input.Results[0])
+				if err != nil {
+					t.Fatalf("chain.DecodeResult(): %v", err)
+				}
+				first.Outcome = []byte(
+					`{"code":"entity_not_found","status":"accepted"}`,
+				)
+				input.Results[0], err = chain.EncodeResult(first)
+				if err != nil {
+					t.Fatalf("chain.EncodeResult(): %v", err)
+				}
+				rebuildReplayResultHead(t, &input)
+				return signReplayInput(
+					t,
+					input,
+					fixture.signerPrivateKey,
+				)
+			},
+			want: ErrReplicationOutcomeMismatch,
+		},
+		{
+			name: "signer not active in end authority",
+			mutate: func(
+				t *testing.T,
+				fixture settledReplicaImportFixture,
+			) replication.Batch {
+				privateKey := ed25519.NewKeyFromSeed(
+					bytes.Repeat([]byte{0xe8}, ed25519.SeedSize),
+				)
+				defer clear(privateKey)
+				signerID, err := device.DeriveID(
+					privateKey.Public().(ed25519.PublicKey),
+				)
+				if err != nil {
+					t.Fatalf("device.DeriveID(unauthorized signer): %v", err)
+				}
+				input := fixture.batch.Unsigned().Input()
+				input.ServerDeviceID = signerID
+				return signReplayInput(t, input, privateKey)
+			},
+			want: ErrReplicationSignerUnauthorized,
+		},
 	}
-	tamperedInput := fixture.batch.Unsigned().Input()
-	first, err := chain.DecodeResult(tamperedInput.Results[0])
-	if err != nil {
-		t.Fatalf("chain.DecodeResult(): %v", err)
-	}
-	first.Outcome = []byte(`{"code":"entity_not_found","status":"accepted"}`)
-	tamperedInput.Results[0], err = chain.EncodeResult(first)
-	if err != nil {
-		t.Fatalf("chain.EncodeResult(): %v", err)
-	}
-	rebuildReplayResultHead(t, &tamperedInput)
-	tampered := signReplayInput(
-		t,
-		tamperedInput,
-		fixture.signerPrivateKey,
-	)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSettledReplicaImportFixture(t)
+			before, err := fixture.replica.View(testContext(t))
+			if err != nil {
+				t.Fatalf("View(before): %v", err)
+			}
+			progressBefore, err := fixture.replica.ReplicationProgress(
+				testContext(t),
+			)
+			if err != nil {
+				t.Fatalf("ReplicationProgress(before): %v", err)
+			}
 
-	if _, err := fixture.replica.ImportResultBatch(
-		testContext(t),
-		fixture.relayDeviceID,
-		tampered,
-	); !errors.Is(err, ErrReplicationOutcomeMismatch) {
-		t.Fatalf(
-			"ImportResultBatch(tampered) error = %v, want outcome mismatch",
-			err,
-		)
-	}
-	after, err := fixture.replica.View(testContext(t))
-	if err != nil {
-		t.Fatalf("View(after failed replay): %v", err)
-	}
-	if after.Heads != before.Heads ||
-		after.ProjectionStateDigest != before.ProjectionStateDigest ||
-		after.AdmissionRevision != before.AdmissionRevision {
-		t.Fatalf(
-			"failed replay changed durable cut:\nbefore=%+v\nafter=%+v",
-			before,
-			after,
-		)
-	}
+			if _, err := fixture.replica.ImportResultBatch(
+				testContext(t),
+				fixture.relayDeviceID,
+				test.mutate(t, fixture),
+			); !errors.Is(err, test.want) {
+				t.Fatalf(
+					"ImportResultBatch(invalid) error = %v, want %v",
+					err,
+					test.want,
+				)
+			}
+			after, err := fixture.replica.View(testContext(t))
+			if err != nil {
+				t.Fatalf("View(after failed replay): %v", err)
+			}
+			progressAfter, err := fixture.replica.ReplicationProgress(
+				testContext(t),
+			)
+			if err != nil {
+				t.Fatalf("ReplicationProgress(after): %v", err)
+			}
+			if after.Heads != before.Heads ||
+				after.ProjectionStateDigest != before.ProjectionStateDigest ||
+				after.AdmissionRevision != before.AdmissionRevision ||
+				!reflect.DeepEqual(progressAfter, progressBefore) {
+				t.Fatalf(
+					"failed replay changed durable cut:\nbefore=%+v\n"+
+						"after=%+v\nprogress_before=%+v\nprogress_after=%+v",
+					before,
+					after,
+					progressBefore,
+					progressAfter,
+				)
+			}
 
-	if _, err := fixture.replica.ImportResultBatch(
-		testContext(t),
-		fixture.relayDeviceID,
-		fixture.batch,
-	); err != nil {
-		t.Fatalf("ImportResultBatch(valid after failure): %v", err)
+			if _, err := fixture.replica.ImportResultBatch(
+				testContext(t),
+				fixture.relayDeviceID,
+				fixture.batch,
+			); err != nil {
+				t.Fatalf("ImportResultBatch(valid after failure): %v", err)
+			}
+		})
 	}
 }
 
