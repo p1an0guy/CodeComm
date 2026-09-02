@@ -89,11 +89,12 @@ type Service struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	lifecycleMu sync.Mutex
-	closed      bool
-	operations  sync.WaitGroup
-	closeOnce   sync.Once
-	releaseOnce sync.Once
+	lifecycleMu     sync.Mutex
+	closed          bool
+	withdrawalEpoch uint64
+	operations      sync.WaitGroup
+	closeOnce       sync.Once
+	releaseOnce     sync.Once
 
 	refreshToken chan struct{}
 
@@ -157,12 +158,13 @@ func newService(options serviceOptions) (*Service, error) {
 
 // Refresh persists a fresh sequence, signs the complete endpoint set, and
 // atomically replaces the current publication. Any error leaves the last
-// valid publication unchanged.
+// valid publication unchanged. A later concurrent Withdraw supersedes the
+// refresh without installing its result.
 func (service *Service) Refresh(
 	ctx context.Context,
 	input RefreshInput,
 ) error {
-	operationCtx, finish, err := service.beginOperation(ctx)
+	operationCtx, finish, withdrawalEpoch, err := service.beginRefresh(ctx)
 	if err != nil {
 		return err
 	}
@@ -238,11 +240,34 @@ func (service *Service) Refresh(
 	if err := operationCtx.Err(); err != nil {
 		return service.contextErrorLocked(err)
 	}
+	if service.withdrawalEpoch != withdrawalEpoch {
+		return nil
+	}
 	service.publicationMu.Lock()
 	old := service.current
 	service.current = bytes.Clone(canonical)
 	service.publicationMu.Unlock()
 	clear(old)
+	return nil
+}
+
+// Withdraw atomically removes the current signed endpoint set without signing
+// an empty set. It is idempotent. Refreshes admitted before this call may
+// finish, but cannot publish afterward; a later Refresh may publish normally.
+func (service *Service) Withdraw() error {
+	if service == nil {
+		return ErrInvalidOptions
+	}
+	service.lifecycleMu.Lock()
+	defer service.lifecycleMu.Unlock()
+	if service.closed {
+		return ErrClosed
+	}
+	service.withdrawalEpoch++
+	service.publicationMu.Lock()
+	clear(service.current)
+	service.current = nil
+	service.publicationMu.Unlock()
 	return nil
 }
 
@@ -253,9 +278,8 @@ func (service *Service) CurrentEndpointSet() ([]byte, bool) {
 		return nil, false
 	}
 	service.lifecycleMu.Lock()
-	closed := service.closed
-	service.lifecycleMu.Unlock()
-	if closed {
+	defer service.lifecycleMu.Unlock()
+	if service.closed {
 		return nil, false
 	}
 	service.publicationMu.RLock()
@@ -291,12 +315,12 @@ func (service *Service) Wait() error {
 	}
 	service.operations.Wait()
 	service.releaseOnce.Do(func() {
+		service.lifecycleMu.Lock()
 		service.publicationMu.Lock()
 		clear(service.current)
 		service.current = nil
 		service.publicationMu.Unlock()
 
-		service.lifecycleMu.Lock()
 		clear(service.identityPrivateKey)
 		service.identityPrivateKey = nil
 		service.localState = nil
@@ -304,6 +328,7 @@ func (service *Service) Wait() error {
 		service.ctx = nil
 		service.cancel = nil
 		service.refreshToken = nil
+		service.withdrawalEpoch = 0
 		service.sessionID = ""
 		service.workspaceID = ""
 		service.recoveryGeneration = 0
@@ -318,24 +343,25 @@ func (service *Service) Close() error {
 	return service.Wait()
 }
 
-func (service *Service) beginOperation(
+func (service *Service) beginRefresh(
 	ctx context.Context,
-) (context.Context, func(), error) {
+) (context.Context, func(), uint64, error) {
 	if service == nil || ctx == nil {
-		return nil, nil, ErrInvalidOptions
+		return nil, nil, 0, ErrInvalidOptions
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 
 	service.lifecycleMu.Lock()
 	if service.closed {
 		service.lifecycleMu.Unlock()
-		return nil, nil, ErrClosed
+		return nil, nil, 0, ErrClosed
 	}
 	service.operations.Add(1)
 	serviceContext := service.ctx
 	timeout := service.operationTimeout
+	withdrawalEpoch := service.withdrawalEpoch
 	service.lifecycleMu.Unlock()
 
 	operationCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -347,9 +373,9 @@ func (service *Service) beginOperation(
 	}
 	if err := operationCtx.Err(); err != nil {
 		finish()
-		return nil, nil, service.contextError(err)
+		return nil, nil, 0, service.contextError(err)
 	}
-	return operationCtx, finish, nil
+	return operationCtx, finish, withdrawalEpoch, nil
 }
 
 func (service *Service) contextError(err error) error {

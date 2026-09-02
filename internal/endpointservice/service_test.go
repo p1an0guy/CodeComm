@@ -188,6 +188,171 @@ func TestRefreshFailurePreservesPriorPublication(t *testing.T) {
 	}
 }
 
+func TestWithdrawClearsCurrentPublicationAndAllowsLaterRefresh(t *testing.T) {
+	member, privateKey := endpointServiceTestIdentity(t, 0x46)
+	var allocations int
+	state := endpointServiceStateFunc(func(
+		_ context.Context,
+		_ domain.DeviceID,
+		_ domain.Timestamp,
+	) (uint64, error) {
+		allocations++
+		return uint64(allocations), nil
+	})
+	service := endpointServiceTestService(t, member, privateKey, state)
+	t.Cleanup(func() { _ = service.Close() })
+
+	if err := service.Refresh(
+		context.Background(),
+		endpointServiceTestRefreshInput(),
+	); err != nil {
+		t.Fatalf("Refresh(): %v", err)
+	}
+	retained := service.current
+	if len(retained) == 0 {
+		t.Fatal("Refresh() retained no publication")
+	}
+	if err := service.Withdraw(); err != nil {
+		t.Fatalf("Withdraw(): %v", err)
+	}
+	if _, found := service.CurrentEndpointSet(); found {
+		t.Fatal("CurrentEndpointSet() returned a withdrawn publication")
+	}
+	if service.current != nil {
+		t.Fatal("Withdraw() retained the current publication")
+	}
+	if !bytes.Equal(retained, make([]byte, len(retained))) {
+		t.Fatal("Withdraw() did not clear retained publication bytes")
+	}
+	if allocations != 1 {
+		t.Fatalf(
+			"sequence allocations after Withdraw() = %d, want 1",
+			allocations,
+		)
+	}
+	if err := service.Withdraw(); err != nil {
+		t.Fatalf("second Withdraw(): %v", err)
+	}
+	if allocations != 1 {
+		t.Fatalf(
+			"sequence allocations after second Withdraw() = %d, want 1",
+			allocations,
+		)
+	}
+
+	if err := service.Refresh(
+		context.Background(),
+		endpointServiceTestRefreshInput(),
+	); err != nil {
+		t.Fatalf("Refresh(after withdrawal): %v", err)
+	}
+	if _, found := service.CurrentEndpointSet(); !found {
+		t.Fatal("later Refresh() did not publish an endpoint set")
+	}
+}
+
+func TestWithdrawSupersedesConcurrentOlderRefresh(t *testing.T) {
+	member, privateKey := endpointServiceTestIdentity(t, 0x47)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var (
+		mu          sync.Mutex
+		allocations int
+		releaseOnce sync.Once
+	)
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	})
+	state := endpointServiceStateFunc(func(
+		ctx context.Context,
+		_ domain.DeviceID,
+		_ domain.Timestamp,
+	) (uint64, error) {
+		mu.Lock()
+		allocations++
+		allocation := allocations
+		mu.Unlock()
+		if allocation == 2 {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+		return uint64(allocation), nil
+	})
+	service := endpointServiceTestService(t, member, privateKey, state)
+	t.Cleanup(func() { _ = service.Close() })
+	input := endpointServiceTestRefreshInput()
+	if err := service.Refresh(context.Background(), input); err != nil {
+		t.Fatalf("first Refresh(): %v", err)
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- service.Refresh(context.Background(), input)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Refresh() did not reach storage")
+	}
+	retained := service.current
+	if err := service.Withdraw(); err != nil {
+		t.Fatalf("Withdraw(): %v", err)
+	}
+	if _, found := service.CurrentEndpointSet(); found {
+		t.Fatal("CurrentEndpointSet() returned a withdrawn publication")
+	}
+	if !bytes.Equal(retained, make([]byte, len(retained))) {
+		t.Fatal("Withdraw() did not clear retained publication bytes")
+	}
+
+	releaseOnce.Do(func() {
+		close(release)
+	})
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatalf("concurrent Refresh(): %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Refresh() did not finish")
+	}
+	if _, found := service.CurrentEndpointSet(); found {
+		t.Fatal("older Refresh() republished after Withdraw()")
+	}
+}
+
+func TestWithdrawRejectsClosedOrNilService(t *testing.T) {
+	var nilService *Service
+	if err := nilService.Withdraw(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("nil Withdraw() error = %v, want %v", err, ErrInvalidOptions)
+	}
+
+	member, privateKey := endpointServiceTestIdentity(t, 0x48)
+	state := endpointServiceStateFunc(func(
+		context.Context,
+		domain.DeviceID,
+		domain.Timestamp,
+	) (uint64, error) {
+		return 1, nil
+	})
+	service := endpointServiceTestService(t, member, privateKey, state)
+	if err := service.BeginClose(); err != nil {
+		t.Fatalf("BeginClose(): %v", err)
+	}
+	if err := service.Withdraw(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Withdraw(closed) error = %v, want %v", err, ErrClosed)
+	}
+	if err := service.Wait(); err != nil {
+		t.Fatalf("Wait(): %v", err)
+	}
+}
+
 func TestCloseCancelsRefreshAndClearsOwnedState(t *testing.T) {
 	member, privateKey := endpointServiceTestIdentity(t, 0x43)
 	entered := make(chan struct{})
