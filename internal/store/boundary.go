@@ -477,12 +477,27 @@ func (store *Store) Initialize(
 		); err != nil {
 			return err
 		}
-		return writeBoundaryConsensusState(conn, initial, heads)
+		if err := writeBoundaryConsensusState(conn, initial, heads); err != nil {
+			return err
+		}
+		observedAt, err := checkpointCadenceMigrationObservedAt(conn)
+		if err != nil {
+			return err
+		}
+		return writeCheckpointCadenceBoundary(
+			conn,
+			initial.SessionID,
+			initial.WorkspaceID,
+			0,
+			heads,
+			observedAt,
+		)
 	})
 	if err != nil {
 		return ApplyHeads{}, err
 	}
 	store.advanceAdmissionRevision()
+	store.signalResultHeadChange()
 	return heads, nil
 }
 
@@ -692,12 +707,27 @@ func (store *Store) InstallSuccessor(
 		); err != nil {
 			return err
 		}
-		return writeSuccessorConsensusState(conn, successor, heads)
+		if err := writeSuccessorConsensusState(
+			conn,
+			successor,
+			heads,
+		); err != nil {
+			return err
+		}
+		return writeCheckpointCadenceBoundary(
+			conn,
+			successor.SessionID,
+			successor.WorkspaceID,
+			successor.RecoveryGeneration,
+			heads,
+			successor.ObservedAt,
+		)
 	})
 	if err != nil {
 		return ApplyHeads{}, err
 	}
 	store.advanceAdmissionRevision()
+	store.signalResultHeadChange()
 	return heads, nil
 }
 
@@ -867,6 +897,7 @@ func clearGenerationLocalState(conn *sqlite.Conn) error {
 		"replication_cursors",
 		"replication_watermark_observations",
 		"rebootstrap_install_marker",
+		"checkpoint_cadence_state",
 		"settled_nonvoter_state",
 		"raft_committed_configuration",
 		"outbox",

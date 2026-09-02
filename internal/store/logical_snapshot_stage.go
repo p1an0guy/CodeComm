@@ -480,6 +480,7 @@ func (store *Store) importLogicalSnapshotCommand(
 		return ApplyHeads{}, err
 	}
 	store.advanceAdmissionRevision()
+	store.signalResultHeadChange()
 	return heads, nil
 }
 

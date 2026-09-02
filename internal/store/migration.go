@@ -161,6 +161,8 @@ func mustLoadMigrations() []migration {
 			)
 		case version == 9 && name == "rebootstrap_install_marker":
 			candidate.policy = migrationPolicyReviewedReversible
+		case version == 10 && name == "checkpoint_cadence":
+			candidate.policy = migrationPolicyReviewedReversible
 		}
 		migrations = append(migrations, candidate)
 	}

@@ -31,6 +31,7 @@ var requiredTables = []string{
 	"audit_events",
 	"canonical_refs",
 	"chain_checkpoints",
+	"checkpoint_cadence_state",
 	"command_results",
 	"consensus_state",
 	"control_file_approvals",
@@ -155,6 +156,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"replication_watermark_observations",
 			"recovery_boundary_audit",
 			"rebootstrap_install_marker",
+			"checkpoint_cadence",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))

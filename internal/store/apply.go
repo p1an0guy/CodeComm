@@ -267,6 +267,13 @@ func (store *Store) Apply(
 			if err := writeCheckpoint(conn, *request.Checkpoint); err != nil {
 				return err
 			}
+			if err := writeCheckpointCadenceCheckpoint(
+				conn,
+				request,
+				heads,
+			); err != nil {
+				return err
+			}
 		}
 		if err := store.reachApplyStage(applyAfterCheckpoint); err != nil {
 			return err
@@ -306,6 +313,7 @@ func (store *Store) Apply(
 		result.AdmissionRevision = store.admissionRevision.Load()
 	} else {
 		result.AdmissionRevision = store.advanceAdmissionRevision()
+		store.signalResultHeadChange()
 	}
 	return result, nil
 }

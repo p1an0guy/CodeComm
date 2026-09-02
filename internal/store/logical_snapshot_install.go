@@ -243,6 +243,7 @@ func (store *Store) installLogicalSnapshot(
 	}
 	defer store.applyMu.Unlock()
 
+	resultHeadChanged := false
 	err = stage.store.withConn(ctx, func(source *sqlite.Conn) (err error) {
 		previousInterrupt := source.SetInterrupt(ctx.Done())
 		defer source.SetInterrupt(previousInterrupt)
@@ -303,6 +304,11 @@ func (store *Store) installLogicalSnapshot(
 			}
 			defer end(&err)
 
+			destinationState, destinationFound, err :=
+				readConsensusState(destination)
+			if err != nil {
+				return err
+			}
 			generationChanged, err :=
 				verifyLogicalSnapshotInstallDestination(
 					source,
@@ -314,6 +320,8 @@ func (store *Store) installLogicalSnapshot(
 			if err != nil {
 				return err
 			}
+			resultHeadChanged = !destinationFound ||
+				!sameResultHeadState(destinationState, sourceState)
 			preservedMarker, markerFound, err := readRebootstrapInstallMarker(
 				destination,
 			)
@@ -438,6 +446,13 @@ func (store *Store) installLogicalSnapshot(
 				destination,
 				root,
 				options.VerifiedAt,
+			); err != nil {
+				return err
+			}
+			if err := writeCheckpointCadenceSnapshot(
+				destination,
+				cut,
+				options.InstalledAt,
 			); err != nil {
 				return err
 			}
@@ -575,6 +590,9 @@ func (store *Store) installLogicalSnapshot(
 		AttestationID: attestationID,
 	}
 	result.AdmissionRevision = store.advanceAdmissionRevision()
+	if resultHeadChanged {
+		store.signalResultHeadChange()
+	}
 	return result, nil
 }
 
@@ -1014,6 +1032,7 @@ func clearLogicalSnapshotDestination(
 		"raft_committed_configuration",
 		"replication_cursors",
 		"replication_watermark_observations",
+		"checkpoint_cadence_state",
 		"settled_nonvoter_state",
 	} {
 		if err := execute(conn, "DELETE FROM "+table+";"); err != nil {

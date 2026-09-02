@@ -57,6 +57,7 @@ type Store struct {
 	applyMu           sync.Mutex
 	applyFailpoint    func(applyStage) error
 	admissionRevision atomic.Uint64
+	resultHeadChanges *resultHeadChangeFeed
 
 	controlFileFailpoint func(controlFileDecisionStage) error
 }
@@ -135,6 +136,14 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err := verifyCurrentCommitmentTip(conn); err != nil {
 		return nil, normalizeSQLiteError(ctx, "verify commitment tip", err)
 	}
+	if _, _, _, err := verifyCheckpointCadenceBinding(conn); err != nil &&
+		!errors.Is(err, ErrApplyConflict) {
+		return nil, normalizeSQLiteError(
+			ctx,
+			"verify checkpoint cadence",
+			err,
+		)
+	}
 	conn.SetInterrupt(nil)
 	if err := conn.Close(); err != nil {
 		return nil, normalizeSQLiteError(ctx, "close startup connection", err)
@@ -154,7 +163,11 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err != nil {
 		return nil, normalizeSQLiteError(ctx, "open connection pool", err)
 	}
-	store := &Store{path: path, pool: pool}
+	store := &Store{
+		path:              path,
+		pool:              pool,
+		resultHeadChanges: newResultHeadChangeFeed(),
+	}
 	store.admissionRevision.Store(1)
 	if err := store.withConn(ctx, func(*sqlite.Conn) error { return nil }); err != nil {
 		_ = pool.Close()
@@ -199,6 +212,7 @@ func (store *Store) Close() error {
 		return store.closeErr
 	}
 	store.closed = true
+	store.resultHeadChanges.close()
 	store.closeErr = store.pool.Close()
 	if store.closeErr != nil {
 		store.closeErr = fmt.Errorf("store: close: %w", store.closeErr)

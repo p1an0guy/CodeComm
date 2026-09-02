@@ -235,6 +235,7 @@ func (store *Store) ImportSettledNonvoterResultBatch(
 		return ResultBatchImportResult{}, err
 	}
 	result.AdmissionRevision = store.advanceAdmissionRevision()
+	store.signalResultHeadChange()
 	return result, nil
 }
 
@@ -385,6 +386,16 @@ func (store *Store) importVerifiedCommand(
 	}
 	if err := store.writeImportedCommandLocalRows(conn, applyRequest); err != nil {
 		return ApplyHeads{}, fmt.Errorf("write local rows: %w", err)
+	}
+	if err := writeCheckpointCadenceCheckpoint(
+		conn,
+		applyRequest,
+		heads,
+	); err != nil {
+		return ApplyHeads{}, fmt.Errorf(
+			"write checkpoint cadence: %w",
+			err,
+		)
 	}
 	if err := writePostCommandLocalCleanup(conn, applyRequest); err != nil {
 		return ApplyHeads{}, fmt.Errorf(
