@@ -68,6 +68,10 @@ type InviteSigner func(pairing.Invite) (pairing.SignedInvite, error)
 // InviteIDGenerator returns a never-reused UUIDv7.
 type InviteIDGenerator func() (domain.UUIDv7, error)
 
+// InviteEndpointProvider returns the issuer's complete current listener
+// snapshot. The Inviter validates and clones every result before signing.
+type InviteEndpointProvider func() ([]pairing.Endpoint, error)
+
 // InviterOptions bind all issuer-controlled fields that must not come from a
 // local operator request.
 type InviterOptions struct {
@@ -80,6 +84,7 @@ type InviterOptions struct {
 	IdentityPublicKey   []byte
 	SignedGenesisDigest [sha256.Size]byte
 	Endpoints           []pairing.Endpoint
+	EndpointProvider    InviteEndpointProvider
 	Sign                InviteSigner
 	Clock               func() time.Time
 	GenerateID          InviteIDGenerator
@@ -112,6 +117,7 @@ type Inviter struct {
 	identityPublicKey  [ed25519.PublicKeySize]byte
 	genesisDigest      [sha256.Size]byte
 	endpoints          []pairing.Endpoint
+	endpointProvider   InviteEndpointProvider
 	sign               InviteSigner
 	clock              func() time.Time
 	generateID         InviteIDGenerator
@@ -127,6 +133,7 @@ func NewInviter(options InviterOptions) (*Inviter, error) {
 		!options.IssuerDeviceID.Valid() ||
 		len(options.IdentityPublicKey) != ed25519.PublicKeySize ||
 		len(options.Endpoints) > pairing.MaxInviteEndpoints ||
+		options.EndpointProvider != nil && len(options.Endpoints) != 0 ||
 		options.Sign == nil {
 		return nil, ErrInvalidInviter
 	}
@@ -152,7 +159,9 @@ func NewInviter(options InviterOptions) (*Inviter, error) {
 		recoveryGeneration: options.RecoveryGeneration,
 		issuerDeviceID:     options.IssuerDeviceID,
 		genesisDigest:      options.SignedGenesisDigest,
-		endpoints:          endpoints, sign: options.Sign, clock: clock,
+		endpoints:          endpoints,
+		endpointProvider:   options.EndpointProvider,
+		sign:               options.Sign, clock: clock,
 		generateID: generateID,
 	}
 	copy(result.identityPublicKey[:], options.IdentityPublicKey)
@@ -168,7 +177,8 @@ func (inviter *Inviter) Create(
 	if inviter == nil || ctx == nil || request.validate() != nil {
 		return IssuedInvite{}, ErrInvalidInviter
 	}
-	if len(inviter.endpoints) == 0 {
+	endpoints, err := inviter.currentEndpoints()
+	if err != nil || len(endpoints) == 0 {
 		return IssuedInvite{}, ErrUnavailable
 	}
 	if err := ctx.Err(); err != nil {
@@ -201,7 +211,7 @@ func (inviter *Inviter) Create(
 		SignedGenesisDigest: inviter.genesisDigest,
 		Mode:                request.Mode, Role: request.Role,
 		InitialCredentialEpoch: request.InitialCredentialEpoch,
-		Endpoints:              append([]pairing.Endpoint(nil), inviter.endpoints...),
+		Endpoints:              endpoints,
 	}
 	copy(value.InviterIdentityPublicKey[:], inviter.identityPublicKey[:])
 	value.SubjectDeviceID = cloneDeviceID(request.SubjectDeviceID)
@@ -252,6 +262,35 @@ func (inviter *Inviter) Create(
 		)
 	}
 	return IssuedInvite{Invite: signed, Record: activated}, nil
+}
+
+func (inviter *Inviter) currentEndpoints() (
+	endpoints []pairing.Endpoint,
+	err error,
+) {
+	if inviter == nil {
+		return nil, ErrInvalidInviter
+	}
+	if inviter.endpointProvider == nil {
+		return append([]pairing.Endpoint(nil), inviter.endpoints...), nil
+	}
+	defer func() {
+		if recover() != nil {
+			endpoints = nil
+			err = ErrUnavailable
+		}
+	}()
+	endpoints, err = inviter.endpointProvider()
+	if err != nil ||
+		len(endpoints) == 0 ||
+		len(endpoints) > pairing.MaxInviteEndpoints {
+		return nil, ErrUnavailable
+	}
+	endpoints = append([]pairing.Endpoint(nil), endpoints...)
+	if !validInviteEndpoints(endpoints) {
+		return nil, ErrUnavailable
+	}
+	return endpoints, nil
 }
 
 // List returns only revocable issuer-local invites without reading any secret.

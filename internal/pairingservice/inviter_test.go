@@ -118,6 +118,92 @@ func TestInviterAbandonsReservationWhenSecretCreateFails(t *testing.T) {
 	}
 }
 
+func TestInviterSnapshotsCurrentEndpointProvider(t *testing.T) {
+	t.Parallel()
+
+	fixture := newServiceFixture(t)
+	genesisDigest, err := chain.GenesisDigest([]byte(serviceTestGenesis))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], genesisDigest[:])
+	key := testPrivateKey(1)
+	value := fixture.invite.Invite()
+	defer clear(value.Secret[:])
+	first := pairing.Endpoint{
+		IP: netip.MustParseAddr("192.0.2.10"), Port: 47831,
+	}
+	second := pairing.Endpoint{
+		IP: netip.MustParseAddr("192.0.2.11"), Port: 47831,
+	}
+	current := []pairing.Endpoint{first}
+	identifiers := []domain.UUIDv7{
+		serviceTestUUID(730),
+		serviceTestUUID(731),
+	}
+	inviter, err := NewInviter(InviterOptions{
+		State: fixture.state, Secrets: fixture.secrets,
+		SessionID: serviceTestSessionID, WorkspaceID: serviceTestWorkspaceID,
+		RecoveryGeneration: 0, IssuerDeviceID: value.InviterDeviceID,
+		IdentityPublicKey:   value.InviterIdentityPublicKey[:],
+		SignedGenesisDigest: digest,
+		EndpointProvider: func() ([]pairing.Endpoint, error) {
+			return current, nil
+		},
+		Sign: func(invite pairing.Invite) (pairing.SignedInvite, error) {
+			return pairing.SignInvite(invite, key)
+		},
+		Clock: func() time.Time {
+			return time.Date(2026, 8, 13, 12, 1, 0, 0, time.UTC)
+		},
+		GenerateID: func() (domain.UUIDv7, error) {
+			id := identifiers[0]
+			identifiers = identifiers[1:]
+			return id, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewInviter(): %v", err)
+	}
+	request := CreateInviteRequest{
+		Mode: pairing.ModeNew, Role: device.RoleEditor,
+		InitialCredentialEpoch: 1,
+	}
+	issued, err := inviter.Create(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Create(first): %v", err)
+	}
+	firstValue := issued.Invite.Invite()
+	defer clear(firstValue.Secret[:])
+	if len(firstValue.Endpoints) != 1 || firstValue.Endpoints[0] != first {
+		t.Fatalf("first invite endpoints = %v", firstValue.Endpoints)
+	}
+
+	current = nil
+	if _, err := inviter.Create(
+		t.Context(),
+		request,
+	); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Create(no endpoints) error = %v, want unavailable", err)
+	}
+
+	current = []pairing.Endpoint{second}
+	issued, err = inviter.Create(t.Context(), request)
+	if err != nil {
+		t.Fatalf("Create(second): %v", err)
+	}
+	secondValue := issued.Invite.Invite()
+	defer clear(secondValue.Secret[:])
+	if len(secondValue.Endpoints) != 1 ||
+		secondValue.Endpoints[0] != second {
+		t.Fatalf("second invite endpoints = %v", secondValue.Endpoints)
+	}
+	if firstValue.Endpoints[0] != first {
+		t.Fatal("later provider update mutated the first signed invite")
+	}
+}
+
 func TestInviterRejectsNoncanonicalEndpointsAndModes(t *testing.T) {
 	t.Parallel()
 
