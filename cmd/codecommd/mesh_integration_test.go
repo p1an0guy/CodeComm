@@ -2453,12 +2453,18 @@ func completeDaemonMeshPairingJoin(
 			Now:  credentialNow,
 		}
 		for {
-			attemptInvite, parseErr := pairing.ParseInviteCode(created.Code)
-			if parseErr != nil {
-				outcomes <- joinOutcome{err: parseErr}
-				return
+			if runOptions.Resume {
+				runOptions.Invite = pairing.SignedInvite{}
+			} else {
+				attemptInvite, parseErr := pairing.ParseInviteCode(
+					created.Code,
+				)
+				if parseErr != nil {
+					outcomes <- joinOutcome{err: parseErr}
+					return
+				}
+				runOptions.Invite = attemptInvite
 			}
-			runOptions.Invite = attemptInvite
 			result, runErr := joinbootstrap.Run(ctx, runOptions)
 			if runErr == nil ||
 				!errors.Is(
@@ -2476,6 +2482,14 @@ func completeDaemonMeshPairingJoin(
 				outcomes <- joinOutcome{result: result, err: runErr}
 				return
 			}
+			pending, pendingErr := joinbootstrap.HasPending(
+				options.statePath,
+			)
+			if pendingErr != nil {
+				outcomes <- joinOutcome{err: pendingErr}
+				return
+			}
+			runOptions.Resume = pending
 			select {
 			case <-ctx.Done():
 				outcomes <- joinOutcome{err: ctx.Err()}
