@@ -15,9 +15,10 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - The non-expiring identity-mTLS consensus plane carries unmodified HashiCorp Raft framing over
   RFC 8441. Admission uses applied membership; replication uses live configuration. Certificate,
   session, generation, expected-peer, route, and control-mode mismatches fail closed.
-- Three real voters elect, replicate, recover after cold restart, reject divergent state, and
-  preserve exact SQLite/Raft commitments. The mesh harness can sever established connections, not
-  only future dials.
+- Three real voters elect, replicate, recover after cold restart, and preserve exact SQLite/Raft
+  commitments. Production tests corrupt a follower's checkpoint accumulator and covered
+  projection row; checkpoint apply, snapshot export, and cold restart halt without persisting the
+  triggering command. The mesh harness can sever established connections, not only future dials.
 - Canonical-coverage receipt contracts and the no-bypass configuration gate are implemented.
   Verified fixture providers permit integration changes; an absent production Git provider blocks
   changes.
@@ -94,6 +95,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   capacity failures remain retryable without weakening malformed-response checks; explicit
   per-connection graceful shutdown sends GOAWAY even after response headers flush, lets the final
   active response finish, and prevents a superseded connection from occupying an idle ingress slot.
+- Strict `GET /v1/events/stream` SSE sends an initial durable watermark, coalesced monotonic updates,
+  and 15-second keepalives under per-stream progress deadlines. Settled peers wake catch-up from SSE
+  while retaining a 30-second correctness fallback; integration proves convergence before fallback.
+- A checksummed migration persists receiver-local checkpoint cadence bound to the active lineage,
+  latest accepted checkpoint, committed policy, and current heads. The supervised leader scheduler
+  reacts to durable head changes, retries leadership races, forces event/time-threshold checkpoints,
+  survives successor/snapshot boundaries, and fails closed on cadence corruption.
 - The six-field command-result record now has a strict canonical decoder. Immutable result-batch
   values bind every envelope field under `codecomm/v1/batch`, verify both dense chains and signer
   identity, and enforce the 256-record/64 MiB expanded limits. SQLite exports bounded ranges only
@@ -247,8 +255,12 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- SSE, divergence recovery, and the remaining Phase 3 fault/performance matrix are outstanding.
-  Final §14 benchmark confirmation remains a Phase 6 exit gate.
+- The remaining Phase 3 fault matrix needs directed drop/delay/duplicate/truncate links, current/N-1
+  upgrade convergence, Raft/SQLite durability faults, killed-leader recovery, wake plus address
+  change, and in-flight full-plane revocation.
+- §14's Phase 3 control percentiles and 10k-event coordination-growth budget remain unmeasured; the
+  frozen growth trace and benchmark runner do not yet exist. Phase 6 reviews this evidence but is
+  not its first confirmation gate. Git availability/storage measurements remain Phase 5 work.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -261,6 +273,7 @@ test gaps above remain open.
 Primary tests:
 
 - `TestDaemonProductionMeshComposition`
+- `TestDaemonProductionMeshIntegrityProofs`
 - `TestDaemonProductionReadmissionComposition`
 - `TestDecisionApprovedResumeRequiresCommittedAdmission`
 - `TestDecisionApprovedRebootstrapResumeRequiresFreshInvite`
@@ -285,6 +298,7 @@ Primary tests:
 - `TestLegacyUnixLockInteroperability` / `TestLegacyWindowsLockInteroperability`
 - `TestOpenRejectsHardLinkedDatabase`
 - `TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers`
+- `TestDaemonCheckpointScheduler*`
 - `TestVerifiedLogicalSnapshotStageAtomicallyMarksRebootstrap`
 - `TestVerifiedLogicalSnapshotStageRejectsRebootstrapForAuthority`
 - `TestVerifiedLogicalSnapshotStageInstallsSuccessorOverRaftPredecessor`
@@ -308,6 +322,8 @@ Primary tests:
 - `TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart`
 - `TestSettledReplicaFailedReplayLeavesDurableCutUnchanged`
 - `TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart`
+- `TestServerEventStream*` / `TestClientEventStream*`
+- `TestResultHeadChanges*`
 - `TestDaemonContentPeerBootstrapInstallsAuthorityVerifiedLaterEpoch`
 - `TestGuidedVoterPlacementBindsChoiceToFreshCAS`
 - `TestGuidedVoterPlacementRequiresOwnerAndStableTwoDeviceTopology`
