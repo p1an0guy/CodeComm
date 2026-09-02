@@ -59,6 +59,13 @@ type InterfaceJoin struct {
 	Family         AddressFamily
 }
 
+// MulticastInterfaceSelection binds one selected OS interface to the exact
+// address families on which the daemon has a reachable peer listener.
+type MulticastInterfaceSelection struct {
+	Interface net.Interface
+	Families  []AddressFamily
+}
+
 // InterfaceFailure reports a local multicast failure without hiding partial
 // startup or refresh success on other selected interfaces.
 type InterfaceFailure struct {
@@ -176,6 +183,18 @@ func OpenMulticast(
 	})
 }
 
+// OpenSelectedMulticast opens only the requested family joins. A family with
+// no usable address on its selected interface is reported and never joined.
+func OpenSelectedMulticast(
+	port uint16,
+	selected []MulticastInterfaceSelection,
+) (*MulticastIO, MulticastReport, error) {
+	return openSelectedMulticast(port, selected, multicastDependencies{
+		open:  openNativeMulticastSocket,
+		addrs: interfaceAddrs,
+	})
+}
+
 func openMulticast(
 	port uint16,
 	selected []net.Interface,
@@ -186,6 +205,35 @@ func openMulticast(
 	}
 
 	desired, failures := resolveInterfaceFamilies(selected, deps.addrs)
+	return openMulticastDesired(port, deps, desired, failures)
+}
+
+func openSelectedMulticast(
+	port uint16,
+	selected []MulticastInterfaceSelection,
+	deps multicastDependencies,
+) (*MulticastIO, MulticastReport, error) {
+	if port < MinMulticastPort ||
+		deps.open == nil ||
+		deps.addrs == nil {
+		return nil, MulticastReport{}, ErrInvalidMulticastConfig
+	}
+	desired, failures, err := resolveSelectedInterfaceFamilies(
+		selected,
+		deps.addrs,
+	)
+	if err != nil {
+		return nil, MulticastReport{}, err
+	}
+	return openMulticastDesired(port, deps, desired, failures)
+}
+
+func openMulticastDesired(
+	port uint16,
+	deps multicastDependencies,
+	desired map[joinKey]net.Interface,
+	failures []InterfaceFailure,
+) (*MulticastIO, MulticastReport, error) {
 	sockets := make(map[AddressFamily]multicastSocket, 2)
 	joins := make(map[joinKey]net.Interface, len(desired))
 
@@ -392,7 +440,30 @@ func (multicast *MulticastIO) Refresh(
 		return MulticastReport{}, err
 	}
 	desired, failures := resolveInterfaceFamilies(selected, multicast.deps.addrs)
+	return multicast.refreshDesired(desired, failures)
+}
 
+// RefreshSelected applies an exact interface-family join set.
+func (multicast *MulticastIO) RefreshSelected(
+	selected []MulticastInterfaceSelection,
+) (MulticastReport, error) {
+	if multicast == nil {
+		return MulticastReport{}, ErrMulticastClosed
+	}
+	desired, failures, err := resolveSelectedInterfaceFamilies(
+		selected,
+		multicast.deps.addrs,
+	)
+	if err != nil {
+		return MulticastReport{}, err
+	}
+	return multicast.refreshDesired(desired, failures)
+}
+
+func (multicast *MulticastIO) refreshDesired(
+	desired map[joinKey]net.Interface,
+	failures []InterfaceFailure,
+) (MulticastReport, error) {
 	multicast.refreshMu.Lock()
 	defer multicast.refreshMu.Unlock()
 	multicast.mu.Lock()
@@ -975,6 +1046,78 @@ func resolveInterfaceFamilies(
 		}
 	}
 	return desired, failures
+}
+
+func resolveSelectedInterfaceFamilies(
+	selected []MulticastInterfaceSelection,
+	addrs func(*net.Interface) ([]net.Addr, error),
+) (
+	map[joinKey]net.Interface,
+	[]InterfaceFailure,
+	error,
+) {
+	if len(selected) == 0 ||
+		len(selected) > MaxSelectedInterfaces ||
+		addrs == nil {
+		return nil, nil, ErrInvalidMulticastConfig
+	}
+	interfaces := make([]net.Interface, len(selected))
+	for index := range selected {
+		interfaces[index] = selected[index].Interface
+		if len(selected[index].Families) == 0 ||
+			len(selected[index].Families) > 2 {
+			return nil, nil, ErrInvalidMulticastConfig
+		}
+		seen := make(map[AddressFamily]struct{}, len(selected[index].Families))
+		for _, family := range selected[index].Families {
+			if family != AddressFamilyIPv4 &&
+				family != AddressFamilyIPv6 {
+				return nil, nil, ErrInvalidMulticastConfig
+			}
+			if _, duplicate := seen[family]; duplicate {
+				return nil, nil, ErrInvalidMulticastConfig
+			}
+			seen[family] = struct{}{}
+		}
+	}
+	if err := validateSelectedInterfaces(interfaces); err != nil {
+		return nil, nil, err
+	}
+
+	desired := make(map[joinKey]net.Interface, len(selected)*2)
+	failures := make([]InterfaceFailure, 0)
+	for _, selection := range selected {
+		iface := selection.Interface
+		addresses, err := addrs(&iface)
+		if err != nil {
+			failures = append(failures, interfaceFailure(
+				iface,
+				0,
+				"addresses",
+				err,
+			))
+			continue
+		}
+		available := availableFamilies(addresses)
+		for _, family := range selection.Families {
+			if !slices.Contains(available, family) {
+				failures = append(failures, interfaceFailure(
+					iface,
+					family,
+					"addresses",
+					errors.New(
+						"interface has no usable address for selected family",
+					),
+				))
+				continue
+			}
+			desired[joinKey{
+				family:         family,
+				interfaceIndex: iface.Index,
+			}] = iface
+		}
+	}
+	return desired, failures, nil
 }
 
 func availableFamilies(addresses []net.Addr) []AddressFamily {

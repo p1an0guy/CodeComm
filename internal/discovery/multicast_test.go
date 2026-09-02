@@ -224,6 +224,44 @@ func TestOpenMulticastConfiguresJoinsAndSendsPerInterface(t *testing.T) {
 	}
 }
 
+func TestOpenSelectedMulticastJoinsOnlyListenerFamilies(t *testing.T) {
+	t.Parallel()
+
+	iface := testInterface(7, "ethernet0")
+	network := newFakeMulticastNetwork(map[int][]net.Addr{
+		iface.Index: testAddresses("192.0.2.7", "2001:db8::7"),
+	})
+	multicast, report, err := openSelectedMulticast(
+		49123,
+		[]MulticastInterfaceSelection{{
+			Interface: iface,
+			Families:  []AddressFamily{AddressFamilyIPv4},
+		}},
+		network.dependencies(),
+	)
+	if err != nil {
+		t.Fatalf("openSelectedMulticast() error = %v", err)
+	}
+	t.Cleanup(func() { _ = multicast.Close() })
+
+	want := []InterfaceJoin{{
+		InterfaceIndex: iface.Index,
+		InterfaceName:  iface.Name,
+		Family:         AddressFamilyIPv4,
+	}}
+	if !equalJoins(report.Joins, want) {
+		t.Fatalf("selected joins = %#v, want %#v", report.Joins, want)
+	}
+	if network.openCountFor(AddressFamilyIPv4) != 1 ||
+		network.openCountFor(AddressFamilyIPv6) != 0 {
+		t.Fatalf(
+			"family socket counts = IPv4 %d, IPv6 %d",
+			network.openCountFor(AddressFamilyIPv4),
+			network.openCountFor(AddressFamilyIPv6),
+		)
+	}
+}
+
 func TestOpenMulticastAllowsPartialFamilyFailure(t *testing.T) {
 	t.Parallel()
 
