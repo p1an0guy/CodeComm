@@ -501,22 +501,26 @@ func runDaemon(
 		return errInvalidDaemonDependencies
 	}
 	var (
-		agentService       *agent.Service
-		credentialService  *credentialservice.Service
-		pairingService     *pairingservice.Service
-		peerIngress        *transport.Ingress
-		discoveryRuntime   *daemonDiscoveryRuntime
-		contentPeerRuntime *daemonContentPeerRuntime
-		manualEndpoints    ui.ManualEndpointOperator
-		snapshotRepository *daemonLogicalSnapshotRepository
-		snapshotPublisher  *daemonLogicalSnapshotPublisher
+		agentService        *agent.Service
+		credentialService   *credentialservice.Service
+		pairingService      *pairingservice.Service
+		peerIngress         *transport.Ingress
+		discoveryRuntime    *daemonDiscoveryRuntime
+		contentPeerRuntime  *daemonContentPeerRuntime
+		manualEndpoints     ui.ManualEndpointOperator
+		snapshotRepository  *daemonLogicalSnapshotRepository
+		snapshotPublisher   *daemonLogicalSnapshotPublisher
+		checkpointScheduler *daemonCheckpointScheduler
 	)
 	runtimeClosed := false
 	defer func() {
 		if runtimeClosed {
 			return
 		}
-		components := make([]phasedDaemonComponent, 0, 7)
+		components := make([]phasedDaemonComponent, 0, 9)
+		if checkpointScheduler != nil {
+			components = append(components, checkpointScheduler)
+		}
 		if agentService != nil {
 			components = append(components, agentService)
 		}
@@ -738,6 +742,22 @@ func runDaemon(
 	}
 	meshFactory.ClearIdentityCertificate()
 
+	checkpointSource, err := newDaemonCheckpointRuntimeSource(
+		localState,
+		node,
+	)
+	if err != nil {
+		return err
+	}
+	checkpointScheduler, err = newDaemonCheckpointScheduler(
+		ctx,
+		checkpointSource,
+		daemonCheckpointSchedulerOptions{},
+	)
+	if err != nil {
+		return err
+	}
+
 	operatorStatusSource, err := newDaemonOperatorStatusSource(
 		node,
 		localState,
@@ -783,6 +803,7 @@ func runDaemon(
 		contentPeerRuntime,
 		snapshotPublisher,
 		snapshotRepository,
+		checkpointScheduler,
 	)
 	runtimeClosed = true
 	return serveErr
@@ -801,10 +822,15 @@ func serveUntilStopped(
 	contentPeerRuntime *daemonContentPeerRuntime,
 	snapshotPublisher *daemonLogicalSnapshotPublisher,
 	snapshotRepository *daemonLogicalSnapshotRepository,
+	checkpointScheduler *daemonCheckpointScheduler,
 ) error {
-	components := []phasedDaemonComponent{agentService}
+	components := []phasedDaemonComponent{
+		checkpointScheduler,
+		agentService,
+	}
 	fatalComponents := []daemonFatalComponent{
 		node,
+		checkpointScheduler,
 		agentService,
 		credentialService,
 		pairingService,
