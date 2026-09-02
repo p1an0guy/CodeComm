@@ -70,7 +70,7 @@ type daemonConsensusTransportFactory interface {
 		transport.ContentCertificateProvider,
 		transport.ConnectionHandler,
 		transport.ConnectionHandler,
-		func(context.Context, netip.AddrPort) (net.Listener, error),
+		net.Listener,
 	) (*transport.Ingress, error)
 	ConsensusRoutes() *transport.ConsensusRouteTable
 	SetAuthenticatedConnectivity(
@@ -329,15 +329,18 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 	contentCertificate transport.ContentCertificateProvider,
 	pairingHandler transport.ConnectionHandler,
 	contentHandler transport.ConnectionHandler,
-	listen func(context.Context, netip.AddrPort) (net.Listener, error),
+	listener net.Listener,
 ) (*transport.Ingress, error) {
 	if len(options.peerListeners) == 0 {
+		if listener != nil {
+			return nil, errDaemonMeshConstruction
+		}
 		return nil, nil
 	}
 	if factory == nil ||
 		admission == nil ||
 		contentCertificate == nil ||
-		listen == nil {
+		listener == nil {
 		return nil, errDaemonMeshConstruction
 	}
 	if err := factory.prepareVerifiers(admission); err != nil {
@@ -347,14 +350,6 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 		pairingHandler == nil &&
 		contentHandler == nil {
 		return nil, errDaemonMeshConstruction
-	}
-	listener, err := openDaemonPeerListeners(
-		ctx,
-		options.peerListeners,
-		listen,
-	)
-	if err != nil {
-		return nil, err
 	}
 	owned := false
 	defer func() {
@@ -514,57 +509,6 @@ func (factory *daemonMeshTransportFactory) SetAuthenticatedConnectivity(
 		)
 	}
 	return nil
-}
-
-func openDaemonPeerListeners(
-	ctx context.Context,
-	endpoints []netip.AddrPort,
-	listen func(context.Context, netip.AddrPort) (net.Listener, error),
-) (net.Listener, error) {
-	if ctx == nil || len(endpoints) == 0 || listen == nil {
-		return nil, errDaemonMeshConstruction
-	}
-	listeners := make([]net.Listener, 0, len(endpoints))
-	closeListeners := func() error {
-		errs := make([]error, 0, len(listeners))
-		for _, listener := range listeners {
-			errs = append(errs, listener.Close())
-		}
-		return errors.Join(errs...)
-	}
-	for _, endpoint := range endpoints {
-		listener, err := listen(ctx, endpoint)
-		if err != nil {
-			return nil, errors.Join(
-				fmt.Errorf(
-					"%w: listen on %s: %v",
-					errDaemonMeshConstruction,
-					endpoint,
-					err,
-				),
-				closeListeners(),
-			)
-		}
-		if listener == nil {
-			return nil, errors.Join(
-				errDaemonMeshConstruction,
-				closeListeners(),
-			)
-		}
-		listeners = append(listeners, listener)
-	}
-	aggregate, err := transport.NewAggregateListener(listeners...)
-	if err != nil {
-		return nil, errors.Join(
-			fmt.Errorf(
-				"%w: aggregate peer listeners: %v",
-				errDaemonMeshConstruction,
-				err,
-			),
-			closeListeners(),
-		)
-	}
-	return aggregate, nil
 }
 
 func listenDaemonPeer(

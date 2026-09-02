@@ -28,10 +28,10 @@ func TestDaemonRecoveringMulticastOpensAfterStartupFailure(t *testing.T) {
 	attempts := 0
 	multicast, _, err := newDaemonRecoveringMulticast(
 		discovery.DefaultMulticastPort,
-		[]net.Interface{iface},
+		daemonRecoveringMulticastTestSelection(iface),
 		func(
 			uint16,
-			[]net.Interface,
+			[]discovery.MulticastInterfaceSelection,
 		) (daemonDiscoveryMulticast, discovery.MulticastReport, error) {
 			attempts++
 			if attempts == 1 {
@@ -56,7 +56,9 @@ func TestDaemonRecoveringMulticastOpensAfterStartupFailure(t *testing.T) {
 		t.Fatalf("degraded Send() error = %v", err)
 	}
 
-	got, err := multicast.Refresh([]net.Interface{iface})
+	got, err := multicast.RefreshSelected(
+		daemonRecoveringMulticastTestSelection(iface),
+	)
 	if err != nil {
 		t.Fatalf("Refresh(recover) error = %v", err)
 	}
@@ -84,7 +86,9 @@ func TestDaemonRecoveringMulticastOpensAfterStartupFailure(t *testing.T) {
 		t.Fatalf("delegate payload = %q, want %q", got, payload)
 	}
 
-	if _, err := multicast.Refresh([]net.Interface{iface}); err != nil {
+	if _, err := multicast.RefreshSelected(
+		daemonRecoveringMulticastTestSelection(iface),
+	); err != nil {
 		t.Fatalf("Refresh(unchanged) error = %v", err)
 	}
 	select {
@@ -113,10 +117,10 @@ func TestDaemonRecoveringMulticastMasksReceiveFailureAndReopens(
 	attempts := 0
 	multicast, _, err := newDaemonRecoveringMulticast(
 		discovery.DefaultMulticastPort,
-		[]net.Interface{iface},
+		daemonRecoveringMulticastTestSelection(iface),
 		func(
 			uint16,
-			[]net.Interface,
+			[]discovery.MulticastInterfaceSelection,
 		) (daemonDiscoveryMulticast, discovery.MulticastReport, error) {
 			value := delegates[attempts]
 			attempts++
@@ -150,7 +154,9 @@ func TestDaemonRecoveringMulticastMasksReceiveFailureAndReopens(
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := multicast.Refresh([]net.Interface{iface}); err != nil {
+	if _, err := multicast.RefreshSelected(
+		daemonRecoveringMulticastTestSelection(iface),
+	); err != nil {
 		t.Fatalf("Refresh(reopen) error = %v", err)
 	}
 	want := discovery.ReceivedDatagram{
@@ -175,17 +181,146 @@ func TestDaemonRecoveringMulticastMasksReceiveFailureAndReopens(
 	}
 }
 
+func TestDaemonRecoveringMulticastRetiresOnInterfaceLossAndReopens(
+	t *testing.T,
+) {
+	iface := net.Interface{
+		Index: 13,
+		Name:  "ethernet0",
+		Flags: net.FlagUp | net.FlagMulticast,
+	}
+	report := discovery.MulticastReport{Joins: []discovery.InterfaceJoin{{
+		InterfaceIndex: iface.Index,
+		InterfaceName:  iface.Name,
+		Family:         discovery.AddressFamilyIPv4,
+	}}}
+	first := newDaemonRecoveringMulticastTestDelegate(report)
+	second := newDaemonRecoveringMulticastTestDelegate(report)
+	delegates := []*daemonRecoveringMulticastTestDelegate{first, second}
+	attempts := 0
+	multicast, _, err := newDaemonRecoveringMulticast(
+		discovery.DefaultMulticastPort,
+		daemonRecoveringMulticastTestSelection(iface),
+		func(
+			uint16,
+			[]discovery.MulticastInterfaceSelection,
+		) (daemonDiscoveryMulticast, discovery.MulticastReport, error) {
+			delegate := delegates[attempts]
+			attempts++
+			return delegate, report, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDaemonRecoveringMulticast(): %v", err)
+	}
+	t.Cleanup(func() { _ = multicast.Close() })
+	<-multicast.AdvertisementTriggers()
+
+	if _, err := multicast.RefreshSelected(nil); !errors.Is(
+		err,
+		discovery.ErrNoMulticastJoin,
+	) {
+		t.Fatalf("Refresh(no interfaces) error = %v", err)
+	}
+	select {
+	case <-first.done:
+	default:
+		t.Fatal("interface loss did not retire the active multicast delegate")
+	}
+	if !errors.Is(multicast.LastError(), discovery.ErrNoMulticastJoin) {
+		t.Fatalf("interface-loss status = %v", multicast.LastError())
+	}
+	if err := multicast.Send([]byte("offline")); err != nil {
+		t.Fatalf("Send(offline): %v", err)
+	}
+
+	if got, err := multicast.RefreshSelected(
+		daemonRecoveringMulticastTestSelection(iface),
+	); err != nil || !sameDaemonMulticastReports(got, report) {
+		t.Fatalf("Refresh(reopen) = (%+v, %v)", got, err)
+	}
+	if attempts != 2 || multicast.LastError() != nil {
+		t.Fatalf(
+			"reopen state = attempts %d, error %v",
+			attempts,
+			multicast.LastError(),
+		)
+	}
+}
+
+func TestDaemonRecoveringMulticastRetiresStaleJoinsWhenMigrationFails(
+	t *testing.T,
+) {
+	iface := net.Interface{
+		Index: 17,
+		Name:  "ethernet0",
+		Flags: net.FlagUp | net.FlagMulticast,
+	}
+	report := discovery.MulticastReport{Joins: []discovery.InterfaceJoin{{
+		InterfaceIndex: iface.Index,
+		InterfaceName:  iface.Name,
+		Family:         discovery.AddressFamilyIPv4,
+	}}}
+	first := newDaemonRecoveringMulticastTestDelegate(report)
+	first.refreshErr = discovery.ErrNoMulticastJoin
+	reopenFailure := errors.New("replacement join unavailable")
+	attempts := 0
+	multicast, _, err := newDaemonRecoveringMulticast(
+		discovery.DefaultMulticastPort,
+		daemonRecoveringMulticastTestSelection(iface),
+		func(
+			uint16,
+			[]discovery.MulticastInterfaceSelection,
+		) (daemonDiscoveryMulticast, discovery.MulticastReport, error) {
+			attempts++
+			if attempts == 1 {
+				return first, report, nil
+			}
+			return nil, discovery.MulticastReport{}, reopenFailure
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDaemonRecoveringMulticast(): %v", err)
+	}
+	t.Cleanup(func() { _ = multicast.Close() })
+
+	if _, err := multicast.RefreshSelected(
+		daemonRecoveringMulticastTestSelection(iface),
+	); !errors.Is(err, discovery.ErrNoMulticastJoin) ||
+		!errors.Is(err, reopenFailure) {
+		t.Fatalf("RefreshSelected(migration failure) error = %v", err)
+	}
+	select {
+	case <-first.done:
+	default:
+		t.Fatal("failed migration retained stale multicast joins")
+	}
+	if err := multicast.Send([]byte("offline")); err != nil {
+		t.Fatalf("degraded Send() error = %v", err)
+	}
+}
+
+func daemonRecoveringMulticastTestSelection(
+	iface net.Interface,
+) []discovery.MulticastInterfaceSelection {
+	return []discovery.MulticastInterfaceSelection{{
+		Interface: iface,
+		Families:  []discovery.AddressFamily{discovery.AddressFamilyIPv4},
+	}}
+}
+
 type daemonRecoveringMulticastTestResult struct {
 	datagram discovery.ReceivedDatagram
 	err      error
 }
 
 type daemonRecoveringMulticastTestDelegate struct {
-	report   discovery.MulticastReport
-	triggers chan struct{}
-	results  chan daemonRecoveringMulticastTestResult
-	done     chan struct{}
-	close    sync.Once
+	report     discovery.MulticastReport
+	refreshErr error
+	triggers   chan struct{}
+	results    chan daemonRecoveringMulticastTestResult
+	done       chan struct{}
+	close      sync.Once
 
 	mu      sync.Mutex
 	payload []byte
@@ -231,14 +366,14 @@ func (delegate *daemonRecoveringMulticastTestDelegate) ReceiveDatagram(
 	}
 }
 
-func (delegate *daemonRecoveringMulticastTestDelegate) Refresh(
-	[]net.Interface,
+func (delegate *daemonRecoveringMulticastTestDelegate) RefreshSelected(
+	[]discovery.MulticastInterfaceSelection,
 ) (discovery.MulticastReport, error) {
 	select {
 	case <-delegate.done:
 		return discovery.MulticastReport{}, discovery.ErrMulticastClosed
 	default:
-		return delegate.report, nil
+		return delegate.report, delegate.refreshErr
 	}
 }
 

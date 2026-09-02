@@ -343,6 +343,20 @@ func runDaemon(
 		return errInvalidDaemonDependencies
 	}
 	defer meshFactory.ClearIdentityCertificate()
+	var peerListeners *daemonPeerListenerSet
+	if len(options.peerListeners) != 0 {
+		peerListeners, err = openDaemonPeerListeners(
+			ctx,
+			options.peerListeners,
+			dependencies.listenPeer,
+		)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			resultErr = errors.Join(resultErr, peerListeners.Close())
+		}()
+	}
 	originBootID, err := dependencies.newBootID()
 	if err != nil {
 		return fmt.Errorf("codecommd: generate origin boot ID: %w", err)
@@ -370,6 +384,7 @@ func runDaemon(
 			meshFactory,
 			credentials,
 			credentialNow,
+			peerListeners,
 		)
 	}
 	if meshPreflight.evidenceMode != store.ReplicaEvidenceRaft {
@@ -610,6 +625,7 @@ func runDaemon(
 		bootOrigin,
 		operatorBinding,
 		originBootID,
+		peerListeners,
 	)
 	if err != nil {
 		return err
@@ -626,6 +642,7 @@ func runDaemon(
 		credentialService,
 		meshFactory,
 		dependencies,
+		peerListeners,
 	)
 	if err != nil {
 		return err
@@ -709,10 +726,15 @@ func runDaemon(
 		credentialService.ContentCertificate,
 		pairingRuntime.server,
 		contentHandler,
-		dependencies.listenPeer,
+		daemonPeerListenerOrNil(peerListeners),
 	)
 	if err != nil {
 		return err
+	}
+	if discoveryRuntime != nil {
+		if err := discoveryRuntime.attachIngress(peerIngress); err != nil {
+			return err
+		}
 	}
 	meshFactory.ClearIdentityCertificate()
 

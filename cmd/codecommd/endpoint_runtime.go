@@ -37,15 +37,24 @@ func newDaemonEndpointPublisher(
 			err,
 		)
 	}
-	if err := publisher.Refresh(ctx, endpointservice.RefreshInput{
-		AdvertisementInterval: advertisementInterval,
-		SelectedListeners:     options.peerListeners,
-	}); err != nil {
+	var publicationErr error
+	if daemonHasPortablePeerListener(options.peerListeners) {
+		publicationErr = publisher.Refresh(
+			ctx,
+			endpointservice.RefreshInput{
+				AdvertisementInterval: advertisementInterval,
+				SelectedListeners:     options.peerListeners,
+			},
+		)
+	} else {
+		publicationErr = publisher.Withdraw()
+	}
+	if publicationErr != nil {
 		_ = publisher.Close()
 		return nil, fmt.Errorf(
 			"%w: publish endpoint set: %v",
 			errDaemonDiscoveryConstruction,
-			err,
+			publicationErr,
 		)
 	}
 	return publisher, nil

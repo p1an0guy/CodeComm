@@ -28,6 +28,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
+	"github.com/ijonahch/codecomm/internal/contenthttp"
 	"github.com/ijonahch/codecomm/internal/credential"
 	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -188,6 +189,7 @@ type daemonMeshIntegrationNode struct {
 	credentialNow func() time.Time
 	coverage      canonicalcoverage.ReceiptCollector
 	contentPeers  atomic.Pointer[daemonContentPeerRuntime]
+	listenerBinds atomic.Uint64
 
 	listener net.Listener
 	cancel   context.CancelFunc
@@ -271,6 +273,15 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 		credentialClock.Now,
 	)
 	t.Cleanup(func() {
+		for _, node := range append(nodes, retained) {
+			if binds := node.listenerBinds.Load(); binds > 1 {
+				t.Logf(
+					"daemon %s bound its current listener generation %d times",
+					node.deviceID,
+					binds,
+				)
+			}
+		}
 		cleanupDaemonMeshIntegrationNodes(
 			t,
 			append(nodes, retained)...,
@@ -1480,6 +1491,7 @@ func (node *daemonMeshIntegrationNode) start(
 	node.running = true
 	node.meshCapture.reset()
 	node.contentPeers.Store(nil)
+	node.listenerBinds.Store(0)
 	go func() {
 		productionDependencies := productionDaemonDependencies()
 		node.exitErr = runDaemon(
@@ -1498,17 +1510,24 @@ func (node *daemonMeshIntegrationNode) start(
 					node.meshCapture,
 				),
 				listenPeer: func(
-					_ context.Context,
+					listenContext context.Context,
 					endpoint netip.AddrPort,
 				) (net.Listener, error) {
-					if claimed || endpoint != node.peerEndpoint {
+					node.listenerBinds.Add(1)
+					if endpoint != node.peerEndpoint {
 						return nil, fmt.Errorf(
 							"unexpected peer listener request %s",
 							endpoint,
 						)
 					}
-					claimed = true
-					return reserved, nil
+					if !claimed {
+						claimed = true
+						return reserved, nil
+					}
+					return productionDependencies.listenPeer(
+						listenContext,
+						endpoint,
+					)
 				},
 				openMulticast:     openDaemonMeshIntegrationMulticast,
 				listInterfaces:    productionDependencies.listInterfaces,
@@ -2441,10 +2460,19 @@ func completeDaemonMeshPairingJoin(
 			}
 			runOptions.Invite = attemptInvite
 			result, runErr := joinbootstrap.Run(ctx, runOptions)
-			if !errors.Is(
-				runErr,
-				pairingjoiner.ErrEndpointsUnavailable,
-			) {
+			if runErr == nil ||
+				!errors.Is(
+					runErr,
+					pairingjoiner.ErrEndpointsUnavailable,
+				) &&
+					!errors.Is(
+						runErr,
+						joinbootstrap.ErrBootstrapUnavailable,
+					) &&
+					!errors.Is(
+						runErr,
+						contenthttp.ErrConnectionUnavailable,
+					) {
 				outcomes <- joinOutcome{result: result, err: runErr}
 				return
 			}

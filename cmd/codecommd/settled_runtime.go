@@ -29,6 +29,7 @@ func runSettledDaemon(
 	meshFactory daemonConsensusTransportFactory,
 	credentials daemonCredentialHandle,
 	credentialNow func() time.Time,
+	peerListeners *daemonPeerListenerSet,
 ) (resultErr error) {
 	if ctx == nil ||
 		!deviceID.Valid() ||
@@ -222,6 +223,7 @@ func runSettledDaemon(
 		credentialService,
 		meshFactory,
 		dependencies,
+		peerListeners,
 	)
 	if err != nil {
 		return err
@@ -314,10 +316,15 @@ func runSettledDaemon(
 		credentialService.ContentCertificate,
 		nil,
 		contentHandler,
-		dependencies.listenPeer,
+		daemonPeerListenerOrNil(peerListeners),
 	)
 	if err != nil {
 		return err
+	}
+	if discoveryRuntime != nil {
+		if err := discoveryRuntime.attachIngress(peerIngress); err != nil {
+			return err
+		}
 	}
 	meshFactory.ClearIdentityCertificate()
 

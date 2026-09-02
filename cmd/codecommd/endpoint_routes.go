@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"sync"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
@@ -35,11 +37,21 @@ type daemonEndpointRouteState interface {
 }
 
 type daemonEndpointRouteReconciler struct {
+	mu sync.Mutex
+
 	localDeviceID domain.DeviceID
 	state         daemonEndpointRouteState
 	routes        *transport.ConsensusRouteTable
-	staticManual  map[domain.DeviceID][]transport.ExpiringConsensusRoute
+	staticManual  map[domain.DeviceID][]daemonConfiguredManualRoute
+	bindings      map[daemonDiscoverySelector]netip.Addr
 	now           func() time.Time
+}
+
+type daemonConfiguredManualRoute struct {
+	remote          netip.AddrPort
+	local           netip.Addr
+	selector        daemonDiscoverySelector
+	followsSelector bool
 }
 
 func newDaemonEndpointRouteReconciler(
@@ -47,12 +59,16 @@ func newDaemonEndpointRouteReconciler(
 	state daemonEndpointRouteState,
 	routes *transport.ConsensusRouteTable,
 	configured []daemonPeerRoute,
+	bindings map[daemonDiscoverySelector]netip.Addr,
 ) (*daemonEndpointRouteReconciler, error) {
 	if !localDeviceID.Valid() || state == nil || routes == nil {
 		return nil, errDaemonEndpointRouteReconciliation
 	}
+	if !validDaemonDiscoveryBindings(bindings) {
+		return nil, errDaemonEndpointRouteReconciliation
+	}
 	manual := make(
-		map[domain.DeviceID][]transport.ExpiringConsensusRoute,
+		map[domain.DeviceID][]daemonConfiguredManualRoute,
 	)
 	for _, value := range configured {
 		if !value.deviceID.Valid() ||
@@ -61,24 +77,45 @@ func newDaemonEndpointRouteReconciler(
 			value.deviceID == localDeviceID {
 			return nil, errDaemonEndpointRouteReconciliation
 		}
-		manual[value.deviceID] = append(
-			manual[value.deviceID],
-			transport.ExpiringConsensusRoute{
-				ConsensusRoute: transport.ConsensusRoute{
-					PeerDeviceID:         value.deviceID,
-					RemoteEndpoint:       value.remote,
-					SelectedLocalAddress: value.local,
-				},
-			},
-		)
+		route := daemonConfiguredManualRoute{
+			remote: value.remote,
+			local:  value.local,
+		}
+		if bindings != nil {
+			var matches int
+			for selector, address := range bindings {
+				if address == value.local {
+					route.selector = selector
+					matches++
+				}
+			}
+			if matches != 1 {
+				return nil, errDaemonEndpointRouteReconciliation
+			}
+			route.followsSelector = true
+		}
+		manual[value.deviceID] = append(manual[value.deviceID], route)
 	}
 	return &daemonEndpointRouteReconciler{
 		localDeviceID: localDeviceID,
 		state:         state,
 		routes:        routes,
 		staticManual:  manual,
+		bindings:      cloneDaemonDiscoveryBindings(bindings),
 		now:           time.Now,
 	}, nil
+}
+
+func (reconciler *daemonEndpointRouteReconciler) replaceSelectedBindings(
+	bindings map[daemonDiscoverySelector]netip.Addr,
+) error {
+	if reconciler == nil || !validDaemonDiscoveryBindings(bindings) {
+		return errDaemonEndpointRouteReconciliation
+	}
+	reconciler.mu.Lock()
+	reconciler.bindings = cloneDaemonDiscoveryBindings(bindings)
+	reconciler.mu.Unlock()
+	return nil
 }
 
 func (reconciler *daemonEndpointRouteReconciler) reconcile(
@@ -96,6 +133,8 @@ func (reconciler *daemonEndpointRouteReconciler) reconcile(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	reconciler.mu.Lock()
+	defer reconciler.mu.Unlock()
 	now := reconciler.now().UTC()
 	if now.IsZero() {
 		return errDaemonEndpointRouteReconciliation
@@ -152,6 +191,24 @@ func (reconciler *daemonEndpointRouteReconciler) reconcile(
 				)
 			}
 			reconciler.routes.PurgePeer(member.ID, false)
+			manual := daemonConfiguredManualRoutes(
+				member.ID,
+				reconciler.staticManual[member.ID],
+				selected,
+				reconciler.bindings,
+			)
+			if err := reconciler.routes.Replace(
+				member.ID,
+				transport.ConsensusRouteManual,
+				manual,
+			); err != nil {
+				return fmt.Errorf(
+					"%w: remap peer %s manual routes: %w",
+					errDaemonEndpointRouteReconciliation,
+					member.ID,
+					err,
+				)
+			}
 			continue
 		}
 		candidates, err := reconciler.state.ListPeerEndpointCandidates(
@@ -178,7 +235,12 @@ func (reconciler *daemonEndpointRouteReconciler) reconcile(
 		}
 		manual, err := mergeDaemonManualRoutes(
 			grouped[transport.ConsensusRouteManual],
-			reconciler.staticManual[member.ID],
+			daemonConfiguredManualRoutes(
+				member.ID,
+				reconciler.staticManual[member.ID],
+				selected,
+				reconciler.bindings,
+			),
 		)
 		if err != nil {
 			return err
@@ -211,6 +273,63 @@ func (reconciler *daemonEndpointRouteReconciler) reconcile(
 	}
 	reconciler.routes.Expire()
 	return nil
+}
+
+func daemonConfiguredManualRoutes(
+	deviceID domain.DeviceID,
+	configured []daemonConfiguredManualRoute,
+	selected []netip.Addr,
+	bindings map[daemonDiscoverySelector]netip.Addr,
+) []transport.ExpiringConsensusRoute {
+	result := make(
+		[]transport.ExpiringConsensusRoute,
+		0,
+		len(configured),
+	)
+	for _, configuredRoute := range configured {
+		local := configuredRoute.local
+		if configuredRoute.followsSelector {
+			var exists bool
+			local, exists = bindings[configuredRoute.selector]
+			if !exists {
+				continue
+			}
+		}
+		if !slices.Contains(selected, local) ||
+			local.Is4() != configuredRoute.remote.Addr().Is4() {
+			continue
+		}
+		result = append(result, transport.ExpiringConsensusRoute{
+			ConsensusRoute: transport.ConsensusRoute{
+				PeerDeviceID:         deviceID,
+				RemoteEndpoint:       configuredRoute.remote,
+				SelectedLocalAddress: local,
+			},
+		})
+	}
+	return result
+}
+
+func validDaemonDiscoveryBindings(
+	bindings map[daemonDiscoverySelector]netip.Addr,
+) bool {
+	seen := make(map[netip.Addr]struct{}, len(bindings))
+	for selector, address := range bindings {
+		if selector.interfaceName == "" ||
+			selector.family != discovery.AddressFamilyIPv4 &&
+				selector.family != discovery.AddressFamilyIPv6 ||
+			!validDaemonSelectedAddress(address) ||
+			address.Is4() !=
+				(selector.family == discovery.AddressFamilyIPv4) ||
+			address.IsLinkLocalUnicast() != selector.linkLocal {
+			return false
+		}
+		if _, duplicate := seen[address]; duplicate {
+			return false
+		}
+		seen[address] = struct{}{}
+	}
+	return true
 }
 
 func daemonEndpointRoutes(

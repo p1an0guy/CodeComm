@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"net"
 	"slices"
 	"sync"
 
@@ -33,10 +32,10 @@ type daemonRecoveringMulticast struct {
 
 func newDaemonRecoveringMulticast(
 	port uint16,
-	selected []net.Interface,
+	selected []discovery.MulticastInterfaceSelection,
 	opener daemonMulticastOpener,
 ) (*daemonRecoveringMulticast, discovery.MulticastReport, error) {
-	if port == 0 || len(selected) == 0 || opener == nil {
+	if port == 0 || opener == nil {
 		return nil, discovery.MulticastReport{}, errDaemonDiscoveryConstruction
 	}
 	value := &daemonRecoveringMulticast{
@@ -47,6 +46,10 @@ func newDaemonRecoveringMulticast(
 		done:     make(chan struct{}),
 	}
 	value.signalAdvertisement()
+	if len(selected) == 0 {
+		value.recordError(discovery.ErrNoMulticastJoin)
+		return value, discovery.MulticastReport{}, nil
+	}
 	report, _ := value.openLocked(selected)
 	return value, report, nil
 }
@@ -56,6 +59,20 @@ func (multicast *daemonRecoveringMulticast) AdvertisementTriggers() <-chan struc
 		return nil
 	}
 	return multicast.triggers
+}
+
+func (multicast *daemonRecoveringMulticast) TriggerAdvertisement() error {
+	if multicast == nil {
+		return discovery.ErrMulticastClosed
+	}
+	multicast.mu.RLock()
+	closed := multicast.closed
+	multicast.mu.RUnlock()
+	if closed {
+		return discovery.ErrMulticastClosed
+	}
+	multicast.signalAdvertisement()
+	return nil
 }
 
 func (multicast *daemonRecoveringMulticast) Send(payload []byte) error {
@@ -115,8 +132,8 @@ func (multicast *daemonRecoveringMulticast) ReceiveDatagram(
 	}
 }
 
-func (multicast *daemonRecoveringMulticast) Refresh(
-	selected []net.Interface,
+func (multicast *daemonRecoveringMulticast) RefreshSelected(
+	selected []discovery.MulticastInterfaceSelection,
 ) (discovery.MulticastReport, error) {
 	if multicast == nil {
 		return discovery.MulticastReport{}, discovery.ErrMulticastClosed
@@ -128,15 +145,24 @@ func (multicast *daemonRecoveringMulticast) Refresh(
 	if closed {
 		return discovery.MulticastReport{}, discovery.ErrMulticastClosed
 	}
+	if len(selected) == 0 {
+		if delegate != nil {
+			multicast.retire(delegate, discovery.ErrNoMulticastJoin)
+		} else {
+			multicast.recordError(discovery.ErrNoMulticastJoin)
+		}
+		return discovery.MulticastReport{}, discovery.ErrNoMulticastJoin
+	}
 	if delegate == nil {
 		return multicast.openLocked(selected)
 	}
 
-	report, err := delegate.Refresh(selected)
+	report, err := delegate.RefreshSelected(selected)
 	if err != nil {
 		multicast.recordError(err)
 		if errors.Is(err, discovery.ErrMulticastClosed) ||
-			errors.Is(err, discovery.ErrMulticastRefresh) {
+			errors.Is(err, discovery.ErrMulticastRefresh) ||
+			errors.Is(err, discovery.ErrNoMulticastJoin) {
 			multicast.retire(delegate, err)
 			reopened, reopenErr := multicast.openLocked(selected)
 			if reopenErr == nil {
@@ -190,7 +216,7 @@ func (multicast *daemonRecoveringMulticast) Close() error {
 }
 
 func (multicast *daemonRecoveringMulticast) openLocked(
-	selected []net.Interface,
+	selected []discovery.MulticastInterfaceSelection,
 ) (discovery.MulticastReport, error) {
 	delegate, report, err := multicast.opener(multicast.port, selected)
 	if err == nil && (delegate == nil || len(report.Joins) == 0) {

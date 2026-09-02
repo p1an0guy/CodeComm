@@ -196,7 +196,7 @@ func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 	certificate transport.ContentCertificateProvider,
 	pairingHandler transport.ConnectionHandler,
 	contentHandler transport.ConnectionHandler,
-	listen func(context.Context, netip.AddrPort) (net.Listener, error),
+	listener net.Listener,
 ) (*transport.Ingress, error) {
 	if factory == nil || factory.delegate == nil || factory.capture == nil ||
 		node == nil || certificate == nil || contentHandler == nil {
@@ -221,7 +221,7 @@ func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 		certificate,
 		pairingHandler,
 		contentHandler,
-		listen,
+		listener,
 	)
 	if err != nil {
 		return nil, err
@@ -262,7 +262,7 @@ type daemonMeshIntegrationMulticast struct {
 
 func openDaemonMeshIntegrationMulticast(
 	port uint16,
-	selected []net.Interface,
+	selected []discovery.MulticastInterfaceSelection,
 ) (daemonDiscoveryMulticast, discovery.MulticastReport, error) {
 	report, err := daemonMeshIntegrationMulticastReport(port, selected)
 	if err != nil {
@@ -278,24 +278,28 @@ func openDaemonMeshIntegrationMulticast(
 
 func daemonMeshIntegrationMulticastReport(
 	port uint16,
-	selected []net.Interface,
+	selected []discovery.MulticastInterfaceSelection,
 ) (discovery.MulticastReport, error) {
 	if port != discovery.DefaultMulticastPort || len(selected) == 0 {
 		return discovery.MulticastReport{}, errDaemonMeshContentHarness
 	}
 	report := discovery.MulticastReport{
-		Joins: make([]discovery.InterfaceJoin, len(selected)),
+		Joins: make([]discovery.InterfaceJoin, 0, len(selected)*2),
 	}
-	for index, networkInterface := range selected {
+	for _, selection := range selected {
+		networkInterface := selection.Interface
 		if networkInterface.Index < 1 || networkInterface.Name == "" ||
 			networkInterface.Flags&net.FlagUp == 0 ||
-			networkInterface.Flags&net.FlagLoopback != 0 {
+			networkInterface.Flags&net.FlagLoopback != 0 ||
+			len(selection.Families) == 0 {
 			return discovery.MulticastReport{}, errDaemonMeshContentHarness
 		}
-		report.Joins[index] = discovery.InterfaceJoin{
-			InterfaceIndex: networkInterface.Index,
-			InterfaceName:  networkInterface.Name,
-			Family:         discovery.AddressFamilyIPv4,
+		for _, family := range selection.Families {
+			report.Joins = append(report.Joins, discovery.InterfaceJoin{
+				InterfaceIndex: networkInterface.Index,
+				InterfaceName:  networkInterface.Name,
+				Family:         family,
+			})
 		}
 	}
 	return report, nil
@@ -328,8 +332,8 @@ func (multicast *daemonMeshIntegrationMulticast) ReceiveDatagram(
 	}
 }
 
-func (multicast *daemonMeshIntegrationMulticast) Refresh(
-	selected []net.Interface,
+func (multicast *daemonMeshIntegrationMulticast) RefreshSelected(
+	selected []discovery.MulticastInterfaceSelection,
 ) (discovery.MulticastReport, error) {
 	select {
 	case <-multicast.closed:
@@ -564,23 +568,39 @@ func exerciseDaemonLogicalSnapshotContent(
 		daemonMeshIntegrationTimeout,
 	)
 	defer cancel()
-	control, err := dialDaemonMeshExternalContentClient(
-		ctx,
-		sourceCertificate,
-		source.peerEndpoint.Addr(),
-		target,
-	)
-	if err != nil {
-		t.Fatalf("dial logical snapshot control: %v", err)
+	var control *daemonMeshPairedContentConnection
+	var lastErr error
+	for ctx.Err() == nil {
+		control, err = dialDaemonMeshExternalContentClient(
+			ctx,
+			sourceCertificate,
+			source.peerEndpoint.Addr(),
+			target,
+		)
+		if err == nil {
+			if _, err = control.client.Session(ctx); err == nil {
+				break
+			}
+			err = errors.Join(err, control.Close())
+			control = nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if control == nil {
+		t.Fatalf(
+			"logical snapshot control did not stabilize: %v",
+			errors.Join(lastErr, ctx.Err()),
+		)
 	}
 	defer func() {
 		if err := control.Close(); err != nil {
 			t.Errorf("close logical snapshot control: %v", err)
 		}
 	}()
-	if _, err := control.client.Session(ctx); err != nil {
-		t.Fatalf("bind logical snapshot control: %v", err)
-	}
 	var root logicalsnapshot.Root
 	for {
 		root, err = control.client.LatestSnapshot(ctx)

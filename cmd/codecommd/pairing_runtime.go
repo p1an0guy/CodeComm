@@ -58,6 +58,7 @@ func newDaemonPairingRuntime(
 	bootOrigin *agent.BootOrigin,
 	operatorBinding event.Binding,
 	originBootID domain.UUIDv7,
+	peerListeners *daemonPeerListenerSet,
 ) (_ daemonPairingRuntime, resultErr error) {
 	if ctx == nil ||
 		!deviceID.Valid() ||
@@ -66,6 +67,7 @@ func newDaemonPairingRuntime(
 		credentials == nil ||
 		node == nil ||
 		bootOrigin == nil ||
+		(len(options.peerListeners) != 0) != (peerListeners != nil) ||
 		view.SessionID != options.sessionID ||
 		view.WorkspaceID != options.workspaceID ||
 		view.RecoveryGeneration > domain.MaxSafeInteger {
@@ -81,10 +83,6 @@ func newDaemonPairingRuntime(
 	}
 	var genesisDigest [sha256.Size]byte
 	copy(genesisDigest[:], genesis[:])
-	endpoints, err := daemonPairingEndpoints(options.peerListeners)
-	if err != nil {
-		return daemonPairingRuntime{}, err
-	}
 	authorizer, err := pairingservice.NewAdmissionAuthorizer(
 		pairingservice.AdmissionAuthorizerOptions{
 			DeviceID: deviceID, OriginBootID: originBootID,
@@ -147,18 +145,23 @@ func newDaemonPairingRuntime(
 			err,
 		)
 	}
-	inviter, err := pairingservice.NewInviter(pairingservice.InviterOptions{
+	inviterOptions := pairingservice.InviterOptions{
 		State: localState, Secrets: credentials,
 		SessionID: options.sessionID, WorkspaceID: options.workspaceID,
 		RecoveryGeneration:  view.RecoveryGeneration,
 		IssuerDeviceID:      deviceID,
 		IdentityPublicKey:   identityPublicKey,
 		SignedGenesisDigest: genesisDigest,
-		Endpoints:           endpoints,
 		Sign: func(value pairing.Invite) (pairing.SignedInvite, error) {
 			return pairing.SignInvite(value, identityPrivateKey)
 		},
-	})
+	}
+	if peerListeners != nil {
+		inviterOptions.EndpointProvider = func() ([]pairing.Endpoint, error) {
+			return daemonPairingEndpoints(peerListeners.Current())
+		}
+	}
+	inviter, err := pairingservice.NewInviter(inviterOptions)
 	if err != nil {
 		return daemonPairingRuntime{}, fmt.Errorf(
 			"%w: inviter: %v",

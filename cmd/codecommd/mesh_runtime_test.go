@@ -306,13 +306,13 @@ func TestOpenDaemonPeerListenersClosesEarlierListenersAfterBindFailure(
 	t *testing.T,
 ) {
 	bindErr := errors.New("bind failed")
-	first := &daemonMeshTestListener{}
-	second := &daemonMeshTestListener{}
 	endpoints := []netip.AddrPort{
 		netip.MustParseAddrPort("192.0.2.1:41001"),
-		netip.MustParseAddrPort("192.0.2.2:41002"),
-		netip.MustParseAddrPort("192.0.2.3:41003"),
+		netip.MustParseAddrPort("192.0.2.2:41001"),
+		netip.MustParseAddrPort("192.0.2.3:41001"),
 	}
+	first := &daemonMeshTestListener{endpoint: endpoints[0]}
+	second := &daemonMeshTestListener{endpoint: endpoints[1]}
 	call := 0
 	_, err := openDaemonPeerListeners(
 		context.Background(),
@@ -463,6 +463,7 @@ func applyDaemonMeshTestEntry(
 
 type daemonMeshTestListener struct {
 	closeCalls int
+	endpoint   netip.AddrPort
 }
 
 func (*daemonMeshTestListener) Accept() (net.Conn, error) {
@@ -474,14 +475,14 @@ func (listener *daemonMeshTestListener) Close() error {
 	return nil
 }
 
-func (*daemonMeshTestListener) Addr() net.Addr {
-	return daemonMeshTestAddr("daemon-mesh-test")
+func (listener *daemonMeshTestListener) Addr() net.Addr {
+	return daemonMeshTestAddr(listener.endpoint.String())
 }
 
 type daemonMeshTestAddr string
 
 func (daemonMeshTestAddr) Network() string {
-	return "test"
+	return "tcp"
 }
 
 func (address daemonMeshTestAddr) String() string {

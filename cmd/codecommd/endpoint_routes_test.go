@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ijonahch/codecomm/internal/discovery"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
@@ -75,6 +76,7 @@ func TestDaemonEndpointRouteReconcilerRestoresAndPurgesRoutes(t *testing.T) {
 		state,
 		routes,
 		configured,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("newDaemonEndpointRouteReconciler(): %v", err)
@@ -159,6 +161,7 @@ func TestDaemonEndpointRouteReconcilerPreservesLiveDiscoveryOwnership(t *testing
 		state,
 		routes,
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("newDaemonEndpointRouteReconciler(): %v", err)
@@ -191,6 +194,82 @@ func TestDaemonEndpointRouteReconcilerPreservesLiveDiscoveryOwnership(t *testing
 		peerID,
 	); !errors.Is(err, transport.ErrConsensusEndpointUnavailable) {
 		t.Fatalf("ambiguous restored discovery route error = %v", err)
+	}
+}
+
+func TestDaemonEndpointRouteReconcilerRemapsConfiguredManualSource(
+	t *testing.T,
+) {
+	now := time.Now().UTC().Truncate(time.Second)
+	localID := daemonEndpointRouteTestDeviceID('c')
+	peerID := daemonEndpointRouteTestDeviceID('d')
+	original := netip.MustParseAddr("192.0.2.10")
+	replacement := netip.MustParseAddr("192.0.2.11")
+	unrelated := netip.MustParseAddr("192.0.2.12")
+	remote := netip.MustParseAddrPort("192.0.2.20:47831")
+	selector := daemonDiscoverySelector{
+		interfaceName: "ethernet0",
+		family:        discovery.AddressFamilyIPv4,
+	}
+	configured := []daemonPeerRoute{{
+		deviceID: peerID,
+		remote:   remote,
+		local:    original,
+	}}
+	routes, err := transport.NewConsensusRouteTable(
+		[]netip.Addr{original},
+		[]transport.ConsensusRoute{{
+			PeerDeviceID:         peerID,
+			RemoteEndpoint:       remote,
+			SelectedLocalAddress: original,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("NewConsensusRouteTable(): %v", err)
+	}
+	reconciler, err := newDaemonEndpointRouteReconciler(
+		localID,
+		&daemonEndpointRouteStateStub{
+			snapshot: daemonEndpointRouteSnapshot(localID, peerID),
+		},
+		routes,
+		configured,
+		map[daemonDiscoverySelector]netip.Addr{
+			selector: original,
+		},
+	)
+	if err != nil {
+		t.Fatalf("newDaemonEndpointRouteReconciler(): %v", err)
+	}
+	reconciler.now = func() time.Time { return now }
+
+	if err := routes.ReplaceSelectedAddresses(
+		[]netip.Addr{original, replacement, unrelated},
+	); err != nil {
+		t.Fatalf("install transition addresses: %v", err)
+	}
+	if err := reconciler.replaceSelectedBindings(
+		map[daemonDiscoverySelector]netip.Addr{
+			selector: replacement,
+		},
+	); err != nil {
+		t.Fatalf("replace selected bindings: %v", err)
+	}
+	if err := reconciler.reconcile(
+		t.Context(),
+		[]netip.Addr{replacement, unrelated},
+		false,
+	); err != nil {
+		t.Fatalf("reconcile replacement: %v", err)
+	}
+	if err := routes.ReplaceSelectedAddresses(
+		[]netip.Addr{replacement, unrelated},
+	); err != nil {
+		t.Fatalf("retire original address: %v", err)
+	}
+	endpoints, err := routes.ResolveConsensusEndpoints(t.Context(), peerID)
+	if err != nil || len(endpoints) != 1 || endpoints[0] != remote {
+		t.Fatalf("remapped endpoints = (%v, %v)", endpoints, err)
 	}
 }
 
@@ -252,6 +331,7 @@ func TestDaemonEndpointRouteReconcilerQuarantinesPeerCollision(t *testing.T) {
 		localID,
 		state,
 		routes,
+		nil,
 		nil,
 	)
 	if err != nil {

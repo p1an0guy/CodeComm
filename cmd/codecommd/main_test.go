@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,7 +117,7 @@ func TestDaemonRecoversUnchangedCommitmentsAfterProcessKill(t *testing.T) {
 		endpoint,
 		daemonTestFirstBootID,
 	)
-	firstStatus := waitForDaemonTestStatus(t, endpoint)
+	firstStatus := waitForDaemonTestStatus(t, endpoint, first)
 	assertDaemonStatusMatchesView(t, firstStatus, baseline)
 	first.kill(t)
 
@@ -129,7 +128,7 @@ func TestDaemonRecoversUnchangedCommitmentsAfterProcessKill(t *testing.T) {
 		endpoint,
 		daemonTestSecondBootID,
 	)
-	secondStatus := waitForDaemonTestStatus(t, endpoint)
+	secondStatus := waitForDaemonTestStatus(t, endpoint, second)
 	assertDaemonStatusMatchesView(t, secondStatus, baseline)
 	second.kill(t)
 
@@ -576,6 +575,8 @@ func (testIdentityHandle) Delete(
 type daemonTestProcess struct {
 	command *exec.Cmd
 	stderr  *bytes.Buffer
+	done    <-chan struct{}
+	waitErr error
 }
 
 func startDaemonTestProcess(
@@ -602,15 +603,30 @@ func startDaemonTestProcess(
 		"CODECOMM_TEST_DAEMON_HELPER=1",
 		"CODECOMM_TEST_BOOT_ID="+string(bootID),
 	)
+	command.Stdout = stderr
 	command.Stderr = stderr
 	if err := command.Start(); err != nil {
 		t.Fatalf("start daemon helper: %v", err)
 	}
-	process := &daemonTestProcess{command: command, stderr: stderr}
+	waitDone := make(chan struct{})
+	process := &daemonTestProcess{
+		command: command,
+		stderr:  stderr,
+		done:    waitDone,
+	}
+	go func() {
+		process.waitErr = command.Wait()
+		close(waitDone)
+	}()
 	t.Cleanup(func() {
 		if process.command != nil && process.command.Process != nil {
-			_ = process.command.Process.Kill()
-			_ = process.command.Wait()
+			select {
+			case <-process.done:
+			default:
+				_ = process.command.Process.Kill()
+				<-process.done
+			}
+			process.command = nil
 		}
 	})
 	return process
@@ -623,15 +639,20 @@ func (process *daemonTestProcess) kill(t *testing.T) {
 		process.command.Process == nil {
 		t.Fatal("daemon helper is not running")
 	}
+	select {
+	case <-process.done:
+		t.Fatalf(
+			"daemon helper exited before kill: %v\noutput: %s",
+			process.waitErr,
+			process.stderr,
+		)
+	default:
+	}
 	if err := process.command.Process.Kill(); err != nil {
 		t.Fatalf("kill daemon helper: %v\nstderr: %s", err, process.stderr)
 	}
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- process.command.Wait()
-	}()
 	select {
-	case <-waitDone:
+	case <-process.done:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("daemon helper did not exit after kill\nstderr: %s", process.stderr)
 	}
@@ -641,8 +662,32 @@ func (process *daemonTestProcess) kill(t *testing.T) {
 func waitForDaemonTestStatus(
 	t *testing.T,
 	endpoint ipc.Endpoint,
+	processes ...*daemonTestProcess,
 ) ui.Snapshot {
-	return waitForDaemonTestStatusOrExit(t, endpoint, nil)
+	t.Helper()
+	var processDone <-chan error
+	if len(processes) == 1 && processes[0] != nil {
+		processDoneChannel := make(chan error, 1)
+		process := processes[0]
+		go func() {
+			<-process.done
+			processDoneChannel <- process.waitErr
+		}()
+		processDone = processDoneChannel
+	}
+	snapshot, err := awaitDaemonTestStatus(endpoint, processDone, true)
+	if err == nil {
+		return snapshot
+	}
+	var diagnostics strings.Builder
+	for _, process := range processes {
+		if process != nil && process.stderr != nil {
+			diagnostics.WriteString("\nstderr: ")
+			diagnostics.WriteString(process.stderr.String())
+		}
+	}
+	t.Fatalf("daemon status did not become ready: %v%s", err, diagnostics.String())
+	return ui.Snapshot{}
 }
 
 func waitForDaemonTestStatusOrExit(
@@ -651,14 +696,31 @@ func waitForDaemonTestStatusOrExit(
 	runDone <-chan error,
 ) ui.Snapshot {
 	t.Helper()
+	snapshot, err := awaitDaemonTestStatus(endpoint, runDone, true)
+	if err != nil {
+		t.Fatalf("daemon status did not become ready: %v", err)
+	}
+	return snapshot
+}
+
+func awaitDaemonTestStatus(
+	endpoint ipc.Endpoint,
+	runDone <-chan error,
+	requireStrongWrites bool,
+) (ui.Snapshot, error) {
 	deadline := time.Now().Add(20 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		if runDone != nil {
 			select {
 			case err := <-runDone:
-				t.Fatalf(
-					"daemon exited before becoming ready: %v",
+				if err == nil {
+					return ui.Snapshot{}, errors.New(
+						"daemon exited before becoming ready",
+					)
+				}
+				return ui.Snapshot{}, fmt.Errorf(
+					"daemon exited before becoming ready: %w",
 					err,
 				)
 			default:
@@ -681,9 +743,10 @@ func waitForDaemonTestStatusOrExit(
 				err = closeErr
 			}
 			if err == nil &&
-				snapshot.Consensus.StrongWrites == "available" {
+				(!requireStrongWrites ||
+					snapshot.Consensus.StrongWrites == "available") {
 				cancel()
-				return snapshot
+				return snapshot, nil
 			}
 			if err == nil {
 				err = fmt.Errorf(
@@ -696,8 +759,7 @@ func waitForDaemonTestStatusOrExit(
 		lastErr = err
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("daemon status did not become ready: %v", lastErr)
-	return ui.Snapshot{}
+	return ui.Snapshot{}, lastErr
 }
 
 func waitForDaemonTestReadableStatusOrExit(
@@ -844,7 +906,7 @@ func (*daemonTestMeshFactory) NewIngress(
 	transport.ContentCertificateProvider,
 	transport.ConnectionHandler,
 	transport.ConnectionHandler,
-	func(context.Context, netip.AddrPort) (net.Listener, error),
+	net.Listener,
 ) (*transport.Ingress, error) {
 	return nil, nil
 }
