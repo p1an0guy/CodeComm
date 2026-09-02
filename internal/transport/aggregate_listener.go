@@ -250,6 +250,16 @@ func (listener *AggregateListener) isClosed() bool {
 	}
 }
 
+func (listener *AggregateListener) available() bool {
+	if listener == nil || listener.isClosed() {
+		return false
+	}
+	listener.stateMu.Lock()
+	available := listener.remaining > 0
+	listener.stateMu.Unlock()
+	return available
+}
+
 func (aggregateListenerAddress) Network() string {
 	return "tcp"
 }

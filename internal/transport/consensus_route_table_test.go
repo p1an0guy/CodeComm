@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -411,8 +412,8 @@ func TestConsensusRouteTableSelectedAddressRefreshRollsBack(t *testing.T) {
 	}
 	if err := table.ReplaceSelectedAddresses(
 		[]netip.Addr{learnedLocal},
-	); !errors.Is(err, ErrInvalidConsensusRouteTable) {
-		t.Fatalf("ReplaceSelectedAddresses(manual conflict) error = %v", err)
+	); err != nil {
+		t.Fatalf("ReplaceSelectedAddresses(drop stale manual) error = %v", err)
 	}
 
 	endpoints, err := table.ResolveConsensusEndpoints(
@@ -420,10 +421,9 @@ func TestConsensusRouteTableSelectedAddressRefreshRollsBack(t *testing.T) {
 		routeTablePeerA,
 	)
 	if err != nil ||
-		len(endpoints) != 2 ||
-		endpoints[0] != manualEndpoint ||
-		endpoints[1] != learnedEndpoint {
-		t.Fatalf("routes after rejected refreshes = (%v, %v)", endpoints, err)
+		len(endpoints) != 1 ||
+		endpoints[0] != learnedEndpoint {
+		t.Fatalf("routes after selected refresh = (%v, %v)", endpoints, err)
 	}
 }
 
@@ -640,5 +640,631 @@ func TestConsensusRouteTableConcurrentResolveAndSelectedAddressRefresh(
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+}
+
+func TestConsensusRouteTableSelectedAddressRefreshClosesTrackedConnections(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	retainedLocal := netip.MustParseAddr("192.0.2.10")
+	removedLocal := netip.MustParseAddr("192.0.2.11")
+	retainedEndpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	removedEndpoint := netip.MustParseAddrPort("192.0.2.21:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{retainedLocal, removedLocal},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{
+			{
+				ConsensusRoute: ConsensusRoute{
+					PeerDeviceID:         routeTablePeerA,
+					RemoteEndpoint:       retainedEndpoint,
+					SelectedLocalAddress: retainedLocal,
+				},
+				ExpiresAt: now.Add(time.Hour),
+			},
+			{
+				ConsensusRoute: ConsensusRoute{
+					PeerDeviceID:         routeTablePeerA,
+					RemoteEndpoint:       removedEndpoint,
+					SelectedLocalAddress: removedLocal,
+				},
+				ExpiresAt: now.Add(time.Hour),
+			},
+		},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	peers := make(map[string]net.Conn)
+	table.dialContext = func(
+		_ context.Context,
+		_ *net.Dialer,
+		_ string,
+		address string,
+	) (net.Conn, error) {
+		connection, peer := net.Pipe()
+		peers[address] = peer
+		return connection, nil
+	}
+	retained, err := table.DialConsensusEndpoint(
+		context.Background(),
+		retainedEndpoint,
+	)
+	if err != nil {
+		t.Fatalf("DialConsensusEndpoint(retained) error = %v", err)
+	}
+	removed, err := table.DialConsensusEndpoint(
+		context.Background(),
+		removedEndpoint,
+	)
+	if err != nil {
+		t.Fatalf("DialConsensusEndpoint(removed) error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = retained.Close()
+		_ = removed.Close()
+		for _, peer := range peers {
+			_ = peer.Close()
+		}
+	})
+
+	retainedTracked := retained.(*consensusRouteTableConn)
+	removedTracked := removed.(*consensusRouteTableConn)
+	table.mu.Lock()
+	retainedAddress, retainedRegistered := table.connections[retainedTracked]
+	removedAddress, removedRegistered := table.connections[removedTracked]
+	table.mu.Unlock()
+	if !retainedRegistered || retainedAddress != retainedLocal {
+		t.Fatalf(
+			"retained connection registration = (%s, %t), want (%s, true)",
+			retainedAddress,
+			retainedRegistered,
+			retainedLocal,
+		)
+	}
+	if !removedRegistered || removedAddress != removedLocal {
+		t.Fatalf(
+			"removed connection registration = (%s, %t), want (%s, true)",
+			removedAddress,
+			removedRegistered,
+			removedLocal,
+		)
+	}
+
+	if err := table.ReplaceSelectedAddresses(
+		[]netip.Addr{retainedLocal, retainedLocal},
+	); !errors.Is(err, ErrInvalidConsensusRouteTable) {
+		t.Fatalf("ReplaceSelectedAddresses(invalid) error = %v", err)
+	}
+	if got := consensusRouteTableConnectionCount(table); got != 2 {
+		t.Fatalf("tracked connections after rejected refresh = %d, want 2", got)
+	}
+
+	if err := table.ReplaceSelectedAddresses(
+		[]netip.Addr{retainedLocal},
+	); err != nil {
+		t.Fatalf("ReplaceSelectedAddresses() error = %v", err)
+	}
+	assertConsensusRoutePeerClosed(
+		t,
+		peers[removedEndpoint.String()],
+	)
+	table.mu.Lock()
+	_, retainedRegistered = table.connections[retainedTracked]
+	_, removedRegistered = table.connections[removedTracked]
+	table.mu.Unlock()
+	if !retainedRegistered || removedRegistered {
+		t.Fatalf(
+			"registrations after refresh = (retained %t, removed %t)",
+			retainedRegistered,
+			removedRegistered,
+		)
+	}
+
+	if err := retained.Close(); err != nil {
+		t.Fatalf("retained.Close() error = %v", err)
+	}
+	if got := consensusRouteTableConnectionCount(table); got != 0 {
+		t.Fatalf("tracked connections after Close = %d, want 0", got)
+	}
+	assertConsensusRoutePeerClosed(
+		t,
+		peers[retainedEndpoint.String()],
+	)
+}
+
+func TestConsensusRouteTableRebindClosesConnectionAndRetainsRoute(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	local := netip.MustParseAddr("192.0.2.10")
+	endpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{local},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{{
+			ConsensusRoute: ConsensusRoute{
+				PeerDeviceID:         routeTablePeerA,
+				RemoteEndpoint:       endpoint,
+				SelectedLocalAddress: local,
+			},
+			ExpiresAt: now.Add(time.Hour),
+		}},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	var peer net.Conn
+	table.dialContext = func(
+		context.Context,
+		*net.Dialer,
+		string,
+		string,
+	) (net.Conn, error) {
+		connection, remote := net.Pipe()
+		peer = remote
+		return connection, nil
+	}
+	connection, err := table.DialConsensusEndpoint(
+		context.Background(),
+		endpoint,
+	)
+	if err != nil {
+		t.Fatalf("DialConsensusEndpoint() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = connection.Close()
+		_ = peer.Close()
+	})
+
+	if err := table.RebindSelectedAddresses(
+		[]netip.Addr{local},
+		[]netip.Addr{local},
+	); err != nil {
+		t.Fatalf("RebindSelectedAddresses() error = %v", err)
+	}
+	assertConsensusRoutePeerClosed(t, peer)
+	if got := consensusRouteTableConnectionCount(table); got != 0 {
+		t.Fatalf("tracked connections after rebind = %d, want 0", got)
+	}
+	endpoints, err := table.ResolveConsensusEndpoints(
+		context.Background(),
+		routeTablePeerA,
+	)
+	if err != nil || len(endpoints) != 1 || endpoints[0] != endpoint {
+		t.Fatalf("route after rebind = (%v, %v)", endpoints, err)
+	}
+}
+
+func TestConsensusRouteTableInvalidRebindIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	local := netip.MustParseAddr("192.0.2.10")
+	unselected := netip.MustParseAddr("192.0.2.11")
+	endpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{local},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{{
+			ConsensusRoute: ConsensusRoute{
+				PeerDeviceID:         routeTablePeerA,
+				RemoteEndpoint:       endpoint,
+				SelectedLocalAddress: local,
+			},
+			ExpiresAt: now.Add(time.Hour),
+		}},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	var peer net.Conn
+	table.dialContext = func(
+		context.Context,
+		*net.Dialer,
+		string,
+		string,
+	) (net.Conn, error) {
+		connection, remote := net.Pipe()
+		peer = remote
+		return connection, nil
+	}
+	connection, err := table.DialConsensusEndpoint(
+		context.Background(),
+		endpoint,
+	)
+	if err != nil {
+		t.Fatalf("DialConsensusEndpoint() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = connection.Close()
+		_ = peer.Close()
+	})
+
+	for _, input := range []struct {
+		selected []netip.Addr
+		rebound  []netip.Addr
+	}{
+		{
+			selected: []netip.Addr{local},
+			rebound:  []netip.Addr{unselected},
+		},
+		{
+			selected: []netip.Addr{local, unselected},
+			rebound:  []netip.Addr{unselected},
+		},
+	} {
+		if err := table.RebindSelectedAddresses(
+			input.selected,
+			input.rebound,
+		); !errors.Is(err, ErrInvalidConsensusRouteTable) {
+			t.Fatalf(
+				"RebindSelectedAddresses(%v, %v) error = %v",
+				input.selected,
+				input.rebound,
+				err,
+			)
+		}
+	}
+	if got := consensusRouteTableConnectionCount(table); got != 1 {
+		t.Fatalf("tracked connections after rejected rebind = %d, want 1", got)
+	}
+	endpoints, err := table.ResolveConsensusEndpoints(
+		context.Background(),
+		routeTablePeerA,
+	)
+	if err != nil || len(endpoints) != 1 || endpoints[0] != endpoint {
+		t.Fatalf("route after rejected rebind = (%v, %v)", endpoints, err)
+	}
+
+	if err := table.RebindSelectedAddresses(
+		[]netip.Addr{local},
+		[]netip.Addr{local},
+	); err != nil {
+		t.Fatalf("valid RebindSelectedAddresses() error = %v", err)
+	}
+	assertConsensusRoutePeerClosed(t, peer)
+}
+
+func TestConsensusRouteTableDialReturnsPostDialContextCancellation(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	local := netip.MustParseAddr("192.0.2.10")
+	endpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{local},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{{
+			ConsensusRoute: ConsensusRoute{
+				PeerDeviceID:         routeTablePeerA,
+				RemoteEndpoint:       endpoint,
+				SelectedLocalAddress: local,
+			},
+			ExpiresAt: now.Add(time.Hour),
+		}},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var peer net.Conn
+	table.dialContext = func(
+		context.Context,
+		*net.Dialer,
+		string,
+		string,
+	) (net.Conn, error) {
+		connection, remote := net.Pipe()
+		peer = remote
+		cancel()
+		return connection, nil
+	}
+	connection, err := table.DialConsensusEndpoint(ctx, endpoint)
+	if connection != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf(
+			"DialConsensusEndpoint() = (%v, %v), want (nil, canceled)",
+			connection,
+			err,
+		)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	assertConsensusRoutePeerClosed(t, peer)
+	if got := consensusRouteTableConnectionCount(table); got != 0 {
+		t.Fatalf("tracked connections after canceled dial = %d, want 0", got)
+	}
+}
+
+func TestConsensusRouteTableDialFailsClosedAcrossAddressReplacement(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	originalLocal := netip.MustParseAddr("192.0.2.10")
+	replacementLocal := netip.MustParseAddr("192.0.2.11")
+	endpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{originalLocal},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{{
+			ConsensusRoute: ConsensusRoute{
+				PeerDeviceID:         routeTablePeerA,
+				RemoteEndpoint:       endpoint,
+				SelectedLocalAddress: originalLocal,
+			},
+			ExpiresAt: now.Add(time.Hour),
+		}},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseDial)
+		})
+	}
+	defer release()
+	peerResult := make(chan net.Conn, 1)
+	table.dialContext = func(
+		_ context.Context,
+		_ *net.Dialer,
+		_ string,
+		_ string,
+	) (net.Conn, error) {
+		close(dialStarted)
+		<-releaseDial
+		connection, peer := net.Pipe()
+		peerResult <- peer
+		return connection, nil
+	}
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		connection, dialErr := table.DialConsensusEndpoint(
+			context.Background(),
+			endpoint,
+		)
+		result <- dialResult{connection: connection, err: dialErr}
+	}()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DialConsensusEndpoint() did not reach dial")
+	}
+	if err := table.ReplaceSelectedAddresses(
+		[]netip.Addr{replacementLocal},
+	); err != nil {
+		t.Fatalf("ReplaceSelectedAddresses(replacement) error = %v", err)
+	}
+	if err := table.ReplaceSelectedAddresses(
+		[]netip.Addr{originalLocal},
+	); err != nil {
+		t.Fatalf("ReplaceSelectedAddresses(re-add) error = %v", err)
+	}
+	release()
+
+	var dial dialResult
+	select {
+	case dial = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("DialConsensusEndpoint() did not return")
+	}
+	if dial.connection != nil ||
+		!errors.Is(dial.err, ErrConsensusEndpointUnavailable) {
+		t.Fatalf(
+			"DialConsensusEndpoint() = (%v, %v), want (nil, unavailable)",
+			dial.connection,
+			dial.err,
+		)
+	}
+	peer := <-peerResult
+	defer peer.Close()
+	assertConsensusRoutePeerClosed(t, peer)
+	if got := consensusRouteTableConnectionCount(table); got != 0 {
+		t.Fatalf("tracked connections after stale dial = %d, want 0", got)
+	}
+}
+
+func TestConsensusRouteTableRefreshClosesOutsideTableLock(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	originalLocal := netip.MustParseAddr("192.0.2.10")
+	replacementLocal := netip.MustParseAddr("192.0.2.11")
+	endpoint := netip.MustParseAddrPort("192.0.2.20:47831")
+	table, err := newConsensusRouteTable(
+		[]netip.Addr{originalLocal},
+		nil,
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("newConsensusRouteTable() error = %v", err)
+	}
+	if err := table.Replace(
+		routeTablePeerA,
+		ConsensusRouteSigned,
+		[]ExpiringConsensusRoute{{
+			ConsensusRoute: ConsensusRoute{
+				PeerDeviceID:         routeTablePeerA,
+				RemoteEndpoint:       endpoint,
+				SelectedLocalAddress: originalLocal,
+			},
+			ExpiresAt: now.Add(time.Hour),
+		}},
+	); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseClose)
+		})
+	}
+	defer release()
+	var peer net.Conn
+	table.dialContext = func(
+		_ context.Context,
+		_ *net.Dialer,
+		_ string,
+		_ string,
+	) (net.Conn, error) {
+		connection, remote := net.Pipe()
+		peer = remote
+		return &blockingConsensusRouteCloseConn{
+			Conn:    connection,
+			started: closeStarted,
+			release: releaseClose,
+		}, nil
+	}
+	connection, err := table.DialConsensusEndpoint(
+		context.Background(),
+		endpoint,
+	)
+	if err != nil {
+		t.Fatalf("DialConsensusEndpoint() error = %v", err)
+	}
+	t.Cleanup(func() {
+		release()
+		_ = connection.Close()
+		_ = peer.Close()
+	})
+
+	replaceResult := make(chan error, 1)
+	go func() {
+		replaceResult <- table.ReplaceSelectedAddresses(
+			[]netip.Addr{replacementLocal},
+		)
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ReplaceSelectedAddresses() did not close the connection")
+	}
+
+	resolveResult := make(chan error, 1)
+	go func() {
+		_, resolveErr := table.ResolveConsensusEndpoints(
+			context.Background(),
+			routeTablePeerA,
+		)
+		resolveResult <- resolveErr
+	}()
+	select {
+	case resolveErr := <-resolveResult:
+		if !errors.Is(resolveErr, ErrConsensusEndpointUnavailable) {
+			t.Fatalf(
+				"ResolveConsensusEndpoints() during Close error = %v",
+				resolveErr,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route table lock remained held while closing a connection")
+	}
+
+	release()
+	select {
+	case replaceErr := <-replaceResult:
+		if replaceErr != nil {
+			t.Fatalf("ReplaceSelectedAddresses() error = %v", replaceErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReplaceSelectedAddresses() did not return after Close")
+	}
+	assertConsensusRoutePeerClosed(t, peer)
+}
+
+type blockingConsensusRouteCloseConn struct {
+	net.Conn
+
+	started     chan struct{}
+	release     <-chan struct{}
+	startedOnce sync.Once
+}
+
+func (connection *blockingConsensusRouteCloseConn) Close() error {
+	connection.startedOnce.Do(func() {
+		close(connection.started)
+	})
+	<-connection.release
+	return connection.Conn.Close()
+}
+
+func consensusRouteTableConnectionCount(table *ConsensusRouteTable) int {
+	table.mu.Lock()
+	defer table.mu.Unlock()
+	return len(table.connections)
+}
+
+func assertConsensusRoutePeerClosed(t *testing.T, connection net.Conn) {
+	t.Helper()
+	if err := connection.SetReadDeadline(
+		time.Now().Add(time.Second),
+	); err != nil {
+		if errors.Is(err, io.ErrClosedPipe) {
+			return
+		}
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	var buffer [1]byte
+	if _, err := connection.Read(buffer[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read() after peer Close error = %v, want EOF", err)
 	}
 }

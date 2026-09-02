@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -2264,6 +2265,131 @@ func (listener *invalidFirstRemoteListener) Accept() (net.Conn, error) {
 		return &invalidRemoteConn{Conn: connection}, nil
 	}
 	return connection, nil
+}
+
+func TestIngressClosesOnlyConnectionsBoundToVanishedAddress(t *testing.T) {
+	t.Parallel()
+
+	vanished := netip.MustParseAddr("192.0.2.10")
+	retained := netip.MustParseAddr("192.0.2.11")
+	vanishedServer, vanishedPeer := net.Pipe()
+	retainedServer, retainedPeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = vanishedServer.Close()
+		_ = vanishedPeer.Close()
+		_ = retainedServer.Close()
+		_ = retainedPeer.Close()
+	})
+	vanishedConnection := &ingressLocalAddressConn{
+		Conn: vanishedServer,
+		local: net.TCPAddrFromAddrPort(
+			netip.AddrPortFrom(vanished, 47831),
+		),
+	}
+	retainedConnection := &ingressLocalAddressConn{
+		Conn: retainedServer,
+		local: net.TCPAddrFromAddrPort(
+			netip.AddrPortFrom(retained, 47831),
+		),
+	}
+	vanishedContext, cancelVanished := context.WithCancel(t.Context())
+	retainedContext, cancelRetained := context.WithCancel(t.Context())
+	t.Cleanup(cancelVanished)
+	t.Cleanup(cancelRetained)
+	ingress := &Ingress{
+		active: map[net.Conn]*ingressPeer{
+			vanishedConnection: {
+				cancel: cancelVanished,
+			},
+			retainedConnection: {
+				cancel: cancelRetained,
+			},
+		},
+	}
+	ingress.stateMu.Lock()
+	preInvalidationGeneration := ingress.localBindingGeneration
+	ingress.stateMu.Unlock()
+
+	result, err := ingress.CloseConnectionsBoundTo(
+		[]netip.Addr{vanished},
+	)
+	if err != nil {
+		t.Fatalf("CloseConnectionsBoundTo(): %v", err)
+	}
+	if result != (LocalAddressCloseResult{Checked: 2, Closed: 1}) {
+		t.Fatalf("close result = %+v", result)
+	}
+	lateServer, latePeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = lateServer.Close()
+		_ = latePeer.Close()
+	})
+	lateConnection := &ingressLocalAddressConn{
+		Conn: lateServer,
+		local: net.TCPAddrFromAddrPort(
+			netip.AddrPortFrom(vanished, 47831),
+		),
+	}
+	_, cancelLate := context.WithCancel(t.Context())
+	t.Cleanup(cancelLate)
+	if ingress.registerConnection(
+		lateConnection,
+		cancelLate,
+		preInvalidationGeneration,
+	) {
+		t.Fatal("pre-invalidation accept registered after invalidation")
+	}
+	select {
+	case <-vanishedContext.Done():
+	default:
+		t.Fatal("vanished-address connection context remains active")
+	}
+	select {
+	case <-retainedContext.Done():
+		t.Fatal("retained-address connection context was canceled")
+	default:
+	}
+	if err := vanishedPeer.SetReadDeadline(
+		time.Now().Add(ingressTestTimeout),
+	); err == nil {
+		var closed [1]byte
+		if _, err := vanishedPeer.Read(closed[:]); err == nil ||
+			isIngressTimeout(err) {
+			t.Fatalf("vanished-address peer remains open: %v", err)
+		}
+	}
+
+	if err := retainedPeer.SetWriteDeadline(
+		time.Now().Add(ingressTestTimeout),
+	); err != nil {
+		t.Fatalf("SetWriteDeadline(retained): %v", err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := retainedPeer.Write([]byte{0x42})
+		writeDone <- writeErr
+	}()
+	if err := retainedConnection.SetReadDeadline(
+		time.Now().Add(ingressTestTimeout),
+	); err != nil {
+		t.Fatalf("SetReadDeadline(retained): %v", err)
+	}
+	var value [1]byte
+	if _, err := io.ReadFull(retainedConnection, value[:]); err != nil {
+		t.Fatalf("read retained connection: %v", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write retained connection: %v", err)
+	}
+}
+
+type ingressLocalAddressConn struct {
+	net.Conn
+	local net.Addr
+}
+
+func (connection *ingressLocalAddressConn) LocalAddr() net.Addr {
+	return connection.local
 }
 
 type invalidRemoteConn struct {

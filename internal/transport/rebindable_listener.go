@@ -184,6 +184,20 @@ func (listener *RebindableListener) Close() error {
 	return err
 }
 
+// Available reports whether the current generation still has at least one
+// accepting child listener. It becomes false during zero-listener intervals,
+// terminal child exhaustion, and shutdown.
+func (listener *RebindableListener) Available() bool {
+	if listener == nil {
+		return false
+	}
+	listener.stateMu.Lock()
+	current := listener.current
+	closed := listener.closed
+	listener.stateMu.Unlock()
+	return !closed && current != nil && current.available()
+}
+
 // Addr returns the current generation's canonical endpoint description.
 // During a zero-listener interval and after Close, it retains the most recent
 // nonempty address so callers always receive a valid immutable net.Addr.

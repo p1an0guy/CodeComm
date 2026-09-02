@@ -91,6 +91,7 @@ type Ingress struct {
 	stopping               bool
 	serveCancel            context.CancelFunc
 	revalidationGeneration uint64
+	localBindingGeneration uint64
 	memberAccessAvailable  bool
 	active                 map[net.Conn]*ingressPeer
 	selectedContent        map[net.Conn]ContentCertificate
@@ -136,6 +137,12 @@ type IngressStats struct {
 
 // RevalidationResult reports one bounded pass over established peers.
 type RevalidationResult struct {
+	Checked int
+	Closed  int
+}
+
+// LocalAddressCloseResult reports one bounded local-address invalidation pass.
+type LocalAddressCloseResult struct {
 	Checked int
 	Closed  int
 }
@@ -250,6 +257,9 @@ func (ingress *Ingress) Serve(ctx context.Context) error {
 	)
 acceptLoop:
 	for {
+		ingress.stateMu.Lock()
+		localBindingGeneration := ingress.localBindingGeneration
+		ingress.stateMu.Unlock()
 		connection, err := ingress.listener.Accept()
 		if err != nil {
 			ingress.stateMu.Lock()
@@ -300,7 +310,11 @@ acceptLoop:
 			continue
 		}
 		connectionContext, connectionCancel := context.WithCancel(serveContext)
-		if !ingress.registerConnection(connection, connectionCancel) {
+		if !ingress.registerConnection(
+			connection,
+			connectionCancel,
+			localBindingGeneration,
+		) {
 			connectionCancel()
 			permit.Release()
 			_ = connection.Close()
@@ -566,6 +580,82 @@ func (ingress *Ingress) RevalidatePeers() RevalidationResult {
 	return result
 }
 
+// CloseConnectionsBoundTo closes pending and established inbound connections
+// whose local socket is bound to one of the removed interface addresses.
+func (ingress *Ingress) CloseConnectionsBoundTo(
+	addresses []netip.Addr,
+) (LocalAddressCloseResult, error) {
+	if ingress == nil || len(addresses) == 0 {
+		return LocalAddressCloseResult{}, nil
+	}
+	removed := make(map[netip.Addr]struct{}, len(addresses))
+	for _, address := range addresses {
+		if !address.IsValid() ||
+			address.IsUnspecified() ||
+			address.IsMulticast() {
+			return LocalAddressCloseResult{}, ErrInvalidIngressConfig
+		}
+		removed[address.Unmap()] = struct{}{}
+	}
+
+	type target struct {
+		connection net.Conn
+		cancel     context.CancelFunc
+	}
+	ingress.stateMu.Lock()
+	ingress.localBindingGeneration++
+	result := LocalAddressCloseResult{Checked: len(ingress.active)}
+	targets := make([]target, 0, len(ingress.active))
+	if !ingress.stopping {
+		for connection, peer := range ingress.active {
+			local, ok := ingressConnectionLocalAddress(connection)
+			if !ok {
+				continue
+			}
+			if _, matches := removed[local]; !matches || peer.closing {
+				continue
+			}
+			peer.closing = true
+			targets = append(targets, target{
+				connection: connection,
+				cancel:     peer.cancel,
+			})
+		}
+	}
+	ingress.stateMu.Unlock()
+
+	for _, target := range targets {
+		if target.cancel != nil {
+			target.cancel()
+		}
+		_ = target.connection.Close()
+	}
+	result.Closed = len(targets)
+	return result, nil
+}
+
+func ingressConnectionLocalAddress(connection net.Conn) (netip.Addr, bool) {
+	if connection == nil || connection.LocalAddr() == nil {
+		return netip.Addr{}, false
+	}
+	if address, ok := connection.LocalAddr().(*net.TCPAddr); ok {
+		value, valid := netip.AddrFromSlice(address.IP)
+		if !valid {
+			return netip.Addr{}, false
+		}
+		value = value.Unmap()
+		if value.Is6() && value.IsLinkLocalUnicast() {
+			value = value.WithZone(address.Zone)
+		}
+		return value, value.IsValid()
+	}
+	endpoint, err := netip.ParseAddrPort(connection.LocalAddr().String())
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return endpoint.Addr().Unmap(), true
+}
+
 func (ingress *Ingress) recoverConnectionPanic() {
 	if recover() != nil {
 		ingress.recoveredPanics.Add(1)
@@ -601,10 +691,12 @@ func (ingress *Ingress) initiateShutdown() {
 func (ingress *Ingress) registerConnection(
 	connection net.Conn,
 	cancel context.CancelFunc,
+	localBindingGeneration uint64,
 ) bool {
 	ingress.stateMu.Lock()
 	defer ingress.stateMu.Unlock()
-	if ingress.stopping {
+	if ingress.stopping ||
+		localBindingGeneration != ingress.localBindingGeneration {
 		return false
 	}
 	ingress.active[connection] = &ingressPeer{cancel: cancel}

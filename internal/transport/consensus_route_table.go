@@ -58,10 +58,24 @@ type ExpiringConsensusRoute struct {
 type ConsensusRouteTable struct {
 	now func() time.Time
 
-	mu       sync.Mutex
-	selected map[netip.Addr]struct{}
-	routes   map[consensusRouteTableKey]consensusRouteTableEntry
+	dialContext consensusRouteDialContextFunc
+
+	mu          sync.Mutex
+	selected    map[netip.Addr]*consensusAddressSelection
+	routes      map[consensusRouteTableKey]consensusRouteTableEntry
+	connections map[*consensusRouteTableConn]netip.Addr
 }
+
+type consensusRouteDialContextFunc func(
+	context.Context,
+	*net.Dialer,
+	string,
+	string,
+) (net.Conn, error)
+
+// One token represents an uninterrupted interval in which an address remains
+// selected. Retained addresses preserve their token across replacements.
+type consensusAddressSelection byte
 
 type consensusRouteTableKey struct {
 	peer     domain.DeviceID
@@ -81,9 +95,25 @@ type effectiveConsensusRoute struct {
 	local    netip.Addr
 }
 
+type consensusRouteDialPlan struct {
+	dialer    *net.Dialer
+	network   string
+	address   string
+	local     netip.Addr
+	selection *consensusAddressSelection
+}
+
+type consensusRouteTableConn struct {
+	net.Conn
+
+	table          *ConsensusRouteTable
+	unregisterOnce sync.Once
+}
+
 var (
 	_ ConsensusEndpointResolver = (*ConsensusRouteTable)(nil)
 	_ ConsensusEndpointDialer   = (*ConsensusRouteTable)(nil)
+	_ net.Conn                  = (*consensusRouteTableConn)(nil)
 )
 
 // NewConsensusRouteTable validates the selected local addresses and installs
@@ -115,12 +145,21 @@ func newConsensusRouteTable(
 		return nil, err
 	}
 	table := &ConsensusRouteTable{
-		now:      now,
+		now: now,
+		dialContext: func(
+			ctx context.Context,
+			dialer *net.Dialer,
+			network string,
+			address string,
+		) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, address)
+		},
 		selected: selected,
 		routes: make(
 			map[consensusRouteTableKey]consensusRouteTableEntry,
 			len(manualRoutes),
 		),
+		connections: make(map[*consensusRouteTableConn]netip.Addr),
 	}
 	expiring := make([]ExpiringConsensusRoute, len(manualRoutes))
 	for index, route := range manualRoutes {
@@ -140,10 +179,32 @@ func newConsensusRouteTable(
 }
 
 // ReplaceSelectedAddresses atomically installs the complete selected-source
-// set. Learned routes tied to removed addresses are discarded. Manual routes
-// prevent removal of their selected source.
+// set. Routes and active outbound connections tied to removed addresses are
+// discarded; durable manual configuration is owned above this table and may
+// be remapped onto a newly selected source.
 func (table *ConsensusRouteTable) ReplaceSelectedAddresses(
 	selectedLocalAddresses []netip.Addr,
+) error {
+	return table.replaceSelectedAddresses(selectedLocalAddresses, nil)
+}
+
+// RebindSelectedAddresses replaces the selected-source set and rotates the
+// generation of retained addresses whose OS interface binding changed. Active
+// connections on removed or rebound addresses are closed outside the table
+// lock; routes on a rebound address remain eligible for a fresh dial.
+func (table *ConsensusRouteTable) RebindSelectedAddresses(
+	selectedLocalAddresses []netip.Addr,
+	reboundLocalAddresses []netip.Addr,
+) error {
+	return table.replaceSelectedAddresses(
+		selectedLocalAddresses,
+		reboundLocalAddresses,
+	)
+}
+
+func (table *ConsensusRouteTable) replaceSelectedAddresses(
+	selectedLocalAddresses []netip.Addr,
+	reboundLocalAddresses []netip.Addr,
 ) error {
 	if table == nil {
 		return ErrInvalidConsensusRouteTable
@@ -154,29 +215,52 @@ func (table *ConsensusRouteTable) ReplaceSelectedAddresses(
 	if err != nil {
 		return err
 	}
+	rebound, err := normalizeSelectedConsensusAddresses(
+		reboundLocalAddresses,
+	)
+	if err != nil {
+		return err
+	}
+	for address := range rebound {
+		if _, retained := selected[address]; !retained {
+			return ErrInvalidConsensusRouteTable
+		}
+	}
 
 	table.mu.Lock()
-	defer table.mu.Unlock()
-	for key, entry := range table.routes {
-		if key.source != ConsensusRouteManual {
-			continue
+	for address := range rebound {
+		if _, previouslySelected := table.selected[address]; !previouslySelected {
+			table.mu.Unlock()
+			return ErrInvalidConsensusRouteTable
 		}
-		if _, retained := selected[entry.local]; !retained {
-			return fmt.Errorf(
-				"%w: selected addresses exclude a manual route",
-				ErrInvalidConsensusRouteTable,
-			)
+	}
+	for address := range selected {
+		_, mustRebind := rebound[address]
+		if retained, exists := table.selected[address]; exists && !mustRebind {
+			selected[address] = retained
 		}
 	}
 
 	table.selected = selected
 	for key, entry := range table.routes {
-		if key.source == ConsensusRouteManual {
-			continue
-		}
 		if _, retained := selected[entry.local]; !retained {
 			delete(table.routes, key)
 		}
+	}
+	stale := make([]*consensusRouteTableConn, 0)
+	for connection, local := range table.connections {
+		_, retained := selected[local]
+		_, reboundAddress := rebound[local]
+		if retained && !reboundAddress {
+			continue
+		}
+		delete(table.connections, connection)
+		stale = append(stale, connection)
+	}
+	table.mu.Unlock()
+
+	for _, connection := range stale {
+		_ = connection.Close()
 	}
 	return nil
 }
@@ -263,29 +347,105 @@ func (table *ConsensusRouteTable) DialConsensusEndpoint(
 	ctx context.Context,
 	endpoint netip.AddrPort,
 ) (net.Conn, error) {
-	dialer, network, address, err := table.dialConfiguration(ctx, endpoint)
+	plan, err := table.prepareDial(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return dialer.DialContext(ctx, network, address)
+	connection, err := table.dialContext(
+		ctx,
+		plan.dialer,
+		plan.network,
+		plan.address,
+	)
+	if err != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return nil, err
+	}
+	if connection == nil {
+		return nil, ErrConsensusEndpointUnavailable
+	}
+	tracked := &consensusRouteTableConn{
+		Conn:  connection,
+		table: table,
+	}
+
+	table.mu.Lock()
+	table.expireLocked(table.now())
+	currentLocal, routeErr := table.effectiveLocalLocked(endpoint)
+	contextErr := ctx.Err()
+	if contextErr != nil ||
+		table.selected[plan.local] != plan.selection ||
+		routeErr != nil ||
+		currentLocal != plan.local {
+		table.mu.Unlock()
+		_ = connection.Close()
+		if contextErr != nil {
+			return nil, contextErr
+		}
+		return nil, ErrConsensusEndpointUnavailable
+	}
+	table.connections[tracked] = plan.local
+	table.mu.Unlock()
+	return tracked, nil
 }
 
 func (table *ConsensusRouteTable) dialConfiguration(
 	ctx context.Context,
 	endpoint netip.AddrPort,
 ) (*net.Dialer, string, string, error) {
+	plan, err := table.prepareDial(ctx, endpoint)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return plan.dialer, plan.network, plan.address, nil
+}
+
+func (table *ConsensusRouteTable) prepareDial(
+	ctx context.Context,
+	endpoint netip.AddrPort,
+) (consensusRouteDialPlan, error) {
 	if table == nil || ctx == nil || !endpoint.IsValid() {
-		return nil, "", "", ErrConsensusEndpointUnavailable
+		return consensusRouteDialPlan{}, ErrConsensusEndpointUnavailable
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, "", "", err
+		return consensusRouteDialPlan{}, err
 	}
 	table.mu.Lock()
 	defer table.mu.Unlock()
 	table.expireLocked(table.now())
+	local, err := table.effectiveLocalLocked(endpoint)
+	if err != nil {
+		return consensusRouteDialPlan{}, err
+	}
+	selection := table.selected[local]
+	if selection == nil {
+		return consensusRouteDialPlan{}, ErrConsensusEndpointUnavailable
+	}
+	network := "tcp6"
+	if endpoint.Addr().Is4() {
+		network = "tcp4"
+	}
+	return consensusRouteDialPlan{
+		dialer: &net.Dialer{
+			LocalAddr: net.TCPAddrFromAddrPort(
+				netip.AddrPortFrom(local, 0),
+			),
+		},
+		network:   network,
+		address:   endpoint.String(),
+		local:     local,
+		selection: selection,
+	}, nil
+}
+
+func (table *ConsensusRouteTable) effectiveLocalLocked(
+	endpoint netip.AddrPort,
+) (netip.Addr, error) {
 	effective, ambiguous := table.effectiveLocked()
 	if _, blocked := ambiguous[endpoint]; blocked {
-		return nil, "", "", ErrConsensusRouteAmbiguous
+		return netip.Addr{}, ErrConsensusRouteAmbiguous
 	}
 	var local netip.Addr
 	for _, route := range effective {
@@ -293,20 +453,29 @@ func (table *ConsensusRouteTable) dialConfiguration(
 			continue
 		}
 		if local.IsValid() && local != route.local {
-			return nil, "", "", ErrConsensusRouteAmbiguous
+			return netip.Addr{}, ErrConsensusRouteAmbiguous
 		}
 		local = route.local
 	}
 	if !local.IsValid() {
-		return nil, "", "", ErrConsensusEndpointUnavailable
+		return netip.Addr{}, ErrConsensusEndpointUnavailable
 	}
-	network := "tcp6"
-	if endpoint.Addr().Is4() {
-		network = "tcp4"
-	}
-	return &net.Dialer{
-		LocalAddr: net.TCPAddrFromAddrPort(netip.AddrPortFrom(local, 0)),
-	}, network, endpoint.String(), nil
+	return local, nil
+}
+
+func (table *ConsensusRouteTable) unregisterConnection(
+	connection *consensusRouteTableConn,
+) {
+	table.mu.Lock()
+	delete(table.connections, connection)
+	table.mu.Unlock()
+}
+
+func (connection *consensusRouteTableConn) Close() error {
+	connection.unregisterOnce.Do(func() {
+		connection.table.unregisterConnection(connection)
+	})
+	return connection.Conn.Close()
 }
 
 func (table *ConsensusRouteTable) replaceLocked(
@@ -510,11 +679,14 @@ func validateConsensusRouteExpiry(
 
 func normalizeSelectedConsensusAddresses(
 	addresses []netip.Addr,
-) (map[netip.Addr]struct{}, error) {
+) (map[netip.Addr]*consensusAddressSelection, error) {
 	if len(addresses) > MaxSelectedConsensusAddresses {
 		return nil, ErrInvalidConsensusRouteTable
 	}
-	selected := make(map[netip.Addr]struct{}, len(addresses))
+	selected := make(
+		map[netip.Addr]*consensusAddressSelection,
+		len(addresses),
+	)
 	for _, address := range addresses {
 		if !validSelectedSourceAddress(address) {
 			return nil, ErrInvalidConsensusRouteTable
@@ -522,7 +694,7 @@ func normalizeSelectedConsensusAddresses(
 		if _, duplicate := selected[address]; duplicate {
 			return nil, ErrInvalidConsensusRouteTable
 		}
-		selected[address] = struct{}{}
+		selected[address] = new(consensusAddressSelection)
 	}
 	return selected, nil
 }
