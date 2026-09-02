@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission/rebootstrap, content
 credentials, endpoint and proposal relay, voter reconciliation, and revocation are
 production-composed; Phase 3 exit gate remains open
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -219,6 +219,12 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Operator status reports multicast as disabled, locally available, or degraded, with selected
   addresses and the manual-endpoint count. Degraded errors are bounded and control-free; the TUI
   names `peer endpoint add` as the recovery action without weakening peer authentication.
+- Selected-interface identity now survives DHCP/VPN address churn. A two-second reconciler
+  re-resolves address slots, atomically replaces listener generations, withdraws stale endpoint
+  sets before route work, closes inbound and outbound connections bound to removed generations,
+  remaps explicit manual sources, limits multicast to listener-backed families, and immediately
+  re-advertises. Total address or bind loss leaves no published endpoint, selected route, or stale
+  multicast delegate; unchanged refresh recovers an exhausted listener and later address return.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -229,27 +235,24 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   production-composed. Readmission is covered from a verifier-approved synthesized successor;
   production `codecomm cluster recover-quorum` and its full recovery/readmission E2E belong to
   Phase 6 and are not Phase 3 exit requirements.
-- Listener selection is currently supplied as foreground daemon flags. Automatic address-change
-  rebinding remains missing.
 - Result export, serving, scratch replay/import, terminal authority authorization, durable batch
   evidence, mode-aware startup, and peer fetch/catch-up orchestration are implemented.
   Snapshot artifact transport, two-pass quarantine replay, and standalone settled installation are
-  implemented, including automatic fallback selection and tail resumption. Multi-activation
-  integration coverage, SSE, and divergence recovery remain open. Removal needs the reciprocal
-  verified freeze before restarting in settled mode; it may not relabel imported results as local
-  Raft provenance.
+  implemented, including automatic fallback selection and tail resumption. Removal needs the
+  reciprocal verified freeze before restarting in settled mode; it may not relabel imported
+  results as local Raft provenance.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- Automatic listener rebinding, multi-activation catch-up, SSE, divergence recovery, and the
-  remaining Phase 3 fault/performance matrix are outstanding. Final §14 benchmark confirmation
-  remains a Phase 6 exit gate.
+- Multi-activation catch-up, SSE, divergence recovery, and the remaining Phase 3
+  fault/performance matrix are outstanding. Final §14 benchmark confirmation remains a Phase 6
+  exit gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
 that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
-production local-Git provider and Phase 6 quorum recovery are not exit requirements. Listener and
-Phase 3 test gaps above remain open.
+production local-Git provider and Phase 6 quorum recovery are not exit requirements. The Phase 3
+test gaps above remain open.
 
 ## Evidence
 
@@ -309,6 +312,13 @@ Primary tests:
 - `TestPeerEndpointCLIAddListFilterAndRemoveJSON`
 - `TestOperatorClientManagesManualEndpoints`
 - `TestDaemonDiscoveryManualEndpointChangeReconcilesRoutesImmediately`
+- `TestDaemonDiscoveryRefreshRebindsAndWithdrawsOnInterfaceLoss`
+- `TestDaemonDiscoveryRefreshBindFailureWithdrawsUntilRecovery`
+- `TestDaemonDiscoveryRefreshRebindsSameAddressAfterInterfaceReplacement`
+- `TestDaemonPeerListenerSet*`
+- `TestConsensusRouteTableSelectedAddressRefreshClosesTrackedConnections`
+- `TestIngressClosesOnlyConnectionsBoundToVanishedAddress`
+- `TestOpenSelectedMulticastJoinsOnlyListenerFamilies`
 - `TestManualEndpointManagementFailsClosedOnCorruption`
 - `TestOperatorStatusIncludesLocalNetworkState`
 - `TestDaemonOperatorStatusSourceReportsNetworkModes`
