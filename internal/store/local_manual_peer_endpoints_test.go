@@ -182,6 +182,7 @@ func TestManualEndpointManagementRejectsInvalidArgumentsAndContexts(
 	deviceID := fixture.members[0].ID
 	valid := netip.MustParseAddrPort("192.0.2.1:47831")
 
+	//lint:ignore SA1012 This call verifies the nil-context rejection contract.
 	if _, err := state.ListManualEndpoints(nil); !errors.Is(
 		err,
 		ErrInvalidLocalState,
@@ -229,6 +230,7 @@ func TestManualEndpointManagementRejectsInvalidArgumentsAndContexts(
 	}
 
 	if _, err := state.RemoveManualEndpoint(
+		//lint:ignore SA1012 This call verifies the nil-context rejection contract.
 		nil,
 		deviceID,
 		valid,
