@@ -243,7 +243,10 @@ type daemonMeshPairingJoinResult struct {
 
 func TestDaemonProductionMeshComposition(t *testing.T) {
 	if os.Getenv(daemonMeshIntegrationChildMarker) != "1" {
-		runDaemonMeshIntegrationChild(t)
+		runDaemonMeshIntegrationChild(
+			t,
+			"^TestDaemonProductionMeshComposition$",
+		)
 		return
 	}
 	registerDaemonIntegrationChildResult(t)
@@ -3230,8 +3233,11 @@ func listenDaemonMeshIntegrationEndpoint(
 	return nil
 }
 
-func runDaemonMeshIntegrationChild(t *testing.T) {
+func runDaemonMeshIntegrationChild(t *testing.T, testPattern string) {
 	t.Helper()
+	if testPattern == "" {
+		t.Fatal("mesh integration child test pattern is empty")
+	}
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		daemonMeshIntegrationProcessTimeout,
@@ -3240,7 +3246,7 @@ func runDaemonMeshIntegrationChild(t *testing.T) {
 	command := exec.CommandContext(
 		ctx,
 		os.Args[0],
-		"-test.run=^TestDaemonProductionMeshComposition$",
+		"-test.run="+testPattern,
 		"-test.count=1",
 		"-test.v",
 	)
