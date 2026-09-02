@@ -85,6 +85,9 @@ type FSM struct {
 	committedConfig     atomic.Pointer[committedRaftConfiguration]
 	appliedCommandIndex atomic.Uint64
 
+	applyMu    sync.Mutex
+	applyState fsmApplyState
+
 	haltOnce sync.Once
 	haltMu   sync.RWMutex
 	haltErr  error
@@ -109,6 +112,14 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: load durable state: %v", ErrInvalidFSMOptions, err)
 	}
+	decoded, err := decodeStateView(view)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: decode durable state: %v",
+			ErrInvalidFSMOptions,
+			err,
+		)
+	}
 	feed := newChangeFeed()
 	fsm := &FSM{
 		store:        options.Store,
@@ -122,6 +133,7 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 		validateConfig:       validateConfiguration,
 		authorizationChanges: feed,
 		admissionChanged:     feed.subscribeWithoutInitial(),
+		applyState:           newFSMApplyState(view, decoded),
 		halted:               make(chan error, 1),
 	}
 	if fsm.snapshotSigner != nil {
@@ -189,6 +201,8 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 	if fsm == nil {
 		return ApplyResponse{Err: ErrInvalidFSMOptions}
 	}
+	fsm.applyMu.Lock()
+	defer fsm.applyMu.Unlock()
 	if err := fsm.HaltError(); err != nil {
 		return ApplyResponse{
 			LogIndex: raftLogIndex(log),
@@ -204,22 +218,12 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		return fsm.halt(log, ErrInvalidCommand)
 	}
 
-	view, err := fsm.store.View(context.Background())
-	if err != nil {
-		return fsm.halt(log, fmt.Errorf("load committed state: %w", err))
-	}
-	decoded, err := decodeStateView(view)
-	if err != nil {
-		return fsm.halt(log, fmt.Errorf(
-			"decode committed state: %w",
-			err,
-		))
-	}
+	current := fsm.applyState
 	deviceID, err := commandOriginDeviceID(log.Data)
 	if err != nil {
 		return fsm.halt(log, err)
 	}
-	identityKey, exists := decoded.IdentityPublicKey(deviceID)
+	identityKey, exists := current.identityPublicKey(deviceID)
 	if !exists {
 		return fsm.halt(log, fmt.Errorf(
 			"%w: origin device %q is absent from committed membership",
@@ -228,8 +232,8 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		))
 	}
 	signed, err := event.ParseAndVerify(log.Data, event.VerificationContext{
-		SessionID:         view.SessionID,
-		WorkspaceID:       view.WorkspaceID,
+		SessionID:         current.sessionID,
+		WorkspaceID:       current.workspaceID,
 		IdentityPublicKey: identityKey,
 	})
 	if err != nil {
@@ -257,8 +261,8 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		))
 	}
 	if duplicate &&
-		view.LastRaftAppliedLogIndex != nil &&
-		log.Index <= *view.LastRaftAppliedLogIndex {
+		current.lastRaftAppliedLogIndex != 0 &&
+		log.Index <= current.lastRaftAppliedLogIndex {
 		if err := fsm.store.VerifyRaftCommand(
 			context.Background(),
 			log.Term,
@@ -275,14 +279,14 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		return ApplyResponse{
 			LogIndex: log.Index,
 			Result: store.ApplyResult{
-				Heads:             view.Heads,
+				Heads:             current.heads,
 				Outcome:           lookup.Outcome,
-				AdmissionRevision: view.AdmissionRevision,
+				AdmissionRevision: current.admissionRevision,
 				Duplicate:         true,
 			},
 		}
 	}
-	if duplicate && view.LastRaftAppliedLogIndex == nil {
+	if duplicate && current.lastRaftAppliedLogIndex == 0 {
 		return fsm.halt(log, fmt.Errorf(
 			"%w: durable result exists without an applied Raft watermark",
 			ErrInvalidCommand,
@@ -301,18 +305,18 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 	applyContext := ApplyContext{
 		Term:               log.Term,
 		LogIndex:           log.Index,
-		RecoveryGeneration: view.RecoveryGeneration,
+		RecoveryGeneration: current.recoveryGeneration,
 		AppliedAt:          appliedAt,
 		OriginBootID:       fsm.originBootID,
 		MonotonicNowNS:     monotonicNow,
-		PriorHeads:         view.Heads,
+		PriorHeads:         current.heads,
 	}
 	if duplicate {
 		result, err := fsm.store.Apply(context.Background(), store.ApplyRequest{
 			Term:               log.Term,
 			LogIndex:           log.Index,
 			AppliedAt:          appliedAt,
-			RecoveryGeneration: view.RecoveryGeneration,
+			RecoveryGeneration: current.recoveryGeneration,
 			Proposal:           signed,
 		})
 		if err != nil {
@@ -327,26 +331,27 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 				err,
 			))
 		}
+		fsm.applyState.advanceDuplicate(log, result)
 		fsm.publishAppliedCommand(log.Index)
 		return ApplyResponse{LogIndex: log.Index, Result: result}
 	}
 	outcome, err := reduceCommitted(
-		decoded.Reducer,
+		current.reducer,
 		signed,
 		log,
-		view.Heads,
+		current.heads,
 	)
 	if err != nil {
 		return fsm.halt(log, fmt.Errorf("reduce command: %w", err))
 	}
-	prospective := decoded.Reducer
+	prospective := current.reducer
 	if err := prospective.Apply(outcome.Changes); err != nil {
 		return fsm.halt(log, fmt.Errorf(
 			"validate prospective reducer state: %w",
 			err,
 		))
 	}
-	nextAdmission, err := decoded.Admission.Advance(peerauth.Changes{
+	nextAdmission, err := current.admission.Advance(peerauth.Changes{
 		AdvancesEventChain:       outcome.Changes.AdvancesEventChain,
 		Devices:                  outcome.Changes.Devices,
 		AuditCounters:            outcome.Changes.AuditCounters,
@@ -373,6 +378,13 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 		nextAdmission,
 		result.AdmissionRevision,
 		admissionAccessChanged(outcome.Changes),
+	)
+	fsm.applyState.advance(
+		log,
+		result,
+		prospective,
+		nextAdmission,
+		outcome.Changes,
 	)
 	fsm.admissionMu.Unlock()
 	fsm.publishAppliedCommand(log.Index)

@@ -503,6 +503,8 @@ func (fsm *FSM) publishRestoredRaftSnapshot(
 	if fsm == nil || fsm.store == nil || admissionRevision == 0 {
 		return ErrInvalidFSMOptions
 	}
+	fsm.applyMu.Lock()
+	defer fsm.applyMu.Unlock()
 	view, err := fsm.store.View(context.Background())
 	if err != nil {
 		return err
@@ -511,6 +513,10 @@ func (fsm *FSM) publishRestoredRaftSnapshot(
 	if err != nil {
 		return err
 	}
+	if view.AdmissionRevision != admissionRevision {
+		return ErrRaftSnapshotMetadataMismatch
+	}
+	fsm.applyState = newFSMApplyState(view, decoded)
 	fsm.admissionMu.Lock()
 	fsm.publishPeerAdmissionLocked(
 		decoded.Admission,
