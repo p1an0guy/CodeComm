@@ -47,8 +47,9 @@ import (
 )
 
 const (
-	secureMeshChild     = "CODECOMM_SECURE_MESH_CHILD"
-	secureMeshInProcess = "CODECOMM_SECURE_MESH_IN_PROCESS"
+	secureMeshChild           = "CODECOMM_SECURE_MESH_CHILD"
+	secureMeshInProcess       = "CODECOMM_SECURE_MESH_IN_PROCESS"
+	secureMeshTestBootIDCount = 24
 )
 
 var (
@@ -643,6 +644,17 @@ func newSecureMeshHarnessWithOptions(
 					index+7,
 				)),
 			},
+		}
+		for restart := 3; restart < secureMeshTestBootIDCount; restart++ {
+			identities[index].bootIDs = append(
+				identities[index].bootIDs,
+				domain.UUIDv7(fmt.Sprintf(
+					"019b17cc-%04x-7def-b%03x-%012x",
+					restart,
+					index,
+					restart*len(identities)+index+1,
+				)),
+			)
 		}
 		for _, bootID := range identities[index].bootIDs {
 			if !bootID.Valid() {
