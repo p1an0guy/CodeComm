@@ -33,6 +33,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/voterset"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/joinbootstrap"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -210,6 +211,8 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 					return daemonTestFirstBootID, nil
 				},
 				newMeshFactory: newDaemonTestMeshFactory,
+				daemonVersion:  joinbootstrap.CurrentDaemonVersion,
+				maxApplyLevel:  joinbootstrap.CurrentMaxApplyLevel,
 			},
 		)
 	}()
@@ -252,6 +255,121 @@ func TestDaemonGracefulShutdownClosesConsensusAndLocalWorkers(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	waitForDaemonTestLeader(t, reopened)
+}
+
+func TestDaemonStartupCommitsChangedMembershipVersionReport(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state", "state.db")
+	consensusDir := filepath.Join(root, "consensus")
+	endpoint := daemonTestEndpoint(t)
+	initial, identityPrivateKey, deviceID := daemonTestInitialState(t)
+	t.Cleanup(func() { clear(identityPrivateKey) })
+	initial.Projections.Devices[0].DaemonVersion = "0.0.9"
+
+	setupNode, err := consensus.OpenSingleNode(
+		context.Background(),
+		consensus.SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    statePath,
+			ConsensusDir: consensusDir,
+			OriginBootID: daemonTestSetupBootID,
+			InitialState: &initial,
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenSingleNode(setup): %v", err)
+	}
+	waitForDaemonTestLeader(t, setupNode)
+	if err := setupNode.Close(); err != nil {
+		t.Fatalf("Close(setup): %v", err)
+	}
+
+	runContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- runDaemon(
+			runContext,
+			daemonOptions{
+				statePath:    statePath,
+				consensusDir: consensusDir,
+				endpoint:     endpoint,
+				sessionID:    daemonTestSessionID,
+				workspaceID:  daemonTestWorkspaceID,
+			},
+			daemonDependencies{
+				loadIdentity: func(
+					context.Context,
+				) (identityHandle, []byte, error) {
+					return testIdentityHandle{},
+						bytes.Clone(identityPrivateKey),
+						nil
+				},
+				newBootID: func() (domain.UUIDv7, error) {
+					return daemonTestFirstBootID, nil
+				},
+				newMeshFactory: newDaemonTestMeshFactory,
+				daemonVersion:  joinbootstrap.CurrentDaemonVersion,
+				maxApplyLevel:  joinbootstrap.CurrentMaxApplyLevel,
+			},
+		)
+	}()
+	snapshot := waitForDaemonTestStatusOrExit(t, endpoint, runDone)
+	deadline := time.Now().Add(10 * time.Second)
+	for snapshot.Session.DaemonVersion !=
+		joinbootstrap.CurrentDaemonVersion &&
+		time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		snapshot = waitForDaemonTestStatusOrExit(t, endpoint, runDone)
+	}
+	if snapshot.Session.DaemonVersion !=
+		joinbootstrap.CurrentDaemonVersion ||
+		snapshot.Session.EventChainIndex != 1 ||
+		snapshot.Session.ResultIndex != 1 {
+		t.Fatalf("reported daemon status = %#v", snapshot.Session)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runDaemon() after version report: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("version-report daemon did not complete graceful shutdown")
+	}
+
+	reopened, err := store.Open(
+		context.Background(),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(reopen): %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	durable, err := reopened.LocalState().StatusSnapshot(
+		context.Background(),
+		deviceID,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("StatusSnapshot(reopen): %v", err)
+	}
+	if durable.Member.DaemonVersion !=
+		joinbootstrap.CurrentDaemonVersion ||
+		durable.Member.MaxApplyLevel != event.MaxSupportedApplyLevel ||
+		durable.Member.EntityVersion != 2 {
+		t.Fatalf("reopened member = %#v", durable.Member)
+	}
+	outbox, err := reopened.LocalState().OutboxRecords(context.Background())
+	if err != nil {
+		t.Fatalf("OutboxRecords(reopen): %v", err)
+	}
+	for _, record := range outbox {
+		if record.Kind == event.KindMembershipVersionReported {
+			t.Fatalf("reopened outbox retained version report: %#v", record)
+		}
+	}
 }
 
 func TestDaemonStartsSettledReplicaWithoutOpeningRaft(t *testing.T) {
@@ -315,6 +433,8 @@ func TestDaemonStartsSettledReplicaWithoutOpeningRaft(t *testing.T) {
 					return daemonTestFirstBootID, nil
 				},
 				newMeshFactory: newDaemonTestMeshFactory,
+				daemonVersion:  joinbootstrap.CurrentDaemonVersion,
+				maxApplyLevel:  joinbootstrap.CurrentMaxApplyLevel,
 			},
 		)
 	}()
@@ -537,6 +657,8 @@ func TestDaemonProcessHelper(t *testing.T) {
 				return bootID, nil
 			},
 			newMeshFactory: newDaemonMeshTransportFactory,
+			daemonVersion:  joinbootstrap.CurrentDaemonVersion,
+			maxApplyLevel:  joinbootstrap.CurrentMaxApplyLevel,
 		},
 	)
 	if err != nil {

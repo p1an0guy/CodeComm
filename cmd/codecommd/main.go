@@ -26,6 +26,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
+	"github.com/ijonahch/codecomm/internal/joinbootstrap"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/pairingservice"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
@@ -78,6 +79,8 @@ type daemonDependencies struct {
 	loadIdentity   func(context.Context) (identityHandle, []byte, error)
 	newBootID      func() (domain.UUIDv7, error)
 	newMeshFactory daemonMeshFactoryConstructor
+	daemonVersion  string
+	maxApplyLevel  uint64
 	listenPeer     func(
 		context.Context,
 		netip.AddrPort,
@@ -225,6 +228,8 @@ func productionDaemonDependencies() daemonDependencies {
 			return result, nil
 		},
 		newMeshFactory: newDaemonMeshTransportFactory,
+		daemonVersion:  joinbootstrap.CurrentDaemonVersion,
+		maxApplyLevel:  joinbootstrap.CurrentMaxApplyLevel,
 		listenPeer:     listenDaemonPeer,
 		openMulticast:  openDaemonMulticast,
 		listInterfaces: net.Interfaces,
@@ -246,6 +251,9 @@ func runDaemon(
 		dependencies.loadIdentity == nil ||
 		dependencies.newBootID == nil ||
 		dependencies.newMeshFactory == nil ||
+		!device.ValidDaemonVersion(dependencies.daemonVersion) ||
+		dependencies.maxApplyLevel < 1 ||
+		dependencies.maxApplyLevel > domain.MaxApplyLevel ||
 		len(options.peerListeners) != 0 &&
 			dependencies.listenPeer == nil ||
 		incompleteDaemonDiscoveryDependencies(dependencies) {
@@ -424,7 +432,10 @@ func runDaemon(
 	}
 
 	processClock := consensus.NewSystemApplyClock()
-	var bootOrigin *agent.BootOrigin
+	var (
+		bootOrigin               *agent.BootOrigin
+		versionReportPreparation *daemonVersionReportPreparation
+	)
 	proposalForwarder := &daemonProposalForwarderRelay{}
 	node, err := consensus.OpenNode(
 		ctx,
@@ -483,7 +494,21 @@ func runDaemon(
 					},
 				)
 				if err == nil {
-					bootOrigin = created
+					// The node starts voter reconciliation after this factory
+					// returns, so reserve the version report first.
+					prepared, prepareErr := prepareDaemonVersionReport(
+						ctx,
+						localState,
+						created,
+						deviceID,
+						dependencies.daemonVersion,
+						dependencies.maxApplyLevel,
+					)
+					err = prepareErr
+					if err == nil {
+						bootOrigin = created
+						versionReportPreparation = &prepared
+					}
 				}
 				return created, err
 			},
@@ -496,7 +521,7 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	if bootOrigin == nil {
+	if bootOrigin == nil || versionReportPreparation == nil {
 		_ = node.Close()
 		return errInvalidDaemonDependencies
 	}
@@ -511,15 +536,19 @@ func runDaemon(
 		snapshotRepository  *daemonLogicalSnapshotRepository
 		snapshotPublisher   *daemonLogicalSnapshotPublisher
 		checkpointScheduler *daemonCheckpointScheduler
+		versionReport       *daemonVersionReportGate
 	)
 	runtimeClosed := false
 	defer func() {
 		if runtimeClosed {
 			return
 		}
-		components := make([]phasedDaemonComponent, 0, 9)
+		components := make([]phasedDaemonComponent, 0, 10)
 		if checkpointScheduler != nil {
 			components = append(components, checkpointScheduler)
+		}
+		if versionReport != nil {
+			components = append(components, versionReport)
 		}
 		if agentService != nil {
 			components = append(components, agentService)
@@ -587,8 +616,29 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	if err := agentService.Recover(ctx); err != nil {
-		return fmt.Errorf("codecommd: recover local agent state: %w", err)
+	versionReport, err = newDaemonVersionReportGate(
+		ctx,
+		daemonVersionReportOptions{
+			State:         localState,
+			Origin:        bootOrigin,
+			Agent:         agentService,
+			RecoverAgents: agentService.Recover,
+			DeviceID:      deviceID,
+			DaemonVersion: dependencies.daemonVersion,
+			MaxApplyLevel: dependencies.maxApplyLevel,
+			Prepared:      versionReportPreparation,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !versionReport.requiresReport() {
+		if err := versionReport.Start(); err != nil {
+			return err
+		}
+		if err := versionReport.WaitReady(ctx); err != nil {
+			return err
+		}
 	}
 	credentials, ok := credentialHandle.(daemonCredentialHandle)
 	if !ok {
@@ -741,6 +791,9 @@ func runDaemon(
 		}
 	}
 	meshFactory.ClearIdentityCertificate()
+	if err := versionReport.Start(); err != nil {
+		return err
+	}
 
 	checkpointSource, err := newDaemonCheckpointRuntimeSource(
 		localState,
@@ -777,7 +830,7 @@ func runDaemon(
 	if err != nil {
 		return err
 	}
-	router, err := ipc.NewClassRouter(operatorService, agentService)
+	router, err := ipc.NewClassRouter(operatorService, versionReport)
 	if err != nil {
 		return err
 	}
@@ -795,6 +848,7 @@ func runDaemon(
 		localServer,
 		node,
 		agentService,
+		versionReport,
 		bootOrigin,
 		credentialService,
 		pairingService,
@@ -814,6 +868,7 @@ func serveUntilStopped(
 	server *ipc.Server,
 	node *consensus.SingleNode,
 	agentService *agent.Service,
+	versionReport *daemonVersionReportGate,
 	bootOrigin *agent.BootOrigin,
 	credentialService *credentialservice.Service,
 	pairingService *pairingservice.Service,
@@ -826,11 +881,13 @@ func serveUntilStopped(
 ) error {
 	components := []phasedDaemonComponent{
 		checkpointScheduler,
+		versionReport,
 		agentService,
 	}
 	fatalComponents := []daemonFatalComponent{
 		node,
 		checkpointScheduler,
+		versionReport,
 		agentService,
 		credentialService,
 		pairingService,
@@ -935,7 +992,11 @@ func serveDaemonRuntime(
 					return stop(errInvalidDaemonDependencies, 0)
 				}
 				if fatal := component.FatalError(); fatal != nil {
-					return stop(fatal, 0)
+					return stop(fmt.Errorf(
+						"codecommd: fatal component %T: %w",
+						component,
+						fatal,
+					), 0)
 				}
 			}
 		}

@@ -23,6 +23,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/pairingjoiner"
@@ -32,7 +33,7 @@ import (
 
 const (
 	CurrentDaemonVersion = "0.1.0"
-	CurrentMaxApplyLevel = 1
+	CurrentMaxApplyLevel = event.MaxSupportedApplyLevel
 )
 
 var (

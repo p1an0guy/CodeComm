@@ -74,6 +74,12 @@ const (
 	daemonMeshRebootstrapTailEventID = domain.UUIDv7(
 		"018f47de-89ab-7def-b123-7123456789ab",
 	)
+	daemonMeshRebootstrapVersionBootID = domain.UUIDv7(
+		"018f47de-89ab-7def-a223-7123456789ab",
+	)
+	daemonMeshRebootstrapVersionEventID = domain.UUIDv7(
+		"018f47de-89ab-7def-b223-7123456789ab",
+	)
 )
 
 type daemonTestCredentialStore struct {
@@ -180,6 +186,8 @@ func (secrets *daemonTestCredentialStore) wipe() {
 type daemonMeshIntegrationNode struct {
 	deviceID      domain.DeviceID
 	privateKey    ed25519.PrivateKey
+	daemonVersion string
+	maxApplyLevel uint64
 	statePath     string
 	consensusDir  string
 	localEndpoint ipc.Endpoint
@@ -251,6 +259,135 @@ func TestDaemonProductionMeshComposition(t *testing.T) {
 	}
 	registerDaemonIntegrationChildResult(t)
 	runDaemonProductionMeshComposition(t)
+}
+
+func TestDaemonProductionVersionUpgradeComposition(t *testing.T) {
+	if os.Getenv(daemonMeshIntegrationChildMarker) != "1" {
+		runDaemonMeshIntegrationChild(
+			t,
+			"^TestDaemonProductionVersionUpgradeComposition$",
+		)
+		return
+	}
+	registerDaemonIntegrationChildResult(t)
+	runDaemonProductionVersionUpgradeComposition(t)
+}
+
+func runDaemonProductionVersionUpgradeComposition(t *testing.T) {
+	t.Helper()
+	const previousDaemonVersion = "0.0.9"
+
+	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 3)
+	nodes := newDaemonMeshIntegrationNodes(
+		t,
+		t.TempDir(),
+		selectedAddress,
+		listeners,
+		time.Now,
+	)
+	t.Cleanup(func() {
+		cleanupDaemonMeshIntegrationNodes(t, nodes...)
+		for _, node := range nodes {
+			clear(node.privateKey)
+		}
+	})
+
+	previous := nodes[len(nodes)-1]
+	previous.daemonVersion = previousDaemonVersion
+	initial := daemonMeshIntegrationInitialState(t, nodes, device.Device{})
+	for index := range initial.Projections.Devices {
+		initial.Projections.Devices[index].DaemonVersion =
+			previousDaemonVersion
+	}
+	bootstrap := daemonMeshIntegrationBootstrap(nodes)
+	for _, node := range nodes {
+		initializeDaemonMeshIntegrationStore(t, node.statePath, initial)
+		seedDaemonMeshIntegrationRaft(
+			t,
+			node.consensusDir,
+			node.deviceID,
+			bootstrap,
+		)
+		node.start(t, nodes)
+	}
+
+	voterIDs := daemonMeshIntegrationDeviceIDs(nodes)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		func(statuses []ui.Snapshot) bool {
+			if !daemonMeshIntegrationClusterReady(statuses, voterIDs) ||
+				!daemonMeshIntegrationMutationConverged(statuses) {
+				return false
+			}
+			for _, node := range nodes {
+				version := joinbootstrap.CurrentDaemonVersion
+				entityVersion := uint64(2)
+				if node == previous {
+					version = previousDaemonVersion
+					entityVersion = 1
+				}
+				if !daemonMeshIntegrationMemberCompatibility(
+					statuses,
+					node.deviceID,
+					version,
+					entityVersion,
+				) {
+					return false
+				}
+			}
+			return true
+		},
+	)
+
+	previous.stop(t)
+	previous.daemonVersion = joinbootstrap.CurrentDaemonVersion
+	previous.listener = listenDaemonMeshIntegrationEndpoint(
+		t,
+		previous.peerEndpoint,
+	)
+	previous.start(t, nodes)
+	upgradeConverged := func(statuses []ui.Snapshot) bool {
+		if !daemonMeshIntegrationClusterReady(statuses, voterIDs) ||
+			!daemonMeshIntegrationMutationConverged(statuses) {
+			return false
+		}
+		for _, node := range nodes {
+			if !daemonMeshIntegrationMemberCompatibility(
+				statuses,
+				node.deviceID,
+				joinbootstrap.CurrentDaemonVersion,
+				2,
+			) {
+				return false
+			}
+		}
+		return true
+	}
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		upgradeConverged,
+	)
+	waitForDaemonMeshIntegrationStableHeads(
+		t,
+		nodes,
+		daemonSnapshotLeadershipRetry+time.Second,
+	)
+	statuses := waitForDaemonMeshIntegrationCluster(
+		t,
+		nodes,
+		upgradeConverged,
+	)
+	finalChainIndex := statuses[0].Session.EventChainIndex
+	finalResultIndex := statuses[0].Session.ResultIndex
+	stopDaemonMeshIntegrationNodes(t, nodes...)
+	assertDaemonMeshVersionUpgradeDurable(
+		t,
+		nodes,
+		finalChainIndex,
+		finalResultIndex,
+	)
 }
 
 func runDaemonProductionMeshComposition(t *testing.T) {
@@ -466,7 +603,7 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 				statuses,
 				nonvoter.ID,
 				device.StatusActive,
-				1,
+				3,
 			) && daemonMeshIntegrationMutationConverged(statuses)
 		},
 	)
@@ -509,7 +646,7 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 				statuses,
 				nonvoter.ID,
 				device.StatusActive,
-				1,
+				3,
 			) && daemonMeshIntegrationMutationConverged(statuses) &&
 				statuses[restarted.indexIn(nodes)].Session.EventChainIndex >=
 					mutationChainIndex &&
@@ -627,6 +764,25 @@ func exerciseDaemonMeshRebootstrap(
 		1,
 		false,
 	)
+	versionContext, cancelVersion := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	versionResult, err := applyDaemonSettledEventWithLeaderRetry(
+		versionContext,
+		nodes,
+		daemonMeshRebootstrapTailVersionEvent(t, retained),
+	)
+	cancelVersion()
+	if err != nil ||
+		versionResult.Outcome.Status != store.OutcomeAccepted ||
+		versionResult.Outcome.Code != "accepted" {
+		t.Fatalf(
+			"post-snapshot retained version report = (%+v, %v)",
+			versionResult,
+			err,
+		)
+	}
 	tailContext, cancelTail := context.WithTimeout(
 		context.Background(),
 		daemonMeshIntegrationTimeout,
@@ -651,6 +807,12 @@ func exerciseDaemonMeshRebootstrap(
 		nodes,
 		func(statuses []ui.Snapshot) bool {
 			return daemonMeshIntegrationClusterReady(statuses, voterIDs) &&
+				daemonMeshIntegrationMemberStatus(
+					statuses,
+					member.ID,
+					device.StatusActive,
+					2,
+				) &&
 				daemonMeshIntegrationAgentStatus(
 					statuses,
 					daemonMeshRebootstrapTailAgentSessionID,
@@ -687,7 +849,7 @@ func exerciseDaemonMeshRebootstrap(
 					statuses,
 					member.ID,
 					device.StatusActive,
-					1,
+					3,
 				) &&
 				daemonMeshIntegrationAgentAbsent(
 					statuses,
@@ -749,7 +911,7 @@ func waitForDaemonMeshRebootstrapIPC(
 					[]ui.Snapshot{status},
 					retained.deviceID,
 					device.StatusActive,
-					1,
+					3,
 				) ||
 				!daemonMeshIntegrationAgentAbsent(
 					[]ui.Snapshot{status},
@@ -889,13 +1051,31 @@ func assertDaemonMeshRebootstrapDurableState(
 			status.CredentialAuthority.VoterSetVersion,
 		)
 	}
+	wantMemberVersion := joinbootstrap.CurrentDaemonVersion
+	wantMemberEntityVersion := uint64(1)
+	if !wantMarker {
+		wantMemberVersion = retained.daemonVersion
+		wantMemberEntityVersion = 3
+	}
+	if status.Member.DaemonVersion != wantMemberVersion ||
+		status.Member.MaxApplyLevel !=
+			joinbootstrap.CurrentMaxApplyLevel ||
+		status.Member.Status != device.StatusActive ||
+		status.Member.EntityVersion != wantMemberEntityVersion {
+		t.Fatalf(
+			"rebootstrap exact retained member = %+v, want version %s entity %d",
+			status.Member,
+			wantMemberVersion,
+			wantMemberEntityVersion,
+		)
+	}
 	var localFound bool
 	for _, candidate := range status.Members {
 		if candidate.ID == retained.deviceID {
 			localFound = true
 			if candidate.Role != device.RoleEditor ||
 				candidate.Status != device.StatusActive ||
-				candidate.EntityVersion != 1 {
+				candidate.EntityVersion != wantMemberEntityVersion {
 				t.Fatalf(
 					"rebootstrap changed retained member = %+v",
 					candidate,
@@ -962,6 +1142,68 @@ func daemonMeshRebootstrapTailAgentEvent(
 	signed, err := event.Sign(proposal, retained.privateKey)
 	if err != nil {
 		t.Fatalf("Sign(rebootstrap tail): %v", err)
+	}
+	return signed
+}
+
+func daemonMeshRebootstrapTailVersionEvent(
+	t *testing.T,
+	retained *daemonMeshIntegrationNode,
+) event.SignedEvent {
+	t.Helper()
+	if retained == nil ||
+		!retained.deviceID.Valid() ||
+		len(retained.privateKey) != ed25519.PrivateKeySize {
+		t.Fatal("invalid retained version-event fixture")
+	}
+	authority, err := event.NewLocalAuthority(
+		retained.deviceID,
+		daemonMeshRebootstrapVersionBootID,
+	)
+	if err != nil {
+		t.Fatalf("NewLocalAuthority(rebootstrap version): %v", err)
+	}
+	binding, err := authority.DaemonBinding()
+	if err != nil {
+		t.Fatalf("DaemonBinding(rebootstrap version): %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"daemon_version":  "0.0.9",
+		"max_apply_level": joinbootstrap.CurrentMaxApplyLevel,
+	})
+	if err != nil {
+		t.Fatalf("marshal rebootstrap version payload: %v", err)
+	}
+	expectedVersion := uint64(1)
+	proposal, err := event.BuildProposal(
+		event.Command{
+			Kind: event.KindMembershipVersionReported,
+			EntityID: event.StringEntityID(
+				string(retained.deviceID),
+			),
+			ExpectedEntityVersion: &expectedVersion,
+			Actions:               []event.Action{},
+			Payload:               payload,
+			Redaction: event.Redaction{
+				Policy:        event.RedactionDefault,
+				FieldsRemoved: []event.RedactionField{},
+			},
+		},
+		binding,
+		event.BuildContext{
+			EventID:        daemonMeshRebootstrapVersionEventID,
+			SessionID:      daemonTestSessionID,
+			WorkspaceID:    daemonTestWorkspaceID,
+			CreatedAt:      daemonTestTimestamp,
+			OriginSequence: 1,
+		},
+	)
+	if err != nil {
+		t.Fatalf("BuildProposal(rebootstrap version): %v", err)
+	}
+	signed, err := event.Sign(proposal, retained.privateKey)
+	if err != nil {
+		t.Fatalf("Sign(rebootstrap version): %v", err)
 	}
 	return signed
 }
@@ -1083,7 +1325,7 @@ func exerciseDaemonNextDayCredentialRecovery(
 				statuses,
 				activeDeviceID,
 				device.StatusActive,
-				1,
+				3,
 			) && daemonMeshIntegrationMutationConverged(statuses) &&
 				statuses[0].Session.EventChainIndex >=
 					minChainIndex &&
@@ -1219,6 +1461,8 @@ func newDaemonMeshIntegrationNodes(
 		nodes[index] = &daemonMeshIntegrationNode{
 			deviceID:      deviceID,
 			privateKey:    privateKey,
+			daemonVersion: joinbootstrap.CurrentDaemonVersion,
+			maxApplyLevel: joinbootstrap.CurrentMaxApplyLevel,
 			statePath:     filepath.Join(root, fmt.Sprintf("node-%d", index), "state.db"),
 			consensusDir:  filepath.Join(root, fmt.Sprintf("node-%d", index), "consensus"),
 			localEndpoint: daemonTestEndpoint(t),
@@ -1255,7 +1499,9 @@ func daemonMeshIntegrationInitialState(
 			EntityVersion:     1,
 		})
 	}
-	devices = append(devices, nonvoter)
+	if nonvoter.ID.Valid() {
+		devices = append(devices, nonvoter)
+	}
 	sort.Slice(devices, func(left, right int) bool {
 		return devices[left].ID < devices[right].ID
 	})
@@ -1320,6 +1566,8 @@ func newDaemonMeshIntegrationRetainedNode(
 	return &daemonMeshIntegrationNode{
 		deviceID:      deviceID,
 		privateKey:    privateKey,
+		daemonVersion: joinbootstrap.CurrentDaemonVersion,
+		maxApplyLevel: joinbootstrap.CurrentMaxApplyLevel,
 		statePath:     filepath.Join(root, "retained", "state.db"),
 		consensusDir:  filepath.Join(root, "retained", "consensus"),
 		localEndpoint: daemonTestEndpoint(t),
@@ -1512,6 +1760,8 @@ func (node *daemonMeshIntegrationNode) start(
 				newMeshFactory: newDaemonMeshIntegrationFactoryConstructor(
 					node.meshCapture,
 				),
+				daemonVersion: node.daemonVersion,
+				maxApplyLevel: node.maxApplyLevel,
 				listenPeer: func(
 					listenContext context.Context,
 					endpoint netip.AddrPort,
@@ -1810,10 +2060,16 @@ func waitForDaemonMeshIntegrationCluster(
 			select {
 			case <-node.exited:
 				node.running = false
+				stage, ready := node.meshCapture.lifecycleState()
 				t.Fatalf(
-					"daemon %s exited before convergence: %v",
+					"daemon %s exited before convergence: %v "+
+						"(stage=%q, ready=%t, fatal=%v, content=%s)",
 					node.deviceID,
 					node.exitErr,
+					stage,
+					ready,
+					node.meshCapture.fatalError(),
+					daemonMeshIntegrationContentDiagnostics(node),
 				)
 			default:
 			}
@@ -2025,6 +2281,30 @@ func daemonMeshIntegrationMemberStatus(
 		}
 	}
 	return true
+}
+
+func daemonMeshIntegrationMemberCompatibility(
+	statuses []ui.Snapshot,
+	deviceID domain.DeviceID,
+	daemonVersion string,
+	entityVersion uint64,
+) bool {
+	for _, snapshot := range statuses {
+		if snapshot.Session.LocalDeviceID != string(deviceID) {
+			continue
+		}
+		if snapshot.Session.DaemonVersion != daemonVersion {
+			return false
+		}
+		for _, member := range snapshot.Members {
+			if member.DeviceID == string(deviceID) {
+				return member.Status == string(device.StatusActive) &&
+					member.EntityVersion == entityVersion
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func daemonMeshIntegrationAgentStatus(
@@ -3025,6 +3305,102 @@ func assertDaemonMeshFreshJoinDurableState(
 	return member, authorization, epochPrivateKey, identityPrivateKey
 }
 
+func assertDaemonMeshVersionUpgradeDurable(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	chainIndex uint64,
+	resultIndex uint64,
+) {
+	t.Helper()
+	var baseline *store.StateView
+	for _, node := range nodes {
+		database, err := store.Open(
+			context.Background(),
+			store.Options{Path: node.statePath},
+		)
+		if err != nil {
+			t.Fatalf("reopen upgraded store %s: %v", node.deviceID, err)
+		}
+		status, statusErr := database.LocalState().StatusSnapshot(
+			context.Background(),
+			node.deviceID,
+			len(nodes),
+		)
+		view, viewErr := database.View(context.Background())
+		verifyErr := database.VerifyCommitmentHistory(context.Background())
+		if statusErr != nil {
+			_ = database.Close()
+			t.Fatalf("durable upgraded status %s: %v", node.deviceID, statusErr)
+		}
+		if viewErr != nil {
+			_ = database.Close()
+			t.Fatalf("durable upgraded view %s: %v", node.deviceID, viewErr)
+		}
+		if verifyErr != nil {
+			_ = database.Close()
+			t.Fatalf("verify upgraded commitments %s: %v", node.deviceID, verifyErr)
+		}
+		if view.Heads.ChainIndex != chainIndex ||
+			view.Heads.ResultIndex != resultIndex ||
+			len(status.Members) != len(nodes) {
+			_ = database.Close()
+			t.Fatalf(
+				"durable upgraded cut %s = heads %+v, members %d",
+				node.deviceID,
+				view.Heads,
+				len(status.Members),
+			)
+		}
+		for _, expected := range nodes {
+			exact, exactErr := database.LocalState().StatusSnapshot(
+				context.Background(),
+				expected.deviceID,
+				1,
+			)
+			if exactErr != nil {
+				_ = database.Close()
+				t.Fatalf(
+					"read durable member %s on %s: %v",
+					expected.deviceID,
+					node.deviceID,
+					exactErr,
+				)
+			}
+			member := exact.Member
+			if member.DaemonVersion !=
+				joinbootstrap.CurrentDaemonVersion ||
+				member.MaxApplyLevel !=
+					joinbootstrap.CurrentMaxApplyLevel ||
+				member.Status != device.StatusActive ||
+				member.EntityVersion != 2 {
+				_ = database.Close()
+				t.Fatalf(
+					"durable upgraded member %s on %s = %+v",
+					expected.deviceID,
+					node.deviceID,
+					member,
+				)
+			}
+		}
+		if err := database.Close(); err != nil {
+			t.Fatalf("close upgraded store %s: %v", node.deviceID, err)
+		}
+		if baseline == nil {
+			cloned := view
+			baseline = &cloned
+			continue
+		}
+		if view.Heads != baseline.Heads ||
+			view.ProjectionStateDigest != baseline.ProjectionStateDigest ||
+			!reflect.DeepEqual(view.ProjectionRows, baseline.ProjectionRows) {
+			t.Fatalf(
+				"upgraded durable state diverged on %s",
+				node.deviceID,
+			)
+		}
+	}
+}
+
 func assertDaemonMeshIntegrationDurableMutation(
 	t *testing.T,
 	nodes []*daemonMeshIntegrationNode,
@@ -3074,7 +3450,7 @@ func assertDaemonMeshIntegrationDurableMutation(
 			}
 			if member.ID == activeDeviceID {
 				active = member.Status == device.StatusActive &&
-					member.EntityVersion == 1
+					member.EntityVersion == 3
 			}
 		}
 		if status.VoterSet.VoterSetVersion != 1 ||

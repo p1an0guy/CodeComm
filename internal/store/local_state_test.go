@@ -582,6 +582,84 @@ func TestLocalStateReservesSessionCapacityForCheckpoint(t *testing.T) {
 			err,
 		)
 	}
+
+	versionInput := normalInput
+	versionInput.ClientInstanceID = testWorkingRootID
+	versionInput.RequestID = testLaunchAgentID
+	versionInput.BindingClass = LocalBindingDaemon
+	versionInput.RequestKind = event.KindMembershipVersionReported
+	versionInput.CanonicalRequest = []byte(
+		`{"daemon_version":"0.2.0","expected_entity_version":1,` +
+			`"max_apply_level":1,"operation":"membership.version_reported"}`,
+	)
+	buildVersionReport := func(
+		eventID domain.UUIDv7,
+		sequence uint64,
+	) (event.SignedEvent, error) {
+		expectedVersion := uint64(1)
+		proposal, err := event.BuildProposal(
+			event.Command{
+				Kind: event.KindMembershipVersionReported,
+				EntityID: event.StringEntityID(
+					string(deviceID),
+				),
+				ExpectedEntityVersion: &expectedVersion,
+				Actions:               []event.Action{},
+				Payload: []byte(
+					`{"daemon_version":"0.2.0","max_apply_level":1}`,
+				),
+				Redaction: event.Redaction{
+					Policy:        event.RedactionDefault,
+					FieldsRemoved: []event.RedactionField{},
+				},
+			},
+			daemon,
+			event.BuildContext{
+				EventID:        eventID,
+				SessionID:      domain.UUIDv7(testSessionID),
+				WorkspaceID:    testWorkspaceID,
+				CreatedAt:      testAppliedAt,
+				OriginSequence: sequence,
+			},
+		)
+		if err != nil {
+			return event.SignedEvent{}, err
+		}
+		return event.Sign(proposal, privateKey)
+	}
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		versionInput,
+		func() (domain.UUIDv7, error) {
+			return domain.UUIDv7(
+				"01890f47-3e72-7000-8000-00000000002a",
+			), nil
+		},
+		buildVersionReport,
+	); err != nil {
+		t.Fatalf("version-report ReserveCommand(): %v", err)
+	}
+
+	versionInput.ClientInstanceID = domain.UUIDv7(
+		"01890f47-3e72-7000-8000-00000000002b",
+	)
+	versionInput.RequestID = domain.UUIDv7(
+		"01890f47-3e72-7000-8000-00000000002c",
+	)
+	if _, _, err := state.ReserveCommand(
+		context.Background(),
+		versionInput,
+		func() (domain.UUIDv7, error) {
+			t.Fatal("second version report allocated an event ID")
+			return "", nil
+		},
+		buildVersionReport,
+	); !errors.Is(err, ErrLocalBackpressure) {
+		t.Fatalf(
+			"second version report error = %v, want ErrLocalBackpressure",
+			err,
+		)
+	}
 }
 
 func TestApplyResolvesLocalCheckpointOnlyForDurableTerminalStates(

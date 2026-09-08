@@ -65,6 +65,7 @@ func runSettledDaemon(
 		contentPeerRuntime  *daemonContentPeerRuntime
 		peerIngress         *transport.Ingress
 		snapshotRepository  *daemonLogicalSnapshotRepository
+		versionReport       *daemonVersionReportGate
 	)
 	runtimeClosed := false
 	defer func() {
@@ -73,6 +74,7 @@ func runSettledDaemon(
 		}
 		components := settledDaemonComponents(
 			agentService,
+			versionReport,
 			bootOrigin,
 			credentialConsensus,
 			credentialService,
@@ -172,6 +174,44 @@ func runSettledDaemon(
 		LifecycleOrigin:    daemonBinding,
 		BootOrigin:         bootOrigin,
 	})
+	if err != nil {
+		return err
+	}
+	var synchronizeMembership func(context.Context) error
+	if rebootstrapMarker != nil {
+		synchronizeMembership = func(
+			recoveryContext context.Context,
+		) error {
+			return (daemonRebootstrapCurrencyBarrier{
+				replica: replica,
+				peers:   contentPeerRuntime,
+			}).WaitCurrent(recoveryContext)
+		}
+	}
+	versionReport, err = newDaemonVersionReportGate(
+		ctx,
+		daemonVersionReportOptions{
+			State:       localState,
+			Origin:      bootOrigin,
+			Agent:       agentService,
+			Synchronize: synchronizeMembership,
+			RecoverAgents: func(recoveryContext context.Context) error {
+				return recoverSettledAgentState(
+					recoveryContext,
+					localState,
+					rebootstrapMarker,
+					daemonRebootstrapCurrencyBarrier{
+						replica: replica,
+						peers:   contentPeerRuntime,
+					},
+					agentService,
+				)
+			},
+			DeviceID:      deviceID,
+			DaemonVersion: dependencies.daemonVersion,
+			MaxApplyLevel: dependencies.maxApplyLevel,
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -297,18 +337,6 @@ func runSettledDaemon(
 			return err
 		}
 	}
-	if err := recoverSettledAgentState(
-		ctx,
-		localState,
-		rebootstrapMarker,
-		daemonRebootstrapCurrencyBarrier{
-			replica: replica,
-			peers:   contentPeerRuntime,
-		},
-		agentService,
-	); err != nil {
-		return err
-	}
 	peerIngress, err = meshFactory.NewIngress(
 		ctx,
 		options,
@@ -327,6 +355,14 @@ func runSettledDaemon(
 		}
 	}
 	meshFactory.ClearIdentityCertificate()
+	if err := versionReport.Start(); err != nil {
+		return err
+	}
+	if rebootstrapMarker != nil || !versionReport.requiresReport() {
+		if err := versionReport.WaitReady(ctx); err != nil {
+			return err
+		}
+	}
 
 	operatorStatusSource, err := newDaemonOperatorStatusSource(
 		replica,
@@ -356,7 +392,7 @@ func runSettledDaemon(
 	if err != nil {
 		return err
 	}
-	router, err := ipc.NewClassRouter(operatorService, agentService)
+	router, err := ipc.NewClassRouter(operatorService, versionReport)
 	if err != nil {
 		return err
 	}
@@ -371,6 +407,7 @@ func runSettledDaemon(
 	}
 	components := settledDaemonComponents(
 		agentService,
+		versionReport,
 		bootOrigin,
 		credentialConsensus,
 		credentialService,
@@ -380,6 +417,7 @@ func runSettledDaemon(
 	)
 	fatalComponents := []daemonFatalComponent{
 		replica,
+		versionReport,
 		agentService,
 		bootOrigin,
 		credentialService,
@@ -404,6 +442,7 @@ func runSettledDaemon(
 
 func settledDaemonComponents(
 	agents *agent.Service,
+	versionReport *daemonVersionReportGate,
 	boot *agent.BootOrigin,
 	control *daemonSettledCredentialConsensus,
 	credentials *credentialservice.Service,
@@ -411,7 +450,10 @@ func settledDaemonComponents(
 	content *daemonContentPeerRuntime,
 	snapshots *daemonLogicalSnapshotRepository,
 ) []phasedDaemonComponent {
-	components := make([]phasedDaemonComponent, 0, 7)
+	components := make([]phasedDaemonComponent, 0, 8)
+	if versionReport != nil {
+		components = append(components, versionReport)
+	}
 	if agents != nil {
 		components = append(components, agents)
 	}

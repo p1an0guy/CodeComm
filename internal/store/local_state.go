@@ -18,6 +18,7 @@ const (
 	MaxUnresolvedCommandsPerOrigin       = 256
 	MaxUnresolvedCommandsPerSession      = 4096
 	ReservedCheckpointCommandsPerSession = 1
+	ReservedVersionReportsPerSession     = 1
 )
 
 var (
@@ -582,14 +583,17 @@ func checkLocalBackpressure(
 	scopeID domain.UUIDv7,
 	kind event.Kind,
 ) error {
-	var scopeCount, sessionCount int64
+	var scopeCount, sessionCount, versionReportCount int64
 	if err := queryOneArgs(
 		conn,
 		`SELECT
 		    count(*) FILTER (
 		        WHERE origin_scope_kind = ?3 AND origin_scope_id = ?4
 		    ),
-		    count(*)
+		    count(*),
+		    count(*) FILTER (
+		        WHERE request_kind = 'membership.version_reported'
+		    )
 		   FROM local_requests
 		  WHERE session_id = ?1
 		    AND recovery_generation = ?2
@@ -603,19 +607,33 @@ func checkLocalBackpressure(
 		func(stmt *sqlite.Stmt) {
 			scopeCount = stmt.ColumnInt64(0)
 			sessionCount = stmt.ColumnInt64(1)
+			versionReportCount = stmt.ColumnInt64(2)
 		},
 	); err != nil {
 		return err
+	}
+	if versionReportCount < 0 ||
+		versionReportCount > ReservedVersionReportsPerSession {
+		return ErrLocalStateIntegrity
 	}
 	sessionLimit := int64(
 		MaxUnresolvedCommandsPerSession -
 			ReservedCheckpointCommandsPerSession,
 	)
-	if kind == event.KindConsensusCheckpoint {
+	effectiveSessionCount := sessionCount - versionReportCount
+	switch kind {
+	case event.KindConsensusCheckpoint:
 		sessionLimit = MaxUnresolvedCommandsPerSession
+	case event.KindMembershipVersionReported:
+		if versionReportCount == ReservedVersionReportsPerSession {
+			return ErrLocalBackpressure
+		}
+		effectiveSessionCount = sessionCount
+		sessionLimit = MaxUnresolvedCommandsPerSession +
+			ReservedVersionReportsPerSession
 	}
 	if scopeCount >= MaxUnresolvedCommandsPerOrigin ||
-		sessionCount >= sessionLimit {
+		effectiveSessionCount >= sessionLimit {
 		return ErrLocalBackpressure
 	}
 	return nil

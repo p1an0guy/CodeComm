@@ -77,6 +77,7 @@ type BootOrigin struct {
 	closed        bool
 	workerStarted bool
 	resultSignal  chan struct{}
+	versionReport *store.LocalCommandRecord
 	clearOnce     sync.Once
 }
 
@@ -206,7 +207,7 @@ func (origin *BootOrigin) SubmitOperatorCommand(
 
 	operationContext, cancel := origin.operationContext(ctx)
 	defer cancel()
-	if err := origin.acquireShared(operationContext); err != nil {
+	if err := origin.acquireSharedReservation(operationContext); err != nil {
 		return operatorcommand.Result{}, err
 	}
 	now := origin.clock()
@@ -360,6 +361,26 @@ func (origin *BootOrigin) RunExclusive(
 		if err := origin.acquireExclusive(operationContext); err != nil {
 			return err
 		}
+		pending, err := origin.drainVersionReportPriorityLocked(
+			operationContext,
+		)
+		if err != nil {
+			origin.releaseExclusive()
+			if bootOriginFatal(err) {
+				origin.recordFatal(err)
+			}
+			return err
+		}
+		if pending {
+			origin.releaseExclusive()
+			if !waitBootOriginRetry(
+				operationContext,
+				pairingOutboxPollInterval,
+			) {
+				return operationContext.Err()
+			}
+			continue
+		}
 		status, err := origin.drainScopeLocked(
 			operationContext,
 			origin.scope,
@@ -456,6 +477,26 @@ func (origin *BootOrigin) RunOrderedBootReservation(
 		if err := origin.acquireExclusive(operationContext); err != nil {
 			return err
 		}
+		pending, err := origin.drainVersionReportPriorityLocked(
+			operationContext,
+		)
+		if err != nil {
+			origin.releaseExclusive()
+			if bootOriginFatal(err) {
+				origin.recordFatal(err)
+			}
+			return err
+		}
+		if pending {
+			origin.releaseExclusive()
+			if !waitBootOriginRetry(
+				operationContext,
+				pairingOutboxPollInterval,
+			) {
+				return operationContext.Err()
+			}
+			continue
+		}
 		status, err := origin.drainScopeLocked(
 			operationContext,
 			origin.scope,
@@ -503,7 +544,7 @@ func (origin *BootOrigin) RunBootReservation(
 	}
 	operationContext, cancel := origin.operationContext(ctx)
 	defer cancel()
-	if err := origin.acquireShared(operationContext); err != nil {
+	if err := origin.acquireSharedReservation(operationContext); err != nil {
 		return err
 	}
 	err := operation(operationContext)
@@ -626,7 +667,7 @@ func (origin *BootOrigin) SubmitVoterSetActivation(
 
 	operationContext, cancel := origin.operationContext(ctx)
 	defer cancel()
-	if err := origin.acquireShared(operationContext); err != nil {
+	if err := origin.acquireSharedReservation(operationContext); err != nil {
 		return store.CommandOutcome{}, err
 	}
 	generation, err := origin.local.CurrentRecoveryGeneration(
@@ -682,7 +723,7 @@ func (origin *BootOrigin) SubmitCredentialAuthorization(
 
 	operationContext, cancel := origin.operationContext(ctx)
 	defer cancel()
-	if err := origin.acquireShared(operationContext); err != nil {
+	if err := origin.acquireSharedReservation(operationContext); err != nil {
 		return store.CommandOutcome{}, err
 	}
 	record, err := origin.reserveCredentialAuthorizationLocked(
@@ -918,7 +959,7 @@ func (origin *BootOrigin) submitDaemonCommand(
 	}
 	operationContext, cancel := origin.operationContext(ctx)
 	defer cancel()
-	if err := origin.acquireShared(operationContext); err != nil {
+	if err := origin.acquireSharedReservation(operationContext); err != nil {
 		return store.CommandOutcome{}, err
 	}
 	record, err := origin.reserveDaemonCommandLocked(
@@ -1066,6 +1107,14 @@ func (origin *BootOrigin) drainScopeLocked(
 	ctx context.Context,
 	scope store.OutboxScope,
 ) (bootDrainStatus, error) {
+	return origin.drainScopeThroughLocked(ctx, scope, "")
+}
+
+func (origin *BootOrigin) drainScopeThroughLocked(
+	ctx context.Context,
+	scope store.OutboxScope,
+	stopAfter domain.UUIDv7,
+) (bootDrainStatus, error) {
 	for {
 		record, found, err := origin.local.ClaimNextOutbox(ctx, scope)
 		if err != nil {
@@ -1073,6 +1122,12 @@ func (origin *BootOrigin) drainScopeLocked(
 		}
 		if !found {
 			return bootDrainEmpty, nil
+		}
+		if stopAfter.Valid() && record.EventID != stopAfter {
+			return bootDrainEmpty, fmt.Errorf(
+				"%w: version report is not the head of its boot scope",
+				ErrBootOriginIntegrity,
+			)
 		}
 		signed, err := origin.validateBootOutboxRecord(record, scope)
 		if err != nil {
@@ -1160,7 +1215,56 @@ func (origin *BootOrigin) drainScopeLocked(
 			}
 		}
 		origin.signalResult()
+		if record.EventID == stopAfter {
+			return bootDrainEmpty, nil
+		}
 	}
+}
+
+func (origin *BootOrigin) drainVersionReportPriorityLocked(
+	ctx context.Context,
+) (bool, error) {
+	priority := origin.versionReportPriority()
+	if priority == nil {
+		return false, nil
+	}
+	current, found, err := origin.local.LookupRequest(
+		ctx,
+		priority.ClientInstanceID,
+		priority.RequestID,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf(
+			"%w: priority version report request is missing",
+			ErrBootOriginIntegrity,
+		)
+	}
+	if current.State == store.LocalRequestResolved {
+		return true, nil
+	}
+	if current.State == store.LocalRequestAbandoned ||
+		current.State == store.LocalRequestExpired {
+		return false, fmt.Errorf(
+			"%w: priority version report became terminal without an outcome",
+			ErrBootOriginIntegrity,
+		)
+	}
+	scope := store.OutboxScope{
+		OriginDeviceID:  priority.OriginDeviceID,
+		OriginScopeKind: priority.OriginScopeKind,
+		OriginScopeID:   priority.OriginScopeID,
+	}
+	if _, err := origin.drainScopeThroughLocked(
+		ctx,
+		scope,
+		priority.EventID,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (origin *BootOrigin) validateBootOutboxRecord(
@@ -1210,6 +1314,10 @@ func (origin *BootOrigin) drainBootQueues(
 		return false, err
 	}
 	defer origin.releaseShared()
+	if pending, err := origin.drainVersionReportPriorityLocked(ctx); err != nil ||
+		pending {
+		return pending, err
+	}
 	scopes, err := origin.local.OutboxScopes(ctx)
 	if err != nil {
 		return false, err
@@ -1232,6 +1340,25 @@ func (origin *BootOrigin) drainBootQueues(
 		pending = pending || status == bootDrainBlocked
 	}
 	return pending, nil
+}
+
+func (origin *BootOrigin) versionReportPriority() *store.LocalCommandRecord {
+	if origin == nil {
+		return nil
+	}
+	origin.mu.Lock()
+	defer origin.mu.Unlock()
+	if origin.versionReport == nil {
+		return nil
+	}
+	priority := *origin.versionReport
+	priority.SignedProposal = bytes.Clone(priority.SignedProposal)
+	if priority.Outcome != nil {
+		outcome := *priority.Outcome
+		outcome.JSON = bytes.Clone(outcome.JSON)
+		priority.Outcome = &outcome
+	}
+	return &priority
 }
 
 func (origin *BootOrigin) run() {
@@ -1365,6 +1492,23 @@ func (origin *BootOrigin) acquireShared(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// acquireSharedReservation prevents ordinary boot-scope commands from being
+// sequenced ahead of a startup version report or its corrective successor.
+func (origin *BootOrigin) acquireSharedReservation(ctx context.Context) error {
+	for {
+		if err := origin.acquireShared(ctx); err != nil {
+			return err
+		}
+		if origin.versionReportPriority() == nil {
+			return nil
+		}
+		origin.releaseShared()
+		if !waitBootOriginRetry(ctx, pairingOutboxPollInterval) {
+			return ctx.Err()
+		}
+	}
 }
 
 func (origin *BootOrigin) releaseShared() {
