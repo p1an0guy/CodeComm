@@ -3,15 +3,37 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/raft"
+	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/snapshotbuilder"
 	"github.com/ijonahch/codecomm/internal/store"
 )
+
+func TestRetryableDaemonSnapshotPublicationErrors(t *testing.T) {
+	for _, candidate := range []error{
+		raft.ErrNotLeader,
+		consensus.ErrProposalForwardingUnavailable,
+		fmt.Errorf(
+			"forward checkpoint: %w",
+			consensus.ErrProposalForwardingUnavailable,
+		),
+	} {
+		if !retryableDaemonSnapshotPublication(candidate) {
+			t.Fatalf("error %v was not retryable", candidate)
+		}
+	}
+	if retryableDaemonSnapshotPublication(errors.New("corrupt snapshot")) {
+		t.Fatal("unclassified snapshot failure was retryable")
+	}
+}
 
 func TestDaemonLogicalSnapshotPublisherWakesForAuthorizationChange(
 	t *testing.T,

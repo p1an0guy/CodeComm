@@ -218,6 +218,7 @@ func retryableDaemonSnapshotPublication(err error) bool {
 	return errors.Is(err, raft.ErrNotLeader) ||
 		errors.Is(err, raft.ErrLeadershipLost) ||
 		errors.Is(err, raft.ErrLeadershipTransferInProgress) ||
+		errors.Is(err, consensus.ErrProposalForwardingUnavailable) ||
 		errors.Is(err, consensus.ErrLeadershipEpochChanged) ||
 		errors.Is(err, consensus.ErrCheckpointProofUnavailable) ||
 		errors.Is(err, store.ErrLogicalSnapshotNotCovered) ||
