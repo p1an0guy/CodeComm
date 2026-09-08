@@ -1,0 +1,32 @@
+name: phase-3-nightly
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase-3-nightly
+  cancel-in-progress: false
+
+jobs:
+  coordination-growth:
+    name: Durable 10k coordination growth
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Enforce frozen 10k-event budget
+        env:
+          CODECOMM_PHASE3_PERFORMANCE: "1"
+        run: >-
+          go test -count=1 -timeout 35m -v
+          -run "^TestCoordinationGrowthBudget$"
+          ./internal/phase3bench
