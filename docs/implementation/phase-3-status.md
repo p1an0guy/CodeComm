@@ -243,6 +243,10 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   remaps explicit manual sources, limits multicast to listener-backed families, and immediately
   re-advertises. Total address or bind loss leaves no published endpoint, selected route, or stale
   multicast delegate; unchanged refresh recovers an exhausted listener and later address return.
+- A portable production-composition test removes one follower's interface past credential expiry,
+  wakes it on a different literal address, and proves signed discovery, listener replacement,
+  credential renewal, content restoration, strong-write convergence, and cold reopen without
+  operator action. A raced pre-rebind accept is discarded without stopping ingress.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -279,8 +283,7 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The remaining Phase 3 fault matrix needs wake plus address change and in-flight full-plane
-  revocation.
+- The remaining Phase 3 fault matrix needs in-flight full-plane revocation.
 - The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
   real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
   mapping, empty outbox, and full commitment-history verification. Its first complete run grew
@@ -304,6 +307,7 @@ test gaps above remain open.
 Primary tests:
 
 - `TestDaemonProductionMeshComposition`
+- `TestDaemonProductionWakeAddressChangeComposition`
 - `TestDaemonProductionVersionUpgradeComposition`
 - `TestDaemonProductionMeshIntegrityProofs`
 - `TestDaemonStartupCommitsChangedMembershipVersionReport`
@@ -372,6 +376,7 @@ Primary tests:
 - `TestDaemonDiscoveryRefreshBindFailureWithdrawsUntilRecovery`
 - `TestDaemonDiscoveryRefreshRebindsSameAddressAfterInterfaceReplacement`
 - `TestDaemonPeerListenerSet*`
+- `TestIngressContinuesAfterAcceptedConnectionGenerationInvalidation`
 - `TestConsensusRouteTableSelectedAddressRefreshClosesTrackedConnections`
 - `TestIngressClosesOnlyConnectionsBoundToVanishedAddress`
 - `TestOpenSelectedMulticastJoinsOnlyListenerFamilies`
