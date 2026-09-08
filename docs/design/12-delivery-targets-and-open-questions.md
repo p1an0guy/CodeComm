@@ -95,8 +95,23 @@ Resource budgets, at two scopes because §3.2 allows several session daemons per
 | Session Git/control/artifact storage | Never admit work above `session_git_storage_limit_bytes`; canonical/conflict/explicit-pin refs are never quota-evicted |
 | Unpinned retained drafts | ≤100 snapshots per source device across all streams; ≤256 explicit local pins per session |
 
-The growth target uses a frozen representative mix of bounded task/lease/activity events; it is not
-a worst-case claim against 256 KiB events, whose retained bytes are necessarily linear.
+The frozen v2 growth trace is 500 identical 20-command blocks: per block, two `task.created`,
+seven `task.updated` (one stale-version rejection), five `activity.recorded`, and two each of
+`lease.acquired`, `lease.renewed`, and `lease.released`; totals are 9,500 accepted and 500 rejected.
+It sends 3,642,500 canonical local-request bytes and 8,882,778 signed-proposal bytes through durable
+reservation, outbox, Raft, reducer, and SQLite paths, forcing a production checkpoint every 500
+accepted commands (19 total). SHA-256
+`c92094c9829132f0f96bf859e81c3bce8837b9bb8bcd5c948312abd159d26fe6` pins framed requests,
+proposals, and expected outcomes. Measurement subtracts a clean closed baseline, includes
+`state.db` sidecars and every `consensus/` file, disables automatic Raft snapshots to retain the
+complete log, then reopens and verifies every request/checkpoint mapping, heads, projection
+commitments, empty outbox, and full commitment history. This is representative, not a worst-case
+claim against 256 KiB events, whose retained bytes are necessarily linear.
+
+The first complete measurement (2026-09-08, `darwin/arm64`) grew from 1,044,480 to 116,514,816
+bytes: 115,470,336 bytes (110.121 MiB), so the 50 MiB gate **fails**. SQLite contributed
+82,030,592 growth bytes and retained consensus state 33,439,744. The target remains unchanged and
+unconfirmed pending storage-layout/retention work or an explicitly reviewed revision.
 
 Confirmation is split by plane, because three targets measure mechanisms that do not exist until
 phase 5: consensus and control targets plus the coordination-growth budget confirm at **phase 3**;

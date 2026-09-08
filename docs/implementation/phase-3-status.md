@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission/rebootstrap, content
 credentials, endpoint and proposal relay, voter reconciliation, and revocation are
 production-composed; Phase 3 exit gate remains open
-Last updated: 2026-09-02
+Last updated: 2026-09-08
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -239,6 +239,11 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
+- A bounded directed-stream harness injects one-way drop, delay, duplicate, and truncation into
+  live Raft links. Each case commits through the healthy quorum, forces a new post-commit stream,
+  proves the target remains behind while the exact fault generation is active, then heals,
+  converges, cold-reopens, and verifies commitment history. Controller generation retirement,
+  connection ownership, cancellation, deadlines, and counters pass repeated race tests.
 
 ## Open Exit Gates
 
@@ -255,12 +260,18 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The remaining Phase 3 fault matrix needs directed drop/delay/duplicate/truncate links, current/N-1
-  upgrade convergence, Raft/SQLite durability faults, killed-leader recovery, wake plus address
-  change, and in-flight full-plane revocation.
-- §14's Phase 3 control percentiles and 10k-event coordination-growth budget remain unmeasured; the
-  frozen growth trace and benchmark runner do not yet exist. Phase 6 reviews this evidence but is
-  not its first confirmation gate. Git availability/storage measurements remain Phase 5 work.
+- The remaining Phase 3 fault matrix needs current/N-1 upgrade convergence, Raft/SQLite durability
+  faults, killed-leader recovery, wake plus address change, and in-flight full-plane revocation.
+- The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
+  real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
+  mapping, empty outbox, and full commitment-history verification. Its first complete run grew
+  coordination storage by 115,470,336 bytes (110.121 MiB), failing the 50 MiB gate: `state.db`
+  contributed 82,030,592 bytes and retained consensus state 33,439,744. A live sample at 4,284
+  results found `command_results` occupying 17,625,088 bytes with 7,240,315 unused because each
+  proposal-plus-mutation row consumes a 4 KiB page. The requirement remains unchanged; Phase 3
+  needs storage-layout/retention work or a reviewed revision.
+- §14's Phase 3 control percentiles remain unmeasured. Phase 6 reviews this evidence but is not its
+  first confirmation gate. Git availability/storage measurements remain Phase 5 work.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -315,6 +326,7 @@ Primary tests:
 - `TestSecureMeshIsolatedMinorityCannotEscalate`
 - `TestSecureMeshFollowerForwardsOnlyToObservedLeader`
 - `TestSecureMeshTopologyPartitionClosesEstablishedConnections`
+- `TestSecureMeshDirectedFaultsHealAndReopen`
 - `TestOpenNodeUsesInjectedDeviceAddressedTransport`
 - `TestInspectDaemonMeshState*`
 - `TestSettledReplicaImportsAndReopensAuthorityHandoff`
@@ -346,6 +358,8 @@ Primary tests:
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
 - `TestFSMSemanticRaftSnapshotCaptureAndRestoreUsesCommandWatermark`
+- `TestCoordinationGrowthWorkloadContract`
+- `TestCoordinationGrowthBudget` (currently fails the recorded 50 MiB gate)
 
 Run:
 
