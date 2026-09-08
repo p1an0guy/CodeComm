@@ -244,6 +244,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   proves the target remains behind while the exact fault generation is active, then heals,
   converges, cold-reopens, and verifies commitment history. Controller generation retirement,
   connection ownership, cancellation, deadlines, and counters pass repeated race tests.
+- A deterministic three-voter durability test holds one follower immediately before FSM apply,
+  commits through the healthy quorum, and proves the follower retained the exact committed Raft
+  command while its SQLite heads, projections, and applied watermark remained unchanged. A one-shot
+  pre-transaction failure halts that follower; ordinary restart replays the retained command,
+  converges, verifies its Raft binding, and scrubs every replica's commitment history. This closes
+  the cross-layer crash boundary together with the per-write transaction rollback and WAL-layout
+  tests, and passes repeated and race runs without a production failpoint.
 - A nightly leader-replacement gate severs every established leader link before stopping the node,
   preventing graceful transfer, then measures until the surviving majority commits. Across 20
   restart-and-converge cycles the quiet three-voter baseline measured p95 2.087 s and maximum
@@ -265,8 +272,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The remaining Phase 3 fault matrix needs current/N-1 upgrade convergence, Raft/SQLite durability
-  faults, wake plus address change, and in-flight full-plane revocation.
+- The remaining Phase 3 fault matrix needs current/N-1 upgrade convergence, wake plus address
+  change, and in-flight full-plane revocation.
 - The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
   real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
   mapping, empty outbox, and full commitment-history verification. Its first complete run grew
@@ -365,6 +372,7 @@ Primary tests:
 - `TestVerifyAndStageLogicalSnapshotReplaysRealReducerHistory`
 - `TestInstallStandaloneLogicalSnapshotSuccessorPreservesPredecessorAttestationPrefix`
 - `TestFSMSemanticRaftSnapshotCaptureAndRestoreUsesCommandWatermark`
+- `TestSecureMeshRaftCommitSQLiteReplayDurability`
 - `TestCoordinationGrowthWorkloadContract`
 - `TestCoordinationGrowthBudget` (currently fails the recorded 50 MiB gate)
 
