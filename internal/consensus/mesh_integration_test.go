@@ -40,6 +40,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/testharness/faultnet"
 	"github.com/ijonahch/codecomm/internal/transport"
 	"github.com/ijonahch/codecomm/internal/voteractivation"
 	"go.etcd.io/bbolt"
@@ -418,6 +419,7 @@ type secureMeshHarness struct {
 	nodes                     []*secureMeshNode
 	resolver                  secureMeshResolver
 	topology                  *secureMeshTopology
+	faults                    *faultnet.Controller
 	coverage                  *configurationCoverageCollector
 	manualVoterReconciliation bool
 	compactSnapshots          bool
@@ -652,8 +654,13 @@ func newSecureMeshHarnessWithOptions(
 		return identities[left].deviceID < identities[right].deviceID
 	})
 
+	faults, err := faultnet.NewController(2 * time.Second)
+	if err != nil {
+		t.Fatalf("faultnet.NewController(): %v", err)
+	}
 	harness := &secureMeshHarness{
 		topology:                  newSecureMeshTopology(),
+		faults:                    faults,
 		resolver:                  make(secureMeshResolver, len(identities)),
 		manualVoterReconciliation: options.manualVoterReconciliation,
 		compactSnapshots:          options.compactSnapshots,
@@ -888,6 +895,7 @@ func (harness *secureMeshHarness) startNode(
 				Dialer: secureMeshDialer{
 					localDeviceID: candidate.identity.deviceID,
 					topology:      harness.topology,
+					faults:        harness.faults,
 				},
 				VerifyExpectedPeer:   verifiers.VerifyExpectedConsensusPeer,
 				AuthorizePeer:        gate.AuthorizePeer,
@@ -1036,6 +1044,9 @@ func (harness *secureMeshHarness) close(t *testing.T) {
 	for index := len(harness.nodes) - 1; index >= 0; index-- {
 		harness.stopNode(t, harness.nodes[index])
 		clear(harness.nodes[index].identity.private)
+	}
+	if err := harness.faults.Close(); err != nil {
+		t.Errorf("fault controller Close(): %v", err)
 	}
 }
 
@@ -1843,6 +1854,7 @@ func (resolver secureMeshResolver) ResolveConsensusEndpoints(
 type secureMeshDialer struct {
 	localDeviceID domain.DeviceID
 	topology      *secureMeshTopology
+	faults        *faultnet.Controller
 }
 
 func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
@@ -1859,6 +1871,7 @@ func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
 	t.Cleanup(func() { _ = remote.Close() })
 	tracked, allowed := topology.trackConnection(
 		localDeviceID,
+		remoteDeviceID,
 		endpoint,
 		address,
 		local,
@@ -1892,6 +1905,7 @@ func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
 	racingLocal, racingRemote := net.Pipe()
 	if connection, allowed := topology.trackConnection(
 		localDeviceID,
+		remoteDeviceID,
 		endpoint,
 		address,
 		racingLocal,
@@ -1909,8 +1923,16 @@ func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
 	if resolved, allowed := topology.resolve(
 		localDeviceID,
 		endpoint,
-	); !allowed || resolved != address {
-		t.Fatalf("healed resolution = (%q, %t), want (%q, true)", resolved, allowed, address)
+	); !allowed ||
+		resolved.deviceID != remoteDeviceID ||
+		resolved.address != address {
+		t.Fatalf(
+			"healed resolution = (%+v, %t), want (%s, %q, true)",
+			resolved,
+			allowed,
+			remoteDeviceID,
+			address,
+		)
 	}
 }
 
@@ -1918,7 +1940,7 @@ func (dialer secureMeshDialer) DialConsensusEndpoint(
 	ctx context.Context,
 	endpoint netip.AddrPort,
 ) (net.Conn, error) {
-	address, allowed := dialer.topology.resolve(
+	target, allowed := dialer.topology.resolve(
 		dialer.localDeviceID,
 		endpoint,
 	)
@@ -1926,18 +1948,32 @@ func (dialer secureMeshDialer) DialConsensusEndpoint(
 		return nil, transport.ErrConsensusEndpointUnavailable
 	}
 	var networkDialer net.Dialer
-	connection, err := networkDialer.DialContext(ctx, "tcp4", address)
+	connection, err := networkDialer.DialContext(
+		ctx,
+		"tcp4",
+		target.address,
+	)
 	if err != nil {
+		return nil, err
+	}
+	faulted, err := dialer.faults.Wrap(
+		connection,
+		dialer.localDeviceID,
+		target.deviceID,
+	)
+	if err != nil {
+		_ = connection.Close()
 		return nil, err
 	}
 	tracked, allowed := dialer.topology.trackConnection(
 		dialer.localDeviceID,
+		target.deviceID,
 		endpoint,
-		address,
-		connection,
+		target.address,
+		faulted,
 	)
 	if !allowed {
-		_ = connection.Close()
+		_ = faulted.Close()
 		return nil, transport.ErrConsensusEndpointUnavailable
 	}
 	return tracked, nil
@@ -2028,30 +2064,32 @@ func (topology *secureMeshTopology) setPartition(
 func (topology *secureMeshTopology) resolve(
 	localDeviceID domain.DeviceID,
 	endpoint netip.AddrPort,
-) (string, bool) {
+) (secureMeshTarget, bool) {
 	topology.mu.RLock()
 	defer topology.mu.RUnlock()
 	target, exists := topology.targets[endpoint]
 	if !exists ||
 		topology.partitioned[localDeviceID] ||
 		topology.partitioned[target.deviceID] {
-		return "", false
+		return secureMeshTarget{}, false
 	}
-	return target.address, true
+	return target, true
 }
 
 func (topology *secureMeshTopology) trackConnection(
 	localDeviceID domain.DeviceID,
+	remoteDeviceID domain.DeviceID,
 	endpoint netip.AddrPort,
 	address string,
 	connection net.Conn,
-) (net.Conn, bool) {
+) (*secureMeshTrackedConnection, bool) {
 	if topology == nil || connection == nil {
 		return nil, false
 	}
 	topology.mu.Lock()
 	target, exists := topology.targets[endpoint]
 	if !exists ||
+		target.deviceID != remoteDeviceID ||
 		target.address != address ||
 		topology.partitioned[localDeviceID] ||
 		topology.partitioned[target.deviceID] {
@@ -2062,7 +2100,7 @@ func (topology *secureMeshTopology) trackConnection(
 		Conn:           connection,
 		topology:       topology,
 		localDeviceID:  localDeviceID,
-		remoteDeviceID: target.deviceID,
+		remoteDeviceID: remoteDeviceID,
 	}
 	topology.connections[tracked] = struct{}{}
 	topology.mu.Unlock()
