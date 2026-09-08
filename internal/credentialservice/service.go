@@ -113,6 +113,10 @@ type Service struct {
 	startMu sync.Mutex
 	started bool
 	closed  bool
+	// shutdownInactive retains the immutable applied cut captured before the
+	// consensus owner closes. Wait uses it after the renewal worker exits so a
+	// self-revocation cannot race durable epoch-key erasure.
+	shutdownInactive *peerauth.Snapshot
 
 	stateMu                sync.RWMutex
 	certificates           map[uint64]retainedCertificate
@@ -120,6 +124,7 @@ type Service struct {
 	fatalErr               error
 
 	closeOnce sync.Once
+	closeErr  error
 }
 
 // New validates dependencies without performing native-store or network I/O.
@@ -349,6 +354,13 @@ func (service *Service) BeginClose() error {
 		service.startMu.Unlock()
 		return nil
 	}
+	snapshot, err := service.consensus.PeerAdmissionSnapshot()
+	if err == nil && snapshot != nil {
+		member, exists := snapshot.Member(service.deviceID)
+		if exists && member.Status != device.StatusActive {
+			service.shutdownInactive = snapshot
+		}
+	}
 	service.closed = true
 	started := service.started
 	service.cancel()
@@ -366,6 +378,16 @@ func (service *Service) Wait() error {
 	}
 	<-service.done
 	service.closeOnce.Do(func() {
+		service.startMu.Lock()
+		inactive := service.shutdownInactive
+		service.shutdownInactive = nil
+		service.startMu.Unlock()
+		if inactive != nil {
+			service.closeErr = service.eraseInactiveMemberKeys(
+				context.Background(),
+				inactive,
+			)
+		}
 		service.stateMu.Lock()
 		clearRetainedCertificates(service.certificates)
 		clear(service.certificates)
@@ -373,7 +395,7 @@ func (service *Service) Wait() error {
 		service.provisionalCertificate = nil
 		service.stateMu.Unlock()
 	})
-	return nil
+	return service.closeErr
 }
 
 // Close stops and joins the service.

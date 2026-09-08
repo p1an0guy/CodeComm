@@ -656,6 +656,61 @@ func TestRevocationErasesRetainedAndCandidateKeys(t *testing.T) {
 	}
 }
 
+func TestCloseErasesRevokedKeysWithoutAnotherReconcile(t *testing.T) {
+	currentPrivate := servicePrivateKey(0x75)
+	fixture := newServiceFixture(t, currentPrivate)
+	binding := serviceBinding(
+		t,
+		fixture,
+		1,
+		currentPrivate.Public().(ed25519.PublicKey),
+	)
+	fixture.consensus.advance(
+		t,
+		fixture.authorization(binding, fixture.now, 1),
+	)
+	candidateReference := serviceEpochReference(t, fixture.deviceID, 2)
+	candidatePrivate := servicePrivateKey(0x76)
+	if err := fixture.secrets.Create(
+		t.Context(),
+		candidateReference,
+		candidatePrivate,
+	); err != nil {
+		t.Fatal(err)
+	}
+	clear(candidatePrivate)
+
+	member, found := fixture.consensus.snapshot.Member(fixture.deviceID)
+	if !found {
+		t.Fatal("local member absent")
+	}
+	member.Status = device.StatusRevoked
+	member.EntityVersion++
+	fixture.consensus.mu.Lock()
+	next, err := fixture.consensus.snapshot.Advance(peerauth.Changes{
+		AdvancesEventChain: true,
+		Devices:            []device.Device{member},
+	})
+	if err == nil {
+		fixture.consensus.snapshot = next
+	}
+	fixture.consensus.mu.Unlock()
+	if err != nil {
+		t.Fatalf("revoke snapshot: %v", err)
+	}
+
+	if err := fixture.service.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	for _, epoch := range []uint64{1, 2} {
+		if fixture.secrets.has(
+			serviceEpochReference(t, fixture.deviceID, epoch),
+		) {
+			t.Fatalf("revoked epoch %d key remains after close", epoch)
+		}
+	}
+}
+
 func newServiceFixture(
 	t *testing.T,
 	initialEpochKey ed25519.PrivateKey,
