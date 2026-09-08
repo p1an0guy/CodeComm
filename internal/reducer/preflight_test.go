@@ -261,6 +261,37 @@ func TestPreflightHaltsBeforeUnknownKindOrUnsupportedApplyLevel(t *testing.T) {
 	}
 }
 
+func TestPreflightHaltsWhenCommittedFloorExceedsBinary(t *testing.T) {
+	t.Parallel()
+
+	fixture := newReducerFixture(t)
+	fixture.state.sessionPolicy.Values.ClusterMinApplyLevel =
+		int64(event.MaxSupportedApplyLevel + 1)
+	for id, member := range fixture.state.devices {
+		member.MaxApplyLevel = event.MaxSupportedApplyLevel + 1
+		fixture.state.devices[id] = member
+	}
+	signed := buildTaskProposal(
+		t,
+		fixture,
+		event.ActorAgent,
+		event.KindTaskCreated,
+		0,
+		`{"priority":2,"title":"task"}`,
+	)
+	outcome, err := Reduce(fixture.state, signed)
+	if !errors.Is(err, ErrApplyLevelUnsupported) {
+		t.Fatalf(
+			"Reduce() = (%#v, %v), want ErrApplyLevelUnsupported",
+			outcome,
+			err,
+		)
+	}
+	if !reflect.DeepEqual(outcome, Outcome{}) {
+		t.Fatalf("unsupported binary produced outcome %#v", outcome)
+	}
+}
+
 func TestSessionBindingMismatchConsumesNothing(t *testing.T) {
 	t.Parallel()
 

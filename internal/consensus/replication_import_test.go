@@ -148,6 +148,65 @@ func TestSettledReplicaImportsRelayedBatchWithoutRaftProvenance(
 	}
 }
 
+func TestOpenSettledReplicaRefusesCommittedApplyFloorAboveBinary(
+	t *testing.T,
+) {
+	initial, _, deviceID := nodeTestInitialState(t)
+	setNodeTestApplyFloorAboveBinary(&initial)
+	statePath := filepath.Join(t.TempDir(), "state", "state.db")
+	database, err := store.Open(
+		context.Background(),
+		store.Options{Path: statePath},
+	)
+	if err != nil {
+		t.Fatalf("store.Open(): %v", err)
+	}
+	if _, err := database.Initialize(context.Background(), initial); err != nil {
+		_ = database.Close()
+		t.Fatalf("Initialize(): %v", err)
+	}
+	storeSettledReplicaTestConfiguration(
+		t,
+		database,
+		raft.Configuration{Servers: []raft.Server{{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(deviceID),
+			Address:  raft.ServerAddress(deviceID),
+		}}},
+	)
+	if _, err := database.EnterSettledNonvoter(
+		context.Background(),
+		domain.Timestamp("2026-09-08T12:00:00Z"),
+	); err != nil {
+		_ = database.Close()
+		t.Fatalf("EnterSettledNonvoter(): %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+
+	replica, err := OpenSettledReplica(
+		context.Background(),
+		SettledReplicaOptions{
+			StatePath:     statePath,
+			OriginBootID:  nodeTestBootID1,
+			LocalDeviceID: deviceID,
+			Clock:         nodeTestClock(),
+		},
+	)
+	if replica != nil {
+		_ = replica.Close()
+		t.Fatal("OpenSettledReplica(incompatible state) returned a replica")
+	}
+	if !errors.Is(err, reducer.ErrApplyLevelUnsupported) {
+		t.Fatalf(
+			"OpenSettledReplica(incompatible state) error = %v, want %v",
+			err,
+			reducer.ErrApplyLevelUnsupported,
+		)
+	}
+}
+
 func TestSettledReplicaAcknowledgementRequiresLiveRelayObservation(
 	t *testing.T,
 ) {

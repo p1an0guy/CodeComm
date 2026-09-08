@@ -547,6 +547,9 @@ func openNode(
 	if err != nil {
 		return nil, fmt.Errorf("consensus: decode initial state: %w", err)
 	}
+	if err := decoded.Reducer.ValidateBinaryApplyLevel(); err != nil {
+		return nil, err
+	}
 	if options.Single {
 		voters := decoded.VoterDeviceIDs()
 		if len(voters) != 1 || voters[0] != options.ServerID {
@@ -2627,7 +2630,16 @@ func (node *SingleNode) apply(
 		return committed, nil
 	}
 	if owner {
+		compatibilityErr := node.fsm.preflightCompatibility(proposal)
 		switch {
+		case compatibilityErr != nil:
+			node.finishProposal(
+				proposal.EventID,
+				flight,
+				store.ApplyResult{},
+				compatibilityErr,
+				false,
+			)
 		case node.IsLeader():
 			if options.leaderIngressDeviceID.Valid() &&
 				!options.leaderIngressAlreadyCharged &&

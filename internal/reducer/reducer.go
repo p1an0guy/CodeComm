@@ -383,15 +383,44 @@ func prepareReduction(
 		return reductionContext{}, Outcome{}, false,
 			ErrReducerCapacityExhausted
 	}
-	proposal := signed.Proposal()
+	if err := state.PreflightCompatibility(signed.Proposal()); err != nil {
+		return reductionContext{}, Outcome{}, false, err
+	}
+
+	context, outcome, done, err := beginReduction(state, signed)
+	return context, outcome, done, err
+}
+
+// ValidateBinaryApplyLevel rejects a committed state whose enabled reducer
+// floor exceeds this binary. Callers use it before starting consensus or
+// settled-replica network surfaces.
+func (state State) ValidateBinaryApplyLevel() error {
 	clusterApplyLevel := state.sessionPolicy.Values.ClusterMinApplyLevel
 	if clusterApplyLevel < 1 {
-		return reductionContext{}, Outcome{}, false,
-			invalidState("cluster apply level is below one")
+		return invalidState("cluster apply level is below one")
 	}
+	if uint64(clusterApplyLevel) > event.MaxSupportedApplyLevel {
+		return fmt.Errorf(
+			"%w: binary supports %d, cluster requires %d",
+			ErrApplyLevelUnsupported,
+			event.MaxSupportedApplyLevel,
+			clusterApplyLevel,
+		)
+	}
+	return nil
+}
+
+// PreflightCompatibility rejects a command that this binary or the committed
+// cluster floor cannot interpret. Leaders call it before Raft enqueue; FSM
+// apply repeats it for retained or otherwise bypassed log entries.
+func (state State) PreflightCompatibility(proposal event.Proposal) error {
+	if err := state.ValidateBinaryApplyLevel(); err != nil {
+		return err
+	}
+	clusterApplyLevel := state.sessionPolicy.Values.ClusterMinApplyLevel
 	if proposal.MinApplyLevel > event.MaxSupportedApplyLevel ||
 		proposal.MinApplyLevel > uint64(clusterApplyLevel) {
-		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+		return fmt.Errorf(
 			"%w: event requires %d, binary supports %d, cluster enables %d",
 			ErrApplyLevelUnsupported,
 			proposal.MinApplyLevel,
@@ -400,22 +429,20 @@ func prepareReduction(
 		)
 	}
 	if _, registered := event.LookupKind(proposal.Kind); !registered {
-		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+		return fmt.Errorf(
 			"%w: %q",
 			ErrKindNotImplemented,
 			proposal.Kind,
 		)
 	}
 	if !implementedKind(proposal.Kind) {
-		return reductionContext{}, Outcome{}, false, fmt.Errorf(
+		return fmt.Errorf(
 			"%w: %q",
 			ErrKindNotImplemented,
 			proposal.Kind,
 		)
 	}
-
-	context, outcome, done, err := beginReduction(state, signed)
-	return context, outcome, done, err
+	return nil
 }
 
 func implementedKind(kind event.Kind) bool {

@@ -590,12 +590,29 @@ func TestPolicyChangedEnforcesApplyLevelMonotonicityAndCapability(t *testing.T) 
 			1,
 			policyPayload(t, values),
 		)
-		assertRejectedCode(
-			t,
+		context, outcome, done, err := beginReduction(
 			fixture.state,
 			proposal,
-			CodeClusterApplyLevelDecrease,
 		)
+		if err != nil || done {
+			t.Fatalf(
+				"beginReduction() = (%#v, %t, %v), want active context",
+				outcome,
+				done,
+				err,
+			)
+		}
+		outcome, err = reducePolicyChanged(context)
+		if err != nil ||
+			outcome.Status != StatusRejected ||
+			outcome.Code != CodeClusterApplyLevelDecrease {
+			t.Fatalf(
+				"reducePolicyChanged() = (%#v, %v), want %s",
+				outcome,
+				err,
+				CodeClusterApplyLevelDecrease,
+			)
+		}
 	})
 
 	t.Run("unsupported active device rejects", func(t *testing.T) {

@@ -115,6 +115,9 @@ func OpenSettledReplica(
 	if err != nil {
 		return nil, err
 	}
+	if err := decoded.Reducer.ValidateBinaryApplyLevel(); err != nil {
+		return nil, err
+	}
 	if err := validateSettledReplicaEligibility(
 		ctx,
 		database,

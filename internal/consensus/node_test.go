@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2297,6 +2298,148 @@ func TestCommittedMalformedCommandHaltsSingleNodeFSM(t *testing.T) {
 	}
 }
 
+func TestNodeRefusesCommittedApplyFloorAboveBinary(t *testing.T) {
+	root := t.TempDir()
+	initial, _, deviceID := nodeTestInitialState(t)
+	setNodeTestApplyFloorAboveBinary(&initial)
+	options := SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "state", "state.db"),
+		ConsensusDir: filepath.Join(root, "consensus"),
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	}
+
+	node, err := OpenSingleNode(context.Background(), options)
+	if node != nil {
+		_ = node.Close()
+		t.Fatal("OpenSingleNode(incompatible genesis) returned a node")
+	}
+	if !errors.Is(err, reducer.ErrApplyLevelUnsupported) {
+		t.Fatalf(
+			"OpenSingleNode(incompatible genesis) error = %v, want %v",
+			err,
+			reducer.ErrApplyLevelUnsupported,
+		)
+	}
+
+	options.InitialState = nil
+	node, err = OpenSingleNode(context.Background(), options)
+	if node != nil {
+		_ = node.Close()
+		t.Fatal("OpenSingleNode(incompatible reopen) returned a node")
+	}
+	if !errors.Is(err, reducer.ErrApplyLevelUnsupported) {
+		t.Fatalf(
+			"OpenSingleNode(incompatible reopen) error = %v, want %v",
+			err,
+			reducer.ErrApplyLevelUnsupported,
+		)
+	}
+}
+
+func TestProposalCompatibilityRejectedBeforeRaft(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]json.RawMessage)
+		want   error
+	}{
+		{
+			name: "unknown kind at committed floor",
+			mutate: func(object map[string]json.RawMessage) {
+				object["kind"] = json.RawMessage(`"task.future"`)
+			},
+			want: reducer.ErrKindNotImplemented,
+		},
+		{
+			name: "event above committed floor",
+			mutate: func(object map[string]json.RawMessage) {
+				object["kind"] = json.RawMessage(`"task.future"`)
+				object["min_apply_level"] = json.RawMessage(`2`)
+			},
+			want: reducer.ErrApplyLevelUnsupported,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			node, identityPrivate, deviceID :=
+				openApplyAtGenerationTestNode(t)
+			base := nodeTestTaskEvent(
+				t,
+				identityPrivate,
+				deviceID,
+				nodeTestBootID1,
+				nodeTestEventID1,
+				nodeTestTaskID1,
+				nodeTestTimestamp1,
+				1,
+				"pre-Raft compatibility",
+			)
+			command := nodeTestResignEvent(
+				t,
+				base.CanonicalBytes(),
+				identityPrivate,
+				test.mutate,
+			)
+			signed, err := event.ParseAndVerify(
+				command,
+				event.VerificationContext{
+					SessionID:         nodeTestSessionID,
+					WorkspaceID:       nodeTestWorkspaceID,
+					IdentityPublicKey: identityPrivate.Public().(ed25519.PublicKey),
+				},
+			)
+			if err != nil {
+				t.Fatalf("ParseAndVerify(): %v", err)
+			}
+			before, err := node.View(testContext(t))
+			if err != nil {
+				t.Fatalf("View(before): %v", err)
+			}
+			lastIndex, err := node.stable.LastIndex()
+			if err != nil {
+				t.Fatalf("LastIndex(before): %v", err)
+			}
+
+			result, err := node.Apply(testContext(t), signed)
+			if !errors.Is(err, test.want) {
+				t.Fatalf(
+					"Apply() = (%#v, %v), want %v",
+					result,
+					err,
+					test.want,
+				)
+			}
+			if !reflect.DeepEqual(result, store.ApplyResult{}) {
+				t.Fatalf("Apply() result = %#v, want zero result", result)
+			}
+			afterIndex, err := node.stable.LastIndex()
+			if err != nil {
+				t.Fatalf("LastIndex(after): %v", err)
+			}
+			if afterIndex != lastIndex {
+				t.Fatalf(
+					"rejected proposal appended Raft log: %d -> %d",
+					lastIndex,
+					afterIndex,
+				)
+			}
+			if fatal := node.FatalError(); fatal != nil {
+				t.Fatalf("rejected proposal halted node: %v", fatal)
+			}
+			assertApplyAtGenerationDidNotAdvance(
+				t,
+				node,
+				before,
+				nodeTestEventID1,
+			)
+		})
+	}
+}
+
 func TestCommittedVersionSkewHaltsBeforeRaftWatermark(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -2472,6 +2615,15 @@ func nodeTestInitialState(
 		},
 	}
 	return initial, identityPrivate, deviceID
+}
+
+func setNodeTestApplyFloorAboveBinary(initial *store.InitialState) {
+	level := event.MaxSupportedApplyLevel + 1
+	initial.Projections.SessionPolicy[0].Values.ClusterMinApplyLevel =
+		int64(level)
+	for index := range initial.Projections.Devices {
+		initial.Projections.Devices[index].MaxApplyLevel = level
+	}
 }
 
 type peerAdmissionTestFixture struct {
@@ -2701,6 +2853,33 @@ func nodeTestSignedCommand(
 	sequence uint64,
 ) event.SignedEvent {
 	t.Helper()
+	return nodeTestSignedEntityCommand(
+		t,
+		privateKey,
+		originDeviceID,
+		actor,
+		kind,
+		string(subjectDeviceID),
+		expectedVersion,
+		payload,
+		eventID,
+		sequence,
+	)
+}
+
+func nodeTestSignedEntityCommand(
+	t *testing.T,
+	privateKey ed25519.PrivateKey,
+	originDeviceID domain.DeviceID,
+	actor event.ActorType,
+	kind event.Kind,
+	entityID string,
+	expectedVersion *uint64,
+	payload any,
+	eventID domain.UUIDv7,
+	sequence uint64,
+) event.SignedEvent {
+	t.Helper()
 	authority, err := event.NewLocalAuthority(
 		originDeviceID,
 		nodeTestBootID1,
@@ -2727,7 +2906,7 @@ func nodeTestSignedCommand(
 	proposal, err := event.BuildProposal(
 		event.Command{
 			Kind:                  kind,
-			EntityID:              event.StringEntityID(string(subjectDeviceID)),
+			EntityID:              event.StringEntityID(entityID),
 			ExpectedEntityVersion: expectedVersion,
 			Actions:               []event.Action{},
 			Payload:               encodedPayload,

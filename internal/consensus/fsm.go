@@ -120,6 +120,13 @@ func NewFSM(options FSMOptions) (*FSM, error) {
 			err,
 		)
 	}
+	if err := decoded.Reducer.ValidateBinaryApplyLevel(); err != nil {
+		return nil, fmt.Errorf(
+			"%w: incompatible durable state: %w",
+			ErrInvalidFSMOptions,
+			err,
+		)
+	}
 	feed := newChangeFeed()
 	fsm := &FSM{
 		store:        options.Store,
@@ -193,6 +200,18 @@ func (fsm *FSM) HaltError() error {
 	fsm.haltMu.RLock()
 	defer fsm.haltMu.RUnlock()
 	return fsm.haltErr
+}
+
+func (fsm *FSM) preflightCompatibility(proposal event.Proposal) error {
+	if fsm == nil {
+		return ErrInvalidFSMOptions
+	}
+	fsm.applyMu.Lock()
+	defer fsm.applyMu.Unlock()
+	if err := fsm.HaltError(); err != nil {
+		return err
+	}
+	return fsm.applyState.reducer.PreflightCompatibility(proposal)
 }
 
 // Apply implements raft.FSM. Raft invokes it serially for committed command
@@ -388,6 +407,12 @@ func (fsm *FSM) Apply(log *raft.Log) interface{} {
 	)
 	fsm.admissionMu.Unlock()
 	fsm.publishAppliedCommand(log.Index)
+	if err := prospective.ValidateBinaryApplyLevel(); err != nil {
+		return fsm.halt(log, fmt.Errorf(
+			"committed apply floor exceeds this binary: %w",
+			err,
+		))
+	}
 	return ApplyResponse{LogIndex: log.Index, Result: result}
 }
 
