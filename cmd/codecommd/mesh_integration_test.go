@@ -199,6 +199,16 @@ type daemonMeshIntegrationNode struct {
 	contentPeers  atomic.Pointer[daemonContentPeerRuntime]
 	listenerBinds atomic.Uint64
 
+	routeDialContext transport.ConsensusRouteDialContext
+	listenPeer       func(
+		context.Context,
+		netip.AddrPort,
+	) (net.Listener, error)
+	listInterfaces  daemonInterfaceLister
+	interfaceAddrs  daemonInterfaceAddressProvider
+	openMulticast   daemonMulticastOpener
+	peerEndpointNow func() netip.AddrPort
+
 	listener net.Listener
 	cancel   context.CancelFunc
 	exited   chan struct{}
@@ -1745,6 +1755,28 @@ func (node *daemonMeshIntegrationNode) start(
 	node.listenerBinds.Store(0)
 	go func() {
 		productionDependencies := productionDaemonDependencies()
+		meshFactory := newDaemonMeshIntegrationFactoryConstructor(
+			node.meshCapture,
+		)
+		if node.routeDialContext != nil {
+			meshFactory =
+				newDaemonMeshIntegrationFactoryConstructorWithDialContext(
+					node.meshCapture,
+					node.routeDialContext,
+				)
+		}
+		listInterfaces := productionDependencies.listInterfaces
+		if node.listInterfaces != nil {
+			listInterfaces = node.listInterfaces
+		}
+		interfaceAddrs := productionDependencies.interfaceAddrs
+		if node.interfaceAddrs != nil {
+			interfaceAddrs = node.interfaceAddrs
+		}
+		openMulticast := openDaemonMeshIntegrationMulticast
+		if node.openMulticast != nil {
+			openMulticast = node.openMulticast
+		}
 		node.exitErr = runDaemon(
 			ctx,
 			options,
@@ -1756,18 +1788,16 @@ func (node *daemonMeshIntegrationNode) start(
 						bytes.Clone(node.privateKey),
 						nil
 				},
-				newBootID: productionDependencies.newBootID,
-				newMeshFactory: newDaemonMeshIntegrationFactoryConstructor(
-					node.meshCapture,
-				),
-				daemonVersion: node.daemonVersion,
-				maxApplyLevel: node.maxApplyLevel,
+				newBootID:      productionDependencies.newBootID,
+				newMeshFactory: meshFactory,
+				daemonVersion:  node.daemonVersion,
+				maxApplyLevel:  node.maxApplyLevel,
 				listenPeer: func(
 					listenContext context.Context,
 					endpoint netip.AddrPort,
 				) (net.Listener, error) {
 					node.listenerBinds.Add(1)
-					if endpoint != node.peerEndpoint {
+					if !claimed && endpoint != node.peerEndpoint {
 						return nil, fmt.Errorf(
 							"unexpected peer listener request %s",
 							endpoint,
@@ -1777,14 +1807,20 @@ func (node *daemonMeshIntegrationNode) start(
 						claimed = true
 						return reserved, nil
 					}
+					if node.listenPeer != nil {
+						return node.listenPeer(
+							listenContext,
+							endpoint,
+						)
+					}
 					return productionDependencies.listenPeer(
 						listenContext,
 						endpoint,
 					)
 				},
-				openMulticast:     openDaemonMeshIntegrationMulticast,
-				listInterfaces:    productionDependencies.listInterfaces,
-				interfaceAddrs:    productionDependencies.interfaceAddrs,
+				openMulticast:     openMulticast,
+				listInterfaces:    listInterfaces,
+				interfaceAddrs:    interfaceAddrs,
 				credentialNow:     node.credentialNow,
 				canonicalCoverage: node.coverage,
 				observeContentPeers: func(runtime *daemonContentPeerRuntime) {
@@ -1794,6 +1830,16 @@ func (node *daemonMeshIntegrationNode) start(
 		)
 		close(node.exited)
 	}()
+}
+
+func (node *daemonMeshIntegrationNode) currentPeerEndpoint() netip.AddrPort {
+	if node == nil {
+		return netip.AddrPort{}
+	}
+	if node.peerEndpointNow != nil {
+		return node.peerEndpointNow()
+	}
+	return node.peerEndpoint
 }
 
 func (node *daemonMeshIntegrationNode) stop(t *testing.T) {

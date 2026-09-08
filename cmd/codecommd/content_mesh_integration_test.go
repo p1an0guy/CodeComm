@@ -144,6 +144,16 @@ type daemonMeshIntegrationTransportFactory struct {
 func newDaemonMeshIntegrationFactoryConstructor(
 	capture *daemonMeshIntegrationFactoryCapture,
 ) daemonMeshFactoryConstructor {
+	return newDaemonMeshIntegrationFactoryConstructorWithDialContext(
+		capture,
+		nil,
+	)
+}
+
+func newDaemonMeshIntegrationFactoryConstructorWithDialContext(
+	capture *daemonMeshIntegrationFactoryCapture,
+	dialContext transport.ConsensusRouteDialContext,
+) daemonMeshFactoryConstructor {
 	return func(
 		options daemonOptions,
 		deviceID domain.DeviceID,
@@ -153,11 +163,12 @@ func newDaemonMeshIntegrationFactoryConstructor(
 		if capture == nil {
 			return nil, errDaemonMeshContentHarness
 		}
-		delegate, err := newDaemonMeshTransportFactory(
+		delegate, err := newDaemonMeshTransportFactoryWithDialContext(
 			options,
 			deviceID,
 			identityCertificate,
 			credentialNow,
+			dialContext,
 		)
 		if err != nil {
 			return nil, err
@@ -1464,13 +1475,32 @@ func dialDaemonMeshPeersClient(
 		daemonMeshIntegrationTimeout,
 	)
 	defer cancel()
+	sourceEndpoint := source.currentPeerEndpoint()
+	targetEndpoint := target.currentPeerEndpoint()
+	if !sourceEndpoint.IsValid() || !targetEndpoint.IsValid() {
+		return nil, errDaemonMeshContentHarness
+	}
 	dialer := net.Dialer{
 		Timeout: 5 * time.Second,
 		LocalAddr: &net.TCPAddr{
-			IP: net.IP(source.peerEndpoint.Addr().AsSlice()),
+			IP: net.IP(sourceEndpoint.Addr().AsSlice()),
 		},
 	}
-	raw, err := dialer.DialContext(ctx, "tcp4", target.peerEndpoint.String())
+	var raw net.Conn
+	if source.routeDialContext == nil {
+		raw, err = dialer.DialContext(
+			ctx,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	} else {
+		raw, err = source.routeDialContext(
+			ctx,
+			&dialer,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf(
 			"%w: dial content endpoint %s: %v",
@@ -1731,9 +1761,10 @@ func validateDaemonMeshEndpointSet(
 		t.Fatalf("validate target endpoint set: %v", err)
 	}
 	value := verified.EndpointSet()
+	currentEndpoint := target.currentPeerEndpoint()
 	if len(value.Endpoints) != 1 ||
-		value.Endpoints[0].IP != target.peerEndpoint.Addr() ||
-		value.Endpoints[0].Port != target.peerEndpoint.Port() {
+		value.Endpoints[0].IP != currentEndpoint.Addr() ||
+		value.Endpoints[0].Port != currentEndpoint.Port() {
 		t.Fatalf("target endpoint set = %+v", value)
 	}
 	return verified

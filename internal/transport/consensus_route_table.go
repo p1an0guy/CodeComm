@@ -58,7 +58,7 @@ type ExpiringConsensusRoute struct {
 type ConsensusRouteTable struct {
 	now func() time.Time
 
-	dialContext consensusRouteDialContextFunc
+	dialContext ConsensusRouteDialContext
 
 	mu          sync.Mutex
 	selected    map[netip.Addr]*consensusAddressSelection
@@ -66,7 +66,9 @@ type ConsensusRouteTable struct {
 	connections map[*consensusRouteTableConn]netip.Addr
 }
 
-type consensusRouteDialContextFunc func(
+// ConsensusRouteDialContext opens one socket using the route table's fully
+// configured dialer. Implementations must preserve its selected local address.
+type ConsensusRouteDialContext func(
 	context.Context,
 	*net.Dialer,
 	string,
@@ -127,6 +129,73 @@ func NewConsensusRouteTable(
 		manualRoutes,
 		time.Now,
 	)
+}
+
+// NewConsensusRouteTableWithDialContext is NewConsensusRouteTable with an
+// injected socket opener for deterministic network fault harnesses.
+func NewConsensusRouteTableWithDialContext(
+	selectedLocalAddresses []netip.Addr,
+	manualRoutes []ConsensusRoute,
+	dialContext ConsensusRouteDialContext,
+) (*ConsensusRouteTable, error) {
+	if dialContext == nil {
+		return nil, ErrInvalidConsensusRouteTable
+	}
+	table, err := newConsensusRouteTable(
+		selectedLocalAddresses,
+		manualRoutes,
+		time.Now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	table.dialContext = func(
+		ctx context.Context,
+		dialer *net.Dialer,
+		network string,
+		address string,
+	) (net.Conn, error) {
+		connection, dialErr := dialContext(
+			ctx,
+			dialer,
+			network,
+			address,
+		)
+		if dialErr != nil || connection == nil {
+			return connection, dialErr
+		}
+		expected, expectedValid := consensusRouteNetAddress(
+			dialer.LocalAddr,
+		)
+		actual, actualValid := consensusRouteNetAddress(
+			connection.LocalAddr(),
+		)
+		if !expectedValid || !actualValid || actual != expected {
+			_ = connection.Close()
+			return nil, ErrConsensusEndpointUnavailable
+		}
+		return connection, nil
+	}
+	return table, nil
+}
+
+func consensusRouteNetAddress(address net.Addr) (netip.Addr, bool) {
+	if address == nil {
+		return netip.Addr{}, false
+	}
+	tcpAddress, ok := address.(*net.TCPAddr)
+	if !ok || tcpAddress == nil {
+		return netip.Addr{}, false
+	}
+	value, valid := netip.AddrFromSlice(tcpAddress.IP)
+	if !valid {
+		return netip.Addr{}, false
+	}
+	value = value.Unmap()
+	if value.Is6() && value.IsLinkLocalUnicast() {
+		value = value.WithZone(tcpAddress.Zone)
+	}
+	return value, value.IsValid()
 }
 
 func newConsensusRouteTable(

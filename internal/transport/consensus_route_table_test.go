@@ -71,6 +71,60 @@ func TestConsensusRouteTableResolvesAndBindsSelectedSource(t *testing.T) {
 	}
 }
 
+func TestConsensusRouteTableInjectedDialerCannotBypassSelectedSource(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	local := netip.MustParseAddr("192.0.2.10")
+	remote := netip.MustParseAddrPort("192.0.2.20:47831")
+	routes := []ConsensusRoute{{
+		PeerDeviceID:         routeTablePeerA,
+		RemoteEndpoint:       remote,
+		SelectedLocalAddress: local,
+	}}
+	if table, err := NewConsensusRouteTableWithDialContext(
+		[]netip.Addr{local},
+		routes,
+		nil,
+	); table != nil || !errors.Is(err, ErrInvalidConsensusRouteTable) {
+		t.Fatalf("nil injected dialer = (%v, %v)", table, err)
+	}
+
+	var peer net.Conn
+	table, err := NewConsensusRouteTableWithDialContext(
+		[]netip.Addr{local},
+		routes,
+		func(
+			context.Context,
+			*net.Dialer,
+			string,
+			string,
+		) (net.Conn, error) {
+			connection, remotePeer := net.Pipe()
+			peer = remotePeer
+			return connection, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewConsensusRouteTableWithDialContext(): %v", err)
+	}
+	connection, err := table.DialConsensusEndpoint(
+		context.Background(),
+		remote,
+	)
+	if connection != nil ||
+		!errors.Is(err, ErrConsensusEndpointUnavailable) {
+		t.Fatalf(
+			"DialConsensusEndpoint(unbound callback) = (%v, %v)",
+			connection,
+			err,
+		)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	assertConsensusRoutePeerClosed(t, peer)
+}
+
 func TestConsensusRouteTablePrioritizesAuthorityAndExpires(t *testing.T) {
 	t.Parallel()
 

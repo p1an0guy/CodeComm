@@ -190,6 +190,22 @@ func newDaemonMeshTransportFactory(
 	identityCertificate tls.Certificate,
 	credentialNow func() time.Time,
 ) (daemonConsensusTransportFactory, error) {
+	return newDaemonMeshTransportFactoryWithDialContext(
+		options,
+		deviceID,
+		identityCertificate,
+		credentialNow,
+		nil,
+	)
+}
+
+func newDaemonMeshTransportFactoryWithDialContext(
+	options daemonOptions,
+	deviceID domain.DeviceID,
+	identityCertificate tls.Certificate,
+	credentialNow func() time.Time,
+	dialContext transport.ConsensusRouteDialContext,
+) (daemonConsensusTransportFactory, error) {
 	if credentialNow == nil {
 		return nil, errDaemonMeshConstruction
 	}
@@ -214,7 +230,17 @@ func newDaemonMeshTransportFactory(
 			selected = append(selected, address)
 		}
 	}
-	resolver, err := transport.NewConsensusRouteTable(selected, routes)
+	var resolver *transport.ConsensusRouteTable
+	var err error
+	if dialContext == nil {
+		resolver, err = transport.NewConsensusRouteTable(selected, routes)
+	} else {
+		resolver, err = transport.NewConsensusRouteTableWithDialContext(
+			selected,
+			routes,
+			dialContext,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf(
 			"%w: consensus routes: %v",
