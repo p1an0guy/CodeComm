@@ -11,7 +11,6 @@ import (
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/domain"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
-	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/ui"
 	"zombiezen.com/go/sqlite"
@@ -81,11 +80,13 @@ func TestDaemonProductionMeshIntegrityProofs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ForceCheckpoint(): %v", err)
 		}
+		// The FSM cache retains its last verified cut; the store transaction
+		// detects a live SQLite rewrite before persisting the checkpoint.
 		requireDaemonMeshExpectedHalt(
 			t,
 			follower,
 			consensus.ErrFSMHalted,
-			reducer.ErrCheckpointIntegrityMismatch,
+			store.ErrApplyConflict,
 		)
 		assertDaemonMeshCheckpointNotPersisted(
 			t,
