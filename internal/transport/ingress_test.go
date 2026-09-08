@@ -2383,6 +2383,70 @@ func TestIngressClosesOnlyConnectionsBoundToVanishedAddress(t *testing.T) {
 	}
 }
 
+func TestIngressContinuesAfterAcceptedConnectionGenerationInvalidation(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	fixture := newIngressTestTLS(t)
+	base := newIngressTestListener(t)
+	listener := &ingressGenerationRaceListener{
+		Listener: base,
+		accepted: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	handled := make(chan struct{}, 1)
+	running := startTestIngress(t, IngressOptions{
+		Listener: listener,
+		TLS:      fixture.server,
+		Consensus: ConnectionHandlerFunc(
+			func(context.Context, *tls.Conn) error {
+				handled <- struct{}{}
+				return nil
+			},
+		),
+	}, PeerConnectionsMax)
+
+	stale := dialIngressTCP(t, base.Addr().String())
+	defer stale.Close()
+	awaitIngressValue(
+		t,
+		listener.accepted,
+		ingressTestTimeout,
+		"pre-invalidation accept",
+	)
+	localEndpoint, err := netip.ParseAddrPort(base.Addr().String())
+	if err != nil {
+		t.Fatalf("parse listener endpoint: %v", err)
+	}
+	if _, err := running.ingress.CloseConnectionsBoundTo(
+		[]netip.Addr{localEndpoint.Addr()},
+	); err != nil {
+		t.Fatalf("CloseConnectionsBoundTo(): %v", err)
+	}
+	listener.open()
+	expectIngressConnectionClosed(t, stale, ingressTestTimeout)
+	select {
+	case err := <-running.done:
+		t.Fatalf("Serve stopped after stale accepted connection: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	current := dialIngressTLS(
+		t,
+		base.Addr().String(),
+		fixture.clients[PlaneConsensus],
+	)
+	defer current.Close()
+	awaitIngressValue(
+		t,
+		handled,
+		ingressTestTimeout,
+		"post-invalidation connection",
+	)
+	stopTestIngress(t, running)
+}
+
 type ingressLocalAddressConn struct {
 	net.Conn
 	local net.Addr
@@ -2398,6 +2462,37 @@ type invalidRemoteConn struct {
 
 func (connection *invalidRemoteConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4zero, Port: 1}
+}
+
+type ingressGenerationRaceListener struct {
+	net.Listener
+	accepted chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	openOnce sync.Once
+}
+
+func (listener *ingressGenerationRaceListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	listener.once.Do(func() {
+		close(listener.accepted)
+		<-listener.release
+	})
+	return connection, nil
+}
+
+func (listener *ingressGenerationRaceListener) Close() error {
+	listener.open()
+	return listener.Listener.Close()
+}
+
+func (listener *ingressGenerationRaceListener) open() {
+	listener.openOnce.Do(func() {
+		close(listener.release)
+	})
 }
 
 type ingressLifecycleListener struct {

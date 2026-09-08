@@ -319,7 +319,7 @@ acceptLoop:
 			permit.Release()
 			_ = connection.Close()
 			ingress.releaseConnectionSlot()
-			break
+			continue
 		}
 		ingress.work.Add(1)
 		go func() {
