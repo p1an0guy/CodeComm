@@ -244,6 +244,11 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   proves the target remains behind while the exact fault generation is active, then heals,
   converges, cold-reopens, and verifies commitment history. Controller generation retirement,
   connection ownership, cancellation, deadlines, and counters pass repeated race tests.
+- A nightly leader-replacement gate severs every established leader link before stopping the node,
+  preventing graceful transfer, then measures until the surviving majority commits. Across 20
+  restart-and-converge cycles the quiet three-voter baseline measured p95 2.087 s and maximum
+  2.130 s against the 5 s target; the same test passes under the race detector. Phase 1 separately
+  covers an OS-killed voter and durable restart.
 
 ## Open Exit Gates
 
@@ -261,7 +266,7 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
 - The remaining Phase 3 fault matrix needs current/N-1 upgrade convergence, Raft/SQLite durability
-  faults, killed-leader recovery, wake plus address change, and in-flight full-plane revocation.
+  faults, wake plus address change, and in-flight full-plane revocation.
 - The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
   real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
   mapping, empty outbox, and full commitment-history verification. Its first complete run grew
@@ -270,8 +275,9 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   results found `command_results` occupying 17,625,088 bytes with 7,240,315 unused because each
   proposal-plus-mutation row consumes a 4 KiB page. The requirement remains unchanged; Phase 3
   needs storage-layout/retention work or a reviewed revision.
-- §14's Phase 3 control percentiles remain unmeasured. Phase 6 reviews this evidence but is not its
-  first confirmation gate. Git availability/storage measurements remain Phase 5 work.
+- §14's leader-replacement mechanism has a quiet three-voter baseline; its stated-load confirmation
+  and the other Phase 3 control percentiles remain unmeasured. Phase 6 reviews this evidence but is
+  not its first confirmation gate. Git availability/storage measurements remain Phase 5 work.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -327,6 +333,7 @@ Primary tests:
 - `TestSecureMeshFollowerForwardsOnlyToObservedLeader`
 - `TestSecureMeshTopologyPartitionClosesEstablishedConnections`
 - `TestSecureMeshDirectedFaultsHealAndReopen`
+- `TestSecureMeshLeaderReplacementLatency`
 - `TestOpenNodeUsesInjectedDeviceAddressedTransport`
 - `TestInspectDaemonMeshState*`
 - `TestSettledReplicaImportsAndReopensAuthorityHandoff`
