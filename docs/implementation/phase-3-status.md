@@ -15,6 +15,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - The non-expiring identity-mTLS consensus plane carries unmodified HashiCorp Raft framing over
   RFC 8441. Admission uses applied membership; replication uses live configuration. Certificate,
   session, generation, expected-peer, route, and control-mode mismatches fail closed.
+- Startup compares the binary's version/apply level with committed active membership before agent
+  recovery. A change durably reserves `membership.version_reported` ahead of every local boot
+  mutation, composes reconnect/status surfaces while withholding agent binds, and recovers agents
+  only after the exact report commits. Restarts serialize any pending prior-binary report first,
+  and one report-only outbox slot preserves ordinary/checkpoint capacity. Production coverage proves
+  N/N-1 three-voter convergence, upgrade/restart, and changed-version settled rebootstrap before
+  crash reap.
 - Three real voters elect, replicate, recover after cold restart, and preserve exact SQLite/Raft
   commitments. Production tests corrupt a follower's checkpoint accumulator and covered
   projection row; checkpoint apply, snapshot export, and cold restart halt without persisting the
@@ -272,8 +279,8 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The remaining Phase 3 fault matrix needs current/N-1 upgrade convergence, wake plus address
-  change, and in-flight full-plane revocation.
+- The remaining Phase 3 fault matrix needs wake plus address change and in-flight full-plane
+  revocation.
 - The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
   real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
   mapping, empty outbox, and full commitment-history verification. Its first complete run grew
@@ -297,7 +304,11 @@ test gaps above remain open.
 Primary tests:
 
 - `TestDaemonProductionMeshComposition`
+- `TestDaemonProductionVersionUpgradeComposition`
 - `TestDaemonProductionMeshIntegrityProofs`
+- `TestDaemonStartupCommitsChangedMembershipVersionReport`
+- `TestDaemonVersionReportGate*`
+- `TestBootOriginVersionReport*`
 - `TestDaemonProductionReadmissionComposition`
 - `TestDecisionApprovedResumeRequiresCommittedAdmission`
 - `TestDecisionApprovedRebootstrapResumeRequiresFreshInvite`
