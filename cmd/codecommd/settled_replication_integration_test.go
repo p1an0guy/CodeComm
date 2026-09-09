@@ -1400,11 +1400,15 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		t,
 		[]*daemonMeshIntegrationNode{target, settled},
 		func(statuses []ui.Snapshot) bool {
+			// The live authority may commit a scheduler result while the
+			// settled replica is stopped for baseline inspection.
 			return len(statuses) == 2 &&
-				statuses[0].Session.ResultIndex == finalResultIndex &&
-				statuses[1].Session.ResultIndex == finalResultIndex &&
-				statuses[0].Session.EventChainIndex == finalChainIndex &&
-				statuses[1].Session.EventChainIndex == finalChainIndex &&
+				statuses[0].Session.ResultIndex >= finalResultIndex &&
+				statuses[1].Session.ResultIndex ==
+					statuses[0].Session.ResultIndex &&
+				statuses[0].Session.EventChainIndex >= finalChainIndex &&
+				statuses[1].Session.EventChainIndex ==
+					statuses[0].Session.EventChainIndex &&
 				statuses[1].Session.AppliedRaftIndex == nil &&
 				daemonMeshIntegrationTarget(statuses, 2, targetIDs) &&
 				daemonSettledTasksConverged(
