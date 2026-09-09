@@ -116,6 +116,13 @@ payload, while command/event indexes retain commitment metadata; clean close phy
 the unpruned Raft bbolt file under exclusive consensus-directory ownership. The verified final cut
 was result index 10,020 and chain index 9,520.
 
+The Phase 3 same-device regression gate runs production daemon, IPC, MCP, Raft, and settled
+replication composition with 3 voters, 5 settled nonvoters, and 32 live local agents split evenly
+between Codex and Claude. Its confirmed 2026-09-09 `darwin/arm64` run measured 20 post-warmup
+samples at p95 2.57825 ms and maximum 2.911334 ms, passing the strict p95 <100 ms target. The
+per-PR gate repeats this control-plane workload; Phase 5 repeats the unchanged timing boundary
+with the full 100k-file/2-GiB Git corpus once that plane exists.
+
 Confirmation is split by plane, because three targets measure mechanisms that do not exist until
 phase 5: consensus and control targets plus the coordination-growth budget confirm at **phase 3**;
 draft-visibility, canonical-materialization, bootstrap, publication, and every disk budget confirm

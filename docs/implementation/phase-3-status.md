@@ -274,6 +274,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   restart-and-converge cycles the quiet three-voter baseline measured p95 2.087 s and maximum
   2.130 s against the 5 s target; the same test passes under the race detector. Phase 1 separately
   covers an OS-killed voter and durable restart.
+- A per-PR same-device gate keeps 3 voters, 5 settled nonvoters, and 32 unique connected local MCP
+  sessions live, with an exact 16/16 Codex/Claude split visible on every replica. It measures from
+  an accepted `task.create` response until another session's `context.get` returns that exact task.
+  Every session participates and remains connected afterward; before and after timing, all eight
+  replicas must export the same verified chain/result hashes, projection accumulator, state digest,
+  lineage, and authority. Across 20 post-warmup samples, the confirmed 2026-09-09 `darwin/arm64`
+  run measured p95 2.57825 ms and maximum 2.911334 ms against the strict p95 <100 ms target.
 
 ## Open Exit Gates
 
@@ -300,9 +307,11 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   53,878,817 closed bytes: 52,076,544 bytes (49.6640625 MiB), passing the 50 MiB gate by 352,256
   bytes. SQLite contributed 41,787,392 growth bytes and consensus 10,289,152; the verified final
   cut was result index 10,020 and chain index 9,520.
-- §14's leader-replacement mechanism has a quiet three-voter baseline; its stated-load confirmation
-  and the other Phase 3 control percentiles remain unmeasured. Phase 6 reviews this evidence but is
-  not its first confirmation gate. Git availability/storage measurements remain Phase 5 work.
+- §14's same-device target is enforced per PR and its Phase 3 control-plane workload is confirmed.
+  The leader-replacement mechanism has a quiet three-voter baseline; its stated-load confirmation
+  and the remaining Phase 3 control percentiles are unmeasured. Phase 5 repeats control timing under
+  the full Git corpus; Git availability/storage measurements also remain Phase 5 work. Phase 6
+  reviews this evidence but is not its first confirmation gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
@@ -400,6 +409,7 @@ Primary tests:
 - `TestSecureMeshRaftCommitSQLiteReplayDurability`
 - `TestCoordinationGrowthWorkloadContract`
 - `TestCoordinationGrowthBudget` (49.6640625 MiB confirmed against the 50 MiB gate)
+- `TestDaemonSameDeviceVisibilityLatency` (2.57825 ms p95 confirmed against the 100 ms gate)
 
 Run:
 
