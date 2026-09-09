@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -364,12 +365,29 @@ func newDaemonMeshVirtualIntegrationNodes(
 	network *daemonMeshVirtualNetwork,
 	credentialNow func() time.Time,
 ) ([]*daemonMeshIntegrationNode, []*daemonMeshVirtualInterface) {
+	return newDaemonMeshVirtualIntegrationNodesCount(
+		t,
+		root,
+		network,
+		credentialNow,
+		3,
+	)
+}
+
+func newDaemonMeshVirtualIntegrationNodesCount(
+	t *testing.T,
+	root string,
+	network *daemonMeshVirtualNetwork,
+	credentialNow func() time.Time,
+	count int,
+) ([]*daemonMeshIntegrationNode, []*daemonMeshVirtualInterface) {
 	t.Helper()
-	if root == "" || network == nil || credentialNow == nil {
+	if root == "" || network == nil || credentialNow == nil ||
+		count < 1 || count > 8 {
 		t.Fatal("invalid virtual mesh fixture")
 	}
 	const port = 47831
-	nodes := make([]*daemonMeshIntegrationNode, 3)
+	nodes := make([]*daemonMeshIntegrationNode, count)
 	interfacesByNode := make(map[*daemonMeshIntegrationNode]*daemonMeshVirtualInterface)
 	for index := range nodes {
 		privateKey := ed25519.NewKeyFromSeed(
@@ -440,13 +458,108 @@ func waitForDaemonMeshVirtualCondition(
 	t.Fatalf("timed out waiting for %s", description)
 }
 
+func TestDaemonMeshVirtualNetworkDirectedWriteGate(t *testing.T) {
+	network := newDaemonMeshVirtualNetwork()
+	t.Cleanup(func() { _ = network.Close() })
+	source := netip.MustParseAddr("192.0.2.10")
+	destination := netip.MustParseAddr("192.0.2.20")
+	endpoint := netip.AddrPortFrom(destination, 47831)
+	listener := network.Listen(t, endpoint)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	gate, err := network.HoldWrites(source, destination)
+	if err != nil {
+		t.Fatalf("HoldWrites(): %v", err)
+	}
+	t.Cleanup(gate.Release)
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{IP: net.IP(source.AsSlice())},
+	}
+	client, err := network.DialContext(
+		t.Context(),
+		dialer,
+		"tcp4",
+		endpoint.String(),
+	)
+	if err != nil {
+		t.Fatalf("DialContext(): %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept(): %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	forwardDone := make(chan error, 1)
+	go func() {
+		_, writeErr := client.Write([]byte("held"))
+		forwardDone <- writeErr
+	}()
+	select {
+	case <-gate.Entered():
+	case <-time.After(time.Second):
+		t.Fatal("directed write did not enter the gate")
+	}
+	select {
+	case err := <-forwardDone:
+		t.Fatalf("directed write bypassed gate: %v", err)
+	default:
+	}
+
+	reverseDone := make(chan error, 1)
+	go func() {
+		_, writeErr := server.Write([]byte("open"))
+		reverseDone <- writeErr
+	}()
+	reverse := make([]byte, len("open"))
+	if _, err := io.ReadFull(client, reverse); err != nil {
+		t.Fatalf("read reverse direction: %v", err)
+	}
+	if string(reverse) != "open" {
+		t.Fatalf("reverse payload = %q", reverse)
+	}
+	if err := <-reverseDone; err != nil {
+		t.Fatalf("write reverse direction: %v", err)
+	}
+
+	gate.Release()
+	forward := make([]byte, len("held"))
+	if _, err := io.ReadFull(server, forward); err != nil {
+		t.Fatalf("read released direction: %v", err)
+	}
+	if string(forward) != "held" {
+		t.Fatalf("released payload = %q", forward)
+	}
+	if err := <-forwardDone; err != nil {
+		t.Fatalf("released write: %v", err)
+	}
+}
+
 type daemonMeshVirtualNetwork struct {
 	mu          sync.Mutex
 	listeners   map[netip.AddrPort]*daemonMeshVirtualListener
 	connections map[*daemonMeshVirtualConnection]struct{}
 	multicasts  map[*daemonMeshVirtualMulticast]struct{}
+	writeGates  map[daemonMeshVirtualLink]*daemonMeshVirtualWriteGate
 	nextPort    atomic.Uint32
 	closed      bool
+}
+
+type daemonMeshVirtualLink struct {
+	source      netip.Addr
+	destination netip.Addr
+}
+
+type daemonMeshVirtualWriteGate struct {
+	network    *daemonMeshVirtualNetwork
+	connection *daemonMeshVirtualConnection
+	link       daemonMeshVirtualLink
+	entered    chan struct{}
+	release    chan struct{}
+
+	enterOnce   sync.Once
+	releaseOnce sync.Once
 }
 
 type daemonMeshVirtualListener struct {
@@ -467,6 +580,10 @@ type daemonMeshVirtualConnection struct {
 	second  net.Conn
 	local   netip.Addr
 	remote  netip.Addr
+	done    chan struct{}
+
+	writeMu    sync.Mutex
+	writeGates map[daemonMeshVirtualLink]*daemonMeshVirtualWriteGate
 
 	close sync.Once
 	err   error
@@ -474,9 +591,11 @@ type daemonMeshVirtualConnection struct {
 
 type daemonMeshVirtualConn struct {
 	net.Conn
-	owner  *daemonMeshVirtualConnection
-	local  net.Addr
-	remote net.Addr
+	owner       *daemonMeshVirtualConnection
+	local       net.Addr
+	remote      net.Addr
+	source      netip.Addr
+	destination netip.Addr
 }
 
 type daemonMeshVirtualMulticast struct {
@@ -503,6 +622,9 @@ func newDaemonMeshVirtualNetwork() *daemonMeshVirtualNetwork {
 		),
 		multicasts: make(
 			map[*daemonMeshVirtualMulticast]struct{},
+		),
+		writeGates: make(
+			map[daemonMeshVirtualLink]*daemonMeshVirtualWriteGate,
 		),
 	}
 }
@@ -633,22 +755,30 @@ func (network *daemonMeshVirtualNetwork) DialContext(
 		second:  serverRaw,
 		local:   local,
 		remote:  remote.Addr(),
+		done:    make(chan struct{}),
+		writeGates: make(
+			map[daemonMeshVirtualLink]*daemonMeshVirtualWriteGate,
+		),
 	}
 	network.connections[pair] = struct{}{}
 	network.mu.Unlock()
 
 	localEndpoint := netip.AddrPortFrom(local, port)
 	client := &daemonMeshVirtualConn{
-		Conn:   clientRaw,
-		owner:  pair,
-		local:  daemonMeshVirtualTCPAddress(localEndpoint),
-		remote: daemonMeshVirtualTCPAddress(remote),
+		Conn:        clientRaw,
+		owner:       pair,
+		local:       daemonMeshVirtualTCPAddress(localEndpoint),
+		remote:      daemonMeshVirtualTCPAddress(remote),
+		source:      local,
+		destination: remote.Addr(),
 	}
 	server := &daemonMeshVirtualConn{
-		Conn:   serverRaw,
-		owner:  pair,
-		local:  daemonMeshVirtualTCPAddress(remote),
-		remote: daemonMeshVirtualTCPAddress(localEndpoint),
+		Conn:        serverRaw,
+		owner:       pair,
+		local:       daemonMeshVirtualTCPAddress(remote),
+		remote:      daemonMeshVirtualTCPAddress(localEndpoint),
+		source:      remote.Addr(),
+		destination: local,
 	}
 	if !listener.enqueue(server) {
 		_ = pair.Close()
@@ -669,6 +799,41 @@ func (network *daemonMeshVirtualNetwork) Listening(
 	return exists
 }
 
+func (network *daemonMeshVirtualNetwork) ConnectionCount(
+	left, right netip.Addr,
+) int {
+	if network == nil || !left.IsValid() || !right.IsValid() {
+		return 0
+	}
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	count := 0
+	for connection := range network.connections {
+		if connection.local == left && connection.remote == right ||
+			connection.local == right && connection.remote == left {
+			count++
+		}
+	}
+	return count
+}
+
+func (network *daemonMeshVirtualNetwork) ConnectionCountForAddress(
+	address netip.Addr,
+) int {
+	if network == nil || !address.IsValid() {
+		return 0
+	}
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	count := 0
+	for connection := range network.connections {
+		if connection.local == address || connection.remote == address {
+			count++
+		}
+	}
+	return count
+}
+
 func (network *daemonMeshVirtualNetwork) DropAddress(address netip.Addr) {
 	if network == nil || !address.IsValid() {
 		return
@@ -683,6 +848,114 @@ func (network *daemonMeshVirtualNetwork) DropAddress(address netip.Addr) {
 	network.mu.Unlock()
 	for _, connection := range connections {
 		_ = connection.Close()
+	}
+}
+
+func (network *daemonMeshVirtualNetwork) HoldWrites(
+	source, destination netip.Addr,
+) (*daemonMeshVirtualWriteGate, error) {
+	if network == nil ||
+		!validDaemonSelectedAddress(source) ||
+		!validDaemonSelectedAddress(destination) ||
+		source == destination {
+		return nil, errDaemonMeshContentHarness
+	}
+	link := daemonMeshVirtualLink{
+		source:      source,
+		destination: destination,
+	}
+	gate := &daemonMeshVirtualWriteGate{
+		network: network,
+		link:    link,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if network.closed {
+		return nil, net.ErrClosed
+	}
+	if _, exists := network.writeGates[link]; exists {
+		return nil, errDaemonMeshContentHarness
+	}
+	network.writeGates[link] = gate
+	return gate, nil
+}
+
+func (network *daemonMeshVirtualNetwork) HoldConnectionWrites(
+	raw net.Conn,
+	source, destination netip.Addr,
+) (*daemonMeshVirtualWriteGate, error) {
+	connection, ok := raw.(*daemonMeshVirtualConn)
+	if network == nil || !ok || connection == nil ||
+		connection.owner == nil ||
+		connection.owner.network != network ||
+		!validDaemonSelectedAddress(source) ||
+		!validDaemonSelectedAddress(destination) ||
+		source == destination ||
+		!((connection.owner.local == source &&
+			connection.owner.remote == destination) ||
+			(connection.owner.local == destination &&
+				connection.owner.remote == source)) {
+		return nil, errDaemonMeshContentHarness
+	}
+	link := daemonMeshVirtualLink{
+		source:      source,
+		destination: destination,
+	}
+	gate := &daemonMeshVirtualWriteGate{
+		connection: connection.owner,
+		link:       link,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	connection.owner.writeMu.Lock()
+	defer connection.owner.writeMu.Unlock()
+	if _, exists := connection.owner.writeGates[link]; exists {
+		return nil, errDaemonMeshContentHarness
+	}
+	select {
+	case <-connection.owner.done:
+		return nil, net.ErrClosed
+	default:
+	}
+	connection.owner.writeGates[link] = gate
+	return gate, nil
+}
+
+func (network *daemonMeshVirtualNetwork) waitForWrite(
+	link daemonMeshVirtualLink,
+	connection *daemonMeshVirtualConnection,
+	connectionDone <-chan struct{},
+) error {
+	if connection != nil {
+		connection.writeMu.Lock()
+		gate := connection.writeGates[link]
+		connection.writeMu.Unlock()
+		if gate != nil {
+			return gate.wait(connectionDone)
+		}
+	}
+	network.mu.Lock()
+	gate := network.writeGates[link]
+	network.mu.Unlock()
+	if gate == nil {
+		return nil
+	}
+	return gate.wait(connectionDone)
+}
+
+func (gate *daemonMeshVirtualWriteGate) wait(
+	connectionDone <-chan struct{},
+) error {
+	gate.enterOnce.Do(func() {
+		close(gate.entered)
+	})
+	select {
+	case <-gate.release:
+		return nil
+	case <-connectionDone:
+		return net.ErrClosed
 	}
 }
 
@@ -716,8 +989,19 @@ func (network *daemonMeshVirtualNetwork) Close() error {
 	for multicast := range network.multicasts {
 		multicasts = append(multicasts, multicast)
 	}
+	gates := make(
+		[]*daemonMeshVirtualWriteGate,
+		0,
+		len(network.writeGates),
+	)
+	for _, gate := range network.writeGates {
+		gates = append(gates, gate)
+	}
 	network.mu.Unlock()
 	var result error
+	for _, gate := range gates {
+		gate.Release()
+	}
 	for _, listener := range listeners {
 		result = errors.Join(result, listener.Close())
 	}
@@ -801,6 +1085,7 @@ func (connection *daemonMeshVirtualConnection) Close() error {
 		return nil
 	}
 	connection.close.Do(func() {
+		close(connection.done)
 		connection.err = errors.Join(
 			connection.first.Close(),
 			connection.second.Close(),
@@ -819,12 +1104,61 @@ func (connection *daemonMeshVirtualConn) Close() error {
 	return connection.owner.Close()
 }
 
+func (connection *daemonMeshVirtualConn) Write(value []byte) (int, error) {
+	if connection == nil || connection.owner == nil {
+		return 0, net.ErrClosed
+	}
+	if err := connection.owner.network.waitForWrite(
+		daemonMeshVirtualLink{
+			source:      connection.source,
+			destination: connection.destination,
+		},
+		connection.owner,
+		connection.owner.done,
+	); err != nil {
+		return 0, err
+	}
+	return connection.Conn.Write(value)
+}
+
 func (connection *daemonMeshVirtualConn) LocalAddr() net.Addr {
 	return connection.local
 }
 
 func (connection *daemonMeshVirtualConn) RemoteAddr() net.Addr {
 	return connection.remote
+}
+
+func (gate *daemonMeshVirtualWriteGate) Entered() <-chan struct{} {
+	if gate == nil {
+		return nil
+	}
+	return gate.entered
+}
+
+func (gate *daemonMeshVirtualWriteGate) Release() {
+	if gate == nil {
+		return
+	}
+	gate.releaseOnce.Do(func() {
+		close(gate.release)
+		if gate.network == nil {
+			if gate.connection == nil {
+				return
+			}
+			gate.connection.writeMu.Lock()
+			if gate.connection.writeGates[gate.link] == gate {
+				delete(gate.connection.writeGates, gate.link)
+			}
+			gate.connection.writeMu.Unlock()
+			return
+		}
+		gate.network.mu.Lock()
+		if gate.network.writeGates[gate.link] == gate {
+			delete(gate.network.writeGates, gate.link)
+		}
+		gate.network.mu.Unlock()
+	})
 }
 
 func daemonMeshVirtualTCPAddress(endpoint netip.AddrPort) *net.TCPAddr {

@@ -95,10 +95,11 @@ func planVoterReconciliation(
 		)
 	}
 
-	if !state.authorityActivated {
-		return state.action(voterReconciliationActivateAuthority, "")
-	}
-	if !input.target.Contains(input.localLeaderID) {
+	leaderOutsideTarget := !input.target.Contains(input.localLeaderID)
+	leaderRevoked := input.memberStatus[input.localLeaderID] ==
+		device.StatusRevoked
+	if leaderOutsideTarget &&
+		(leaderRevoked || state.authorityActivated) {
 		for _, deviceID := range state.targetIDs {
 			if containsDevice(input.reachable, deviceID) &&
 				containsDevice(input.eligible, deviceID) {
@@ -109,6 +110,9 @@ func planVoterReconciliation(
 			}
 		}
 		return state.stalled(voterReconciliationNoTransferTarget, "")
+	}
+	if !state.authorityActivated {
+		return state.action(voterReconciliationActivateAuthority, "")
 	}
 
 	extraVoters := state.extraServers(input.target, raft.Voter)
@@ -206,9 +210,7 @@ func validateVoterReconciliationInput(
 		leaderIsVoter = leaderIsVoter ||
 			deviceID == input.localLeaderID && server.Suffrage == raft.Voter
 	}
-	if !input.localLeaderID.Valid() ||
-		!leaderIsVoter ||
-		!containsDevice(input.reachable, input.localLeaderID) {
+	if !input.localLeaderID.Valid() || !leaderIsVoter {
 		return invalid(voterReconciliationInvalidLeader)
 	}
 	for deviceID, status := range input.memberStatus {
@@ -231,7 +233,14 @@ func validateVoterReconciliationInput(
 			return invalid(voterReconciliationInvalidMembers)
 		}
 	}
-	if input.memberStatus[input.localLeaderID] != device.StatusActive {
+	leaderStatus := input.memberStatus[input.localLeaderID]
+	revokedOutgoingLeader := leaderStatus == device.StatusRevoked &&
+		!input.target.Contains(input.localLeaderID)
+	if leaderStatus != device.StatusActive && !revokedOutgoingLeader {
+		return invalid(voterReconciliationInvalidLeader)
+	}
+	if !revokedOutgoingLeader &&
+		!containsDevice(input.reachable, input.localLeaderID) {
 		return invalid(voterReconciliationInvalidLeader)
 	}
 	for deviceID := range input.reachable {

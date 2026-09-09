@@ -313,6 +313,10 @@ func testConsensusStartupEnabled(t *testing.T) {
 		testConsensusReachabilityCancellation,
 	)
 	t.Run(
+		"handshake cancellation closes socket",
+		testConsensusHandshakeCancellationClosesSocket,
+	)
+	t.Run(
 		"reachability verification is local",
 		testConsensusReachabilityVerificationIsLocal,
 	)

@@ -141,6 +141,51 @@ func TestVoterReconciliationPlansProtocolOrder(t *testing.T) {
 			want: voterReconciliationActivateAuthority,
 		},
 		{
+			name: "revoked outgoing leader transfers before activation",
+			input: voterPlanWithRevokedOutgoingLeader(
+				voterPlanWithEligible(
+					voterPlanWithTargetVersion(
+						voterPlanInput(
+							[]domain.DeviceID{b},
+							[]raft.Server{
+								voterPlanServer(a, raft.Voter),
+								voterPlanServer(b, raft.Voter),
+							},
+							a,
+						),
+						2,
+					),
+					b,
+				),
+			),
+			want:   voterReconciliationTransferLeadership,
+			wantID: b,
+		},
+		{
+			name: "revoked outgoing leader stalls without reachable target",
+			input: voterPlanWithoutReachability(
+				voterPlanWithRevokedOutgoingLeader(
+					voterPlanWithEligible(
+						voterPlanWithTargetVersion(
+							voterPlanInput(
+								[]domain.DeviceID{b},
+								[]raft.Server{
+									voterPlanServer(a, raft.Voter),
+									voterPlanServer(b, raft.Voter),
+								},
+								a,
+							),
+							2,
+						),
+						b,
+					),
+				),
+				b,
+			),
+			want:       voterReconciliationStalled,
+			wantReason: voterReconciliationNoTransferTarget,
+		},
+		{
 			name: "transfer to lowest reachable eligible target",
 			input: voterPlanWithEligible(
 				voterPlanInput(
@@ -380,11 +425,28 @@ func TestVoterReconciliationRejectsInvalidInputs(t *testing.T) {
 			reason: voterReconciliationInvalidMembers,
 		},
 		{
-			name: "target member revoked",
+			name: "revoked leader inside target",
 			mutate: func(input *voterReconciliationInput) {
 				input.memberStatus[a] = device.StatusRevoked
 			},
 			reason: voterReconciliationInvalidMembers,
+		},
+		{
+			name: "outgoing leader requires readmission",
+			mutate: func(input *voterReconciliationInput) {
+				target, err := voterset.New(
+					voterPlanSessionID,
+					[]domain.DeviceID{b},
+					2,
+				)
+				if err != nil {
+					panic(err)
+				}
+				input.target = target
+				input.memberStatus[a] =
+					device.StatusRequiresReadmission
+			},
+			reason: voterReconciliationInvalidLeader,
 		},
 		{
 			name: "unknown reachable member",
@@ -506,6 +568,14 @@ func voterPlanWithStatus(
 	status device.Status,
 ) voterReconciliationInput {
 	input.memberStatus[deviceID] = status
+	return input
+}
+
+func voterPlanWithRevokedOutgoingLeader(
+	input voterReconciliationInput,
+) voterReconciliationInput {
+	input.memberStatus[input.localLeaderID] = device.StatusRevoked
+	delete(input.reachable, input.localLeaderID)
 	return input
 }
 

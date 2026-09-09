@@ -247,6 +247,13 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   wakes it on a different literal address, and proves signed discovery, listener replacement,
   credential renewal, content restoration, strong-write convergence, and cold reopen without
   operator action. A raced pre-rebind accept is discarded without stopping ingress.
+- A five-voter production composition isolates one stale voter, revokes the current leader into a
+  three-voter target, and holds established consensus, content-control, and snapshot-transfer
+  connections in flight. Within five seconds the revoked daemon closes every plane, erases retained
+  epoch keys, and exits; fresh identity/content requests fail. The stale minority admits only its
+  still-applied identity cut but neither elects, advances, nor authorizes the revoked member.
+  Healing completes authority activation and voter removal, rotates surviving credentials, forwards
+  a strong mutation, cold-reopens the final voters, and verifies equal durable commitments.
 - CI runs the security-critical mesh tests in-process with cross-package coverage and enforces a
   45% `consensus` + `transport` floor. The ordinary Linux/macOS/Windows and race jobs retain the
   subprocess and daemon-composition tests.
@@ -283,7 +290,6 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The remaining Phase 3 fault matrix needs in-flight full-plane revocation.
 - The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
   real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
   mapping, empty outbox, and full commitment-history verification. Its first complete run grew
@@ -300,7 +306,7 @@ Phase 3 exit requires its secure-mesh paths to be production-composed, the canon
 to be proven with verified fixture repositories and fail closed in production, and committed proof
 that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
 production local-Git provider and Phase 6 quorum recovery are not exit requirements. The Phase 3
-test gaps above remain open.
+growth and loaded-latency gates above remain open.
 
 ## Evidence
 
@@ -308,6 +314,7 @@ Primary tests:
 
 - `TestDaemonProductionMeshComposition`
 - `TestDaemonProductionWakeAddressChangeComposition`
+- `TestDaemonProductionFullPlaneRevocationComposition`
 - `TestDaemonProductionVersionUpgradeComposition`
 - `TestDaemonProductionMeshIntegrityProofs`
 - `TestDaemonStartupCommitsChangedMembershipVersionReport`

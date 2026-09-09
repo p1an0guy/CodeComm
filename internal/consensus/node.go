@@ -91,6 +91,22 @@ type RaftTransport interface {
 	raft.WithClose
 }
 
+type ownedRaftTransport struct {
+	RaftTransport
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (transport *ownedRaftTransport) Close() error {
+	if transport == nil || nilRaftTransport(transport.RaftTransport) {
+		return nil
+	}
+	transport.closeOnce.Do(func() {
+		transport.closeErr = transport.RaftTransport.Close()
+	})
+	return transport.closeErr
+}
+
 // ConsensusTransportGate is the fail-closed authorization capability passed
 // to a mesh transport factory before the resulting node exists.
 type ConsensusTransportGate interface {
@@ -144,6 +160,7 @@ type SingleNode struct {
 	stable                        *raftboltdb.BoltStore
 	snapshots                     raft.SnapshotStore
 	transport                     RaftTransport
+	ownedTransport                *ownedRaftTransport
 	serverID                      raft.ServerID
 	originBootID                  domain.UUIDv7
 	clock                         ApplyClock
@@ -308,10 +325,15 @@ func openNode(
 	options nodeOpenOptions,
 ) (_ *SingleNode, err error) {
 	transport := options.Transport
+	var ownedTransport *ownedRaftTransport
 	var transportGate *nodeTransportGate
 	defer func() {
-		if err != nil && !nilRaftTransport(transport) {
-			_ = transport.Close()
+		if err != nil {
+			if ownedTransport != nil {
+				_ = ownedTransport.Close()
+			} else if !nilRaftTransport(transport) {
+				_ = transport.Close()
+			}
 		}
 		if err != nil && transportGate != nil {
 			transportGate.close()
@@ -428,6 +450,7 @@ func openNode(
 			return nil, ErrInvalidRaftTopology
 		}
 	}
+	ownedTransport = &ownedRaftTransport{RaftTransport: transport}
 
 	config, err := nodeRaftConfig(
 		options.ServerID,
@@ -676,17 +699,18 @@ func openNode(
 		credentialNow = time.Now
 	}
 	node := &SingleNode{
-		fsm:           fsm,
-		state:         state,
-		stable:        stable,
-		snapshots:     snapshots,
-		transport:     transport,
-		serverID:      raft.ServerID(options.ServerID),
-		originBootID:  options.OriginBootID,
-		clock:         clock,
-		single:        options.Single,
-		transportGate: transportGate,
-		coverageGate:  coverageGate,
+		fsm:            fsm,
+		state:          state,
+		stable:         stable,
+		snapshots:      snapshots,
+		transport:      transport,
+		ownedTransport: ownedTransport,
+		serverID:       raft.ServerID(options.ServerID),
+		originBootID:   options.OriginBootID,
+		clock:          clock,
+		single:         options.Single,
+		transportGate:  transportGate,
+		coverageGate:   coverageGate,
 		checkpointSigner: normalizedCheckpointSigner(
 			options.CheckpointSigner,
 		),
@@ -721,7 +745,7 @@ func openNode(
 		stable,
 		stable,
 		snapshots,
-		transport,
+		ownedTransport,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("consensus: start Raft: %w", err)
@@ -2406,7 +2430,14 @@ func (node *SingleNode) shutdownRaft() error {
 		return ErrInvalidNodeOptions
 	}
 	node.raftShutdownOnce.Do(func() {
-		node.raftShutdownErr = node.raft.Shutdown().Error()
+		var transportErr error
+		if node.ownedTransport != nil {
+			transportErr = node.ownedTransport.Close()
+		}
+		node.raftShutdownErr = errors.Join(
+			transportErr,
+			node.raft.Shutdown().Error(),
+		)
 	})
 	return node.raftShutdownErr
 }

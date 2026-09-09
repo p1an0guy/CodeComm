@@ -175,6 +175,84 @@ func TestConfigurationReadinessRequiresPromotedSubject(t *testing.T) {
 	}
 }
 
+func TestConfigurationReadinessObserveOmitsRevokedOutgoingLeader(
+	t *testing.T,
+) {
+	first := meshTestDeviceID('1')
+	second := meshTestDeviceID('2')
+	third := meshTestDeviceID('3')
+	fourth := meshTestDeviceID('4')
+	fifth := meshTestDeviceID('5')
+	requirement := ConfigurationReadinessRequirement{
+		SessionID:             nodeTestSessionID,
+		RecoveryGeneration:    0,
+		TargetVoterSetVersion: 2,
+		TargetVoterDeviceIDs: []domain.DeviceID{
+			second,
+			third,
+			fourth,
+		},
+		ConfigurationIndex: 11,
+		LiveVoterDeviceIDs: []domain.DeviceID{
+			first,
+			second,
+			third,
+			fourth,
+			fifth,
+		},
+		LiveNonvoterDeviceIDs: []domain.DeviceID{},
+		ActiveDeviceIDs: []domain.DeviceID{
+			second,
+			third,
+			fourth,
+			fifth,
+		},
+		PostChangeVoterDeviceIDs: []domain.DeviceID{
+			first,
+			second,
+			third,
+			fourth,
+			fifth,
+		},
+		RequiredPostChangeQuorum: 3,
+		Operation:                ConfigurationObserve,
+		SubjectDeviceID:          first,
+	}
+	provider := &readinessGateTestProvider{
+		candidate: ConfigurationReadinessCandidate{
+			ReachableDeviceIDs: []domain.DeviceID{
+				second,
+				third,
+				fourth,
+			},
+			CurrentCredentialDeviceIDs: []domain.DeviceID{
+				second,
+				third,
+				fourth,
+			},
+		},
+	}
+	gate := newConfigurationReadinessGate(provider)
+	verified, err := gate.collect(testContext(t), requirement)
+	if err != nil {
+		t.Fatalf("collect(without outgoing leader): %v", err)
+	}
+	if err := gate.verifyCurrent(requirement, verified); err != nil {
+		t.Fatalf("verifyCurrent(without outgoing leader): %v", err)
+	}
+
+	provider.candidate.ReachableDeviceIDs =
+		provider.candidate.ReachableDeviceIDs[:2]
+	provider.candidate.CurrentCredentialDeviceIDs =
+		provider.candidate.CurrentCredentialDeviceIDs[:2]
+	if _, err := gate.collect(
+		testContext(t),
+		requirement,
+	); !errors.Is(err, ErrConfigurationQuorumUnavailable) {
+		t.Fatalf("collect(without active quorum) error = %v", err)
+	}
+}
+
 func TestConfigurationReadinessProviderFreshnessFailurePropagates(
 	t *testing.T,
 ) {

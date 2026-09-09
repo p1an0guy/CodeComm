@@ -124,6 +124,23 @@ func (requirement ConfigurationReadinessRequirement) validate() error {
 	if requirement.RequiredPostChangeQuorum != uint64(required) {
 		return ErrInvalidConfigurationReadiness
 	}
+	if requirement.Operation == ConfigurationObserve {
+		subjectIsLiveVoter := containsSortedDeviceID(
+			requirement.LiveVoterDeviceIDs,
+			requirement.SubjectDeviceID,
+		)
+		subjectIsActive := containsSortedDeviceID(
+			requirement.ActiveDeviceIDs,
+			requirement.SubjectDeviceID,
+		)
+		subjectIsTarget := containsSortedDeviceID(
+			requirement.TargetVoterDeviceIDs,
+			requirement.SubjectDeviceID,
+		)
+		if !subjectIsLiveVoter || !subjectIsActive && subjectIsTarget {
+			return ErrInvalidConfigurationReadiness
+		}
+	}
 	return nil
 }
 
@@ -356,9 +373,15 @@ func validateConfigurationReadinessCandidate(
 	if uint64(ready) < requirement.RequiredPostChangeQuorum {
 		return ErrConfigurationQuorumUnavailable
 	}
-	if requirement.Operation == ConfigurationAddVoter ||
+	subjectMustBeReady := requirement.Operation ==
+		ConfigurationAddVoter ||
 		requirement.Operation == ConfigurationTransfer ||
-		requirement.Operation == ConfigurationObserve {
+		requirement.Operation == ConfigurationObserve &&
+			containsSortedDeviceID(
+				requirement.ActiveDeviceIDs,
+				requirement.SubjectDeviceID,
+			)
+	if subjectMustBeReady {
 		if _, exists := reachable[requirement.SubjectDeviceID]; !exists {
 			return ErrConfigurationQuorumUnavailable
 		}
@@ -569,9 +592,14 @@ func reconciliationReadinessRequirement(
 		Operation:                ConfigurationObserve,
 		SubjectDeviceID:          localLeader,
 	}
+	localMember, localMemberExists := state.Admission.Member(localLeader)
+	revokedOutgoingLeader := localMemberExists &&
+		localMember.Status == device.StatusRevoked &&
+		!state.VoterSet.Contains(localLeader)
 	if !localIsVoter ||
 		requirement.validate() != nil ||
-		!containsSortedDeviceID(activeDeviceIDs, localLeader) {
+		!containsSortedDeviceID(activeDeviceIDs, localLeader) &&
+			!revokedOutgoingLeader {
 		return ConfigurationReadinessRequirement{},
 			ErrInvalidConfigurationReadiness
 	}

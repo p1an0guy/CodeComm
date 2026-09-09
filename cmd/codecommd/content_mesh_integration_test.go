@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -679,6 +680,44 @@ func dialDaemonMeshExternalSnapshotBulk(
 	target *daemonMeshIntegrationNode,
 	root logicalsnapshot.Root,
 ) (*daemonMeshSnapshotBulkConnection, error) {
+	return dialDaemonMeshExternalSnapshotBulkWithDialContext(
+		ctx,
+		certificate,
+		selectedAddress,
+		target,
+		root,
+		nil,
+	)
+}
+
+func dialDaemonMeshExternalSnapshotBulkWithDialContext(
+	ctx context.Context,
+	certificate tls.Certificate,
+	selectedAddress netip.Addr,
+	target *daemonMeshIntegrationNode,
+	root logicalsnapshot.Root,
+	dialContext transport.ConsensusRouteDialContext,
+) (*daemonMeshSnapshotBulkConnection, error) {
+	return dialDaemonMeshExternalSnapshotBulkObserved(
+		ctx,
+		certificate,
+		selectedAddress,
+		target,
+		root,
+		dialContext,
+		nil,
+	)
+}
+
+func dialDaemonMeshExternalSnapshotBulkObserved(
+	ctx context.Context,
+	certificate tls.Certificate,
+	selectedAddress netip.Addr,
+	target *daemonMeshIntegrationNode,
+	root logicalsnapshot.Root,
+	dialContext transport.ConsensusRouteDialContext,
+	observeRaw func(net.Conn),
+) (*daemonMeshSnapshotBulkConnection, error) {
 	if ctx == nil ||
 		ctx.Err() != nil ||
 		!selectedAddress.IsValid() ||
@@ -747,13 +786,30 @@ func dialDaemonMeshExternalSnapshotBulk(
 			IP: net.IP(selectedAddress.AsSlice()),
 		},
 	}
-	raw, err := dialer.DialContext(
-		ctx,
-		"tcp4",
-		target.peerEndpoint.String(),
-	)
+	targetEndpoint := target.currentPeerEndpoint()
+	if !targetEndpoint.IsValid() {
+		return nil, errDaemonMeshContentHarness
+	}
+	var raw net.Conn
+	if dialContext == nil {
+		raw, err = dialer.DialContext(
+			ctx,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	} else {
+		raw, err = dialContext(
+			ctx,
+			&dialer,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if observeRaw != nil {
+		observeRaw(raw)
 	}
 	client, err := contenthttp.OpenSnapshotBulkClient(
 		ctx,
@@ -1027,6 +1083,22 @@ func dialDaemonMeshExternalContentClient(
 	selectedAddress netip.Addr,
 	target *daemonMeshIntegrationNode,
 ) (*daemonMeshPairedContentConnection, error) {
+	return dialDaemonMeshExternalContentClientWithDialContext(
+		ctx,
+		certificate,
+		selectedAddress,
+		target,
+		nil,
+	)
+}
+
+func dialDaemonMeshExternalContentClientWithDialContext(
+	ctx context.Context,
+	certificate tls.Certificate,
+	selectedAddress netip.Addr,
+	target *daemonMeshIntegrationNode,
+	dialContext transport.ConsensusRouteDialContext,
+) (*daemonMeshPairedContentConnection, error) {
 	if ctx == nil || ctx.Err() != nil ||
 		!selectedAddress.IsValid() || target == nil ||
 		!target.deviceID.Valid() {
@@ -1092,11 +1164,25 @@ func dialDaemonMeshExternalContentClient(
 			IP: net.IP(selectedAddress.AsSlice()),
 		},
 	}
-	raw, err := dialer.DialContext(
-		ctx,
-		"tcp4",
-		target.peerEndpoint.String(),
-	)
+	targetEndpoint := target.currentPeerEndpoint()
+	if !targetEndpoint.IsValid() {
+		return nil, errDaemonMeshContentHarness
+	}
+	var raw net.Conn
+	if dialContext == nil {
+		raw, err = dialer.DialContext(
+			ctx,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	} else {
+		raw, err = dialContext(
+			ctx,
+			&dialer,
+			"tcp4",
+			targetEndpoint.String(),
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1221,7 +1307,34 @@ func waitForDaemonMeshContentCredentialEpoch(
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("content credentials did not become available: %v", lastErr)
+	diagnostics := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		localEpoch, localErr := daemonMeshContentCredentialEpoch(node)
+		appliedEpoch := uint64(0)
+		appliedErr := errDaemonMeshContentHarness
+		if consensusNode, ready := node.meshCapture.consensusNode(); ready {
+			if admission, err := consensusNode.PeerAdmissionSnapshot(); err == nil {
+				appliedEpoch, _ = admission.CurrentCredentialEpoch(node.deviceID)
+				appliedErr = nil
+			} else {
+				appliedErr = err
+			}
+		}
+		diagnostics = append(diagnostics, fmt.Sprintf(
+			"%s(local=%d, local_err=%v, applied=%d, applied_err=%v, fatal=%v)",
+			node.deviceID,
+			localEpoch,
+			localErr,
+			appliedEpoch,
+			appliedErr,
+			node.meshCapture.fatalError(),
+		))
+	}
+	t.Fatalf(
+		"content credentials did not become available: %v; %s",
+		lastErr,
+		strings.Join(diagnostics, ", "),
+	)
 }
 
 func daemonMeshContentCredentialEpoch(

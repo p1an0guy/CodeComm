@@ -461,9 +461,16 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			lastErr = dialErr
 			continue
 		}
+		stopCancellation := context.AfterFunc(ctx, func() {
+			_ = raw.Close()
+		})
 		connection := tls.Client(raw, tlsConfig.Clone())
-		if handshakeErr := connection.HandshakeContext(ctx); handshakeErr != nil {
+		closeConnection := func() {
+			stopCancellation()
 			_ = connection.Close()
+		}
+		if handshakeErr := connection.HandshakeContext(ctx); handshakeErr != nil {
+			closeConnection()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -474,7 +481,7 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			connection.ConnectionState(),
 			deviceID,
 		) {
-			_ = connection.Close()
+			closeConnection()
 			lastErr = ErrTLSAdmission
 			continue
 		}
@@ -482,13 +489,13 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			connection.ConnectionState().PeerCertificates[0].Raw,
 		)
 		if parseErr != nil {
-			_ = connection.Close()
+			closeConnection()
 			lastErr = ErrTLSAdmission
 			continue
 		}
 		if requireLiveConfiguration {
 			if err := layer.authorize(deviceID); err != nil {
-				_ = connection.Close()
+				closeConnection()
 				return nil, err
 			}
 		}
@@ -497,7 +504,7 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			deviceID,
 			endpoint,
 		); observeErr != nil {
-			_ = connection.Close()
+			closeConnection()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -509,7 +516,7 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 			connection,
 		)
 		if httpErr != nil {
-			_ = connection.Close()
+			closeConnection()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
@@ -518,8 +525,16 @@ func (layer *ConsensusStreamLayer) dialPhysical(
 		}
 		if err := ctx.Err(); err != nil {
 			_ = httpConnection.Close()
-			_ = connection.Close()
+			closeConnection()
 			return nil, err
+		}
+		if !stopCancellation() {
+			_ = httpConnection.Close()
+			_ = connection.Close()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, ErrConsensusEndpointUnavailable
 		}
 		return &consensusPhysicalClient{
 			raw:      connection,

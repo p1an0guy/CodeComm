@@ -226,7 +226,7 @@ func validateLeadershipTransferTarget(
 		target == domain.DeviceID(localServerID) ||
 		!state.VoterSet.Contains(target) ||
 		state.VoterSet.Contains(domain.DeviceID(localServerID)) ||
-		!credentialAuthorityMatchesTarget(state) {
+		!leadershipTransferAuthorityReady(state, localServerID) {
 		return ErrInvalidLeadershipTransfer
 	}
 	member, exists := state.Admission.Member(target)
@@ -241,6 +241,21 @@ func validateLeadershipTransferTarget(
 		}
 	}
 	return ErrInvalidLeadershipTransfer
+}
+
+func leadershipTransferAuthorityReady(
+	state decodedState,
+	localServerID raft.ServerID,
+) bool {
+	if credentialAuthorityMatchesTarget(state) {
+		return true
+	}
+	localDeviceID := domain.DeviceID(localServerID)
+	localMember, exists := state.Admission.Member(localDeviceID)
+	return exists &&
+		localMember.Status == device.StatusRevoked &&
+		!state.VoterSet.Contains(localDeviceID) &&
+		credentialAuthorityNeedsActivation(state)
 }
 
 func (node *SingleNode) invokeRaftLeadershipTransfer(

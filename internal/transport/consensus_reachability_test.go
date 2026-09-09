@@ -170,6 +170,41 @@ func testConsensusReachabilityCancellation(t *testing.T) {
 	}
 }
 
+func testConsensusHandshakeCancellationClosesSocket(t *testing.T) {
+	harness := newConsensusHarness(t)
+	dialer := &blockingConsensusHandshakeDialer{
+		entered: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	harness.client.dialer = dialer
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, err := harness.client.ProbeConsensusPeer(ctx, harness.serverID)
+		result <- err
+	}()
+	select {
+	case <-dialer.entered:
+	case <-time.After(consensusTestTimeout):
+		t.Fatal("reachability probe did not enter TLS write")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ProbeConsensusPeer() error = %v", err)
+		}
+	case <-time.After(consensusTestTimeout):
+		t.Fatal("canceled TLS handshake did not return")
+	}
+	select {
+	case <-dialer.closed:
+	case <-time.After(consensusTestTimeout):
+		t.Fatal("canceled TLS handshake retained its raw socket")
+	}
+}
+
 func testConsensusReachabilityVerificationIsLocal(t *testing.T) {
 	harness := newConsensusHarness(t)
 	token, err := harness.client.ProbeConsensusPeer(
@@ -218,4 +253,51 @@ func (dialer *blockingConsensusProbeDialer) DialConsensusEndpoint(
 	dialer.once.Do(func() { close(dialer.entered) })
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+type blockingConsensusHandshakeDialer struct {
+	entered chan struct{}
+	closed  chan struct{}
+}
+
+func (dialer *blockingConsensusHandshakeDialer) DialConsensusEndpoint(
+	context.Context,
+	netip.AddrPort,
+) (net.Conn, error) {
+	client, server := net.Pipe()
+	return &blockingConsensusHandshakeConn{
+		Conn:    client,
+		peer:    server,
+		entered: dialer.entered,
+		closed:  dialer.closed,
+	}, nil
+}
+
+type blockingConsensusHandshakeConn struct {
+	net.Conn
+	peer    net.Conn
+	entered chan struct{}
+	closed  chan struct{}
+
+	enterOnce sync.Once
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (connection *blockingConsensusHandshakeConn) Write(
+	value []byte,
+) (int, error) {
+	connection.enterOnce.Do(func() { close(connection.entered) })
+	return connection.Conn.Write(value)
+}
+
+func (connection *blockingConsensusHandshakeConn) Close() error {
+	connection.closeOnce.Do(func() {
+		close(connection.closed)
+		connection.closeErr = errors.Join(
+			connection.Conn.Close(),
+			connection.peer.Close(),
+		)
+	})
+	return connection.closeErr
 }
