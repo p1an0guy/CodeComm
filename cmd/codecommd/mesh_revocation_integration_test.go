@@ -380,7 +380,7 @@ func runDaemonProductionFullPlaneRevocationComposition(t *testing.T) {
 	for _, gate := range isolation {
 		gate.Release()
 	}
-	statuses = waitForDaemonMeshIntegrationCluster(
+	waitForDaemonMeshIntegrationCluster(
 		t,
 		finalNodes,
 		func(statuses []ui.Snapshot) bool {
