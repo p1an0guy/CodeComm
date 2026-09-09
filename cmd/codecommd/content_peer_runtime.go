@@ -135,6 +135,19 @@ type daemonContentPeerWorker struct {
 	eventStreamReplicatedResult atomic.Uint64
 }
 
+type daemonContentPeerWorkerOperations struct {
+	dial func(
+		context.Context,
+		domain.DeviceID,
+	) (*daemonContentPeerConnection, error)
+	maintain func(
+		context.Context,
+		domain.DeviceID,
+		*daemonContentPeerConnection,
+	) error
+	wait func(context.Context, time.Duration) bool
+}
+
 type daemonContentPeerTransientErrorSnapshot struct {
 	PeerID    domain.DeviceID
 	Operation string
@@ -431,6 +444,22 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 	ctx context.Context,
 	worker *daemonContentPeerWorker,
 ) {
+	runtime.runWorkerWithOperations(
+		ctx,
+		worker,
+		daemonContentPeerWorkerOperations{
+			dial:     runtime.dialPeer,
+			maintain: runtime.maintainPeer,
+			wait:     runtime.waitWorker,
+		},
+	)
+}
+
+func (runtime *daemonContentPeerRuntime) runWorkerWithOperations(
+	ctx context.Context,
+	worker *daemonContentPeerWorker,
+	operations daemonContentPeerWorkerOperations,
+) {
 	defer close(worker.done)
 	var connection *daemonContentPeerConnection
 	defer func() {
@@ -449,7 +478,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 		}
 		if connection == nil {
 			var err error
-			connection, err = runtime.dialPeer(ctx, worker.deviceID)
+			connection, err = operations.dial(ctx, worker.deviceID)
 			if err != nil {
 				if errors.Is(err, errDaemonContentPeerState) &&
 					ctx.Err() == nil {
@@ -459,17 +488,18 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 				if ctx.Err() == nil {
 					worker.recordTransientError("dial", err)
 				}
-				if !runtime.waitWorker(ctx, runtime.jitter(retry)) {
+				if !operations.wait(ctx, runtime.jitter(retry)) {
 					return
 				}
 				retry = min(retry*2, daemonContentPeerRetryMaximum)
 				continue
 			}
 			worker.setConnection(connection)
+			retry = daemonContentPeerRetryInitial
 		}
-		err := runtime.maintainPeer(ctx, worker.deviceID, connection)
+		err := operations.maintain(ctx, worker.deviceID, connection)
 		if errors.Is(err, errDaemonContentPeerCredentialAdvanced) {
-			replacement, err := runtime.dialPeer(ctx, worker.deviceID)
+			replacement, err := operations.dial(ctx, worker.deviceID)
 			if err == nil {
 				worker.setConnection(replacement)
 				_ = connection.Close()
@@ -484,7 +514,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			} else if err != nil && ctx.Err() == nil {
 				worker.recordTransientError("dial", err)
 			}
-			if !runtime.waitWorker(
+			if !operations.wait(
 				ctx,
 				daemonContentPeerRefreshInterval,
 			) {
@@ -507,7 +537,7 @@ func (runtime *daemonContentPeerRuntime) runWorker(
 			if ctx.Err() == nil {
 				worker.recordTransientError("sync", err)
 			}
-			if !runtime.waitWorker(ctx, runtime.jitter(retry)) {
+			if !operations.wait(ctx, runtime.jitter(retry)) {
 				return
 			}
 			retry = min(retry*2, daemonContentPeerRetryMaximum)

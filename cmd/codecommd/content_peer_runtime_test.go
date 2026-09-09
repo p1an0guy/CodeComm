@@ -220,6 +220,133 @@ func TestDaemonContentPeerWorkerForgetsReplicationPeerOnExit(t *testing.T) {
 	}
 }
 
+func TestDaemonContentPeerWorkerDialBackoffDoublesAndCaps(t *testing.T) {
+	runtime := &daemonContentPeerRuntime{
+		jitter: func(delay time.Duration) time.Duration {
+			return delay
+		},
+	}
+	worker := &daemonContentPeerWorker{
+		deviceID: daemonContentTestDeviceID(t, 0xe1),
+		done:     make(chan struct{}),
+	}
+	wantDelays := []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		daemonContentPeerRetryMaximum,
+		daemonContentPeerRetryMaximum,
+	}
+	var delays []time.Duration
+	runtime.runWorkerWithOperations(
+		t.Context(),
+		worker,
+		daemonContentPeerWorkerOperations{
+			dial: func(
+				context.Context,
+				domain.DeviceID,
+			) (*daemonContentPeerConnection, error) {
+				return nil, errors.New("endpoint unavailable")
+			},
+			maintain: func(
+				context.Context,
+				domain.DeviceID,
+				*daemonContentPeerConnection,
+			) error {
+				t.Fatal("failed dial reached connection maintenance")
+				return nil
+			},
+			wait: func(
+				_ context.Context,
+				delay time.Duration,
+			) bool {
+				delays = append(delays, delay)
+				return len(delays) < len(wantDelays)
+			},
+		},
+	)
+	if !slices.Equal(delays, wantDelays) {
+		t.Fatalf("dial retry delays = %v, want %v", delays, wantDelays)
+	}
+}
+
+func TestDaemonContentPeerWorkerOrdinaryDialResetsBackoff(t *testing.T) {
+	runtime := &daemonContentPeerRuntime{
+		jitter: func(delay time.Duration) time.Duration {
+			return delay
+		},
+	}
+	worker := &daemonContentPeerWorker{
+		deviceID: daemonContentTestDeviceID(t, 0xe2),
+		done:     make(chan struct{}),
+	}
+	const failedDials = 7
+	dialCount := 0
+	maintainCount := 0
+	var delays []time.Duration
+	runtime.runWorkerWithOperations(
+		t.Context(),
+		worker,
+		daemonContentPeerWorkerOperations{
+			dial: func(
+				context.Context,
+				domain.DeviceID,
+			) (*daemonContentPeerConnection, error) {
+				dialCount++
+				if dialCount <= failedDials {
+					return nil, errors.New("endpoint unavailable")
+				}
+				return &daemonContentPeerConnection{}, nil
+			},
+			maintain: func(
+				context.Context,
+				domain.DeviceID,
+				*daemonContentPeerConnection,
+			) error {
+				maintainCount++
+				return errors.New("connection lost")
+			},
+			wait: func(
+				_ context.Context,
+				delay time.Duration,
+			) bool {
+				delays = append(delays, delay)
+				return len(delays) <= failedDials
+			},
+		},
+	)
+	wantDelays := []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		daemonContentPeerRetryInitial,
+	}
+	if !slices.Equal(delays, wantDelays) {
+		t.Fatalf(
+			"retry delays across ordinary dial = %v, want %v",
+			delays,
+			wantDelays,
+		)
+	}
+	if dialCount != failedDials+1 {
+		t.Fatalf("dial count = %d, want %d", dialCount, failedDials+1)
+	}
+	if maintainCount != 1 {
+		t.Fatalf("maintain count = %d, want 1", maintainCount)
+	}
+	if connection := worker.currentConnection(); connection != nil {
+		t.Fatalf("worker retained closed connection %p", connection)
+	}
+}
+
 func TestDaemonContentPeerTransientErrorsAreBoundedAndClear(t *testing.T) {
 	firstID := daemonContentTestDeviceID(t, 0xe1)
 	secondID := daemonContentTestDeviceID(t, 0xe2)
