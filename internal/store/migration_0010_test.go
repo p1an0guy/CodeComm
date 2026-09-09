@@ -115,6 +115,9 @@ func downgradeCheckpointCadenceTestStoreToV9(
 	err := database.LocalState().withImmediate(
 		context.Background(),
 		func(conn *sqlite.Conn) error {
+			if err := downgradeCommandResultPayloadsForTest(conn); err != nil {
+				return err
+			}
 			if err := queryOne(
 				conn,
 				`SELECT applied_at FROM schema_migrations

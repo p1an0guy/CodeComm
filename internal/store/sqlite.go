@@ -16,14 +16,31 @@ func configureStartupConnection(conn *sqlite.Conn) error {
 	if err := configurePooledConnection(conn); err != nil {
 		return err
 	}
-	var journalMode string
-	if err := queryOne(conn, "PRAGMA journal_mode = WAL;", func(stmt *sqlite.Stmt) {
-		journalMode = strings.ToLower(stmt.ColumnText(0))
+	var pageCount int64
+	if err := queryOne(conn, "PRAGMA page_count;", func(stmt *sqlite.Stmt) {
+		pageCount = stmt.ColumnInt64(0)
 	}); err != nil {
 		return err
 	}
-	if journalMode != "wal" {
-		return fmt.Errorf("journal_mode = %q, want wal", journalMode)
+	if pageCount < 0 {
+		return fmt.Errorf("page_count = %d, want nonnegative", pageCount)
+	}
+	if pageCount == 0 {
+		if err := execute(conn, "PRAGMA page_size = 8192;"); err != nil {
+			return err
+		}
+		var pageSize int64
+		if err := queryOne(conn, "PRAGMA page_size;", func(stmt *sqlite.Stmt) {
+			pageSize = stmt.ColumnInt64(0)
+		}); err != nil {
+			return err
+		}
+		if pageSize != 8192 {
+			return fmt.Errorf("page_size = %d, want 8192", pageSize)
+		}
+	}
+	if err := setSQLiteJournalMode(conn, "wal"); err != nil {
+		return err
 	}
 	var version string
 	if err := queryOne(conn, "SELECT sqlite_version();", func(stmt *sqlite.Stmt) {
@@ -33,6 +50,26 @@ func configureStartupConnection(conn *sqlite.Conn) error {
 	}
 	if compareSQLiteVersion(version, minimumSQLiteVersion) < 0 {
 		return fmt.Errorf("%w: got %s, want >= %s", ErrSQLiteVersion, version, minimumSQLiteVersion)
+	}
+	return nil
+}
+
+func setSQLiteJournalMode(conn *sqlite.Conn, mode string) error {
+	if mode != "wal" && mode != "delete" {
+		return fmt.Errorf("unsupported journal mode %q", mode)
+	}
+	var journalMode string
+	if err := queryOne(
+		conn,
+		"PRAGMA journal_mode = "+strings.ToUpper(mode)+";",
+		func(stmt *sqlite.Stmt) {
+			journalMode = strings.ToLower(stmt.ColumnText(0))
+		},
+	); err != nil {
+		return err
+	}
+	if journalMode != mode {
+		return fmt.Errorf("journal_mode = %q, want %s", journalMode, mode)
 	}
 	return nil
 }

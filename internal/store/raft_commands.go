@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -64,7 +65,6 @@ func (store *Store) VerifyRaftCommand(
 			`SELECT a.term = ?3
 			        AND a.event_id = ?4
 			        AND a.proposal_digest = ?5
-			        AND r.proposal_json = ?6
 			        AND r.proposal_digest = ?5
 			   FROM raft_command_applications AS a
 			   JOIN command_results AS r ON r.event_id = a.event_id
@@ -76,7 +76,6 @@ func (store *Store) VerifyRaftCommand(
 				term,
 				string(signed.Proposal().EventID),
 				digest[:],
-				string(signed.CanonicalBytes()),
 			},
 			func(stmt *sqlite.Stmt) {
 				count++
@@ -87,6 +86,24 @@ func (store *Store) VerifyRaftCommand(
 			return err
 		}
 		if count != 1 || !matches {
+			return fmt.Errorf(
+				"%w: term=%d log_index=%d event_id=%s",
+				ErrRaftCommandBinding,
+				term,
+				logIndex,
+				signed.Proposal().EventID,
+			)
+		}
+		stored, found, err := readStoredCommandResult(
+			conn,
+			signed.Proposal().EventID,
+		)
+		if err != nil {
+			return err
+		}
+		if !found ||
+			stored.proposalDigest != digest ||
+			!bytes.Equal(stored.proposalJSON, signed.CanonicalBytes()) {
 			return fmt.Errorf(
 				"%w: term=%d log_index=%d event_id=%s",
 				ErrRaftCommandBinding,

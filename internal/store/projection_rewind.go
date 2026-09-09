@@ -109,7 +109,7 @@ func projectionStateDigestAtResultCut(
 	var rowErr error
 	queryErr := queryArgs(
 		conn,
-		`SELECT result_index, projection_mutations_json
+		`SELECT result_index
 		   FROM command_results
 		  WHERE session_id = ?1 AND recovery_generation = ?2
 		    AND result_index > ?3
@@ -132,7 +132,15 @@ func projectionStateDigestAtResultCut(
 				)
 				return
 			}
-			encoded := []byte(stmt.ColumnText(1))
+			payload, payloadErr := requireCommandResultPayload(
+				conn,
+				uint64(storedIndex),
+			)
+			if payloadErr != nil {
+				rowErr = payloadErr
+				return
+			}
+			encoded := payload.mutations
 			mutations, decodeErr := chain.DecodeMutations(encoded)
 			if decodeErr != nil {
 				rowErr = decodeErr

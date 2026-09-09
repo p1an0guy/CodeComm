@@ -69,16 +69,15 @@ func TestProjectionScratchMatchesSQLiteMutationAndStateDigests(t *testing.T) {
 
 	var storedMutationJSON []byte
 	err = database.withConn(context.Background(), func(conn *sqlite.Conn) error {
-		return queryOneArgs(
+		payload, err := requireCommandResultPayload(
 			conn,
-			`SELECT projection_mutations_json
-			   FROM command_results
-			  WHERE result_index = ?1;`,
-			[]any{after.Heads.ResultIndex},
-			func(stmt *sqlite.Stmt) {
-				storedMutationJSON = []byte(stmt.ColumnText(0))
-			},
+			after.Heads.ResultIndex,
 		)
+		if err != nil {
+			return err
+		}
+		storedMutationJSON = payload.mutations
+		return nil
 	})
 	if err != nil {
 		t.Fatalf("read stored mutations: %v", err)

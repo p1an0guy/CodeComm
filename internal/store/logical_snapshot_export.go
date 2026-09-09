@@ -571,19 +571,39 @@ func verifyLogicalSnapshotCheckpointKeepsAuthority(
 	var (
 		encoded []byte
 		count   int
+		rowErr  error
 	)
 	if err := queryArgs(
 		conn,
-		`SELECT projection_mutations_json
+		`SELECT result_index
 		   FROM command_results
 		  WHERE event_id = ?1;`,
 		[]any{string(eventID)},
 		func(stmt *sqlite.Stmt) {
 			count++
-			encoded = []byte(stmt.ColumnText(0))
+			value := stmt.ColumnInt64(0)
+			if value < 1 {
+				rowErr = errors.New("invalid checkpoint result index")
+				return
+			}
+			payload, err := requireCommandResultPayload(
+				conn,
+				uint64(value),
+			)
+			if err != nil {
+				rowErr = err
+				return
+			}
+			encoded = payload.mutations
 		},
 	); err != nil {
 		return err
+	}
+	if rowErr != nil {
+		return logicalSnapshotIntegrity(
+			"read checkpoint mutations",
+			rowErr,
+		)
 	}
 	if count != 1 {
 		return logicalSnapshotIntegrity(
@@ -733,7 +753,7 @@ func streamLogicalSnapshotResults(
 	var rowErr error
 	err := queryArgs(
 		conn,
-		`SELECT event_id, projection_mutations_json
+		`SELECT event_id, result_index
 		   FROM command_results
 		  WHERE result_index <= ?1
 		  ORDER BY result_index;`,
@@ -760,7 +780,20 @@ func streamLogicalSnapshotResults(
 				rowErr = err
 				return
 			}
-			mutationJSON := []byte(stmt.ColumnText(1))
+			value := stmt.ColumnInt64(1)
+			if value < 1 {
+				rowErr = errors.New("invalid result index")
+				return
+			}
+			payload, payloadErr := requireCommandResultPayload(
+				conn,
+				uint64(value),
+			)
+			if payloadErr != nil {
+				rowErr = payloadErr
+				return
+			}
+			mutationJSON := payload.mutations
 			mutations, err := chain.DecodeMutations(mutationJSON)
 			if err != nil {
 				rowErr = err

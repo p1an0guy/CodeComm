@@ -604,11 +604,13 @@ type storedCommandResult struct {
 	proposalJSON       []byte
 	proposalDigest     Digest
 	outcome            CommandOutcome
+	mutationJSON       []byte
 	chainIndex         *uint64
 	chainHash          *Digest
 	resultIndex        uint64
 	previousResultHash Digest
 	resultHash         Digest
+	compactedPayload   bool
 }
 
 func readStoredCommandResult(
@@ -622,10 +624,10 @@ func readStoredCommandResult(
 	)
 	err := queryArgs(
 		conn,
-		`SELECT session_id, recovery_generation, proposal_json, proposal_digest,
-		        outcome_status, outcome_code,
-		        outcome_json, chain_index, chain_hash, result_index,
-		        previous_result_hash, result_hash
+		`SELECT session_id, recovery_generation, proposal_json,
+		        proposal_digest, outcome_status, outcome_code, outcome_json,
+		        projection_mutations_json, chain_index, chain_hash,
+		        result_index, previous_result_hash, result_hash
 		   FROM command_results WHERE event_id = ?1;`,
 		[]any{string(eventID)},
 		func(stmt *sqlite.Stmt) {
@@ -641,40 +643,42 @@ func readStoredCommandResult(
 				return
 			}
 			result.recoveryGeneration = uint64(generation)
-			result.proposalJSON = []byte(stmt.ColumnText(2))
+			result.proposalJSON = bytes.Clone([]byte(stmt.ColumnText(2)))
 			if rowErr = copyDigestColumn(
 				&result.proposalDigest,
-				stmt,
-				3,
+				stmt, 3,
 			); rowErr != nil {
 				return
 			}
 			result.outcome = CommandOutcome{
 				Status: OutcomeStatus(stmt.ColumnText(4)),
 				Code:   stmt.ColumnText(5),
-				JSON:   []byte(stmt.ColumnText(6)),
+				JSON:   bytes.Clone([]byte(stmt.ColumnText(6))),
 			}
-			chainIndexNull := stmt.ColumnType(7) == sqlite.TypeNull
-			chainHashNull := stmt.ColumnType(8) == sqlite.TypeNull
+			result.mutationJSON = bytes.Clone(
+				[]byte(stmt.ColumnText(7)),
+			)
+			chainIndexNull := stmt.ColumnType(8) == sqlite.TypeNull
+			chainHashNull := stmt.ColumnType(9) == sqlite.TypeNull
 			if chainIndexNull != chainHashNull {
 				rowErr = errors.New("partial accepted chain tuple")
 				return
 			}
 			if !chainIndexNull {
-				value := stmt.ColumnInt64(7)
+				value := stmt.ColumnInt64(8)
 				if value < 1 {
 					rowErr = errors.New("invalid accepted chain index")
 					return
 				}
 				index := uint64(value)
 				hash := new(Digest)
-				if rowErr = copyDigestColumn(hash, stmt, 8); rowErr != nil {
+				if rowErr = copyDigestColumn(hash, stmt, 9); rowErr != nil {
 					return
 				}
 				result.chainIndex = &index
 				result.chainHash = hash
 			}
-			value := stmt.ColumnInt64(9)
+			value := stmt.ColumnInt64(10)
 			if value < 1 {
 				rowErr = errors.New("invalid result index")
 				return
@@ -682,12 +686,16 @@ func readStoredCommandResult(
 			result.resultIndex = uint64(value)
 			if rowErr = copyDigestColumn(
 				&result.previousResultHash,
-				stmt,
-				10,
+				stmt, 11,
 			); rowErr != nil {
 				return
 			}
-			rowErr = copyDigestColumn(&result.resultHash, stmt, 11)
+			if rowErr = copyDigestColumn(
+				&result.resultHash,
+				stmt, 12,
+			); rowErr != nil {
+				return
+			}
 		},
 	)
 	if err != nil {
@@ -705,6 +713,41 @@ func readStoredCommandResult(
 			"%w: duplicate event ID rows",
 			ErrCommandResultCorrupt,
 		)
+	}
+	if count == 1 {
+		inline := commandResultPayload{
+			proposal:  result.proposalJSON,
+			outcome:   result.outcome.JSON,
+			mutations: result.mutationJSON,
+		}
+		compacted, partial := commandResultPayloadSentinels(inline)
+		if partial {
+			return storedCommandResult{}, false,
+				commandResultPayloadError("legacy sentinels are partial", nil)
+		}
+		if compacted {
+			payload, found, err := readCompactedCommandResultPayload(
+				conn,
+				result.resultIndex,
+			)
+			if err != nil {
+				return storedCommandResult{}, false, err
+			}
+			if !found {
+				return storedCommandResult{}, false,
+					commandResultPayloadError("payload row is missing", nil)
+			}
+			result.proposalJSON = payload.proposal
+			result.outcome.JSON = payload.outcome
+			result.mutationJSON = payload.mutations
+			result.compactedPayload = true
+		} else if err := validateLegacyCommandResultPayload(
+			conn,
+			inline,
+		); err != nil {
+			return storedCommandResult{}, false,
+				commandResultPayloadError("invalid legacy payload", err)
+		}
 	}
 	return result, count == 1, nil
 }
@@ -801,13 +844,17 @@ func verifyStoredCommandResult(
 	}
 	if accepted {
 		var eventMatches bool
+		expectedProposal := stored.proposalJSON
+		if stored.compactedPayload {
+			expectedProposal = []byte(commandResultObjectSentinel)
+		}
 		err = queryOneArgs(
 			conn,
 			`SELECT proposal_json = ?2 AND proposal_digest = ?3
 			   FROM events WHERE event_id = ?1;`,
 			[]any{
 				string(stored.eventID),
-				string(stored.proposalJSON),
+				string(expectedProposal),
 				stored.proposalDigest[:],
 			},
 			func(stmt *sqlite.Stmt) {
@@ -989,7 +1036,7 @@ func writeAcceptedEvent(
 		proposal.Origin.Sequence(),
 		string(proposal.Origin.ActorType()),
 		string(proposal.CreatedAt),
-		string(signed.CanonicalBytes()),
+		commandResultObjectSentinel,
 		digest[:],
 		signed.OriginSignature(),
 	)
@@ -1054,7 +1101,7 @@ func writeCommandResult(
 	if err != nil || !bytes.Equal(expectedResult, resultJSON) {
 		return fmt.Errorf("%w: command-result preimage changed", ErrIntegrityCheck)
 	}
-	return execute(
+	if err := execute(
 		conn,
 		`INSERT INTO command_results(
 		    event_id, session_id, workspace_id, recovery_generation,
@@ -1077,17 +1124,28 @@ func writeCommandResult(
 		string(scopeKind),
 		scopeID,
 		proposal.Origin.Sequence(),
-		string(signed.CanonicalBytes()),
+		commandResultObjectSentinel,
 		digest[:],
 		string(request.Outcome.Status),
 		request.Outcome.Code,
-		string(request.Outcome.JSON),
-		string(mutationJSON),
+		commandResultObjectSentinel,
+		commandResultMutationsSentinel,
 		chainIndex,
 		chainHash,
 		heads.ResultIndex,
 		heads.PreviousResultHash[:],
 		heads.ResultHash[:],
+	); err != nil {
+		return err
+	}
+	return writeCommandResultPayload(
+		conn,
+		heads.ResultIndex,
+		commandResultPayload{
+			proposal:  signed.CanonicalBytes(),
+			outcome:   request.Outcome.JSON,
+			mutations: mutationJSON,
+		},
 	)
 }
 

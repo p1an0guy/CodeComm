@@ -567,13 +567,7 @@ func resultRangeRecords(
 	var rowErr error
 	err := queryArgs(
 		conn,
-		`SELECT r.event_id,
-		        EXISTS (
-		            SELECT 1
-		              FROM json_each(r.projection_mutations_json) AS mutation
-		             WHERE json_extract(mutation.value, '$.table')
-		                   IN ('devices', 'credential_authority')
-		        )
+		`SELECT r.event_id, r.result_index
 		   FROM command_results AS r
 		  WHERE r.session_id = ?1
 		    AND r.recovery_generation = ?2
@@ -595,9 +589,35 @@ func resultRangeRecords(
 				rowErr = errors.New("invalid result event ID")
 				return
 			}
+			index := stmt.ColumnInt64(1)
+			if index < 1 {
+				rowErr = errors.New("invalid result index")
+				return
+			}
+			payload, err := requireCommandResultPayload(
+				conn,
+				uint64(index),
+			)
+			if err != nil {
+				rowErr = err
+				return
+			}
+			mutations, err := chain.DecodeMutations(payload.mutations)
+			if err != nil {
+				rowErr = err
+				return
+			}
+			authorizationChange := false
+			for _, mutation := range mutations {
+				if mutation.Table == "devices" ||
+					mutation.Table == "credential_authority" {
+					authorizationChange = true
+					break
+				}
+			}
 			result = append(result, resultRangeRecord{
 				eventID:             eventID,
-				authorizationChange: stmt.ColumnBool(1),
+				authorizationChange: authorizationChange,
 			})
 		},
 	)

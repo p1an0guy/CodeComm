@@ -299,15 +299,34 @@ func TestLogicalSnapshotCheckpointCannotChangeSignerAuthority(
 	if err != nil {
 		t.Fatalf("EncodeMutations(): %v", err)
 	}
-	executeSettledCheckpointTestSQL(
-		t,
-		fixture.store,
-		`UPDATE command_results
-		    SET projection_mutations_json = ?1
-		  WHERE event_id = ?2;`,
-		string(encoded),
-		string(testCheckpointEventID),
-	)
+	if err := fixture.store.LocalState().withImmediate(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			var resultIndex int64
+			if err := queryOneArgs(
+				conn,
+				"SELECT result_index FROM command_results WHERE event_id = ?1;",
+				[]any{string(testCheckpointEventID)},
+				func(stmt *sqlite.Stmt) {
+					resultIndex = stmt.ColumnInt64(0)
+				},
+			); err != nil {
+				return err
+			}
+			if resultIndex < 1 {
+				return errors.New("invalid checkpoint result index")
+			}
+			return rewriteCommandResultPayloadForTest(
+				conn,
+				uint64(resultIndex),
+				func(payload *commandResultPayload) {
+					payload.mutations = bytes.Clone(encoded)
+				},
+			)
+		},
+	); err != nil {
+		t.Fatalf("rewrite checkpoint payload: %v", err)
+	}
 	err = fixture.store.withConn(
 		context.Background(),
 		func(conn *sqlite.Conn) error {

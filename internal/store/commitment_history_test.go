@@ -118,11 +118,12 @@ func TestVerifyCommitmentHistoryRejectsMutationHistoryTampering(t *testing.T) {
 	err = value.withConn(
 		context.Background(),
 		func(conn *sqlite.Conn) error {
-			return execute(
+			return rewriteCommandResultPayloadForTest(
 				conn,
-				`UPDATE command_results
-				    SET projection_mutations_json = '[]'
-				  WHERE result_index = 1;`,
+				1,
+				func(payload *commandResultPayload) {
+					payload.mutations = []byte("[]")
+				},
 			)
 		},
 	)

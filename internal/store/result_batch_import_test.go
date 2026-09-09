@@ -309,13 +309,13 @@ func TestSettledNonvoterReopenRejectsUnsignedProjectionRewrite(t *testing.T) {
 		context.Background(),
 		func(conn *sqlite.Conn) error {
 			for index, encoded := range encodedMutations {
-				if err := execute(
+				resultIndex := input.FromResultIndex + uint64(index)
+				if err := rewriteCommandResultPayloadForTest(
 					conn,
-					`UPDATE command_results
-					    SET projection_mutations_json = ?1
-					  WHERE result_index = ?2;`,
-					string(encoded),
-					input.FromResultIndex+uint64(index),
+					resultIndex,
+					func(payload *commandResultPayload) {
+						payload.mutations = bytes.Clone(encoded)
+					},
 				); err != nil {
 					return err
 				}
@@ -783,15 +783,30 @@ func resultBatchStoredMutations(
 			var decodeErr error
 			err := query(
 				conn,
-				`SELECT projection_mutations_json
-				   FROM command_results ORDER BY result_index;`,
+				`SELECT result_index
+					   FROM command_results ORDER BY result_index;`,
 				func(stmt *sqlite.Stmt) {
 					if decodeErr != nil {
 						return
 					}
+					value := stmt.ColumnInt64(0)
+					if value < 1 {
+						decodeErr = errors.New(
+							"invalid stored result index",
+						)
+						return
+					}
+					payload, err := requireCommandResultPayload(
+						conn,
+						uint64(value),
+					)
+					if err != nil {
+						decodeErr = err
+						return
+					}
 					var decoded []chain.Mutation
 					decoded, decodeErr = chain.DecodeMutations(
-						[]byte(stmt.ColumnText(0)),
+						payload.mutations,
 					)
 					result = append(result, decoded)
 				},

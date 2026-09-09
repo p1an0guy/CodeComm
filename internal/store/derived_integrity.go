@@ -251,7 +251,7 @@ func verifyActivityView(
 	)
 	err := query(
 		conn,
-		`SELECT r.result_index, r.outcome_status, r.proposal_json,
+		`SELECT r.result_index, r.outcome_status, r.event_id,
 		        a.event_id, a.session_id, a.device_id, a.actor_type,
 		        a.agent_session_id, a.event_kind, a.task_id,
 		        a.rationale_summary, a.capture_level, a.actions_json,
@@ -264,8 +264,21 @@ func verifyActivityView(
 				return
 			}
 			rows++
+			resultIndex := stmt.ColumnInt64(0)
+			if resultIndex < 1 {
+				rowErr = errors.New("invalid activity result index")
+				return
+			}
+			payload, err := requireCommandResultPayload(
+				conn,
+				uint64(resultIndex),
+			)
+			if err != nil {
+				rowErr = err
+				return
+			}
 			proposal, err := event.InspectUnverifiedProposal(
-				[]byte(stmt.ColumnText(2)),
+				payload.proposal,
 			)
 			if err != nil {
 				rowErr = fmt.Errorf("decode result proposal: %w", err)
@@ -303,7 +316,7 @@ func verifyActivityView(
 			}
 			var members map[string]json.RawMessage
 			if err := json.Unmarshal(
-				[]byte(stmt.ColumnText(2)),
+				payload.proposal,
 				&members,
 			); err != nil {
 				rowErr = err
@@ -386,7 +399,7 @@ func verifyCommandAuditView(conn *sqlite.Conn) error {
 	err := query(
 		conn,
 		`SELECT r.result_index, r.outcome_status, r.outcome_code,
-		        r.proposal_json, a.audit_id, a.session_id, a.source_kind,
+		        r.event_id, a.audit_id, a.session_id, a.source_kind,
 		        a.event_id, a.result_index, a.reporter_device_id,
 		        a.subject_device_id, a.subject_credential_epoch,
 		        a.actor_type, a.ipc_channel, a.action_code,
@@ -425,8 +438,13 @@ func verifyCommandAuditView(conn *sqlite.Conn) error {
 				)
 				return
 			}
+			payload, err := requireCommandResultPayload(conn, index)
+			if err != nil {
+				rowErr = err
+				return
+			}
 			proposal, err := event.InspectUnverifiedProposal(
-				[]byte(stmt.ColumnText(3)),
+				payload.proposal,
 			)
 			if err != nil {
 				rowErr = fmt.Errorf("decode audit proposal: %w", err)
@@ -509,7 +527,7 @@ func verifyReducerAlarmAuditView(conn *sqlite.Conn) error {
 	err := query(
 		conn,
 		`SELECT r.result_index, r.outcome_status, r.outcome_code,
-		        r.proposal_json, a.audit_id, a.session_id, a.source_kind,
+		        r.event_id, a.audit_id, a.session_id, a.source_kind,
 		        a.event_id, a.result_index, a.reporter_device_id,
 		        a.subject_device_id, a.subject_credential_epoch,
 		        a.actor_type, a.ipc_channel, a.action_code,
@@ -541,8 +559,13 @@ func verifyReducerAlarmAuditView(conn *sqlite.Conn) error {
 			previous = index
 			rows++
 
+			payload, err := requireCommandResultPayload(conn, index)
+			if err != nil {
+				rowErr = err
+				return
+			}
 			proposal, err := event.InspectUnverifiedProposal(
-				[]byte(stmt.ColumnText(3)),
+				payload.proposal,
 			)
 			if err != nil {
 				rowErr = fmt.Errorf("decode reducer alarm proposal: %w", err)

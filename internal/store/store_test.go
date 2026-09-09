@@ -32,6 +32,8 @@ var requiredTables = []string{
 	"canonical_refs",
 	"chain_checkpoints",
 	"checkpoint_cadence_state",
+	"command_result_payload_migration",
+	"command_result_payloads",
 	"command_results",
 	"consensus_state",
 	"control_file_approvals",
@@ -106,6 +108,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 		assertIntQuery(t, conn, "PRAGMA foreign_keys;", 1)
 		assertIntQuery(t, conn, "PRAGMA busy_timeout;", 5000)
 		assertIntQuery(t, conn, "PRAGMA trusted_schema;", 0)
+		assertIntQuery(t, conn, "PRAGMA page_size;", 8192)
 
 		version := queryText(t, conn, "SELECT sqlite_version();")
 		if compareSQLiteVersion(version, minimumSQLiteVersion) < 0 {
@@ -157,6 +160,7 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 			"recovery_boundary_audit",
 			"rebootstrap_install_marker",
 			"checkpoint_cadence",
+			"command_result_payloads",
 		}
 		if len(migrations) != len(wantNames) {
 			t.Fatalf("migration count = %d, want %d", len(migrations), len(wantNames))
@@ -196,6 +200,33 @@ func TestOpenConfiguresAndMigratesStore(t *testing.T) {
 		return nil
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenInitializesPreexistingEmptyDatabaseWithEightKiBPages(
+	t *testing.T,
+) {
+	path := filepath.Join(t.TempDir(), "session", "state.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := Open(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Open(preexisting empty file): %v", err)
+	}
+	defer database.Close()
+	if err := database.withConn(
+		context.Background(),
+		func(conn *sqlite.Conn) error {
+			assertIntQuery(t, conn, "PRAGMA page_size;", 8192)
+			return nil
+		},
+	); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -473,7 +473,7 @@ func projectionAccumulatorAtResultCut(
 	var rowErr error
 	err = queryArgs(
 		conn,
-		`SELECT result_index, result_hash, projection_mutations_json
+		`SELECT result_index, result_hash
 		   FROM command_results
 		  WHERE session_id = ?1 AND recovery_generation = ?2
 		    AND result_index <= ?3
@@ -498,7 +498,15 @@ func projectionAccumulatorAtResultCut(
 			); rowErr != nil {
 				return
 			}
-			mutationJSON := []byte(stmt.ColumnText(2))
+			payload, payloadErr := requireCommandResultPayload(
+				conn,
+				uint64(value),
+			)
+			if payloadErr != nil {
+				rowErr = payloadErr
+				return
+			}
+			mutationJSON := payload.mutations
 			mutations, err := chain.DecodeMutations(mutationJSON)
 			if err != nil {
 				rowErr = err
@@ -703,7 +711,7 @@ func reconstructAttestedBatch(
 	var rowErr error
 	err := queryArgs(
 		conn,
-		`SELECT event_id, result_index, projection_mutations_json
+		`SELECT event_id, result_index
 		   FROM command_results
 		  WHERE session_id = ?1 AND recovery_generation = ?2
 		    AND result_index BETWEEN ?3 AND ?4
@@ -721,13 +729,21 @@ func reconstructAttestedBatch(
 			expected := attestation.fromResultIndex + uint64(len(rows))
 			index := stmt.ColumnInt64(1)
 			eventID := domain.UUIDv7(stmt.ColumnText(0))
-			mutationJSON := []byte(stmt.ColumnText(2))
 			if index < 1 ||
 				uint64(index) != expected ||
 				!eventID.Valid() {
 				rowErr = errors.New("attested result range is not dense")
 				return
 			}
+			payload, payloadErr := requireCommandResultPayload(
+				conn,
+				uint64(index),
+			)
+			if payloadErr != nil {
+				rowErr = payloadErr
+				return
+			}
+			mutationJSON := payload.mutations
 			if _, err := chain.DecodeMutations(mutationJSON); err != nil {
 				rowErr = err
 				return

@@ -111,6 +111,13 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err := applyMigrations(conn, embeddedMigrations, systemClock); err != nil {
 		return nil, normalizeSQLiteError(ctx, "apply migrations", err)
 	}
+	if err := compactCommandResultStorageIfRequired(conn); err != nil {
+		return nil, normalizeSQLiteError(
+			ctx,
+			"compact migrated command-result storage",
+			err,
+		)
+	}
 	if err := checkIntegrity(conn); err != nil {
 		return nil, normalizeSQLiteError(ctx, "check database after migration", err)
 	}
@@ -130,6 +137,13 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 		return nil, normalizeSQLiteError(
 			ctx,
 			"verify committed Raft configuration",
+			err,
+		)
+	}
+	if err := verifyCommandResultPayloadMetadata(conn); err != nil {
+		return nil, normalizeSQLiteError(
+			ctx,
+			"verify command-result payload metadata",
 			err,
 		)
 	}

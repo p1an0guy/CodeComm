@@ -772,7 +772,7 @@ func TestCommitmentsStartupRejectsTampering(t *testing.T) {
 				commitmentExecute(
 					t,
 					store,
-					"UPDATE events SET proposal_json = '{}' WHERE event_id = ?1;",
+					"UPDATE events SET proposal_json = '{\"changed\":true}' WHERE event_id = ?1;",
 					string(testEventID2),
 				)
 			},

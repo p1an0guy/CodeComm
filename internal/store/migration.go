@@ -109,6 +109,7 @@ func bindMigrationPostSQL(
 }
 
 const retainInitialProjectionBoundaryMigrationDigest = "e253d0f29cc56f359773cddb320e9af3f5bcdd26db39f74e434e7b13a07b841d"
+const commandResultPayloadMigrationDigest = "2843dd20e821b6f581bcbc651744002a206cac8702799590341e70006463331e"
 
 func mustLoadMigrations() []migration {
 	entries, err := fs.ReadDir(migrationFiles, "migrations")
@@ -163,6 +164,14 @@ func mustLoadMigrations() []migration {
 			candidate.policy = migrationPolicyReviewedReversible
 		case version == 10 && name == "checkpoint_cadence":
 			candidate.policy = migrationPolicyReviewedReversible
+		case version == 11 && name == "command_result_payloads":
+			candidate.policy = migrationPolicyReviewedReversible
+			candidate = bindMigrationPostSQL(
+				candidate,
+				"command_result_payloads/v1",
+				commandResultPayloadMigrationDigest,
+				migrateCommandResultPayloads,
+			)
 		}
 		migrations = append(migrations, candidate)
 	}

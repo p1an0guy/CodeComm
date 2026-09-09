@@ -51,6 +51,21 @@ func verifyFullCommitmentState(
 	conn *sqlite.Conn,
 	state consensusState,
 ) error {
+	hasPayloadStorage, err := tableExists(
+		conn,
+		"command_result_payloads",
+	)
+	if err != nil {
+		return err
+	}
+	if hasPayloadStorage {
+		if err := verifyCommandResultPayloadInventory(conn); err != nil {
+			return historyIntegrityError(
+				"command-result payload inventory",
+				err,
+			)
+		}
+	}
 	if err := verifyCompleteLogicalSnapshotHistory(conn, state); err != nil {
 		return historyIntegrityError(
 			"complete retained history",
@@ -184,11 +199,13 @@ func verifyCommitmentHistoryWithProjectionRewind(
 	var rowErr error
 	err = queryArgs(
 		conn,
-		`SELECT r.event_id, r.proposal_json, r.proposal_digest,
-		        r.outcome_status, r.outcome_code, r.outcome_json,
-		        r.projection_mutations_json, r.chain_index, r.chain_hash,
-		        r.result_index, r.previous_result_hash, r.result_hash,
-		        e.event_id, e.proposal_json, e.proposal_digest
+		`SELECT r.event_id, r.proposal_digest,
+		        r.outcome_status, r.outcome_code,
+		        r.chain_index, r.chain_hash, r.result_index,
+		        r.previous_result_hash, r.result_hash,
+		        e.event_id, e.proposal_json, e.proposal_digest,
+		        r.proposal_json, r.outcome_json,
+		        r.projection_mutations_json
 		   FROM command_results AS r
 		   LEFT JOIN events AS e ON e.event_id = r.event_id
 		  WHERE r.session_id = ?1 AND r.recovery_generation = ?2
@@ -199,15 +216,54 @@ func verifyCommitmentHistoryWithProjectionRewind(
 				return
 			}
 			eventID := domain.UUIDv7(stmt.ColumnText(0))
-			proposal := []byte(stmt.ColumnText(1))
 			var proposalDigest Digest
 			if !eventID.Valid() {
 				rowErr = errors.New("invalid event ID")
 				return
 			}
-			if rowErr = copyDigestColumn(&proposalDigest, stmt, 2); rowErr != nil {
+			if rowErr = copyDigestColumn(&proposalDigest, stmt, 1); rowErr != nil {
 				return
 			}
+			storedResultIndex := stmt.ColumnInt64(6)
+			if storedResultIndex < 1 ||
+				resultIndex == domain.MaxSafeInteger ||
+				uint64(storedResultIndex) != resultIndex+1 {
+				rowErr = errors.New("result indexes are not dense")
+				return
+			}
+			payload := commandResultPayload{
+				proposal:  bytes.Clone([]byte(stmt.ColumnText(12))),
+				outcome:   bytes.Clone([]byte(stmt.ColumnText(13))),
+				mutations: bytes.Clone([]byte(stmt.ColumnText(14))),
+			}
+			compacted, partial := commandResultPayloadSentinels(payload)
+			if partial {
+				rowErr = errors.New("legacy command-result sentinels are partial")
+				return
+			}
+			if compacted {
+				var found bool
+				payload, found, rowErr =
+					readCompactedCommandResultPayload(
+						conn,
+						uint64(storedResultIndex),
+					)
+				if rowErr != nil {
+					return
+				}
+				if !found {
+					rowErr = errors.New(
+						"compacted command-result payload is missing",
+					)
+					return
+				}
+			} else if rowErr = validateLegacyCommandResultPayload(
+				conn,
+				payload,
+			); rowErr != nil {
+				return
+			}
+			proposal := payload.proposal
 			canonical, canonicalErr := codec.CanonicalizeSignedObject(proposal)
 			if canonicalErr != nil || !bytes.Equal(canonical, proposal) ||
 				proposalDigestFromBytes(proposal) != proposalDigest {
@@ -215,16 +271,16 @@ func verifyCommitmentHistoryWithProjectionRewind(
 				return
 			}
 			outcome := CommandOutcome{
-				Status: OutcomeStatus(stmt.ColumnText(3)),
-				Code:   stmt.ColumnText(4),
-				JSON:   []byte(stmt.ColumnText(5)),
+				Status: OutcomeStatus(stmt.ColumnText(2)),
+				Code:   stmt.ColumnText(3),
+				JSON:   payload.outcome,
 			}
 			if outcomeErr := outcome.validate(); outcomeErr != nil {
 				rowErr = outcomeErr
 				return
 			}
 
-			mutationJSON := []byte(stmt.ColumnText(6))
+			mutationJSON := payload.mutations
 			mutations, mutationErr := chain.DecodeMutations(mutationJSON)
 			if mutationErr != nil {
 				rowErr = fmt.Errorf(
@@ -234,26 +290,19 @@ func verifyCommitmentHistoryWithProjectionRewind(
 				return
 			}
 
-			storedResultIndex := stmt.ColumnInt64(9)
-			if storedResultIndex < 1 ||
-				resultIndex == domain.MaxSafeInteger ||
-				uint64(storedResultIndex) != resultIndex+1 {
-				rowErr = errors.New("result indexes are not dense")
-				return
-			}
 			resultIndex++
 			var previousResultHash, storedResultHash Digest
 			if rowErr = copyDigestColumn(
 				&previousResultHash,
 				stmt,
-				10,
+				7,
 			); rowErr != nil {
 				return
 			}
 			if rowErr = copyDigestColumn(
 				&storedResultHash,
 				stmt,
-				11,
+				8,
 			); rowErr != nil {
 				return
 			}
@@ -263,9 +312,9 @@ func verifyCommitmentHistoryWithProjectionRewind(
 			}
 
 			accepted := outcome.Status == OutcomeAccepted
-			chainIndexNull := stmt.ColumnType(7) == sqlite.TypeNull
-			chainHashNull := stmt.ColumnType(8) == sqlite.TypeNull
-			eventRowNull := stmt.ColumnType(12) == sqlite.TypeNull
+			chainIndexNull := stmt.ColumnType(4) == sqlite.TypeNull
+			chainHashNull := stmt.ColumnType(5) == sqlite.TypeNull
+			eventRowNull := stmt.ColumnType(9) == sqlite.TypeNull
 			if accepted == chainIndexNull ||
 				chainIndexNull != chainHashNull ||
 				accepted == eventRowNull {
@@ -279,7 +328,7 @@ func verifyCommitmentHistoryWithProjectionRewind(
 				ProposalDigest: chain.Digest(proposalDigest),
 			}
 			if accepted {
-				storedChainIndex := stmt.ColumnInt64(7)
+				storedChainIndex := stmt.ColumnInt64(4)
 				if storedChainIndex < 1 ||
 					chainIndex == domain.MaxSafeInteger ||
 					uint64(storedChainIndex) != chainIndex+1 {
@@ -291,19 +340,28 @@ func verifyCommitmentHistoryWithProjectionRewind(
 				if rowErr = copyDigestColumn(
 					&storedChainHash,
 					stmt,
-					8,
+					5,
 				); rowErr != nil {
 					return
 				}
-				if stmt.ColumnText(12) != string(eventID) ||
-					!bytes.Equal([]byte(stmt.ColumnText(13)), proposal) {
+				expectedEventProposal := proposal
+				if compacted {
+					expectedEventProposal = []byte(
+						commandResultObjectSentinel,
+					)
+				}
+				if stmt.ColumnText(9) != string(eventID) ||
+					!bytes.Equal(
+						[]byte(stmt.ColumnText(10)),
+						expectedEventProposal,
+					) {
 					rowErr = errors.New("accepted event bytes differ")
 					return
 				}
 				if rowErr = copyDigestColumn(
 					&eventRowDigest,
 					stmt,
-					14,
+					11,
 				); rowErr != nil {
 					return
 				}

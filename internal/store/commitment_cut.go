@@ -160,7 +160,7 @@ func verifyAccumulatorCut(
 	var rowErr error
 	err := queryArgs(
 		conn,
-		`SELECT result_index, result_hash, projection_mutations_json
+		`SELECT result_index, result_hash
 		   FROM command_results
 		  WHERE session_id = ?1
 		    AND recovery_generation = ?2
@@ -187,9 +187,15 @@ func verifyAccumulatorCut(
 			if rowErr = copyDigestColumn(&resultHash, stmt, 1); rowErr != nil {
 				return
 			}
-			mutations, err := chain.DecodeMutations(
-				[]byte(stmt.ColumnText(2)),
+			payload, err := requireCommandResultPayload(
+				conn,
+				uint64(storedIndex),
 			)
+			if err != nil {
+				rowErr = err
+				return
+			}
+			mutations, err := chain.DecodeMutations(payload.mutations)
 			if err != nil {
 				rowErr = err
 				return

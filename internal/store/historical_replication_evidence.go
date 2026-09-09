@@ -795,7 +795,7 @@ func historicalEvidenceAuthorityAtResultCut(
 	)
 	err := queryArgs(
 		conn,
-		`SELECT result_index, projection_mutations_json
+		`SELECT result_index
 		   FROM command_results
 		  WHERE session_id = ?1 AND recovery_generation = ?2
 		  ORDER BY result_index;`,
@@ -812,7 +812,15 @@ func historicalEvidenceAuthorityAtResultCut(
 				return
 			}
 			index := uint64(storedIndex)
-			encoded := []byte(stmt.ColumnText(1))
+			payload, payloadErr := requireCommandResultPayload(
+				conn,
+				index,
+			)
+			if payloadErr != nil {
+				rowErr = payloadErr
+				return
+			}
+			encoded := payload.mutations
 			mutations, err := chain.DecodeMutations(encoded)
 			if err != nil {
 				rowErr = err
@@ -954,12 +962,13 @@ func historicalGenesisAuthoritySigner(
 	identities map[domain.DeviceID]device.Device,
 ) (domain.DeviceID, error) {
 	var (
-		proposalJSON []byte
-		count        int
+		resultIndex uint64
+		count       int
+		rowErr      error
 	)
 	if err := queryArgs(
 		conn,
-		`SELECT proposal_json
+		`SELECT result_index
 		   FROM command_results
 		  WHERE session_id = ?1 AND recovery_generation = ?2
 		    AND chain_index IS NOT NULL
@@ -968,16 +977,29 @@ func historicalGenesisAuthoritySigner(
 		[]any{string(state.sessionID), state.recoveryGeneration},
 		func(stmt *sqlite.Stmt) {
 			count++
-			proposalJSON = bytes.Clone([]byte(stmt.ColumnText(0)))
+			value := stmt.ColumnInt64(0)
+			if value < 1 {
+				rowErr = errors.New("invalid bootstrap result index")
+				return
+			}
+			resultIndex = uint64(value)
 		},
 	); err != nil {
 		return "", err
+	}
+	if rowErr != nil {
+		return "", rowErr
 	}
 	if count != 1 {
 		return "", errors.New(
 			"historical attestation generation has no accepted bootstrap event",
 		)
 	}
+	payload, err := requireCommandResultPayload(conn, resultIndex)
+	if err != nil {
+		return "", err
+	}
+	proposalJSON := payload.proposal
 	proposal, err := event.InspectUnverifiedProposal(proposalJSON)
 	if err != nil {
 		return "", err

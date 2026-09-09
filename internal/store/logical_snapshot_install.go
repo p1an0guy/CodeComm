@@ -382,6 +382,14 @@ func (store *Store) installLogicalSnapshot(
 					)
 				}
 			}
+			if err := resetCommandResultPayloadMigrationMarker(
+				destination,
+			); err != nil {
+				return logicalSnapshotInstallError(
+					"reset command-result migration marker",
+					err,
+				)
+			}
 			if generationChanged {
 				if err := clearSuccessorGitArtifacts(destination); err != nil {
 					return logicalSnapshotInstallError(
@@ -629,6 +637,7 @@ func logicalSnapshotCopiedTables() []string {
 		"consensus_state",
 		"events",
 		"command_results",
+		"command_result_payloads",
 		"chain_checkpoints",
 	}
 	for _, table := range projectionTables {
@@ -995,6 +1004,9 @@ func requireEmptyLogicalSnapshotDestination(conn *sqlite.Conn) error {
 				nil,
 			)
 		}
+		if table == "command_result_payload_migration" {
+			continue
+		}
 		var count int64
 		if err := queryOne(
 			conn,
@@ -1012,7 +1024,7 @@ func requireEmptyLogicalSnapshotDestination(conn *sqlite.Conn) error {
 			)
 		}
 	}
-	return nil
+	return verifyCommandResultPayloadInventory(conn)
 }
 
 func clearLogicalSnapshotDestination(
