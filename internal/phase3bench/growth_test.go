@@ -98,9 +98,13 @@ func TestCoordinationGrowthBudget(t *testing.T) {
 	if os.Getenv("CODECOMM_PHASE3_PERFORMANCE") != "1" {
 		t.Skip("set CODECOMM_PHASE3_PERFORMANCE=1 to run the 10k-event gate")
 	}
+	root := t.TempDir()
+	if retainedRoot := os.Getenv("CODECOMM_PHASE3_RETAIN_ROOT"); retainedRoot != "" {
+		root = retainedRoot
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	report, err := runCoordinationGrowth(ctx, t.TempDir())
+	report, err := runCoordinationGrowth(ctx, root)
 	if err != nil {
 		t.Fatalf("runCoordinationGrowth(): %v", err)
 	}
