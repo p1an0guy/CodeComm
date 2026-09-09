@@ -7,7 +7,11 @@ import (
 	"os"
 )
 
-func validatePrivateDirectory(info os.FileInfo) error {
+func validateConsensusDirectoryPath(string) error {
+	return nil
+}
+
+func validatePrivateDirectory(_ string, info os.FileInfo) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf(
 			"%w: directory mode %04o permits group or other access",

@@ -37,9 +37,53 @@ import (
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/transport"
+	"github.com/ijonahch/codecomm/internal/workspacelock"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 )
+
+func TestNodeConsensusDirectoryOwnershipRejectsConcurrentOpen(t *testing.T) {
+	root := t.TempDir()
+	initial, _, deviceID := nodeTestInitialState(t)
+	consensusDir := filepath.Join(root, "consensus")
+	first, err := OpenSingleNode(context.Background(), SingleNodeOptions{
+		ServerID:     deviceID,
+		StatePath:    filepath.Join(root, "first", "state.db"),
+		ConsensusDir: consensusDir,
+		OriginBootID: nodeTestBootID1,
+		InitialState: &initial,
+		Clock:        nodeTestClock(),
+		RaftConfig:   nodeTestRaftConfig(),
+	})
+	if err != nil {
+		t.Fatalf("OpenSingleNode(first): %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := OpenSingleNode(
+		context.Background(),
+		SingleNodeOptions{
+			ServerID:     deviceID,
+			StatePath:    filepath.Join(root, "second", "state.db"),
+			ConsensusDir: consensusDir,
+			OriginBootID: nodeTestBootID2,
+			InitialState: &initial,
+			Clock:        nodeTestClock(),
+			RaftConfig:   nodeTestRaftConfig(),
+		},
+	)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("concurrent open returned a node")
+	}
+	if !errors.Is(err, workspacelock.ErrHeld) {
+		t.Fatalf(
+			"OpenSingleNode(concurrent) error = %v, want %v",
+			err,
+			workspacelock.ErrHeld,
+		)
+	}
+}
 
 func TestSingleNodeStatusReportsReadyOneVoterAndDurableWork(t *testing.T) {
 	root := t.TempDir()

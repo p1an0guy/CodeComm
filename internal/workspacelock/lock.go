@@ -79,6 +79,18 @@ func Acquire(statePath string) (*Lock, error) {
 	if err != nil {
 		return nil, err
 	}
+	return AcquireFile(path)
+}
+
+// AcquireFile takes an exclusive lock at an explicit owner-only lock-file
+// path. It is used by storage owners that need a stable lock independent of a
+// replaceable data-file inode.
+func AcquireFile(path string) (*Lock, error) {
+	if path == "" ||
+		!filepath.IsAbs(path) ||
+		filepath.Clean(path) != path {
+		return nil, ErrInvalidPath
+	}
 	if err := validatePlatformPath(path); err != nil {
 		return nil, err
 	}

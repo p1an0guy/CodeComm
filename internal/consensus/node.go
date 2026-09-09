@@ -26,12 +26,14 @@ import (
 	"github.com/ijonahch/codecomm/internal/peerauth"
 	coordstatus "github.com/ijonahch/codecomm/internal/status"
 	"github.com/ijonahch/codecomm/internal/store"
+	"github.com/ijonahch/codecomm/internal/workspacelock"
 	"go.etcd.io/bbolt"
 )
 
 const (
-	raftStoreFilename = "raft.db"
-	snapshotRetention = 3
+	raftStoreFilename     = "raft.db"
+	consensusLockFilename = ".codecomm-consensus.lock"
+	snapshotRetention     = 3
 )
 
 var (
@@ -158,6 +160,9 @@ type SingleNode struct {
 	fsm                           *FSM
 	state                         *store.Store
 	stable                        *raftboltdb.BoltStore
+	raftStorePath                 string
+	compactRaftStore              func(string) error
+	consensusLock                 *workspacelock.Lock
 	snapshots                     raft.SnapshotStore
 	transport                     RaftTransport
 	ownedTransport                *ownedRaftTransport
@@ -345,6 +350,20 @@ func openNode(
 	if err != nil {
 		return nil, err
 	}
+	consensusLock, err := workspacelock.AcquireFile(
+		filepath.Join(consensusDir, consensusLockFilename),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"consensus: acquire storage ownership: %w",
+			err,
+		)
+	}
+	defer func() {
+		if err != nil {
+			_ = consensusLock.Close()
+		}
+	}()
 
 	raftPath := filepath.Join(consensusDir, raftStoreFilename)
 	_, statErr := os.Lstat(raftPath)
@@ -368,6 +387,18 @@ func openNode(
 	boltOptions := *bbolt.DefaultOptions
 	boltOptions.Timeout = 5 * time.Second
 	boltOptions.NoFreelistSync = false
+	boltOptions.OpenFile = func(
+		openPath string,
+		flag int,
+		mode os.FileMode,
+	) (*os.File, error) {
+		return openValidatedRaftBoltFile(
+			openPath,
+			flag,
+			mode,
+			nil,
+		)
+	}
 	stable, err := raftboltdb.New(raftboltdb.Options{
 		Path:        raftPath,
 		BoltOptions: &boltOptions,
@@ -699,18 +730,21 @@ func openNode(
 		credentialNow = time.Now
 	}
 	node := &SingleNode{
-		fsm:            fsm,
-		state:          state,
-		stable:         stable,
-		snapshots:      snapshots,
-		transport:      transport,
-		ownedTransport: ownedTransport,
-		serverID:       raft.ServerID(options.ServerID),
-		originBootID:   options.OriginBootID,
-		clock:          clock,
-		single:         options.Single,
-		transportGate:  transportGate,
-		coverageGate:   coverageGate,
+		fsm:              fsm,
+		state:            state,
+		stable:           stable,
+		raftStorePath:    raftPath,
+		compactRaftStore: compactRaftBoltStore,
+		consensusLock:    consensusLock,
+		snapshots:        snapshots,
+		transport:        transport,
+		ownedTransport:   ownedTransport,
+		serverID:         raft.ServerID(options.ServerID),
+		originBootID:     options.OriginBootID,
+		clock:            clock,
+		single:           options.Single,
+		transportGate:    transportGate,
+		coverageGate:     coverageGate,
 		checkpointSigner: normalizedCheckpointSigner(
 			options.CheckpointSigner,
 		),
@@ -1473,6 +1507,9 @@ func prepareConsensusDirectory(path string) (bool, error) {
 	if path == "" || !filepath.IsAbs(path) {
 		return false, ErrInvalidNodeOptions
 	}
+	if err := validateConsensusDirectoryPath(path); err != nil {
+		return false, err
+	}
 	_, priorErr := os.Lstat(path)
 	created := errors.Is(priorErr, os.ErrNotExist)
 	if priorErr != nil && !created {
@@ -1491,7 +1528,7 @@ func prepareConsensusDirectory(path string) (bool, error) {
 			ErrInsecureConsensusPath,
 		)
 	}
-	if err := validatePrivateDirectory(info); err != nil {
+	if err := validatePrivateDirectory(path, info); err != nil {
 		return false, err
 	}
 	return created, nil
@@ -3299,7 +3336,7 @@ func waitFuture(ctx context.Context, future raftFuture) error {
 	}
 }
 
-// Close stops Raft, which closes its owned transport, before durable stores.
+// Close stops Raft, closes durable stores, then compacts the closed Raft store.
 func (node *SingleNode) Close() error {
 	if node == nil {
 		return ErrInvalidNodeOptions
@@ -3319,10 +3356,19 @@ func (node *SingleNode) Close() error {
 			close(node.monitorStop)
 		}
 		var errs []error
+		raftStopped := node.raft == nil
 		if node.raft != nil {
-			if err := node.shutdownRaft(); err != nil &&
-				!errors.Is(err, raft.ErrRaftShutdown) {
-				errs = append(errs, fmt.Errorf("shutdown Raft: %w", err))
+			shutdownErr := node.shutdownRaft()
+			if shutdownErr == nil ||
+				errors.Is(shutdownErr, raft.ErrRaftShutdown) {
+				raftStopped = true
+			}
+			if shutdownErr != nil &&
+				!errors.Is(shutdownErr, raft.ErrRaftShutdown) {
+				errs = append(
+					errs,
+					fmt.Errorf("shutdown Raft: %w", shutdownErr),
+				)
 			}
 		}
 		node.active.Wait()
@@ -3337,9 +3383,29 @@ func (node *SingleNode) Close() error {
 				errs = append(errs, fmt.Errorf("close state store: %w", err))
 			}
 		}
+		raftStoreClosed := node.stable == nil
 		if node.stable != nil {
 			if err := node.stable.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close Raft store: %w", err))
+			} else {
+				raftStoreClosed = true
+			}
+		}
+		if raftStopped && raftStoreClosed && node.raftStorePath != "" {
+			compactor := node.compactRaftStore
+			if compactor == nil {
+				compactor = compactRaftBoltStore
+			}
+			if err := compactor(node.raftStorePath); err != nil {
+				errs = append(errs, fmt.Errorf("compact Raft store: %w", err))
+			}
+		}
+		if node.consensusLock != nil {
+			if err := node.consensusLock.Close(); err != nil {
+				errs = append(
+					errs,
+					fmt.Errorf("release consensus storage ownership: %w", err),
+				)
 			}
 		}
 		node.closeErr = errors.Join(errs...)
