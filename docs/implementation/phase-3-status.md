@@ -3,7 +3,7 @@
 Status: in progress; secure daemon mesh, discovery, pairing admission/rebootstrap, content
 credentials, endpoint and proposal relay, voter reconciliation, and revocation are
 production-composed; Phase 3 exit gate remains open
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 
 ## Completed
@@ -290,14 +290,16 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
 - Phase boundary, not a Phase 3 gate: Phase 4 supplies the production local-Git
   canonical-coverage provider. Phase 3 requires verified fixture repositories and fail-closed
   production behavior; without that provider, voter changes stop at `object-coverage-degraded`.
-- The frozen 10k growth runner now exercises durable request reservation/outbox resolution, 10,019
-  real Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
-  mapping, empty outbox, and full commitment-history verification. Its first complete run grew
-  coordination storage by 115,470,336 bytes (110.121 MiB), failing the 50 MiB gate: `state.db`
-  contributed 82,030,592 bytes and retained consensus state 33,439,744. A live sample at 4,284
-  results found `command_results` occupying 17,625,088 bytes with 7,240,315 unused because each
-  proposal-plus-mutation row consumes a 4 KiB page. The requirement remains unchanged; Phase 3
-  needs storage-layout/retention work or a reviewed revision.
+- The frozen 10k growth runner exercises durable request reservation/outbox resolution, 10,019
+  measured Raft commits including 19 checkpoints, clean-close measurement, reopen, every request
+  mapping, empty outbox, and full commitment-history verification. Migration 0011 stores immutable
+  proposal/outcome/mutation bytes once in checksummed compressed payloads, uses 8 KiB SQLite pages,
+  and preserves exact logical snapshot/result-range bytes across upgrade. Stable consensus
+  ownership spans physical bbolt compaction, including replacement/sync failure boundaries and
+  Windows path/DACL validation. The confirmed 2026-09-09 `darwin/arm64` run grew from 1,802,273 to
+  53,878,817 closed bytes: 52,076,544 bytes (49.6640625 MiB), passing the 50 MiB gate by 352,256
+  bytes. SQLite contributed 41,787,392 growth bytes and consensus 10,289,152; the verified final
+  cut was result index 10,020 and chain index 9,520.
 - §14's leader-replacement mechanism has a quiet three-voter baseline; its stated-load confirmation
   and the other Phase 3 control percentiles remain unmeasured. Phase 6 reviews this evidence but is
   not its first confirmation gate. Git availability/storage measurements remain Phase 5 work.
@@ -306,7 +308,7 @@ Phase 3 exit requires its secure-mesh paths to be production-composed, the canon
 to be proven with verified fixture repositories and fail closed in production, and committed proof
 that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
 production local-Git provider and Phase 6 quorum recovery are not exit requirements. The Phase 3
-growth and loaded-latency gates above remain open.
+loaded-latency gates above remain open.
 
 ## Evidence
 
@@ -397,7 +399,7 @@ Primary tests:
 - `TestFSMSemanticRaftSnapshotCaptureAndRestoreUsesCommandWatermark`
 - `TestSecureMeshRaftCommitSQLiteReplayDurability`
 - `TestCoordinationGrowthWorkloadContract`
-- `TestCoordinationGrowthBudget` (currently fails the recorded 50 MiB gate)
+- `TestCoordinationGrowthBudget` (49.6640625 MiB confirmed against the 50 MiB gate)
 
 Run:
 

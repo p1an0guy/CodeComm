@@ -108,10 +108,13 @@ complete log, then reopens and verifies every request/checkpoint mapping, heads,
 commitments, empty outbox, and full commitment history. This is representative, not a worst-case
 claim against 256 KiB events, whose retained bytes are necessarily linear.
 
-The first complete measurement (2026-09-08, `darwin/arm64`) grew from 1,044,480 to 116,514,816
-bytes: 115,470,336 bytes (110.121 MiB), so the 50 MiB gate **fails**. SQLite contributed
-82,030,592 growth bytes and retained consensus state 33,439,744. The target remains unchanged and
-unconfirmed pending storage-layout/retention work or an explicitly reviewed revision.
+The confirmed measurement (2026-09-09, `darwin/arm64`) grew from 1,802,273 to 53,878,817
+closed bytes: 52,076,544 bytes (49.6640625 MiB), so the 50 MiB gate **passes** by 352,256 bytes.
+SQLite contributed 41,787,392 growth bytes and retained consensus state 10,289,152. Migration
+0011 stores each immutable proposal/outcome/mutation tuple once as a checksummed compressed
+payload, while command/event indexes retain commitment metadata; clean close physically compacts
+the unpruned Raft bbolt file under exclusive consensus-directory ownership. The verified final cut
+was result index 10,020 and chain index 9,520.
 
 Confirmation is split by plane, because three targets measure mechanisms that do not exist until
 phase 5: consensus and control targets plus the coordination-growth budget confirm at **phase 3**;
