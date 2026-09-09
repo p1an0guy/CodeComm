@@ -25,6 +25,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/ijonahch/codecomm/internal/agent"
 	"github.com/ijonahch/codecomm/internal/canonicalcoverage"
 	"github.com/ijonahch/codecomm/internal/codec"
 	"github.com/ijonahch/codecomm/internal/consensus"
@@ -196,6 +197,7 @@ type daemonMeshIntegrationNode struct {
 	meshCapture   *daemonMeshIntegrationFactoryCapture
 	credentialNow func() time.Time
 	coverage      canonicalcoverage.ReceiptCollector
+	agentService  atomic.Pointer[agent.Service]
 	contentPeers  atomic.Pointer[daemonContentPeerRuntime]
 	listenerBinds atomic.Uint64
 
@@ -1492,12 +1494,12 @@ func newDaemonMeshIntegrationNodes(
 func daemonMeshIntegrationInitialState(
 	t *testing.T,
 	nodes []*daemonMeshIntegrationNode,
-	nonvoter device.Device,
+	nonvoters ...device.Device,
 ) store.InitialState {
 	t.Helper()
 	initial, _, _ := daemonTestInitialState(t)
 	deviceIDs := daemonMeshIntegrationDeviceIDs(nodes)
-	devices := make([]device.Device, 0, len(nodes)+1)
+	devices := make([]device.Device, 0, len(nodes)+len(nonvoters))
 	for _, node := range nodes {
 		devices = append(devices, device.Device{
 			ID:                node.deviceID,
@@ -1509,8 +1511,10 @@ func daemonMeshIntegrationInitialState(
 			EntityVersion:     1,
 		})
 	}
-	if nonvoter.ID.Valid() {
-		devices = append(devices, nonvoter)
+	for _, nonvoter := range nonvoters {
+		if nonvoter.ID.Valid() {
+			devices = append(devices, nonvoter)
+		}
 	}
 	sort.Slice(devices, func(left, right int) bool {
 		return devices[left].ID < devices[right].ID
@@ -1751,6 +1755,7 @@ func (node *daemonMeshIntegrationNode) start(
 	node.exitErr = nil
 	node.running = true
 	node.meshCapture.reset()
+	node.agentService.Store(nil)
 	node.contentPeers.Store(nil)
 	node.listenerBinds.Store(0)
 	go func() {
@@ -1823,6 +1828,9 @@ func (node *daemonMeshIntegrationNode) start(
 				interfaceAddrs:    interfaceAddrs,
 				credentialNow:     node.credentialNow,
 				canonicalCoverage: node.coverage,
+				observeAgentService: func(service *agent.Service) {
+					node.agentService.Store(service)
+				},
 				observeContentPeers: func(runtime *daemonContentPeerRuntime) {
 					node.contentPeers.Store(runtime)
 				},
@@ -2095,8 +2103,44 @@ func waitForDaemonMeshIntegrationCluster(
 	ready func([]ui.Snapshot) bool,
 ) []ui.Snapshot {
 	t.Helper()
-	_, callerFile, callerLine, _ := runtime.Caller(1)
-	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	return waitForDaemonMeshIntegrationClusterWithCaller(
+		t,
+		nodes,
+		daemonMeshIntegrationTimeout,
+		ready,
+		2,
+	)
+}
+
+func waitForDaemonMeshIntegrationClusterWithin(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	timeout time.Duration,
+	ready func([]ui.Snapshot) bool,
+) []ui.Snapshot {
+	t.Helper()
+	return waitForDaemonMeshIntegrationClusterWithCaller(
+		t,
+		nodes,
+		timeout,
+		ready,
+		2,
+	)
+}
+
+func waitForDaemonMeshIntegrationClusterWithCaller(
+	t *testing.T,
+	nodes []*daemonMeshIntegrationNode,
+	timeout time.Duration,
+	ready func([]ui.Snapshot) bool,
+	callerSkip int,
+) []ui.Snapshot {
+	t.Helper()
+	if len(nodes) == 0 || timeout <= 0 || ready == nil {
+		t.Fatal("invalid daemon mesh convergence fixture")
+	}
+	_, callerFile, callerLine, _ := runtime.Caller(callerSkip)
+	deadline := time.Now().Add(timeout)
 	var lastErr error
 	var lastStatuses []ui.Snapshot
 	for time.Now().Before(deadline) {

@@ -90,6 +90,7 @@ type daemonDependencies struct {
 	interfaceAddrs      daemonInterfaceAddressProvider
 	credentialNow       func() time.Time
 	canonicalCoverage   canonicalcoverage.ReceiptCollector
+	observeAgentService func(*agent.Service)
 	observeContentPeers func(*daemonContentPeerRuntime)
 }
 
@@ -615,6 +616,9 @@ func runDaemon(
 	})
 	if err != nil {
 		return err
+	}
+	if dependencies.observeAgentService != nil {
+		dependencies.observeAgentService(agentService)
 	}
 	versionReport, err = newDaemonVersionReportGate(
 		ctx,

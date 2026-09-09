@@ -1682,11 +1682,35 @@ func authorizeDaemonSettledCredential(
 	expectedRole credentialauthorization.Role,
 ) tls.Certificate {
 	t.Helper()
-	if len(voters) == 0 || leader == nil || settled == nil || now.IsZero() {
+	return authorizeDaemonSettledCredentialWithSeed(
+		t,
+		voters,
+		leader,
+		settled,
+		now,
+		expectedRole,
+		0xf1,
+	)
+}
+
+func authorizeDaemonSettledCredentialWithSeed(
+	t *testing.T,
+	voters []*daemonMeshIntegrationNode,
+	leader, settled *daemonMeshIntegrationNode,
+	now time.Time,
+	expectedRole credentialauthorization.Role,
+	seedByte byte,
+) tls.Certificate {
+	t.Helper()
+	if len(voters) == 0 ||
+		leader == nil ||
+		settled == nil ||
+		now.IsZero() ||
+		seedByte == 0 {
 		t.Fatal("invalid settled credential fixture")
 	}
 	epochPrivateKey := ed25519.NewKeyFromSeed(
-		bytes.Repeat([]byte{0xf1}, ed25519.SeedSize),
+		bytes.Repeat([]byte{seedByte}, ed25519.SeedSize),
 	)
 	defer clear(epochPrivateKey)
 	binding, err := credential.SignBinding(
