@@ -10,7 +10,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -444,7 +443,7 @@ func TestMulticastReaderDropsTruncationAndFailsClosedOnReadError(t *testing.T) {
 	multicast := mustOpenFakeMulticast(t, network, iface)
 	socket := network.socket(AddressFamilyIPv4)
 
-	socket.inject(fakeRead{err: syscall.EMSGSIZE})
+	socket.inject(fakeRead{err: testTruncatedDatagramError()})
 	socket.inject(fakeRead{
 		payload:        []byte("after-truncation"),
 		source:         &net.UDPAddr{IP: net.ParseIP("192.0.2.18"), Port: 60400},

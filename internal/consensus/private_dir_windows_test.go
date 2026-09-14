@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -79,6 +80,72 @@ func TestWindowsConsensusDirectoryRejectsUNCPath(t *testing.T) {
 	); !errors.Is(err, ErrInsecureConsensusPath) {
 		t.Fatalf("UNC path error = %v", err)
 	}
+}
+
+func TestWindowsConsensusDirectoryAcceptsShortPathAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "consensus-directory-with-long-name")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shortPath, err := windowsConsensusShortPath(path)
+	if err != nil {
+		t.Skipf("8.3 aliases unavailable: %v", err)
+	}
+	if strings.EqualFold(shortPath, path) {
+		t.Skip("volume did not assign an 8.3 alias")
+	}
+
+	handle, err := openWindowsConsensusDirectory(
+		shortPath,
+		windows.FILE_READ_ATTRIBUTES,
+	)
+	if err != nil {
+		t.Fatalf("short path alias rejected: %v", err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsConsensusDirectoryRejectsParentReparsePoint(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target")
+	child := filepath.Join(target, "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+
+	handle, err := openWindowsConsensusDirectory(
+		filepath.Join(alias, "child"),
+		windows.FILE_READ_ATTRIBUTES,
+	)
+	if err == nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("parent reparse point was accepted")
+	}
+	if !errors.Is(err, ErrInsecureConsensusPath) {
+		t.Fatalf("parent reparse point error = %v", err)
+	}
+}
+
+func windowsConsensusShortPath(path string) (string, error) {
+	encoded, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+	buffer := make([]uint16, maxWindowsConsensusPathUnits)
+	length, err := windows.GetShortPathName(
+		encoded,
+		&buffer[0],
+		uint32(len(buffer)),
+	)
+	if err != nil || length == 0 || length >= uint32(len(buffer)) {
+		return "", errors.Join(errors.New("resolve short path"), err)
+	}
+	return windows.UTF16ToString(buffer[:length]), nil
 }
 
 func TestWindowsRaftBoltFileRejectsPermissiveDACL(t *testing.T) {

@@ -314,9 +314,9 @@ func validateWindowsConsensusFinalPath(
 	finalPath := normalizeWindowsConsensusPath(
 		windows.UTF16ToString(buffer[:length]),
 	)
-	expected, err := raftBoltWindowsPath(path)
+	expected, err := longWindowsConsensusPath(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: expand storage path: %v", ErrInsecureConsensusPath, err)
 	}
 	if strings.HasPrefix(finalPath, `\\?\unc\`) ||
 		strings.HasPrefix(finalPath, `\??\unc\`) ||
@@ -327,6 +327,27 @@ func validateWindowsConsensusFinalPath(
 		)
 	}
 	return nil
+}
+
+func longWindowsConsensusPath(path string) (string, error) {
+	expected, err := raftBoltWindowsPath(path)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := windows.UTF16PtrFromString(expected)
+	if err != nil {
+		return "", err
+	}
+	buffer := make([]uint16, maxWindowsConsensusPathUnits)
+	length, err := windows.GetLongPathName(
+		encoded,
+		&buffer[0],
+		uint32(len(buffer)),
+	)
+	if err != nil || length == 0 || length >= uint32(len(buffer)) {
+		return "", errors.Join(errors.New("resolve long storage path"), err)
+	}
+	return windows.UTF16ToString(buffer[:length]), nil
 }
 
 func normalizeWindowsConsensusPath(path string) string {
