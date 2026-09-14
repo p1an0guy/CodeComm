@@ -281,6 +281,14 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   replicas must export the same verified chain/result hashes, projection accumulator, state digest,
   lineage, and authority. Across 20 post-warmup samples, the confirmed 2026-09-09 `darwin/arm64`
   run measured p95 2.57825 ms and maximum 2.911334 ms against the strict p95 <100 ms target.
+- A nightly coordination-visibility regression runs 8 production-composed daemons on one host
+  through a selected non-loopback interface: 3 voters, 5 settled nonvoters, and 32 agents. A settled
+  member submits signed events over content mTLS to the leader; timing runs from the accepted
+  `POST /v1/events` response until an MCP agent on a different voter returns the exact task and
+  committed positions. One leader term must span the measured window, and all replicas must have
+  equal verified commitments before and after timing. Across 20 post-warmup samples, a 2026-09-09
+  `darwin/arm64` run measured p95 87.80525 ms and maximum 89.79325 ms against the 500 ms regression
+  ceiling. This does not replace Phase 6 native-LAN acceptance.
 
 ## Open Exit Gates
 
@@ -307,17 +315,18 @@ Scope: secure mesh in `docs/IMPLEMENTATION.md` §4 and design §13.
   53,878,817 closed bytes: 52,076,544 bytes (49.6640625 MiB), passing the 50 MiB gate by 352,256
   bytes. SQLite contributed 41,787,392 growth bytes and consensus 10,289,152; the verified final
   cut was result index 10,020 and chain index 9,520.
-- §14's same-device target is enforced per PR and its Phase 3 control-plane workload is confirmed.
-  The leader-replacement mechanism has a quiet three-voter baseline; its stated-load confirmation
-  and the remaining Phase 3 control percentiles are unmeasured. Phase 5 repeats control timing under
-  the full Git corpus; Git availability/storage measurements also remain Phase 5 work. Phase 6
-  reviews this evidence but is not its first confirmation gate.
+- §14's same-device and coordination-visibility single-host regressions are enforced for the Phase 3
+  control plane; native multi-device acceptance remains Phase 6 work. Leader replacement has a
+  quiet three-voter baseline;
+  reconnect, wake recovery, 10k catch-up, and stated-load leader replacement remain unmeasured.
+  Phase 5 repeats control timing under the full Git corpus; Git availability/storage measurements
+  also remain Phase 5 work. Phase 6 reviews this evidence but is not its first confirmation gate.
 
 Phase 3 exit requires its secure-mesh paths to be production-composed, the canonical-coverage gate
 to be proven with verified fixture repositories and fail closed in production, and committed proof
 that a minority commits nothing, self-promotes nothing, and authorizes no credential. The Phase 4
 production local-Git provider and Phase 6 quorum recovery are not exit requirements. The Phase 3
-loaded-latency gates above remain open.
+remaining fault, catch-up, and loaded leader-replacement latency gates above remain open.
 
 ## Evidence
 
@@ -410,6 +419,7 @@ Primary tests:
 - `TestCoordinationGrowthWorkloadContract`
 - `TestCoordinationGrowthBudget` (49.6640625 MiB confirmed against the 50 MiB gate)
 - `TestDaemonSameDeviceVisibilityLatency` (2.57825 ms p95 confirmed against the 100 ms gate)
+- `TestDaemonCoordinationVisibilityLatency` (87.80525 ms p95 confirmed against the 500 ms gate)
 
 Run:
 

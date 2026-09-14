@@ -21,6 +21,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/credentialauthorization"
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/domain/task"
+	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
 	codecommmcp "github.com/ijonahch/codecomm/internal/mcp"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -30,12 +31,16 @@ import (
 )
 
 const (
+	phase3PerformanceEnvironment    = "CODECOMM_PHASE3_PERFORMANCE"
 	phase3MultiAgentEnvironment     = "CODECOMM_PHASE3_MULTI_AGENT"
 	sameDeviceLatencyAgentCount     = 32
 	sameDeviceLatencySampleCount    = 20
 	sameDeviceLatencyTarget         = 100 * time.Millisecond
 	sameDeviceLatencyObservationMax = 2 * time.Second
 	sameDeviceLatencyConvergenceMax = 3 * time.Minute
+	coordinationLatencySampleCount  = 20
+	coordinationLatencyTarget       = 500 * time.Millisecond
+	coordinationLatencyObserveMax   = 35 * time.Second
 )
 
 type sameDeviceLatencyReport struct {
@@ -57,7 +62,34 @@ type sameDeviceLatencyAgent struct {
 	session       *mcpsdk.ClientSession
 	agentSession  domain.UUIDv7
 	workingRoot   domain.UUIDv7
+	deviceID      domain.DeviceID
 	clientKind    agentsession.ClientKind
+}
+
+type daemonLatencyMesh struct {
+	root     string
+	allNodes []*daemonMeshIntegrationNode
+	voters   []*daemonMeshIntegrationNode
+	settled  []*daemonMeshIntegrationNode
+	voterIDs []domain.DeviceID
+	leader   *daemonMeshIntegrationNode
+}
+
+type coordinationVisibilityReport struct {
+	latency.Report
+	OS                string `json:"os"`
+	Architecture      string `json:"architecture"`
+	DeviceCount       int    `json:"device_count"`
+	VoterCount        int    `json:"voter_count"`
+	SettledCount      int    `json:"settled_nonvoter_count"`
+	AgentCount        int    `json:"agent_count"`
+	CodexAgentCount   int    `json:"codex_agent_count"`
+	ClaudeAgentCount  int    `json:"claude_agent_count"`
+	PostWarmupSamples int    `json:"post_warmup_samples"`
+	Topology          string `json:"topology"`
+	SubmitterDeviceID string `json:"submitter_device_id"`
+	AcceptorDeviceID  string `json:"acceptor_device_id"`
+	ObserverDeviceID  string `json:"observer_device_id"`
 }
 
 func TestDaemonSameDeviceVisibilityLatency(t *testing.T) {
@@ -77,7 +109,303 @@ func TestDaemonSameDeviceVisibilityLatency(t *testing.T) {
 	runDaemonSameDeviceVisibilityLatency(t)
 }
 
+func TestDaemonCoordinationVisibilityLatency(t *testing.T) {
+	if os.Getenv(phase3PerformanceEnvironment) != "1" {
+		t.Skip(
+			"set CODECOMM_PHASE3_PERFORMANCE=1 to run the coordination latency gate",
+		)
+	}
+	if os.Getenv(daemonMeshIntegrationChildMarker) != "1" {
+		runDaemonMeshIntegrationChild(
+			t,
+			"^TestDaemonCoordinationVisibilityLatency$",
+		)
+		return
+	}
+	registerDaemonIntegrationChildResult(t)
+	runDaemonCoordinationVisibilityLatency(t)
+}
+
 func runDaemonSameDeviceVisibilityLatency(t *testing.T) {
+	t.Helper()
+	mesh := newDaemonLatencyMesh(t)
+	allNodes := mesh.allNodes
+	voters := mesh.voters
+	settled := mesh.settled
+	voterIDs := mesh.voterIDs
+	leader := mesh.leader
+
+	agents := launchDaemonLatencyAgents(t, mesh, leader)
+
+	warmTitle := "same-device visibility warmup"
+	runSameDeviceVisibilitySample(
+		t,
+		agents[0],
+		agents[1],
+		warmTitle,
+	)
+	waitForDaemonMeshIntegrationStableHeads(
+		t,
+		allNodes,
+		250*time.Millisecond,
+	)
+	requireSameDeviceLatencyCommitments(
+		t,
+		allNodes,
+		leader.deviceID,
+	)
+
+	samples := make([]time.Duration, 0, sameDeviceLatencySampleCount)
+	exercisedAgents := make(map[domain.UUIDv7]struct{}, len(agents))
+	for index := 0; index < sameDeviceLatencySampleCount; index++ {
+		source := agents[index%len(agents)]
+		observer := agents[(index+13)%len(agents)]
+		exercisedAgents[source.agentSession] = struct{}{}
+		exercisedAgents[observer.agentSession] = struct{}{}
+		samples = append(
+			samples,
+			runSameDeviceVisibilitySample(
+				t,
+				source,
+				observer,
+				fmt.Sprintf(
+					"same-device visibility sample %02d",
+					index+1,
+				),
+			),
+		)
+	}
+	if len(exercisedAgents) != len(agents) {
+		t.Fatalf(
+			"timed samples exercised %d of %d agents",
+			len(exercisedAgents),
+			len(agents),
+		)
+	}
+	summary, err := latency.Summarize(samples)
+	if err != nil {
+		t.Fatalf("summarize same-device visibility: %v", err)
+	}
+	report := sameDeviceLatencyReport{
+		Report:            summary,
+		OS:                runtime.GOOS,
+		Architecture:      runtime.GOARCH,
+		DeviceCount:       len(allNodes),
+		VoterCount:        len(voters),
+		SettledCount:      len(settled),
+		AgentCount:        len(agents),
+		CodexAgentCount:   sameDeviceLatencyAgentCount / 2,
+		ClaudeAgentCount:  sameDeviceLatencyAgentCount / 2,
+		PostWarmupSamples: len(samples),
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("encode same-device latency report: %v", err)
+	}
+	t.Logf("CODECOMM_PHASE3_SAME_DEVICE_VISIBILITY=%s", encoded)
+	if summary.P95() >= sameDeviceLatencyTarget {
+		t.Fatalf(
+			"same-device visibility p95 = %s, target <%s",
+			summary.P95(),
+			sameDeviceLatencyTarget,
+		)
+	}
+
+	waitForDaemonMeshIntegrationClusterWithin(
+		t,
+		allNodes,
+		sameDeviceLatencyConvergenceMax,
+		func(statuses []ui.Snapshot) bool {
+			if !sameDeviceLatencyTopologyReady(
+				statuses,
+				len(voters),
+				len(allNodes),
+				voterIDs,
+			) || !sameDeviceLatencyAgentsReady(
+				statuses,
+				agents,
+			) {
+				return false
+			}
+			expectedTasks := uint64(sameDeviceLatencySampleCount + 1)
+			for _, status := range statuses {
+				if status.TaskTotal != expectedTasks ||
+					status.Truncated ||
+					uint64(len(status.Tasks)) != expectedTasks {
+					return false
+				}
+			}
+			return true
+		},
+	)
+	requireSameDeviceLatencyCommitments(
+		t,
+		allNodes,
+		leader.deviceID,
+	)
+}
+
+func runDaemonCoordinationVisibilityLatency(t *testing.T) {
+	t.Helper()
+	mesh := newDaemonLatencyMesh(t)
+	if len(mesh.settled) < 1 {
+		t.Fatal("coordination latency fixture requires one settled submitter")
+	}
+	acceptor := mesh.leader
+	observer := daemonMeshIntegrationFollower(
+		t,
+		mesh.voters,
+		acceptor.deviceID,
+	)
+	submitter := mesh.settled[0]
+	if observer == submitter ||
+		observer == acceptor ||
+		submitter == acceptor {
+		t.Fatal("coordination latency roles are not device-distinct")
+	}
+	agents := launchDaemonLatencyAgentRange(
+		t,
+		mesh,
+		acceptor,
+		0,
+		sameDeviceLatencyAgentCount-1,
+	)
+	agents = append(
+		agents,
+		launchDaemonLatencyAgentRange(
+			t,
+			mesh,
+			observer,
+			sameDeviceLatencyAgentCount-1,
+			1,
+		)...,
+	)
+	awaitDaemonLatencyAgents(t, mesh, agents)
+	observerAgent := agents[len(agents)-1]
+	proposals := waitForDaemonLatencyProposalRuntime(t, submitter, acceptor)
+	warmupLeaderTerm := requireDaemonCoordinationLeader(t, acceptor)
+
+	runCoordinationVisibilitySample(
+		t,
+		proposals,
+		acceptor,
+		submitter,
+		observer,
+		observerAgent,
+		warmupLeaderTerm,
+		1,
+		"coordination visibility warmup",
+	)
+	waitForDaemonMeshIntegrationStableHeads(
+		t,
+		mesh.allNodes,
+		250*time.Millisecond,
+	)
+	requireSameDeviceLatencyCommitments(
+		t,
+		mesh.allNodes,
+		acceptor.deviceID,
+	)
+	timingLeaderTerm := requireDaemonCoordinationLeader(t, acceptor)
+
+	samples := make([]time.Duration, 0, coordinationLatencySampleCount)
+	for index := 0; index < coordinationLatencySampleCount; index++ {
+		samples = append(
+			samples,
+			runCoordinationVisibilitySample(
+				t,
+				proposals,
+				acceptor,
+				submitter,
+				observer,
+				observerAgent,
+				timingLeaderTerm,
+				uint64(index+2),
+				fmt.Sprintf(
+					"coordination visibility sample %02d",
+					index+1,
+				),
+			),
+		)
+	}
+	summary, err := latency.Summarize(samples)
+	if err != nil {
+		t.Fatalf("summarize coordination visibility: %v", err)
+	}
+	report := coordinationVisibilityReport{
+		Report:            summary,
+		OS:                runtime.GOOS,
+		Architecture:      runtime.GOARCH,
+		DeviceCount:       len(mesh.allNodes),
+		VoterCount:        len(mesh.voters),
+		SettledCount:      len(mesh.settled),
+		AgentCount:        len(agents),
+		CodexAgentCount:   sameDeviceLatencyAgentCount / 2,
+		ClaudeAgentCount:  sameDeviceLatencyAgentCount / 2,
+		PostWarmupSamples: len(samples),
+		Topology:          "single_host_selected_non_loopback_interface",
+		SubmitterDeviceID: string(submitter.deviceID),
+		AcceptorDeviceID:  string(acceptor.deviceID),
+		ObserverDeviceID:  string(observer.deviceID),
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("encode coordination latency report: %v", err)
+	}
+	t.Logf("CODECOMM_PHASE3_COORDINATION_VISIBILITY=%s", encoded)
+	if summary.P95() >= coordinationLatencyTarget {
+		t.Fatalf(
+			"coordination visibility p95 = %s, target <%s",
+			summary.P95(),
+			coordinationLatencyTarget,
+		)
+	}
+
+	waitForDaemonMeshIntegrationClusterWithin(
+		t,
+		mesh.allNodes,
+		sameDeviceLatencyConvergenceMax,
+		func(statuses []ui.Snapshot) bool {
+			if !sameDeviceLatencyTopologyReady(
+				statuses,
+				len(mesh.voters),
+				len(mesh.allNodes),
+				mesh.voterIDs,
+			) || !sameDeviceLatencyAgentsReady(
+				statuses,
+				agents,
+			) {
+				return false
+			}
+			expectedTasks := uint64(coordinationLatencySampleCount + 1)
+			for _, status := range statuses {
+				if status.TaskTotal != expectedTasks ||
+					status.Truncated ||
+					uint64(len(status.Tasks)) != expectedTasks {
+					return false
+				}
+			}
+			return true
+		},
+	)
+	requireSameDeviceLatencyCommitments(
+		t,
+		mesh.allNodes,
+		acceptor.deviceID,
+	)
+	if finalTerm := requireDaemonCoordinationLeader(
+		t,
+		acceptor,
+	); finalTerm != timingLeaderTerm {
+		t.Fatalf(
+			"coordination timing crossed leader terms %d and %d",
+			timingLeaderTerm,
+			finalTerm,
+		)
+	}
+}
+
+func newDaemonLatencyMesh(t *testing.T) *daemonLatencyMesh {
 	t.Helper()
 	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 8)
 	root := t.TempDir()
@@ -192,47 +520,94 @@ func runDaemonSameDeviceVisibilityLatency(t *testing.T) {
 			)
 		},
 	)
+	return &daemonLatencyMesh{
+		root:     root,
+		allNodes: allNodes,
+		voters:   voters,
+		settled:  settled,
+		voterIDs: voterIDs,
+		leader:   leader,
+	}
+}
 
-	service := waitForDaemonLatencyAgentService(t, leader)
-	consensusNode, ready := leader.meshCapture.consensusNode()
+func launchDaemonLatencyAgents(
+	t *testing.T,
+	mesh *daemonLatencyMesh,
+	node *daemonMeshIntegrationNode,
+) []*sameDeviceLatencyAgent {
+	t.Helper()
+	if mesh == nil || node == nil {
+		t.Fatal("invalid latency agent fixture")
+	}
+	agents := launchDaemonLatencyAgentRange(
+		t,
+		mesh,
+		node,
+		0,
+		sameDeviceLatencyAgentCount,
+	)
+	awaitDaemonLatencyAgents(t, mesh, agents)
+	return agents
+}
+
+func launchDaemonLatencyAgentRange(
+	t *testing.T,
+	mesh *daemonLatencyMesh,
+	node *daemonMeshIntegrationNode,
+	start, count int,
+) []*sameDeviceLatencyAgent {
+	t.Helper()
+	if mesh == nil ||
+		node == nil ||
+		start < 0 ||
+		count < 1 ||
+		start+count > sameDeviceLatencyAgentCount {
+		t.Fatal("invalid latency agent range")
+	}
+	service := waitForDaemonLatencyAgentService(t, node)
+	_, local, ready := node.meshCapture.snapshot()
 	if !ready {
-		t.Fatal("latency source consensus node was not captured")
+		t.Fatal("latency agent local state was not captured")
 	}
-	local, err := consensusNode.LocalState()
-	if err != nil {
-		t.Fatalf("latency source LocalState(): %v", err)
-	}
-	agents := make([]*sameDeviceLatencyAgent, 0, sameDeviceLatencyAgentCount)
-	for index := 0; index < sameDeviceLatencyAgentCount; index++ {
+	agents := make([]*sameDeviceLatencyAgent, 0, count)
+	for index := start; index < start+count; index++ {
 		agents = append(
 			agents,
 			launchSameDeviceLatencyAgent(
 				t,
 				service,
 				local,
-				leader.localEndpoint,
-				filepath.Join(root, "agents"),
-				leader.deviceID,
+				node.localEndpoint,
+				filepath.Join(mesh.root, "agents"),
+				node.deviceID,
 				index,
 			),
 		)
 	}
+	return agents
+}
+
+func awaitDaemonLatencyAgents(
+	t *testing.T,
+	mesh *daemonLatencyMesh,
+	agents []*sameDeviceLatencyAgent,
+) {
+	t.Helper()
+	if mesh == nil || len(agents) != sameDeviceLatencyAgentCount {
+		t.Fatal("invalid latency agent set")
+	}
 	waitForDaemonMeshIntegrationClusterWithin(
 		t,
-		allNodes,
+		mesh.allNodes,
 		sameDeviceLatencyConvergenceMax,
 		func(statuses []ui.Snapshot) bool {
-			if !sameDeviceLatencyTopologyReady(
+			return sameDeviceLatencyTopologyReady(
 				statuses,
-				len(voters),
-				len(allNodes),
-				voterIDs,
-			) {
-				return false
-			}
-			return sameDeviceLatencyAgentsReady(
+				len(mesh.voters),
+				len(mesh.allNodes),
+				mesh.voterIDs,
+			) && sameDeviceLatencyAgentsReady(
 				statuses,
-				leader.deviceID,
 				agents,
 			)
 		},
@@ -253,114 +628,37 @@ func runDaemonSameDeviceVisibilityLatency(t *testing.T) {
 			t.Fatalf("warm agent context: %v", err)
 		}
 	}
+}
 
-	warmTitle := "same-device visibility warmup"
-	runSameDeviceVisibilitySample(
-		t,
-		agents[0],
-		agents[1],
-		warmTitle,
-	)
-	waitForDaemonMeshIntegrationStableHeads(
-		t,
-		allNodes,
-		250*time.Millisecond,
-	)
-	requireSameDeviceLatencyCommitments(
-		t,
-		allNodes,
-		leader.deviceID,
-	)
-
-	samples := make([]time.Duration, 0, sameDeviceLatencySampleCount)
-	exercisedAgents := make(map[domain.UUIDv7]struct{}, len(agents))
-	for index := 0; index < sameDeviceLatencySampleCount; index++ {
-		source := agents[index%len(agents)]
-		observer := agents[(index+13)%len(agents)]
-		exercisedAgents[source.agentSession] = struct{}{}
-		exercisedAgents[observer.agentSession] = struct{}{}
-		samples = append(
-			samples,
-			runSameDeviceVisibilitySample(
-				t,
-				source,
-				observer,
-				fmt.Sprintf(
-					"same-device visibility sample %02d",
-					index+1,
-				),
-			),
-		)
+func waitForDaemonLatencyProposalRuntime(
+	t *testing.T,
+	source, target *daemonMeshIntegrationNode,
+) *daemonContentPeerRuntime {
+	t.Helper()
+	if source == nil || target == nil || source == target {
+		t.Fatal("invalid latency proposal runtime fixture")
 	}
-	if len(exercisedAgents) != len(agents) {
-		t.Fatalf(
-			"timed samples exercised %d of %d agents",
-			len(exercisedAgents),
-			len(agents),
-		)
-	}
-	summary, err := latency.Summarize(samples)
-	if err != nil {
-		t.Fatalf("summarize same-device visibility: %v", err)
-	}
-	report := sameDeviceLatencyReport{
-		Report:            summary,
-		OS:                runtime.GOOS,
-		Architecture:      runtime.GOARCH,
-		DeviceCount:       len(allNodes),
-		VoterCount:        len(voters),
-		SettledCount:      len(settled),
-		AgentCount:        len(agents),
-		CodexAgentCount:   sameDeviceLatencyAgentCount / 2,
-		ClaudeAgentCount:  sameDeviceLatencyAgentCount / 2,
-		PostWarmupSamples: len(samples),
-	}
-	encoded, err := json.Marshal(report)
-	if err != nil {
-		t.Fatalf("encode same-device latency report: %v", err)
-	}
-	t.Logf("CODECOMM_PHASE3_SAME_DEVICE_VISIBILITY=%s", encoded)
-	if summary.P95() >= sameDeviceLatencyTarget {
-		t.Fatalf(
-			"same-device visibility p95 = %s, target <%s",
-			summary.P95(),
-			sameDeviceLatencyTarget,
-		)
-	}
-
-	waitForDaemonMeshIntegrationClusterWithin(
-		t,
-		allNodes,
-		sameDeviceLatencyConvergenceMax,
-		func(statuses []ui.Snapshot) bool {
-			if !sameDeviceLatencyTopologyReady(
-				statuses,
-				len(voters),
-				len(allNodes),
-				voterIDs,
-			) || !sameDeviceLatencyAgentsReady(
-				statuses,
-				leader.deviceID,
-				agents,
-			) {
-				return false
+	deadline := time.Now().Add(daemonMeshIntegrationTimeout)
+	for time.Now().Before(deadline) {
+		runtime := source.contentPeers.Load()
+		if runtime != nil && runtime.FatalError() == nil {
+			worker := runtime.worker(target.deviceID)
+			if worker != nil && worker.currentConnection() != nil {
+				return runtime
 			}
-			expectedTasks := uint64(sameDeviceLatencySampleCount + 1)
-			for _, status := range statuses {
-				if status.TaskTotal != expectedTasks ||
-					status.Truncated ||
-					uint64(len(status.Tasks)) != expectedTasks {
-					return false
-				}
-			}
-			return true
-		},
-	)
-	requireSameDeviceLatencyCommitments(
-		t,
-		allNodes,
-		leader.deviceID,
-	)
+		}
+		select {
+		case <-source.exited:
+			t.Fatalf(
+				"proposal source exited before content connection: %v",
+				source.exitErr,
+			)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("latency proposal content connection was not established")
+	return nil
 }
 
 func sameDeviceLatencyTopologyReady(
@@ -449,10 +747,9 @@ func requireSameDeviceLatencyCommitments(
 
 func sameDeviceLatencyAgentsReady(
 	statuses []ui.Snapshot,
-	deviceID domain.DeviceID,
 	agents []*sameDeviceLatencyAgent,
 ) bool {
-	if !deviceID.Valid() || len(agents) != sameDeviceLatencyAgentCount {
+	if len(agents) != sameDeviceLatencyAgentCount {
 		return false
 	}
 	expected := make(map[string]*sameDeviceLatencyAgent, len(agents))
@@ -462,6 +759,7 @@ func sameDeviceLatencyAgentsReady(
 		if candidate == nil ||
 			!candidate.agentSession.Valid() ||
 			!candidate.workingRoot.Valid() ||
+			!candidate.deviceID.Valid() ||
 			!candidate.clientKind.Valid() {
 			return false
 		}
@@ -491,7 +789,7 @@ func sameDeviceLatencyAgentsReady(
 		for _, actual := range status.Agents {
 			candidate := expected[actual.AgentSessionID]
 			if candidate == nil ||
-				actual.DeviceID != string(deviceID) ||
+				actual.DeviceID != string(candidate.deviceID) ||
 				actual.ClientKind != string(candidate.clientKind) ||
 				actual.WorkingRootID != string(candidate.workingRoot) ||
 				!agentsession.State(actual.State).Connected() {
@@ -628,6 +926,7 @@ func launchSameDeviceLatencyAgent(
 		adapter:       adapter,
 		serverSession: serverSession,
 		session:       clientSession,
+		deviceID:      deviceID,
 		clientKind:    clientKind,
 	}
 	t.Cleanup(func() {
@@ -743,6 +1042,271 @@ func runSameDeviceVisibilitySample(
 			)
 		}
 	}
+}
+
+func runCoordinationVisibilitySample(
+	t *testing.T,
+	proposals *daemonContentPeerRuntime,
+	acceptor *daemonMeshIntegrationNode,
+	submitter *daemonMeshIntegrationNode,
+	observerNode *daemonMeshIntegrationNode,
+	observer *sameDeviceLatencyAgent,
+	expectedLeaderTerm uint64,
+	originSequence uint64,
+	title string,
+) time.Duration {
+	t.Helper()
+	if proposals == nil ||
+		acceptor == nil ||
+		submitter == nil ||
+		observerNode == nil ||
+		observer == nil ||
+		expectedLeaderTerm < 1 ||
+		originSequence < 1 ||
+		title == "" {
+		t.Fatal("invalid coordination latency sample")
+	}
+	if leaderTerm := requireDaemonCoordinationLeader(
+		t,
+		acceptor,
+	); leaderTerm != expectedLeaderTerm {
+		t.Fatalf(
+			"coordination sample %q started in leader term %d, want %d",
+			title,
+			leaderTerm,
+			expectedLeaderTerm,
+		)
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	before, err := callSameDeviceLatencyTool[codecommmcp.ContextGetOutput](
+		ctx,
+		observer.session,
+		codecommmcp.ToolContextGet,
+		map[string]any{},
+	)
+	cancel()
+	if err != nil {
+		t.Fatalf("read pre-mutation coordination context: %v", err)
+	}
+	signed := coordinationLatencyTaskEvent(
+		t,
+		submitter,
+		originSequence,
+		title,
+	)
+	ctx, cancel = context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	result, err := proposals.Propose(ctx, acceptor.deviceID, signed)
+	acceptedAt := time.Now()
+	cancel()
+	if err != nil {
+		t.Fatalf("POST /v1/events for %q: %v", title, err)
+	}
+	if result.ChainIndex == nil ||
+		result.ChainHash == nil ||
+		result.Outcome.Status != store.OutcomeAccepted ||
+		result.Outcome.Code != "accepted" ||
+		result.ResultIndex <= before.Session.ResultIndex ||
+		*result.ChainIndex <= before.Session.ChainIndex {
+		t.Fatalf(
+			"POST /v1/events for %q returned %#v",
+			title,
+			result,
+		)
+	}
+	chainIndex := *result.ChainIndex
+
+	observeContext, cancelObserve := context.WithTimeout(
+		context.Background(),
+		coordinationLatencyObserveMax,
+	)
+	defer cancelObserve()
+	taskID, validTaskID := signed.Proposal().EntityID.Value()
+	if !validTaskID || !domain.UUIDv7(taskID).Valid() {
+		t.Fatal("coordination proposal has an invalid task ID")
+	}
+	for {
+		observed, observedAt, err := callSameDeviceLatencyToolAt[codecommmcp.ContextGetOutput](
+			observeContext,
+			observer.session,
+			codecommmcp.ToolContextGet,
+			map[string]any{},
+		)
+		if err != nil {
+			if timeoutErr := observeContext.Err(); timeoutErr != nil {
+				t.Fatalf(
+					"task %s was not peer-visible after %s: %v; observer content: %s",
+					taskID,
+					time.Since(acceptedAt),
+					timeoutErr,
+					daemonMeshIntegrationContentDiagnostics(observerNode),
+				)
+			}
+			t.Fatalf("peer context.get after %q: %v", title, err)
+		}
+		if observed.Session.ChainIndex >= chainIndex &&
+			observed.Session.ResultIndex >= result.ResultIndex &&
+			sameDeviceLatencyContextHasTask(observed, taskID, title) {
+			elapsed := observedAt.Sub(acceptedAt)
+			if elapsed < 0 {
+				t.Fatalf(
+					"peer context.get for %q completed before POST acceptance",
+					title,
+				)
+			}
+			if elapsed >= coordinationLatencyTarget {
+				t.Logf(
+					"slow coordination sample %q = %s; observer content: %s",
+					title,
+					elapsed,
+					daemonMeshIntegrationContentDiagnostics(observerNode),
+				)
+			}
+			if finalTerm := requireDaemonCoordinationLeader(
+				t,
+				acceptor,
+			); finalTerm != expectedLeaderTerm {
+				t.Fatalf(
+					"coordination sample %q crossed leader terms %d and %d",
+					title,
+					expectedLeaderTerm,
+					finalTerm,
+				)
+			}
+			return elapsed
+		}
+		if err := observeContext.Err(); err != nil {
+			t.Fatalf(
+				"task %s was not peer-visible after %s: %v; observer content: %s",
+				taskID,
+				time.Since(acceptedAt),
+				err,
+				daemonMeshIntegrationContentDiagnostics(observerNode),
+			)
+		}
+		select {
+		case <-observeContext.Done():
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func requireDaemonCoordinationLeader(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+) uint64 {
+	t.Helper()
+	if node == nil || !node.deviceID.Valid() {
+		t.Fatal("invalid coordination leader fixture")
+	}
+	consensusNode, ready := node.meshCapture.consensusNode()
+	if !ready {
+		t.Fatal("coordination acceptor consensus node was not captured")
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationStatusTimeout,
+	)
+	defer cancel()
+	snapshot, err := consensusNode.Status(ctx)
+	if err != nil {
+		t.Fatalf("coordination acceptor status: %v", err)
+	}
+	if !consensusNode.IsLeader() ||
+		snapshot.Runtime.State != "ready" ||
+		snapshot.Runtime.Role != "leader" ||
+		snapshot.Runtime.LocalDeviceID != node.deviceID ||
+		snapshot.Runtime.LeaderDeviceID != node.deviceID ||
+		snapshot.Runtime.StrongWrites != "available" ||
+		snapshot.Durable.Heads.CurrentTerm == nil {
+		t.Fatalf(
+			"coordination acceptor %s is not the ready leader: %+v",
+			node.deviceID,
+			snapshot.Runtime,
+		)
+	}
+	return *snapshot.Durable.Heads.CurrentTerm
+}
+
+func coordinationLatencyTaskEvent(
+	t *testing.T,
+	submitter *daemonMeshIntegrationNode,
+	originSequence uint64,
+	title string,
+) event.SignedEvent {
+	t.Helper()
+	if submitter == nil ||
+		!submitter.deviceID.Valid() ||
+		len(submitter.privateKey) != ed25519.PrivateKeySize ||
+		originSequence < 1 ||
+		title == "" {
+		t.Fatal("invalid coordination latency event fixture")
+	}
+	authority, err := event.NewLocalAuthority(
+		submitter.deviceID,
+		daemonTestSetupBootID,
+	)
+	if err != nil {
+		t.Fatalf("NewLocalAuthority(coordination latency): %v", err)
+	}
+	binding, err := authority.OperatorBinding()
+	if err != nil {
+		t.Fatalf("OperatorBinding(coordination latency): %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"priority": uint8(task.PriorityNormal),
+		"title":    title,
+	})
+	if err != nil {
+		t.Fatalf("marshal coordination latency payload: %v", err)
+	}
+	proposal, err := event.BuildProposal(
+		event.Command{
+			Kind: event.KindTaskCreated,
+			EntityID: event.StringEntityID(
+				string(sameDeviceLatencyUUID(0x4000 + originSequence)),
+			),
+			Actions: []event.Action{},
+			Payload: payload,
+			Redaction: event.Redaction{
+				Policy:        event.RedactionDefault,
+				FieldsRemoved: []event.RedactionField{},
+			},
+		},
+		binding,
+		event.BuildContext{
+			EventID:     sameDeviceLatencyUUID(0x3000 + originSequence),
+			SessionID:   daemonTestSessionID,
+			WorkspaceID: daemonTestWorkspaceID,
+			CreatedAt: domain.Timestamp(
+				time.Date(
+					2026,
+					time.September,
+					9,
+					15,
+					0,
+					0,
+					0,
+					time.UTC,
+				).Add(time.Duration(originSequence) * time.Millisecond).
+					Format(time.RFC3339Nano),
+			),
+			OriginSequence: originSequence,
+		},
+	)
+	if err != nil {
+		t.Fatalf("BuildProposal(coordination latency): %v", err)
+	}
+	signed, err := event.Sign(proposal, submitter.privateKey)
+	if err != nil {
+		t.Fatalf("Sign(coordination latency): %v", err)
+	}
+	return signed
 }
 
 func sameDeviceLatencyContextHasTask(

@@ -123,6 +123,16 @@ samples at p95 2.57825 ms and maximum 2.911334 ms, passing the strict p95 <100 m
 per-PR gate repeats this control-plane workload; Phase 5 repeats the unchanged timing boundary
 with the full 100k-file/2-GiB Git corpus once that plane exists.
 
+The Phase 3 coordination regression uses 8 production-composed daemons on one host through a
+selected non-loopback interface, with 3 voters, 5 settled nonvoters, and 32 agents. A settled member
+sends signed proposals over content mTLS to the leader's `POST /v1/events`; timing ends when a
+different voter's MCP `context.get` returns the exact task and committed positions. A confirmed
+2026-09-09 `darwin/arm64` run measured 20 post-warmup samples at p95 87.80525 ms and maximum
+89.79325 ms, below the 500 ms regression ceiling. The nightly gate requires one leader term and
+equal verified commitments across all eight replicas before and after timing. This is software-path
+regression evidence, not native LAN acceptance: Phase 5 repeats it with the full Git corpus and
+Phase 6 confirms the quiet-gigabit-LAN target on separate installed devices.
+
 Confirmation is split by plane, because three targets measure mechanisms that do not exist until
 phase 5: consensus and control targets plus the coordination-growth budget confirm at **phase 3**;
 draft-visibility, canonical-materialization, bootstrap, publication, and every disk budget confirm
