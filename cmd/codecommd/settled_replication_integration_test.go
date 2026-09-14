@@ -40,7 +40,6 @@ import (
 const (
 	daemonSettledReplicationChildMarker = "CODECOMM_TEST_SETTLED_REPLICATION_CHILD"
 	daemonSettledSnapshotChildMarker    = "CODECOMM_TEST_SETTLED_SNAPSHOT_CHILD"
-	daemonSettledSnapshotProcessTimeout = 10 * time.Minute
 	daemonTwoDeviceRecoveryEventID      = domain.UUIDv7(
 		"018f47de-89ab-7def-8123-e123456789ab",
 	)
@@ -48,6 +47,8 @@ const (
 		"018f47de-89ab-7def-8123-f123456789ab",
 	)
 )
+
+var daemonSettledSnapshotProcessTimeout = daemonMeshTimeouts.snapshotChild
 
 func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart(
 	t *testing.T,
@@ -2484,6 +2485,9 @@ func runDaemonSettledReplicationChild(t *testing.T) {
 		"-test.run=^TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart$",
 		"-test.count=1",
 		"-test.v",
+		daemonMeshChildWatchdogArgument(
+			daemonMeshIntegrationProcessTimeout,
+		),
 	)
 	command.Env = append(
 		daemonTestEnvironment(os.Environ()),
@@ -2520,6 +2524,9 @@ func runDaemonSettledSnapshotFallbackChild(t *testing.T) {
 		"-test.run=^TestDaemonSettledAutomaticLogicalSnapshotFallbackPersistsAcrossRestart$",
 		"-test.count=1",
 		"-test.v",
+		daemonMeshChildWatchdogArgument(
+			daemonSettledSnapshotProcessTimeout,
+		),
 	)
 	command.Env = append(
 		daemonTestEnvironment(os.Environ()),

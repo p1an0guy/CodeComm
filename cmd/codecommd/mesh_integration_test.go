@@ -54,8 +54,7 @@ import (
 )
 
 const (
-	daemonMeshIntegrationTimeout        = 90 * time.Second
-	daemonMeshIntegrationProcessTimeout = 5 * time.Minute
+	daemonMeshIntegrationStatusTimeout  = time.Second
 	daemonMeshIntegrationChildMarker    = "CODECOMM_TEST_DAEMON_MESH_CHILD"
 	daemonMeshIntegrationRequired       = "CODECOMM_REQUIRE_DAEMON_MESH"
 	daemonIntegrationChildComplete      = "CODECOMM_TEST_CHILD_RESULT=complete"
@@ -81,6 +80,11 @@ const (
 	daemonMeshRebootstrapVersionEventID = domain.UUIDv7(
 		"018f47de-89ab-7def-b223-7123456789ab",
 	)
+)
+
+var (
+	daemonMeshIntegrationTimeout        = daemonMeshTimeouts.convergence
+	daemonMeshIntegrationProcessTimeout = daemonMeshTimeouts.genericChild
 )
 
 type daemonTestCredentialStore struct {
@@ -2267,7 +2271,10 @@ func daemonMeshIntegrationStatusSummary(statuses []ui.Snapshot) string {
 func readDaemonMeshIntegrationStatus(
 	endpoint ipc.Endpoint,
 ) (ui.Snapshot, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationStatusTimeout,
+	)
 	defer cancel()
 	client, err := ui.DialOperator(ctx, ui.OperatorDialOptions{
 		Endpoint:    endpoint,
@@ -3715,6 +3722,9 @@ func runDaemonMeshIntegrationChild(t *testing.T, testPattern string) {
 		"-test.run="+testPattern,
 		"-test.count=1",
 		"-test.v",
+		daemonMeshChildWatchdogArgument(
+			daemonMeshIntegrationProcessTimeout,
+		),
 	)
 	command.Env = append(
 		daemonTestEnvironment(os.Environ()),

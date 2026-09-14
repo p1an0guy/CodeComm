@@ -1009,6 +1009,9 @@ func runDaemonReadmissionIntegrationChild(t *testing.T) {
 		"-test.run=^TestDaemonProductionReadmissionComposition$",
 		"-test.count=1",
 		"-test.v",
+		daemonMeshChildWatchdogArgument(
+			daemonMeshIntegrationProcessTimeout,
+		),
 	)
 	command.Env = append(
 		daemonTestEnvironment(os.Environ()),
