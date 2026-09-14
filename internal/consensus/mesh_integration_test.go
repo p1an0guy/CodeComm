@@ -1948,16 +1948,109 @@ func TestSecureMeshTopologyPartitionClosesEstablishedConnections(
 	}
 }
 
+func TestSecureMeshTopologyPartitionedResolutionResumesOnHeal(
+	t *testing.T,
+) {
+	topology := newSecureMeshTopology()
+	localDeviceID := domain.DeviceID("cc1" + strings.Repeat("1", 64))
+	remoteDeviceID := domain.DeviceID("cc1" + strings.Repeat("2", 64))
+	endpoint := netip.MustParseAddrPort("192.0.2.10:47831")
+	const address = "127.0.0.1:47831"
+	topology.register(remoteDeviceID, endpoint, address)
+	topology.setPartition(remoteDeviceID, true)
+
+	baseContext, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	waitContext := &secureMeshObservedWaitContext{
+		Context: baseContext,
+		entered: make(chan struct{}),
+	}
+	type resolution struct {
+		target secureMeshTarget
+		err    error
+	}
+	resolved := make(chan resolution, 1)
+	go func() {
+		target, err := topology.waitForTarget(
+			waitContext,
+			localDeviceID,
+			endpoint,
+		)
+		resolved <- resolution{target: target, err: err}
+	}()
+
+	select {
+	case <-waitContext.entered:
+	case <-baseContext.Done():
+		t.Fatal("partitioned resolution did not wait for topology change")
+	}
+	select {
+	case result := <-resolved:
+		t.Fatalf(
+			"partitioned resolution completed before heal: (%+v, %v)",
+			result.target,
+			result.err,
+		)
+	default:
+	}
+
+	topology.setPartition(remoteDeviceID, false)
+	select {
+	case result := <-resolved:
+		if result.err != nil ||
+			result.target.deviceID != remoteDeviceID ||
+			result.target.address != address {
+			t.Fatalf(
+				"healed resolution = (%+v, %v), want (%s, %q, nil)",
+				result.target,
+				result.err,
+				remoteDeviceID,
+				address,
+			)
+		}
+	case <-baseContext.Done():
+		t.Fatal("healed resolution did not resume")
+	}
+
+	topology.setPartition(remoteDeviceID, true)
+	canceledContext, cancelWait := context.WithCancel(t.Context())
+	cancelWait()
+	if _, err := topology.waitForTarget(
+		canceledContext,
+		localDeviceID,
+		endpoint,
+	); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled partitioned resolution error = %v", err)
+	}
+
+	topology.mu.Lock()
+	topology.partitionDialDelay = time.Millisecond
+	topology.mu.Unlock()
+	unavailableContext, cancelUnavailable := context.WithTimeout(
+		t.Context(),
+		time.Second,
+	)
+	defer cancelUnavailable()
+	if _, err := topology.waitForTarget(
+		unavailableContext,
+		localDeviceID,
+		endpoint,
+	); !errors.Is(err, transport.ErrConsensusEndpointUnavailable) {
+		t.Fatalf("unhealed partitioned resolution error = %v", err)
+	}
+}
+
 func (dialer secureMeshDialer) DialConsensusEndpoint(
 	ctx context.Context,
 	endpoint netip.AddrPort,
 ) (net.Conn, error) {
-	target, allowed := dialer.topology.resolve(
+	target, err := dialer.topology.waitForTarget(
+		ctx,
 		dialer.localDeviceID,
 		endpoint,
 	)
-	if !allowed {
-		return nil, transport.ErrConsensusEndpointUnavailable
+	if err != nil {
+		return nil, err
 	}
 	var networkDialer net.Dialer
 	connection, err := networkDialer.DialContext(
@@ -1992,10 +2085,12 @@ func (dialer secureMeshDialer) DialConsensusEndpoint(
 }
 
 type secureMeshTopology struct {
-	mu          sync.RWMutex
-	targets     map[netip.AddrPort]secureMeshTarget
-	partitioned map[domain.DeviceID]bool
-	connections map[*secureMeshTrackedConnection]struct{}
+	mu                 sync.RWMutex
+	targets            map[netip.AddrPort]secureMeshTarget
+	partitioned        map[domain.DeviceID]bool
+	connections        map[*secureMeshTrackedConnection]struct{}
+	changes            chan struct{}
+	partitionDialDelay time.Duration
 }
 
 type secureMeshTarget struct {
@@ -2014,6 +2109,20 @@ type secureMeshTrackedConnection struct {
 	closeErr  error
 }
 
+type secureMeshObservedWaitContext struct {
+	context.Context
+
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (ctx *secureMeshObservedWaitContext) Done() <-chan struct{} {
+	ctx.once.Do(func() {
+		close(ctx.entered)
+	})
+	return ctx.Context.Done()
+}
+
 func (connection *secureMeshTrackedConnection) Close() error {
 	if connection == nil {
 		return net.ErrClosed
@@ -2030,6 +2139,9 @@ func newSecureMeshTopology() *secureMeshTopology {
 		targets:     make(map[netip.AddrPort]secureMeshTarget),
 		partitioned: make(map[domain.DeviceID]bool),
 		connections: make(map[*secureMeshTrackedConnection]struct{}),
+		changes:     make(chan struct{}),
+		// Avoid saturating Raft's retry backoff before a short partition heals.
+		partitionDialDelay: secureMeshRaftConfig().HeartbeatTimeout / 2,
 	}
 }
 
@@ -2043,6 +2155,7 @@ func (topology *secureMeshTopology) register(
 		deviceID: deviceID,
 		address:  address,
 	}
+	topology.signalChangeLocked()
 	topology.mu.Unlock()
 }
 
@@ -2050,6 +2163,7 @@ func (topology *secureMeshTopology) unregister(endpoint netip.AddrPort) {
 	topology.mu.Lock()
 	target, exists := topology.targets[endpoint]
 	delete(topology.targets, endpoint)
+	topology.signalChangeLocked()
 	var connections []*secureMeshTrackedConnection
 	if exists {
 		connections = topology.connectionsForDeviceLocked(target.deviceID)
@@ -2063,7 +2177,11 @@ func (topology *secureMeshTopology) setPartition(
 	partitioned bool,
 ) int {
 	topology.mu.Lock()
+	changed := topology.partitioned[deviceID] != partitioned
 	topology.partitioned[deviceID] = partitioned
+	if changed {
+		topology.signalChangeLocked()
+	}
 	var connections []*secureMeshTrackedConnection
 	if partitioned {
 		connections = topology.connectionsForDeviceLocked(deviceID)
@@ -2086,6 +2204,64 @@ func (topology *secureMeshTopology) resolve(
 		return secureMeshTarget{}, false
 	}
 	return target, true
+}
+
+func (topology *secureMeshTopology) waitForTarget(
+	ctx context.Context,
+	localDeviceID domain.DeviceID,
+	endpoint netip.AddrPort,
+) (secureMeshTarget, error) {
+	if topology == nil || ctx == nil {
+		return secureMeshTarget{}, transport.ErrConsensusEndpointUnavailable
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return secureMeshTarget{}, err
+		}
+		topology.mu.RLock()
+		target, exists := topology.targets[endpoint]
+		partitioned := exists &&
+			(topology.partitioned[localDeviceID] ||
+				topology.partitioned[target.deviceID])
+		changes := topology.changes
+		partitionDialDelay := topology.partitionDialDelay
+		topology.mu.RUnlock()
+		if !exists {
+			return secureMeshTarget{},
+				transport.ErrConsensusEndpointUnavailable
+		}
+		if !partitioned {
+			return target, nil
+		}
+		if partitionDialDelay <= 0 {
+			return secureMeshTarget{},
+				transport.ErrConsensusEndpointUnavailable
+		}
+		timer := time.NewTimer(partitionDialDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return secureMeshTarget{}, ctx.Err()
+		case <-changes:
+			timer.Stop()
+		case <-timer.C:
+			if target, allowed := topology.resolve(
+				localDeviceID,
+				endpoint,
+			); allowed {
+				return target, nil
+			}
+			return secureMeshTarget{},
+				transport.ErrConsensusEndpointUnavailable
+		}
+	}
+}
+
+func (topology *secureMeshTopology) signalChangeLocked() {
+	if topology.changes != nil {
+		close(topology.changes)
+	}
+	topology.changes = make(chan struct{})
 }
 
 func (topology *secureMeshTopology) trackConnection(
