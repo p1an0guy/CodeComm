@@ -85,13 +85,15 @@ type daemonDependencies struct {
 		context.Context,
 		netip.AddrPort,
 	) (net.Listener, error)
-	openMulticast       daemonMulticastOpener
-	listInterfaces      daemonInterfaceLister
-	interfaceAddrs      daemonInterfaceAddressProvider
-	credentialNow       func() time.Time
-	canonicalCoverage   canonicalcoverage.ReceiptCollector
-	observeAgentService func(*agent.Service)
-	observeContentPeers func(*daemonContentPeerRuntime)
+	openMulticast             daemonMulticastOpener
+	listInterfaces            daemonInterfaceLister
+	interfaceAddrs            daemonInterfaceAddressProvider
+	credentialNow             func() time.Time
+	canonicalCoverage         canonicalcoverage.ReceiptCollector
+	observeAgentService       func(*agent.Service)
+	observeContentPeers       func(*daemonContentPeerRuntime)
+	observeSnapshotPublisher  func(*daemonLogicalSnapshotPublisher)
+	observeSnapshotRepository func(*daemonLogicalSnapshotRepository)
 }
 
 func main() {
@@ -740,6 +742,12 @@ func runDaemon(
 		)
 		if err != nil {
 			return err
+		}
+		if dependencies.observeSnapshotRepository != nil {
+			dependencies.observeSnapshotRepository(snapshotRepository)
+		}
+		if dependencies.observeSnapshotPublisher != nil {
+			dependencies.observeSnapshotPublisher(snapshotPublisher)
 		}
 		contentHandler, err = newDaemonContentServer(
 			options.sessionID,

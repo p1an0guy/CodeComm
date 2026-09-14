@@ -43,6 +43,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/ipc"
 	"github.com/ijonahch/codecomm/internal/joinbootstrap"
+	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/pairing"
 	"github.com/ijonahch/codecomm/internal/pairingjoiner"
 	"github.com/ijonahch/codecomm/internal/pairingservice"
@@ -189,21 +190,23 @@ func (secrets *daemonTestCredentialStore) wipe() {
 }
 
 type daemonMeshIntegrationNode struct {
-	deviceID      domain.DeviceID
-	privateKey    ed25519.PrivateKey
-	daemonVersion string
-	maxApplyLevel uint64
-	statePath     string
-	consensusDir  string
-	localEndpoint ipc.Endpoint
-	peerEndpoint  netip.AddrPort
-	credentials   *daemonTestCredentialStore
-	meshCapture   *daemonMeshIntegrationFactoryCapture
-	credentialNow func() time.Time
-	coverage      canonicalcoverage.ReceiptCollector
-	agentService  atomic.Pointer[agent.Service]
-	contentPeers  atomic.Pointer[daemonContentPeerRuntime]
-	listenerBinds atomic.Uint64
+	deviceID           domain.DeviceID
+	privateKey         ed25519.PrivateKey
+	daemonVersion      string
+	maxApplyLevel      uint64
+	statePath          string
+	consensusDir       string
+	localEndpoint      ipc.Endpoint
+	peerEndpoint       netip.AddrPort
+	credentials        *daemonTestCredentialStore
+	meshCapture        *daemonMeshIntegrationFactoryCapture
+	credentialNow      func() time.Time
+	coverage           canonicalcoverage.ReceiptCollector
+	agentService       atomic.Pointer[agent.Service]
+	contentPeers       atomic.Pointer[daemonContentPeerRuntime]
+	snapshotPublisher  atomic.Pointer[daemonLogicalSnapshotPublisher]
+	snapshotRepository atomic.Pointer[daemonLogicalSnapshotRepository]
+	listenerBinds      atomic.Uint64
 
 	routeDialContext transport.ConsensusRouteDialContext
 	listenPeer       func(
@@ -430,11 +433,25 @@ func runDaemonProductionMeshComposition(t *testing.T) {
 	)
 	t.Cleanup(func() {
 		for _, node := range append(nodes, retained) {
+			if t.Failed() && node.running {
+				t.Logf(
+					"daemon %s final content diagnostics: %s",
+					node.deviceID,
+					daemonMeshIntegrationContentDiagnostics(node),
+				)
+			}
 			if binds := node.listenerBinds.Load(); binds > 1 {
 				t.Logf(
 					"daemon %s bound its current listener generation %d times",
 					node.deviceID,
 					binds,
+				)
+			}
+			if stats, ready := node.meshCapture.ingressStats(); ready {
+				t.Logf(
+					"daemon %s final ingress stats: %+v",
+					node.deviceID,
+					stats,
 				)
 			}
 		}
@@ -1728,6 +1745,13 @@ func (node *daemonMeshIntegrationNode) start(
 	if node == nil || node.running || node.listener == nil {
 		t.Fatal("invalid daemon mesh test start")
 	}
+	admissionSources, err := daemonMeshIntegrationAdmissionSources(
+		node,
+		nodes,
+	)
+	if err != nil {
+		t.Fatalf("derive collapsed admission sources: %v", err)
+	}
 	options := daemonOptions{
 		statePath:     node.statePath,
 		consensusDir:  node.consensusDir,
@@ -1761,17 +1785,21 @@ func (node *daemonMeshIntegrationNode) start(
 	node.meshCapture.reset()
 	node.agentService.Store(nil)
 	node.contentPeers.Store(nil)
+	node.snapshotPublisher.Store(nil)
+	node.snapshotRepository.Store(nil)
 	node.listenerBinds.Store(0)
 	go func() {
 		productionDependencies := productionDaemonDependencies()
 		meshFactory := newDaemonMeshIntegrationFactoryConstructor(
 			node.meshCapture,
+			admissionSources,
 		)
 		if node.routeDialContext != nil {
 			meshFactory =
 				newDaemonMeshIntegrationFactoryConstructorWithDialContext(
 					node.meshCapture,
 					node.routeDialContext,
+					admissionSources,
 				)
 		}
 		listInterfaces := productionDependencies.listInterfaces
@@ -1838,10 +1866,122 @@ func (node *daemonMeshIntegrationNode) start(
 				observeContentPeers: func(runtime *daemonContentPeerRuntime) {
 					node.contentPeers.Store(runtime)
 				},
+				observeSnapshotPublisher: func(
+					publisher *daemonLogicalSnapshotPublisher,
+				) {
+					node.snapshotPublisher.Store(publisher)
+				},
+				observeSnapshotRepository: func(
+					repository *daemonLogicalSnapshotRepository,
+				) {
+					node.snapshotRepository.Store(repository)
+				},
 			},
 		)
 		close(node.exited)
 	}()
+}
+
+func daemonMeshIntegrationAdmissionSources(
+	local *daemonMeshIntegrationNode,
+	nodes []*daemonMeshIntegrationNode,
+) (map[netip.Addr]uint8, error) {
+	if local == nil || len(nodes) == 0 {
+		return nil, errDaemonMeshContentHarness
+	}
+	counts := make(map[netip.Addr]uint8)
+	seen := make(map[domain.DeviceID]struct{}, len(nodes))
+	for _, candidate := range nodes {
+		if candidate == nil || !candidate.deviceID.Valid() {
+			return nil, errDaemonMeshContentHarness
+		}
+		if _, duplicate := seen[candidate.deviceID]; duplicate {
+			return nil, errDaemonMeshContentHarness
+		}
+		seen[candidate.deviceID] = struct{}{}
+		if candidate.deviceID == local.deviceID {
+			continue
+		}
+		endpoint := candidate.currentPeerEndpoint()
+		if !endpoint.IsValid() {
+			continue
+		}
+		source := endpoint.Addr().Unmap().WithZone("")
+		counts[source]++
+		if counts[source] >
+			transport.HandshakeSourceMultiplicityMax {
+			return nil, errDaemonMeshContentHarness
+		}
+	}
+	for source, count := range counts {
+		if count < 2 {
+			delete(counts, source)
+		}
+	}
+	return counts, nil
+}
+
+func TestDaemonMeshIntegrationAdmissionSources(t *testing.T) {
+	newNode := func(seed byte, address string) *daemonMeshIntegrationNode {
+		privateKey := ed25519.NewKeyFromSeed(
+			bytes.Repeat([]byte{seed}, ed25519.SeedSize),
+		)
+		deviceID, err := device.DeriveID(
+			privateKey.Public().(ed25519.PublicKey),
+		)
+		clear(privateKey)
+		if err != nil {
+			t.Fatalf("derive admission test device: %v", err)
+		}
+		return &daemonMeshIntegrationNode{
+			deviceID: deviceID,
+			peerEndpoint: netip.AddrPortFrom(
+				netip.MustParseAddr(address),
+				47831,
+			),
+		}
+	}
+	local := newNode(0x91, "192.0.2.10")
+	first := newNode(0x92, "192.0.2.20")
+	second := newNode(0x93, "192.0.2.20")
+	distinct := newNode(0x94, "192.0.2.30")
+
+	got, err := daemonMeshIntegrationAdmissionSources(
+		local,
+		[]*daemonMeshIntegrationNode{local, first, second, distinct},
+	)
+	if err != nil {
+		t.Fatalf("daemonMeshIntegrationAdmissionSources() error = %v", err)
+	}
+	want := map[netip.Addr]uint8{
+		netip.MustParseAddr("192.0.2.20"): 2,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"daemonMeshIntegrationAdmissionSources() = %v, want %v",
+			got,
+			want,
+		)
+	}
+
+	got, err = daemonMeshIntegrationAdmissionSources(
+		local,
+		[]*daemonMeshIntegrationNode{first, second, distinct},
+	)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf(
+			"admission sources with external local = (%v, %v), want %v",
+			got,
+			err,
+			want,
+		)
+	}
+	if _, err := daemonMeshIntegrationAdmissionSources(
+		local,
+		[]*daemonMeshIntegrationNode{first, first},
+	); err == nil {
+		t.Fatal("duplicate admission source device was accepted")
+	}
 }
 
 func (node *daemonMeshIntegrationNode) currentPeerEndpoint() netip.AddrPort {
@@ -2234,11 +2374,140 @@ func daemonMeshIntegrationContentDiagnostics(
 	if runtime == nil {
 		return "<unavailable>"
 	}
+	ingress, ingressReady := node.meshCapture.ingressStats()
+	publisher := node.snapshotPublisher.Load()
+	repository := node.snapshotRepository.Load()
+	var (
+		publisherFatal error
+		publisherStats daemonSnapshotPublicationStats
+		snapshotInput  logicalsnapshot.RootInput
+		snapshotErr    error
+		isLeader       bool
+		currentHeads   store.ApplyHeads
+		currentViewErr error
+		appliedChain   uint64
+		admissionErr   error
+		leaderID       domain.DeviceID
+		endpointSets   string
+	)
+	if publisher != nil {
+		publisherFatal = publisher.FatalError()
+		publisherStats = publisher.publicationStats()
+	}
+	if consensusNode, ready := node.meshCapture.consensusNode(); ready {
+		isLeader = consensusNode.IsLeader()
+		viewContext, cancelView := context.WithTimeout(
+			context.Background(),
+			time.Second,
+		)
+		view, err := consensusNode.View(viewContext)
+		cancelView()
+		currentViewErr = err
+		if err == nil {
+			currentHeads = view.Heads
+		}
+		admission, err := consensusNode.PeerAdmissionSnapshot()
+		admissionErr = err
+		if err == nil {
+			appliedChain, _ = admission.AppliedChainIndex()
+		}
+		statusContext, cancelStatus := context.WithTimeout(
+			context.Background(),
+			time.Second,
+		)
+		status, err := consensusNode.Status(statusContext)
+		cancelStatus()
+		if err == nil {
+			leaderID = status.Runtime.LeaderDeviceID
+		}
+	}
+	endpointSets = daemonMeshIntegrationEndpointSetDiagnostics(node)
+	if repository == nil {
+		snapshotErr = errDaemonSnapshotRepository
+	} else {
+		snapshotContext, cancelSnapshot := context.WithTimeout(
+			context.Background(),
+			time.Second,
+		)
+		root, err := repository.LatestSnapshot(snapshotContext)
+		cancelSnapshot()
+		snapshotErr = err
+		if err == nil {
+			snapshotInput = root.Unsigned().Input()
+		}
+	}
 	return fmt.Sprintf(
-		"fatal=%v, transient=%+v",
+		"fatal=%v, transient=%+v, ingress_ready=%t, ingress=%+v, "+
+			"is_leader=%t, snapshot_publisher_fatal=%v, "+
+			"snapshot_publisher_stats=%+v, current_heads=%+v, "+
+			"current_view_error=%v, applied_chain=%d, "+
+			"admission_error=%v, leader_id=%s, endpoint_sets=%s, "+
+			"latest_snapshot=%+v, "+
+			"latest_snapshot_error=%v",
 		runtime.FatalError(),
 		runtime.transientPeerErrors(),
+		ingressReady,
+		ingress,
+		isLeader,
+		publisherFatal,
+		publisherStats,
+		currentHeads,
+		currentViewErr,
+		appliedChain,
+		admissionErr,
+		leaderID,
+		endpointSets,
+		snapshotInput,
+		snapshotErr,
 	)
+}
+
+func daemonMeshIntegrationEndpointSetDiagnostics(
+	node *daemonMeshIntegrationNode,
+) string {
+	if node == nil || node.credentialNow == nil {
+		return "<invalid>"
+	}
+	_, state, ready := node.meshCapture.snapshot()
+	if !ready {
+		return "<state unavailable>"
+	}
+	now := node.credentialNow()
+	timestamp := domain.Timestamp(now.UTC().Format(time.RFC3339Nano))
+	if now.IsZero() || !timestamp.Valid() {
+		return "<clock invalid>"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sets, err := state.ListMemberSignedEndpointSets(
+		ctx,
+		timestamp,
+	)
+	if err != nil {
+		return err.Error()
+	}
+	values := make([]string, 0, len(sets))
+	for _, set := range sets {
+		parsed, err := discovery.ParseEndpointSet(set.EndpointSetJSON)
+		if err != nil {
+			values = append(
+				values,
+				string(set.DeviceID)+":<invalid>",
+			)
+			continue
+		}
+		value := parsed.EndpointSet()
+		values = append(
+			values,
+			fmt.Sprintf(
+				"%s[%s,%s]",
+				set.DeviceID,
+				value.IssuedAt,
+				value.ExpiresAt,
+			),
+		)
+	}
+	return fmt.Sprintf("now=%s sets=%v", timestamp, values)
 }
 
 func daemonMeshIntegrationStatusSummary(statuses []ui.Snapshot) string {
@@ -2810,6 +3079,7 @@ func completeDaemonMeshPairingJoin(
 	}
 	outcomes := make(chan joinOutcome, 1)
 	go func() {
+		retry := daemonContentPeerRetryInitial
 		runOptions := joinbootstrap.Options{
 			StatePath:   options.statePath,
 			Credentials: options.credentials,
@@ -2874,8 +3144,9 @@ func completeDaemonMeshPairingJoin(
 			case <-ctx.Done():
 				outcomes <- joinOutcome{err: ctx.Err()}
 				return
-			case <-time.After(25 * time.Millisecond):
+			case <-time.After(retry):
 			}
+			retry = min(retry*2, daemonContentPeerRetryMaximum)
 		}
 	}()
 
@@ -3008,10 +3279,22 @@ func completeDaemonMeshPairingJoin(
 	select {
 	case outcome = <-outcomes:
 	case <-ctx.Done():
+		select {
+		case outcome = <-outcomes:
+		case <-time.After(5 * time.Second):
+			outcome.err = ctx.Err()
+		}
 		t.Fatalf(
-			"wait for %s bootstrap: %v",
+			"wait for %s bootstrap: %v; join authorization: %s; "+
+				"inviter content: %s",
 			options.request.Mode,
-			ctx.Err(),
+			outcome.err,
+			daemonMeshIntegrationJoinAuthorizationDiagnostics(
+				inviter,
+				review.Core.JoinerDeviceID,
+				options.request.InitialCredentialEpoch,
+			),
+			daemonMeshIntegrationContentDiagnostics(inviter),
 		)
 	}
 	if outcome.err != nil {
@@ -3060,6 +3343,45 @@ func completeDaemonMeshPairingJoin(
 		)
 	}
 	return daemonMeshPairingJoinResult{result: joined, review: review}
+}
+
+func daemonMeshIntegrationJoinAuthorizationDiagnostics(
+	node *daemonMeshIntegrationNode,
+	deviceID domain.DeviceID,
+	epoch uint64,
+) string {
+	if node == nil || !deviceID.Valid() || epoch < 1 {
+		return "<invalid>"
+	}
+	consensusNode, ready := node.meshCapture.consensusNode()
+	if !ready {
+		return "<consensus unavailable>"
+	}
+	admission, err := consensusNode.PeerAdmissionSnapshot()
+	if err != nil {
+		return err.Error()
+	}
+	authorization, found := admission.Authorization(
+		credentialauthorization.Key{
+			SessionID: daemonTestSessionID,
+			DeviceID:  deviceID,
+			Epoch:     epoch,
+		},
+	)
+	if !found {
+		member, memberFound := admission.Member(deviceID)
+		return fmt.Sprintf(
+			"<not committed; member_found=%t member_status=%s>",
+			memberFound,
+			member.Status,
+		)
+	}
+	return fmt.Sprintf(
+		"device=%s epoch=%d chain=%d",
+		authorization.DeviceID,
+		authorization.Epoch,
+		authorization.AuthorizationChainIndex,
+	)
 }
 
 func daemonMeshPairingAttemptMatchesReview(

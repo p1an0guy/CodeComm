@@ -129,6 +129,7 @@ type IngressStats struct {
 	ActiveConnections      int
 	PendingConnections     int
 	EstablishedConnections int
+	Admission              AdmissionStats
 	HandshakeErrors        uint64
 	DispatchErrors         uint64
 	HandlerErrors          uint64
@@ -532,6 +533,7 @@ func (ingress *Ingress) Stats() IngressStats {
 		ActiveConnections:      activeConnections,
 		PendingConnections:     activeConnections - establishedConnections,
 		EstablishedConnections: establishedConnections,
+		Admission:              ingress.admission.Stats(),
 		HandshakeErrors:        ingress.handshakeErrors.Load(),
 		DispatchErrors:         ingress.dispatchErrors.Load(),
 		HandlerErrors:          ingress.handlerErrors.Load(),

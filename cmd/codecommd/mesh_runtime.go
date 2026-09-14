@@ -93,6 +93,8 @@ type daemonMeshTransportFactory struct {
 	routes              *transport.ConsensusRouteTable
 	authenticatedDials  *daemonAuthenticatedDialRelay
 	credentialNow       func() time.Time
+	admissionNow        func() time.Time
+	admissionSources    map[netip.Addr]uint8
 
 	stream    *transport.ConsensusStreamLayer
 	verifiers *peerauth.Verifiers
@@ -254,6 +256,7 @@ func newDaemonMeshTransportFactoryWithDialContext(
 		routes:              resolver,
 		authenticatedDials:  &daemonAuthenticatedDialRelay{},
 		credentialNow:       credentialNow,
+		admissionNow:        time.Now,
 	}, nil
 }
 
@@ -366,7 +369,8 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 	if factory == nil ||
 		admission == nil ||
 		contentCertificate == nil ||
-		listener == nil {
+		listener == nil ||
+		factory.admissionNow == nil {
 		return nil, errDaemonMeshConstruction
 	}
 	if err := factory.prepareVerifiers(admission); err != nil {
@@ -383,8 +387,22 @@ func (factory *daemonMeshTransportFactory) NewIngress(
 			_ = listener.Close()
 		}
 	}()
+	limiter, err := transport.NewAdmissionLimiterWithOptions(
+		transport.AdmissionLimiterOptions{
+			Now:                  factory.admissionNow,
+			SourceMultiplicities: factory.admissionSources,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: peer admission limiter: %v",
+			errDaemonMeshConstruction,
+			err,
+		)
+	}
 	ingress, err := transport.NewIngress(transport.IngressOptions{
-		Listener: listener,
+		Listener:  listener,
+		Admission: limiter,
 		TLS: transport.ServerTLSOptions{
 			IdentityCertificate: factory.identityCertificate,
 			ContentCertificate:  contentCertificate,

@@ -42,6 +42,7 @@ type daemonMeshIntegrationFactoryCapture struct {
 	certificate transport.ContentCertificateProvider
 	localState  store.LocalState
 	consensus   *consensus.Node
+	ingress     *transport.Ingress
 	fatal       daemonFatalComponent
 	stage       string
 	ready       bool
@@ -55,6 +56,7 @@ func (capture *daemonMeshIntegrationFactoryCapture) reset() {
 	capture.certificate = nil
 	capture.localState = store.LocalState{}
 	capture.consensus = nil
+	capture.ingress = nil
 	capture.fatal = nil
 	capture.stage = "factory-created"
 	capture.ready = false
@@ -75,11 +77,13 @@ func (capture *daemonMeshIntegrationFactoryCapture) replace(
 	localState store.LocalState,
 	node *consensus.Node,
 	admission daemonPeerAdmissionRuntime,
+	ingress *transport.Ingress,
 ) {
 	capture.mu.Lock()
 	capture.certificate = certificate
 	capture.localState = localState
 	capture.consensus = node
+	capture.ingress = ingress
 	capture.fatal, _ = admission.(daemonFatalComponent)
 	capture.stage = "ingress-created"
 	capture.ready = true
@@ -125,6 +129,22 @@ func (capture *daemonMeshIntegrationFactoryCapture) fatalError() error {
 	return fatal.FatalError()
 }
 
+func (capture *daemonMeshIntegrationFactoryCapture) ingressStats() (
+	transport.IngressStats,
+	bool,
+) {
+	if capture == nil {
+		return transport.IngressStats{}, false
+	}
+	capture.mu.RLock()
+	ingress := capture.ingress
+	capture.mu.RUnlock()
+	if ingress == nil {
+		return transport.IngressStats{}, false
+	}
+	return ingress.Stats(), true
+}
+
 func (capture *daemonMeshIntegrationFactoryCapture) lifecycleState() (
 	string,
 	bool,
@@ -144,16 +164,19 @@ type daemonMeshIntegrationTransportFactory struct {
 
 func newDaemonMeshIntegrationFactoryConstructor(
 	capture *daemonMeshIntegrationFactoryCapture,
+	admissionSources map[netip.Addr]uint8,
 ) daemonMeshFactoryConstructor {
 	return newDaemonMeshIntegrationFactoryConstructorWithDialContext(
 		capture,
 		nil,
+		admissionSources,
 	)
 }
 
 func newDaemonMeshIntegrationFactoryConstructorWithDialContext(
 	capture *daemonMeshIntegrationFactoryCapture,
 	dialContext transport.ConsensusRouteDialContext,
+	admissionSources map[netip.Addr]uint8,
 ) daemonMeshFactoryConstructor {
 	return func(
 		options daemonOptions,
@@ -174,6 +197,18 @@ func newDaemonMeshIntegrationFactoryConstructorWithDialContext(
 		if err != nil {
 			return nil, err
 		}
+		meshFactory, ok := delegate.(*daemonMeshTransportFactory)
+		if !ok {
+			return nil, errDaemonMeshContentHarness
+		}
+		meshFactory.admissionSources = admissionSources
+		admissionNow, ok := newDaemonMeshIntegrationAdmissionClock(
+			credentialNow,
+		)
+		if !ok {
+			return nil, errDaemonMeshContentHarness
+		}
+		meshFactory.admissionNow = admissionNow
 		return &daemonMeshIntegrationTransportFactory{
 			delegate: delegate,
 			capture:  capture,
@@ -238,7 +273,13 @@ func (factory *daemonMeshIntegrationTransportFactory) NewIngress(
 	if err != nil {
 		return nil, err
 	}
-	factory.capture.replace(certificate, localState, consensusNode, node)
+	factory.capture.replace(
+		certificate,
+		localState,
+		consensusNode,
+		node,
+		ingress,
+	)
 	return ingress, nil
 }
 
@@ -263,6 +304,66 @@ func (factory *daemonMeshIntegrationTransportFactory) SetAuthenticatedConnectivi
 func (factory *daemonMeshIntegrationTransportFactory) ClearIdentityCertificate() {
 	if factory != nil && factory.delegate != nil {
 		factory.delegate.ClearIdentityCertificate()
+	}
+}
+
+func newDaemonMeshIntegrationAdmissionClock(
+	simulatedNow func() time.Time,
+) (func() time.Time, bool) {
+	if simulatedNow == nil {
+		return nil, false
+	}
+	lastSimulated := simulatedNow()
+	if lastSimulated.IsZero() {
+		return nil, false
+	}
+	lastWall := time.Now()
+	adjusted := lastWall
+	var mu sync.Mutex
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		wall := time.Now()
+		simulated := simulatedNow()
+		if simulated.IsZero() {
+			return time.Time{}
+		}
+		elapsed := wall.Sub(lastWall)
+		if simulatedElapsed := simulated.Sub(lastSimulated); simulatedElapsed > elapsed {
+			elapsed = simulatedElapsed
+		}
+		if elapsed > 0 {
+			adjusted = adjusted.Add(elapsed)
+		}
+		lastWall = wall
+		lastSimulated = simulated
+		return adjusted
+	}, true
+}
+
+func TestDaemonMeshIntegrationAdmissionClockTracksElapsedAndSimulatedTime(
+	t *testing.T,
+) {
+	if _, ok := newDaemonMeshIntegrationAdmissionClock(nil); ok {
+		t.Fatal("nil simulated clock was accepted")
+	}
+	simulated := newDaemonMeshIntegrationCredentialClock(
+		time.Unix(1000, 0),
+	)
+	now, ok := newDaemonMeshIntegrationAdmissionClock(simulated.Now)
+	if !ok {
+		t.Fatal("valid simulated clock was rejected")
+	}
+	first := now()
+	time.Sleep(5 * time.Millisecond)
+	second := now()
+	if !second.After(first) {
+		t.Fatalf("static simulation did not preserve elapsed time: %s <= %s", second, first)
+	}
+	simulated.Set(simulated.Now().Add(30 * time.Minute))
+	third := now()
+	if third.Sub(second) < 30*time.Minute {
+		t.Fatalf("simulated jump advanced admission by %s", third.Sub(second))
 	}
 }
 

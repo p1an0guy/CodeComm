@@ -58,6 +58,21 @@ type daemonLogicalSnapshotPublisher struct {
 	closeOnce sync.Once
 	fatalMu   sync.Mutex
 	fatal     error
+
+	diagnosticMu sync.Mutex
+	attempts     uint64
+	successes    uint64
+	lastError    error
+	lastAttempt  time.Time
+	lastSuccess  time.Time
+}
+
+type daemonSnapshotPublicationStats struct {
+	Attempts    uint64
+	Successes   uint64
+	LastError   error
+	LastAttempt time.Time
+	LastSuccess time.Time
 }
 
 func newDaemonLogicalSnapshotPublisher(
@@ -129,6 +144,7 @@ func (publisher *daemonLogicalSnapshotPublisher) run(ctx context.Context) {
 			}
 		}
 		err := publisher.publishOnce(ctx)
+		publisher.recordAttempt(err)
 		switch {
 		case err == nil:
 			delay = publisher.interval
@@ -140,6 +156,36 @@ func (publisher *daemonLogicalSnapshotPublisher) run(ctx context.Context) {
 			publisher.setFatal(err)
 			return
 		}
+	}
+}
+
+func (publisher *daemonLogicalSnapshotPublisher) recordAttempt(err error) {
+	if publisher == nil {
+		return
+	}
+	publisher.diagnosticMu.Lock()
+	defer publisher.diagnosticMu.Unlock()
+	publisher.attempts++
+	publisher.lastError = err
+	publisher.lastAttempt = time.Now()
+	if err == nil {
+		publisher.successes++
+		publisher.lastSuccess = publisher.lastAttempt
+	}
+}
+
+func (publisher *daemonLogicalSnapshotPublisher) publicationStats() daemonSnapshotPublicationStats {
+	if publisher == nil {
+		return daemonSnapshotPublicationStats{}
+	}
+	publisher.diagnosticMu.Lock()
+	defer publisher.diagnosticMu.Unlock()
+	return daemonSnapshotPublicationStats{
+		Attempts:    publisher.attempts,
+		Successes:   publisher.successes,
+		LastError:   publisher.lastError,
+		LastAttempt: publisher.lastAttempt,
+		LastSuccess: publisher.lastSuccess,
 	}
 }
 

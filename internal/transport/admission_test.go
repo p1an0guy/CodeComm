@@ -77,6 +77,12 @@ func TestAdmissionLimiterRateBurstAndRefill(t *testing.T) {
 	if _, err := limiter.TryAcquire(source); !errors.Is(err, ErrSourceRateLimited) {
 		t.Fatalf("TryAcquire() before refill error = %v, want %v", err, ErrSourceRateLimited)
 	}
+	stats := limiter.Stats()
+	if stats.Attempts != HandshakeAttemptBurst+2 ||
+		stats.Admitted != HandshakeAttemptBurst ||
+		stats.SourceRateLimitRejections != 2 {
+		t.Fatalf("rate-limit counters = %+v", stats)
+	}
 	clock.advance(time.Nanosecond)
 	permit, err := limiter.TryAcquire(source)
 	if err != nil {
@@ -91,6 +97,146 @@ func TestAdmissionLimiterRateBurstAndRefill(t *testing.T) {
 			t.Fatalf("TryAcquire() replenished burst %d error = %v", index, err)
 		}
 		permit.Release()
+	}
+}
+
+func TestAdmissionLimiterUsesInjectedClock(t *testing.T) {
+	t.Parallel()
+	if _, err := NewAdmissionLimiterWithClock(nil); !errors.Is(
+		err,
+		ErrInvalidAdmissionConfig,
+	) {
+		t.Fatalf("NewAdmissionLimiterWithClock(nil) error = %v", err)
+	}
+	clock := &admissionTestClock{now: time.Unix(1500, 0)}
+	limiter, err := NewAdmissionLimiterWithClock(clock.read)
+	if err != nil {
+		t.Fatalf("NewAdmissionLimiterWithClock() error = %v", err)
+	}
+	source := netip.MustParseAddr("192.0.2.15")
+	for range HandshakeAttemptBurst {
+		permit, acquireErr := limiter.TryAcquire(source)
+		if acquireErr != nil {
+			t.Fatalf("TryAcquire() error = %v", acquireErr)
+		}
+		permit.Release()
+	}
+	if _, err := limiter.TryAcquire(source); !errors.Is(
+		err,
+		ErrSourceRateLimited,
+	) {
+		t.Fatalf("TryAcquire(over burst) error = %v", err)
+	}
+	clock.advance(6 * time.Second)
+	permit, err := limiter.TryAcquire(source)
+	if err != nil {
+		t.Fatalf("TryAcquire(after injected-clock advance) error = %v", err)
+	}
+	permit.Release()
+}
+
+func TestAdmissionLimiterScalesOnlyCollapsedSourceRate(t *testing.T) {
+	t.Parallel()
+	clock := &admissionTestClock{now: time.Unix(1750, 0)}
+	collapsed := netip.MustParseAddr("192.0.2.16")
+	ordinary := netip.MustParseAddr("192.0.2.17")
+	multiplicities := map[netip.Addr]uint8{collapsed: 4}
+	limiter, err := NewAdmissionLimiterWithOptions(
+		AdmissionLimiterOptions{
+			Now:                  clock.read,
+			SourceMultiplicities: multiplicities,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewAdmissionLimiterWithOptions() error = %v", err)
+	}
+	multiplicities[collapsed] = HandshakeSourceMultiplicityMax
+
+	for index := range 4 * HandshakeAttemptBurst {
+		permit, acquireErr := limiter.TryAcquire(collapsed)
+		if acquireErr != nil {
+			t.Fatalf(
+				"TryAcquire(collapsed burst %d) error = %v",
+				index,
+				acquireErr,
+			)
+		}
+		permit.Release()
+	}
+	if _, err := limiter.TryAcquire(collapsed); !errors.Is(
+		err,
+		ErrSourceRateLimited,
+	) {
+		t.Fatalf("TryAcquire(collapsed over burst) error = %v", err)
+	}
+	clock.advance(1500 * time.Millisecond)
+	permit, err := limiter.TryAcquire(collapsed)
+	if err != nil {
+		t.Fatalf("TryAcquire(collapsed after refill) error = %v", err)
+	}
+	permit.Release()
+
+	for index := range HandshakeAttemptBurst {
+		permit, acquireErr := limiter.TryAcquire(ordinary)
+		if acquireErr != nil {
+			t.Fatalf(
+				"TryAcquire(ordinary burst %d) error = %v",
+				index,
+				acquireErr,
+			)
+		}
+		permit.Release()
+	}
+	if _, err := limiter.TryAcquire(ordinary); !errors.Is(
+		err,
+		ErrSourceRateLimited,
+	) {
+		t.Fatalf("TryAcquire(ordinary over burst) error = %v", err)
+	}
+
+	collapsedState := limiter.sources[collapsed]
+	ordinaryState := limiter.sources[ordinary]
+	if collapsedState == nil ||
+		ordinaryState == nil ||
+		collapsedState.attemptBurst != 4*HandshakeAttemptBurst ||
+		collapsedState.attemptsPerWindow !=
+			4*HandshakeAttemptsPerMinute ||
+		ordinaryState.attemptBurst != HandshakeAttemptBurst ||
+		ordinaryState.attemptsPerWindow !=
+			HandshakeAttemptsPerMinute ||
+		limiter.sourceIdleTimeout != HandshakeSourceIdleTimeout ||
+		limiter.sourcePendingMax != HandshakePendingMax {
+		t.Fatalf(
+			"scaled admission state = collapsed %+v ordinary %+v",
+			collapsedState,
+			ordinaryState,
+		)
+	}
+}
+
+func TestAdmissionLimiterRejectsInvalidSourceMultiplicities(t *testing.T) {
+	t.Parallel()
+	validSource := netip.MustParseAddr("192.0.2.18")
+	tests := []map[netip.Addr]uint8{
+		{{}: 2},
+		{netip.IPv4Unspecified(): 2},
+		{validSource: 0},
+		{validSource: 1},
+		{validSource: HandshakeSourceMultiplicityMax + 1},
+	}
+	for _, multiplicities := range tests {
+		if _, err := NewAdmissionLimiterWithOptions(
+			AdmissionLimiterOptions{
+				Now:                  time.Now,
+				SourceMultiplicities: multiplicities,
+			},
+		); !errors.Is(err, ErrInvalidAdmissionConfig) {
+			t.Fatalf(
+				"NewAdmissionLimiterWithOptions(%v) error = %v",
+				multiplicities,
+				err,
+			)
+		}
 	}
 }
 
@@ -123,6 +269,15 @@ func TestAdmissionLimiterPendingCeilingsAndRelease(t *testing.T) {
 	}
 	if _, err := limiter.TryAcquire(netip.MustParseAddr("192.0.2.3")); !errors.Is(err, ErrHandshakeCapacity) {
 		t.Fatalf("TryAcquire(global full) error = %v, want %v", err, ErrHandshakeCapacity)
+	}
+	stats := limiter.Stats()
+	if stats.Attempts != 5 ||
+		stats.Admitted != 3 ||
+		stats.SourcePendingRejections != 1 ||
+		stats.HandshakeCapacityRejections != 1 ||
+		stats.SourceRateLimitRejections != 0 ||
+		stats.StateLimitRejections != 0 {
+		t.Fatalf("admission counters = %+v", stats)
 	}
 
 	first.Release()
@@ -285,7 +440,9 @@ func TestAdmissionLimiterStateByteCeiling(t *testing.T) {
 		t.Fatalf("TryAcquire(over bytes) error = %v, want %v", err, ErrAdmissionStateLimit)
 	}
 	stats := limiter.Stats()
-	if stats.AccountedBytes != 2*admissionSourceAccountBytes || stats.TrackedSources != 2 {
+	if stats.AccountedBytes != 2*admissionSourceAccountBytes ||
+		stats.TrackedSources != 2 ||
+		stats.StateLimitRejections != 1 {
 		t.Fatalf("Stats() = %+v, want two bounded source entries", stats)
 	}
 	first.Release()

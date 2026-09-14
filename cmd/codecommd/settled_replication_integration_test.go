@@ -30,6 +30,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/domain/device"
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
+	"github.com/ijonahch/codecomm/internal/peerauth"
 	"github.com/ijonahch/codecomm/internal/platform/credentialstore"
 	"github.com/ijonahch/codecomm/internal/replication"
 	"github.com/ijonahch/codecomm/internal/store"
@@ -437,6 +438,19 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		authorityOneTaskID,
 		3,
 	)
+	quiesceDaemonSettledSnapshotPublishers(t, target)
+	finalCheckpoint := forceDaemonSettledFinalCheckpoint(t, target)
+	waitForDaemonMeshIntegrationCluster(
+		t,
+		[]*daemonMeshIntegrationNode{target, settled},
+		func(statuses []ui.Snapshot) bool {
+			return daemonMeshIntegrationMutationConverged(statuses) &&
+				statuses[0].Session.EventChainIndex >=
+					finalCheckpoint.Record.CoveredChainIndex+1 &&
+				statuses[0].Session.ResultIndex >=
+					finalCheckpoint.Record.CoveredResultIndex+1
+		},
+	)
 
 	stopDaemonMeshIntegrationNodes(t, target, settled)
 	assertDaemonSettledReplicationDurableState(
@@ -448,6 +462,85 @@ func runDaemonSettledReplicationIntegration(t *testing.T) {
 		authorityOneResultIndex,
 		3,
 	)
+}
+
+func quiesceDaemonSettledSnapshotPublishers(
+	t *testing.T,
+	nodes ...*daemonMeshIntegrationNode,
+) {
+	t.Helper()
+	publishers := make([]*daemonLogicalSnapshotPublisher, len(nodes))
+	for index, node := range nodes {
+		if node == nil {
+			t.Fatal("nil daemon while quiescing snapshot publication")
+		}
+		publishers[index] = node.snapshotPublisher.Load()
+		if publishers[index] == nil {
+			t.Fatalf(
+				"snapshot publisher for %s was not captured",
+				node.deviceID,
+			)
+		}
+		if err := publishers[index].FatalError(); err != nil {
+			t.Fatalf(
+				"snapshot publisher for %s failed before quiescence: %v",
+				node.deviceID,
+				err,
+			)
+		}
+	}
+	for index, publisher := range publishers {
+		if err := publisher.BeginClose(); err != nil {
+			t.Fatalf(
+				"begin snapshot publisher close for %s: %v",
+				nodes[index].deviceID,
+				err,
+			)
+		}
+	}
+	for index, publisher := range publishers {
+		if err := publisher.Wait(); err != nil {
+			t.Fatalf(
+				"wait for snapshot publisher close for %s: %v",
+				nodes[index].deviceID,
+				err,
+			)
+		}
+		if err := publisher.FatalError(); err != nil {
+			t.Fatalf(
+				"snapshot publisher for %s failed during quiescence: %v",
+				nodes[index].deviceID,
+				err,
+			)
+		}
+	}
+}
+
+func forceDaemonSettledFinalCheckpoint(
+	t *testing.T,
+	node *daemonMeshIntegrationNode,
+) store.AppliedCheckpointLookup {
+	t.Helper()
+	if node == nil {
+		t.Fatal("nil final-checkpoint daemon")
+	}
+	consensusNode, ready := node.meshCapture.consensusNode()
+	if !ready || !consensusNode.IsLeader() {
+		t.Fatalf("%s is not the final-checkpoint leader", node.deviceID)
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		daemonMeshIntegrationTimeout,
+	)
+	defer cancel()
+	checkpoint, err := consensusNode.ForceCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("force final settled checkpoint: %v", err)
+	}
+	if err := checkpoint.Record.Validate(); err != nil {
+		t.Fatalf("validate final settled checkpoint: %v", err)
+	}
+	return checkpoint
 }
 
 func awaitDaemonSettledEventReplication(
@@ -464,8 +557,9 @@ func awaitDaemonSettledEventReplication(
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf(
-		"settled SSE replication did not reach result %d",
+		"settled SSE replication did not reach result %d: %s",
 		resultIndex,
+		daemonMeshIntegrationContentDiagnostics(node),
 	)
 }
 
@@ -871,6 +965,12 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		participant.coverage = coverage
 	}
 	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf(
+				"settled-to-target credential diagnostics: %s",
+				daemonSettledCredentialDiagnostics(settled, target),
+			)
+		}
 		cleanupDaemonMeshIntegrationNodes(t, allNodes...)
 		for _, node := range allNodes {
 			clear(node.privateKey)
@@ -1427,6 +1527,101 @@ func runDaemonSettledSnapshotFallbackIntegration(t *testing.T) {
 		settled,
 		snapshotRoot,
 		installedSnapshotRoot,
+	)
+}
+
+func daemonSettledCredentialDiagnostics(
+	source, target *daemonMeshIntegrationNode,
+) string {
+	if source == nil || target == nil || target.credentialNow == nil {
+		return "<invalid nodes>"
+	}
+	provider, _, ready := source.meshCapture.snapshot()
+	if !ready || provider == nil {
+		return "<source provider unavailable>"
+	}
+	tlsCertificate, err := provider()
+	if err != nil {
+		return fmt.Sprintf("<source provider: %v>", err)
+	}
+	defer clearDaemonTLSCertificate(&tlsCertificate)
+	if len(tlsCertificate.Certificate) != 1 {
+		return fmt.Sprintf(
+			"<source certificate count=%d>",
+			len(tlsCertificate.Certificate),
+		)
+	}
+	certificate, err := transport.ParseContentCertificate(
+		tlsCertificate.Certificate[0],
+	)
+	if err != nil {
+		return fmt.Sprintf("<parse source certificate: %v>", err)
+	}
+	targetNode, ready := target.meshCapture.consensusNode()
+	if !ready {
+		return fmt.Sprintf(
+			"certificate=%+v; <target consensus unavailable>",
+			certificate,
+		)
+	}
+	snapshot, err := targetNode.PeerAdmissionSnapshot()
+	if err != nil {
+		return fmt.Sprintf(
+			"certificate=%+v; <target admission: %v>",
+			certificate,
+			err,
+		)
+	}
+	member, memberFound := snapshot.Member(source.deviceID)
+	currentEpoch, epochFound := snapshot.CurrentCredentialEpoch(
+		source.deviceID,
+	)
+	authorization, authorizationFound := snapshot.Authorization(
+		credentialauthorization.Key{
+			SessionID: daemonTestSessionID,
+			DeviceID:  source.deviceID,
+			Epoch:     certificate.Binding.Epoch,
+		},
+	)
+	appliedChainIndex, appliedFound := snapshot.AppliedChainIndex()
+	now := target.credentialNow()
+	verifiers, verifierErr := peerauth.NewVerifiers(
+		targetNode.PeerAdmissionSnapshot,
+		target.credentialNow,
+	)
+	var verifyErr error
+	if verifierErr == nil {
+		_, verifyErr = verifiers.VerifyContentPeer(certificate)
+	}
+	return fmt.Sprintf(
+		"now=%s certificate={device=%s epoch=%d chain=%d key=%x "+
+			"not_before=%s not_after=%s} member={found=%t value=%+v} "+
+			"current_epoch={found=%t value=%d} "+
+			"authorization={found=%t device=%s epoch=%d chain=%d key=%x "+
+			"not_before=%s validity=%d} applied_chain={found=%t value=%d} "+
+			"verifier={construction=%v verify=%v}",
+		now,
+		certificate.Binding.DeviceID,
+		certificate.Binding.Epoch,
+		certificate.Binding.AuthorizationChainIndex,
+		certificate.KeyDigest,
+		certificate.NotBefore,
+		certificate.NotAfter,
+		memberFound,
+		member,
+		epochFound,
+		currentEpoch,
+		authorizationFound,
+		authorization.DeviceID,
+		authorization.Epoch,
+		authorization.AuthorizationChainIndex,
+		authorization.KeyDigest,
+		authorization.NotBefore,
+		authorization.ValiditySeconds,
+		appliedFound,
+		appliedChainIndex,
+		verifierErr,
+		verifyErr,
 	)
 }
 
@@ -2108,14 +2303,11 @@ func assertDaemonSettledRejectsPriorAuthoritySigner(
 		terminalAuthorityVersion < 2 {
 		t.Fatal("invalid prior-authority rejection fixture")
 	}
-	sourceStore, err := store.Open(
-		context.Background(),
-		store.Options{Path: source.statePath},
-	)
-	if err != nil {
-		t.Fatalf("open prior-authority rejection source: %v", err)
+	_, sourceState, ready := source.meshCapture.snapshot()
+	if !ready {
+		t.Fatal("prior-authority rejection source is unavailable")
 	}
-	exported, found, exportErr := sourceStore.ExportResultRange(
+	exported, found, exportErr := sourceState.ExportResultRange(
 		context.Background(),
 		store.ResultRangeOptions{
 			AfterResultIndex:          afterResultIndex,
@@ -2124,13 +2316,11 @@ func assertDaemonSettledRejectsPriorAuthoritySigner(
 			RequiredAuthorityDeviceID: source.deviceID,
 		},
 	)
-	closeErr := sourceStore.Close()
-	if exportErr != nil || !found || closeErr != nil {
+	if exportErr != nil || !found {
 		t.Fatalf(
-			"export prior-authority rejection range = (found=%t, export_err=%v, close_err=%v)",
+			"export prior-authority rejection range = (found=%t, export_err=%v)",
 			found,
 			exportErr,
-			closeErr,
 		)
 	}
 	if exported.Authority.VoterSetVersion != terminalAuthorityVersion ||
@@ -2211,7 +2401,7 @@ func assertDaemonSettledRejectsPriorAuthoritySigner(
 		context.Background(),
 	)
 	fatalErr := replica.FatalError()
-	closeErr = replica.Close()
+	closeErr := replica.Close()
 	if !errors.Is(
 		importErr,
 		consensus.ErrReplicationSignerUnauthorized,
