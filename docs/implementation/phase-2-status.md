@@ -384,11 +384,10 @@ race, endpoint restart/resume, and process-kill recovery. Test binaries compile 
 for Linux, Windows, and Darwin on AMD64 and ARM64. Linux/Windows native credential-store behavior
 still requires their CI runners as noted in step 3.
 
-Extreme independent-store fan-out is not scheduled inside one test process: both the pinned and
-current modernc stacks showed allocator/binding corruption under that artificial shape, while V1
-runs one store per daemon process. CI admits at most two top-level tests per package; concurrent use
-and close of one production-sized pool remain normal- and race-tested. Reassess the driver before
-any future multi-store process architecture.
+V1 runs one store per daemon process. The Phase 3 in-process mesh harness nevertheless exercises
+several independent pools, so modernc SQLite/libc are pinned to versions whose concurrent shutdown
+passes `TestConcurrentIndependentStoreShutdown`; CI still admits at most two top-level tests per
+package. Reassess the driver before adopting a multi-store production process.
 
 ## Next
 

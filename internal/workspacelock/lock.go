@@ -53,12 +53,20 @@ func (*HeldError) Unwrap() error {
 	return ErrHeld
 }
 
-// Lock is an exclusive OS lock. Close releases it and is idempotent.
+// Lock is an exclusive OS lock. Copies share ownership, and Close releases
+// that ownership exactly once.
 type Lock struct {
+	state *lockState
+}
+
+type lockState struct {
 	mu   sync.Mutex
 	file *os.File
 	path string
 	pid  int
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Path returns the lock path for statePath.
@@ -136,46 +144,56 @@ func AcquireFile(path string) (*Lock, error) {
 
 	locked = false
 	owned = true
-	return &Lock{file: file, path: path, pid: pid}, nil
+	return &Lock{
+		state: &lockState{
+			file: file,
+			path: path,
+			pid:  pid,
+		},
+	}, nil
 }
 
 // Path reports the concrete lock-file path.
 func (lock *Lock) Path() string {
-	if lock == nil {
+	if lock == nil || lock.state == nil {
 		return ""
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
-	return lock.path
+	lock.state.mu.Lock()
+	defer lock.state.mu.Unlock()
+	return lock.state.path
 }
 
 // HolderPID reports this process's recorded ownership identity.
 func (lock *Lock) HolderPID() int {
-	if lock == nil {
+	if lock == nil || lock.state == nil {
 		return 0
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
-	return lock.pid
+	lock.state.mu.Lock()
+	defer lock.state.mu.Unlock()
+	return lock.state.pid
 }
 
 // Close clears the clean-owner record, releases the OS lock, and closes the
 // file. The OS still releases ownership if the process exits without Close.
 func (lock *Lock) Close() error {
-	if lock == nil {
+	if lock == nil || lock.state == nil {
 		return nil
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
-	if lock.file == nil {
-		return nil
-	}
-	clearErr := clearOwnerPID(lock.file)
-	unlockErr := unlockFile(lock.file)
-	closeErr := lock.file.Close()
-	lock.file = nil
-	lock.pid = 0
-	return errors.Join(clearErr, unlockErr, closeErr)
+	state := lock.state
+	state.closeOnce.Do(func() {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.file == nil {
+			return
+		}
+		clearErr := clearOwnerPID(state.file)
+		unlockErr := unlockFile(state.file)
+		closeErr := state.file.Close()
+		state.file = nil
+		state.pid = 0
+		state.closeErr = errors.Join(clearErr, unlockErr, closeErr)
+	})
+	return state.closeErr
 }
 
 func validateOpenedFile(path string, file *os.File) error {

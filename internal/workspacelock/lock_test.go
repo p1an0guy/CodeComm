@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -81,6 +82,74 @@ func TestAcquireExcludesHandlesAndReportsHolder(t *testing.T) {
 	}
 	if err := second.Close(); err != nil {
 		t.Fatalf("Close(second): %v", err)
+	}
+}
+
+func TestCloseIsConcurrentAndIdempotentAcrossCopies(t *testing.T) {
+	statePath := workspaceLockTestStatePath(t)
+	lock, err := Acquire(statePath)
+	if err != nil {
+		t.Fatalf("Acquire(): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = lock.Close()
+	})
+
+	const closerCount = 32
+	copies := make([]Lock, closerCount)
+	for index := range copies {
+		copies[index] = *lock
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, closerCount)
+	var ready sync.WaitGroup
+	ready.Add(closerCount)
+	for index := range copies {
+		go func(copy *Lock) {
+			ready.Done()
+			<-start
+			results <- copy.Close()
+		}(&copies[index])
+	}
+	ready.Wait()
+	close(start)
+
+	for range closerCount {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent Close(): %v", err)
+		}
+	}
+	if pid := lock.HolderPID(); pid != 0 {
+		t.Errorf("HolderPID() after Close = %d", pid)
+	}
+
+	path, err := Path(statePath)
+	if err != nil {
+		t.Fatalf("Path(): %v", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open lock file after Close: %v", err)
+	}
+	pid, readErr := readOwnerPID(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		t.Fatalf("read owner after Close: %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close owner reader: %v", closeErr)
+	}
+	if pid != 0 {
+		t.Fatalf("owner PID after Close = %d", pid)
+	}
+
+	reacquired, err := Acquire(statePath)
+	if err != nil {
+		t.Fatalf("Acquire(after concurrent Close): %v", err)
+	}
+	if err := reacquired.Close(); err != nil {
+		t.Fatalf("Close(reacquired): %v", err)
 	}
 }
 
