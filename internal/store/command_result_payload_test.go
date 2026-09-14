@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ijonahch/codecomm/internal/domain"
@@ -297,6 +298,89 @@ func TestCommandResultPayloadInventoryRejectsTampering(t *testing.T) {
 					_ = reopened.Close()
 				}
 				t.Fatalf("Open(tampered) error = %v, want corruption", err)
+			}
+		})
+	}
+}
+
+func TestCommandResultPayloadInventoryIdentifiesSentinelMismatch(
+	t *testing.T,
+) {
+	tests := []struct {
+		name      string
+		column    string
+		value     string
+		wantField string
+	}{
+		{
+			name:      "proposal",
+			column:    "proposal_json",
+			value:     `{"changed":true}`,
+			wantField: "proposal",
+		},
+		{
+			name:      "outcome",
+			column:    "outcome_json",
+			value:     `{"changed":true}`,
+			wantField: "outcome",
+		},
+		{
+			name:      "mutations",
+			column:    "projection_mutations_json",
+			value:     `[{}]`,
+			wantField: "mutations",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "session", "state.db")
+			database := openTestStore(t, path, nil)
+			initializeTestStore(t, database)
+			if _, err := database.Apply(
+				context.Background(),
+				acceptedApplyRequest(
+					t,
+					testSignedTaskEvent(t, testEventID, 1),
+				),
+			); err != nil {
+				t.Fatalf("Apply(): %v", err)
+			}
+			err := database.LocalState().withImmediate(
+				context.Background(),
+				func(conn *sqlite.Conn) error {
+					if err := execute(
+						conn,
+						"UPDATE command_results SET "+test.column+
+							" = ?1 WHERE result_index = 1;",
+						test.value,
+					); err != nil {
+						return err
+					}
+					return verifyCommandResultPayloadInventory(conn)
+				},
+			)
+			if !errors.Is(err, ErrCommandResultCorrupt) {
+				t.Fatalf(
+					"verifyCommandResultPayloadInventory() error = %v, want corruption",
+					err,
+				)
+			}
+			for _, detail := range []string{
+				"result_index 1",
+				test.wantField + "(type=SQLITE_TEXT",
+				"length=",
+				"sha256=",
+			} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Fatalf(
+						"inventory error %q does not contain %q",
+						err,
+						detail,
+					)
+				}
+			}
+			if strings.Contains(err.Error(), test.value) {
+				t.Fatalf("inventory error exposed payload: %v", err)
 			}
 		})
 	}

@@ -794,26 +794,20 @@ func readCompactedCommandResultPayloadSource(
 	after uint64,
 ) (commandResultPayloadInventoryRow, bool, error) {
 	var (
-		row       commandResultPayloadInventoryRow
-		count     int
-		sentinels bool
-		rowErr    error
+		row    commandResultPayloadInventoryRow
+		count  int
+		rowErr error
 	)
 	err := queryArgs(
 		conn,
 		`SELECT result_index, event_id, proposal_digest, outcome_status,
-		        outcome_code,
-		        proposal_json = ?2 AND outcome_json = ?2
-		            AND projection_mutations_json = ?3
+		        outcome_code, proposal_json, outcome_json,
+		        projection_mutations_json
 		   FROM command_results
 		  WHERE result_index > ?1
 		  ORDER BY result_index
 		  LIMIT 1;`,
-		[]any{
-			after,
-			commandResultObjectSentinel,
-			commandResultMutationsSentinel,
-		},
+		[]any{after},
 		func(stmt *sqlite.Stmt) {
 			count++
 			index := stmt.ColumnInt64(0)
@@ -832,7 +826,11 @@ func readCompactedCommandResultPayloadSource(
 			}
 			row.outcomeStatus = OutcomeStatus(stmt.ColumnText(3))
 			row.outcomeCode = stmt.ColumnText(4)
-			sentinels = stmt.ColumnBool(5)
+			rowErr = verifyCommandResultSentinelColumns(
+				row.resultIndex,
+				stmt,
+				5,
+			)
 		},
 	)
 	if err != nil {
@@ -845,10 +843,6 @@ func readCompactedCommandResultPayloadSource(
 	if count == 0 {
 		return commandResultPayloadInventoryRow{}, false, nil
 	}
-	if !sentinels {
-		return commandResultPayloadInventoryRow{}, false,
-			commandResultPayloadError("legacy sentinels differ", nil)
-	}
 	payload, found, err := readCommandResultPayload(conn, row.resultIndex)
 	if err != nil {
 		return commandResultPayloadInventoryRow{}, false, err
@@ -859,6 +853,46 @@ func readCompactedCommandResultPayloadSource(
 	}
 	row.payload = payload
 	return row, true, nil
+}
+
+func verifyCommandResultSentinelColumns(
+	resultIndex uint64,
+	stmt *sqlite.Stmt,
+	firstColumn int,
+) error {
+	if resultIndex < 1 || stmt == nil || firstColumn < 0 {
+		return errors.New("invalid sentinel verification input")
+	}
+	expected := [...]string{
+		commandResultObjectSentinel,
+		commandResultObjectSentinel,
+		commandResultMutationsSentinel,
+	}
+	names := [...]string{
+		"proposal",
+		"outcome",
+		"mutations",
+	}
+	for offset := range expected {
+		column := firstColumn + offset
+		storageType := stmt.ColumnType(column)
+		value := bytes.Clone(columnBytes(stmt, column))
+		if storageType == sqlite.TypeText &&
+			bytes.Equal(value, []byte(expected[offset])) {
+			continue
+		}
+		digest := sha256.Sum256(value)
+		return fmt.Errorf(
+			"legacy sentinels differ at result_index %d: "+
+				"%s(type=%s length=%d sha256=%x)",
+			resultIndex,
+			names[offset],
+			storageType,
+			len(value),
+			digest,
+		)
+	}
+	return nil
 }
 
 func writeCommandResultSourceFingerprint(
