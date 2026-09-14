@@ -52,31 +52,138 @@ func runConcurrentIndependentStoreShutdown(t *testing.T) {
 	)
 	root := t.TempDir()
 	template := migratedTestStoreTemplate(t)
+	stores := openSeededIndependentStores(
+		t,
+		root,
+		template,
+		"initial",
+		storesPerRound,
+	)
+	defer func() {
+		_ = closeIndependentStores(stores)
+	}()
 	for round := range rounds {
-		stores := make([]*Store, 0, storesPerRound)
-		for index := range storesPerRound {
-			path := filepath.Join(
-				root,
-				fmt.Sprintf("round-%02d-store-%02d", round, index),
-				"state.db",
-			)
-			if err := seedTestStore(path, template); err != nil {
-				closeIndependentStores(stores)
-				t.Fatalf("round %d seed store %d: %v", round, index, err)
-			}
-			database, err := Open(context.Background(), Options{Path: path})
-			if err != nil {
-				closeIndependentStores(stores)
-				t.Fatalf("round %d open store %d: %v", round, index, err)
-			}
-			stores = append(stores, database)
-		}
-
 		initializeEveryPooledConnection(t, stores)
-		if errs := closeIndependentStores(stores); len(errs) != 0 {
-			t.Fatalf("round %d close stores: %v", round, errs)
+		paths := seedIndependentStorePaths(
+			t,
+			root,
+			template,
+			fmt.Sprintf("round-%02d", round),
+			storesPerRound,
+		)
+		replacements, errs := replaceIndependentStores(stores, paths)
+		if len(errs) != 0 {
+			closeIndependentStores(replacements)
+			t.Fatalf("round %d replace stores: %v", round, errs)
 		}
+		stores = replacements
 	}
+	initializeEveryPooledConnection(t, stores)
+	if errs := closeIndependentStores(stores); len(errs) != 0 {
+		t.Fatalf("close final stores: %v", errs)
+	}
+	stores = nil
+}
+
+func openSeededIndependentStores(
+	t *testing.T,
+	root string,
+	template []byte,
+	prefix string,
+	count int,
+) []*Store {
+	t.Helper()
+	paths := seedIndependentStorePaths(t, root, template, prefix, count)
+	stores := make([]*Store, 0, len(paths))
+	for index, path := range paths {
+		database, err := Open(context.Background(), Options{Path: path})
+		if err != nil {
+			closeIndependentStores(stores)
+			t.Fatalf("%s open store %d: %v", prefix, index, err)
+		}
+		stores = append(stores, database)
+	}
+	return stores
+}
+
+func seedIndependentStorePaths(
+	t *testing.T,
+	root string,
+	template []byte,
+	prefix string,
+	count int,
+) []string {
+	t.Helper()
+	paths := make([]string, count)
+	for index := range count {
+		path := filepath.Join(
+			root,
+			fmt.Sprintf("%s-store-%02d", prefix, index),
+			"state.db",
+		)
+		if err := seedTestStore(path, template); err != nil {
+			t.Fatalf("%s seed store %d: %v", prefix, index, err)
+		}
+		paths[index] = path
+	}
+	return paths
+}
+
+type independentStoreOpenResult struct {
+	index    int
+	database *Store
+	err      error
+}
+
+func replaceIndependentStores(
+	stores []*Store,
+	paths []string,
+) ([]*Store, []error) {
+	start := make(chan struct{})
+	errs := make(chan error, len(stores)+len(paths))
+	opened := make(chan independentStoreOpenResult, len(paths))
+	var group sync.WaitGroup
+	for index, database := range stores {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			if err := database.Close(); err != nil {
+				errs <- fmt.Errorf("close store %d: %w", index, err)
+			}
+		}()
+	}
+	for index, path := range paths {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			database, err := Open(context.Background(), Options{Path: path})
+			opened <- independentStoreOpenResult{
+				index:    index,
+				database: database,
+				err:      err,
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(opened)
+	close(errs)
+
+	replacements := make([]*Store, len(paths))
+	var openErrors []error
+	for result := range opened {
+		if result.err != nil {
+			openErrors = append(
+				openErrors,
+				fmt.Errorf("open store %d: %w", result.index, result.err),
+			)
+			continue
+		}
+		replacements[result.index] = result.database
+	}
+	return replacements, append(openErrors, collectErrors(errs)...)
 }
 
 func initializeEveryPooledConnection(t *testing.T, stores []*Store) {
@@ -149,6 +256,9 @@ func closeIndependentStores(stores []*Store) []error {
 	errs := make(chan error, len(stores))
 	var group sync.WaitGroup
 	for _, database := range stores {
+		if database == nil {
+			continue
+		}
 		group.Add(1)
 		go func() {
 			defer group.Done()

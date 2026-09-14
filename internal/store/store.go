@@ -15,6 +15,11 @@ import (
 
 const defaultPoolSize = 4
 
+// sqliteLifecycleMu prevents connection construction and preparation from
+// overlapping pool teardown across independent stores. The SQLite backend has
+// faulted during those concurrent lifecycle operations on supported platforms.
+var sqliteLifecycleMu sync.Mutex
+
 var (
 	ErrInvalidOptions     = errors.New("store: invalid options")
 	ErrClosed             = errors.New("store: closed")
@@ -75,6 +80,13 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 		return nil, fmt.Errorf("%w: path must be absolute", ErrInvalidOptions)
 	}
 	path := filepath.Clean(options.Path)
+
+	sqliteLifecycleMu.Lock()
+	defer sqliteLifecycleMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	created, err := openDatabaseFile(path, syncDirectory)
 	if err != nil {
 		return nil, err
@@ -177,17 +189,37 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	if err != nil {
 		return nil, normalizeSQLiteError(ctx, "open connection pool", err)
 	}
+	if err := prepareConnectionPool(ctx, pool); err != nil {
+		_ = pool.Close()
+		return nil, normalizeSQLiteError(ctx, "prepare connection pool", err)
+	}
 	store := &Store{
 		path:              path,
 		pool:              pool,
 		resultHeadChanges: newResultHeadChangeFeed(),
 	}
 	store.admissionRevision.Store(1)
-	if err := store.withConn(ctx, func(*sqlite.Conn) error { return nil }); err != nil {
-		_ = pool.Close()
-		return nil, err
-	}
 	return store, nil
+}
+
+func prepareConnectionPool(ctx context.Context, pool *sqlitex.Pool) error {
+	connections := make([]*sqlite.Conn, 0, defaultPoolSize)
+	defer func() {
+		for _, conn := range connections {
+			pool.Put(conn)
+		}
+	}()
+	for range defaultPoolSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := pool.Take(ctx)
+		if err != nil {
+			return err
+		}
+		connections = append(connections, conn)
+	}
+	return nil
 }
 
 // Path returns the cleaned absolute database path.
@@ -227,6 +259,8 @@ func (store *Store) Close() error {
 	}
 	store.closed = true
 	store.resultHeadChanges.close()
+	sqliteLifecycleMu.Lock()
+	defer sqliteLifecycleMu.Unlock()
 	store.closeErr = store.pool.Close()
 	if store.closeErr != nil {
 		store.closeErr = fmt.Errorf("store: close: %w", store.closeErr)
