@@ -476,8 +476,13 @@ Required unit/component subjects:
   commitments;
 - discovery cadence (§4.4): every allowed configured interval preserves the configured endpoint-set
   TTL while multicast cadence clamps at 48 seconds; jitter remains within ±25%, advertisement
-  expiry remains within 60 seconds, and mandatory native Linux/macOS/Windows jobs prove same-port
-  multicast exchange rather than converting capability failures into skips;
+  expiry remains within 60 seconds; required hosted Linux/Windows jobs prove native same-port
+  exchange, while macOS uses a physical two-host LAN gate in which one external transmission reaches
+  two same-port Mac receivers and the external peer receives a Mac transmission. A hosted VM
+  without a multicast route and Darwin local-origin loopback are not substitutes; a provisioned
+  gate treats capability failure as failure rather than a skip. Until its two-host harness and
+  runner pair are provisioned, macOS native multicast remains an explicit release blocker; removing
+  the unsupported hosted job is not acceptance evidence;
 - durability write set (§6.2): a failpoint at each §5.3 step-7 boundary leaves event/rejection,
   provenance, consensus state, projections, lifetime `command_results`, audit, checkpoint, lease
   timer metadata, and outbox removal all committed or all absent; separate failpoints prove the local
