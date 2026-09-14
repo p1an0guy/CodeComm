@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -582,6 +583,99 @@ func TestJoinEntityVersionMatchesPairingMode(t *testing.T) {
 		joinEntityVersionMatches(journal, 9) ||
 		joinEntityVersionMatches(journal, 11) {
 		t.Fatal("readmission entity version rule changed")
+	}
+}
+
+func TestAuthorizeJoinCredentialRetriesOnlyUnavailableResponses(t *testing.T) {
+	t.Parallel()
+
+	expected := credentialauthorization.Authorization{
+		Epoch: 7,
+	}
+	attempts := 0
+	var delays []time.Duration
+	authorization, err := authorizeJoinCredentialWithRetry(
+		t.Context(),
+		func(context.Context) (
+			credentialauthorization.Authorization,
+			error,
+		) {
+			attempts++
+			if attempts < 4 {
+				return credentialauthorization.Authorization{},
+					consensus.ErrCredentialRenewalUnavailable
+			}
+			return expected, nil
+		},
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	if err != nil || !reflect.DeepEqual(authorization, expected) {
+		t.Fatalf(
+			"authorizeJoinCredentialWithRetry() = (%#v, %v)",
+			authorization,
+			err,
+		)
+	}
+	wantDelays := [...]time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+	}
+	if len(delays) != len(wantDelays) {
+		t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
+	}
+	for index, want := range wantDelays {
+		if delays[index] != want {
+			t.Fatalf("retry delays = %v, want %v", delays, wantDelays)
+		}
+	}
+
+	rejected := errors.New("permanent rejection")
+	waited := false
+	_, err = authorizeJoinCredentialWithRetry(
+		t.Context(),
+		func(context.Context) (
+			credentialauthorization.Authorization,
+			error,
+		) {
+			return credentialauthorization.Authorization{}, rejected
+		},
+		func(context.Context, time.Duration) error {
+			waited = true
+			return nil
+		},
+	)
+	if !errors.Is(err, rejected) || waited {
+		t.Fatalf("permanent rejection = (waited %t, error %v)", waited, err)
+	}
+}
+
+func TestAuthorizeJoinCredentialStopsWhenRetryWaitIsCanceled(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	canceled := context.Canceled
+	attempts := 0
+	_, err := authorizeJoinCredentialWithRetry(
+		t.Context(),
+		func(context.Context) (
+			credentialauthorization.Authorization,
+			error,
+		) {
+			attempts++
+			return credentialauthorization.Authorization{},
+				consensus.ErrCredentialRenewalUnavailable
+		},
+		func(context.Context, time.Duration) error {
+			return canceled
+		},
+	)
+	if !errors.Is(err, canceled) || attempts != 1 {
+		t.Fatalf("canceled retry = (attempts %d, error %v)", attempts, err)
 	}
 }
 

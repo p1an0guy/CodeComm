@@ -112,7 +112,7 @@ func completeBootstrap(
 		return fmt.Errorf("join bootstrap: select content credential: %w", err)
 	}
 	defer clear(selectedEpochPrivate)
-	authorization, err := consensus.SubmitCredentialRenewal(
+	authorization, err := authorizeJoinCredential(
 		ctx,
 		leader.control,
 		leader.peer.deviceID,
@@ -408,6 +408,57 @@ func credentialAuthorizationExpiredAt(
 		time.Duration(authorization.ValiditySeconds) * time.Second,
 	)
 	return !now.Before(expiresAt), nil
+}
+
+type joinCredentialSubmitter func(
+	context.Context,
+) (credentialauthorization.Authorization, error)
+
+func authorizeJoinCredential(
+	ctx context.Context,
+	requester consensus.CredentialRenewalRequester,
+	peerDeviceID domain.DeviceID,
+	binding credential.Binding,
+) (credentialauthorization.Authorization, error) {
+	return authorizeJoinCredentialWithRetry(
+		ctx,
+		func(attemptContext context.Context) (
+			credentialauthorization.Authorization,
+			error,
+		) {
+			return consensus.SubmitCredentialRenewal(
+				attemptContext,
+				requester,
+				peerDeviceID,
+				binding,
+			)
+		},
+		waitForBootstrapRetry,
+	)
+}
+
+func authorizeJoinCredentialWithRetry(
+	ctx context.Context,
+	submit joinCredentialSubmitter,
+	wait bootstrapRetryWaiter,
+) (credentialauthorization.Authorization, error) {
+	if ctx == nil || submit == nil || wait == nil {
+		return credentialauthorization.Authorization{}, ErrBootstrapMismatch
+	}
+	retry := joinSnapshotRetryDelay
+	for {
+		authorization, err := submit(ctx)
+		if err == nil {
+			return authorization, nil
+		}
+		if !errors.Is(err, consensus.ErrCredentialRenewalUnavailable) {
+			return credentialauthorization.Authorization{}, err
+		}
+		if err := wait(ctx, retry); err != nil {
+			return credentialauthorization.Authorization{}, err
+		}
+		retry = min(retry*2, joinConnectionRetryMaximum)
+	}
 }
 
 func waitForCredentialStatus(
