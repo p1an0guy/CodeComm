@@ -38,6 +38,8 @@ type bootstrapLeaderResolver func(
 	tls.Certificate,
 ) (*bootstrapLeaderConnection, error)
 
+type bootstrapRetryWaiter func(context.Context, time.Duration) error
+
 func resolveInitialBootstrapLeader(
 	ctx context.Context,
 	statePath string,
@@ -108,8 +110,30 @@ func waitForBootstrapLeader(
 	inviterRoutes *pinnedEndpoints,
 	identityCertificate tls.Certificate,
 ) (*bootstrapLeaderConnection, error) {
+	return waitForBootstrapLeaderWithRetry(
+		ctx,
+		journal,
+		inviterRoutes,
+		identityCertificate,
+		resolveBootstrapLeaderOnce,
+		waitForBootstrapRetry,
+	)
+}
+
+func waitForBootstrapLeaderWithRetry(
+	ctx context.Context,
+	journal pendingJournal,
+	inviterRoutes *pinnedEndpoints,
+	identityCertificate tls.Certificate,
+	resolve bootstrapLeaderResolver,
+	wait bootstrapRetryWaiter,
+) (*bootstrapLeaderConnection, error) {
+	if resolve == nil || wait == nil {
+		return nil, ErrBootstrapMismatch
+	}
+	retry := joinSnapshotRetryDelay
 	for {
-		leader, err := resolveBootstrapLeaderOnce(
+		leader, err := resolve(
 			ctx,
 			journal,
 			inviterRoutes,
@@ -121,13 +145,24 @@ func waitForBootstrapLeader(
 		if !errors.Is(err, ErrBootstrapUnavailable) {
 			return nil, err
 		}
-		timer := time.NewTimer(joinSnapshotRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
+		if err := wait(ctx, retry); err != nil {
+			return nil, err
 		}
+		retry = min(retry*2, joinConnectionRetryMaximum)
+	}
+}
+
+func waitForBootstrapRetry(
+	ctx context.Context,
+	delay time.Duration,
+) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

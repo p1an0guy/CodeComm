@@ -30,12 +30,13 @@ import (
 )
 
 const (
-	joinSnapshotMaxBytes      uint64 = 256 << 20
-	joinSnapshotMaxRecords    uint64 = 100_000
-	joinSnapshotMaxChunks     uint64 = 4_096
-	joinSnapshotMaxPages      uint64 = 1
-	joinSnapshotMaxGeneration uint64 = 255
-	joinSnapshotRetryDelay           = 250 * time.Millisecond
+	joinSnapshotMaxBytes       uint64 = 256 << 20
+	joinSnapshotMaxRecords     uint64 = 100_000
+	joinSnapshotMaxChunks      uint64 = 4_096
+	joinSnapshotMaxPages       uint64 = 1
+	joinSnapshotMaxGeneration  uint64 = 255
+	joinSnapshotRetryDelay            = 250 * time.Millisecond
+	joinConnectionRetryMaximum        = 30 * time.Second
 )
 
 var (

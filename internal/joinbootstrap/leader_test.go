@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ijonahch/codecomm/internal/consensus"
 	"github.com/ijonahch/codecomm/internal/pairing"
@@ -143,5 +145,54 @@ func TestDecisionApprovedRebootstrapResumeRequiresFreshInvite(
 			pending,
 			pendingErr,
 		)
+	}
+}
+
+func TestBootstrapLeaderRetryUsesCappedExponentialBackoff(t *testing.T) {
+	t.Parallel()
+
+	journal, _, _ := joinJournalFixture(t)
+	expected := &bootstrapLeaderConnection{}
+	attempts := 0
+	var delays []time.Duration
+	leader, err := waitForBootstrapLeaderWithRetry(
+		t.Context(),
+		journal,
+		nil,
+		tls.Certificate{},
+		func(
+			context.Context,
+			pendingJournal,
+			*pinnedEndpoints,
+			tls.Certificate,
+		) (*bootstrapLeaderConnection, error) {
+			attempts++
+			if attempts == 11 {
+				return expected, nil
+			}
+			return nil, ErrBootstrapUnavailable
+		},
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	if err != nil || leader != expected {
+		t.Fatalf("waitForBootstrapLeaderWithRetry() = (%#v, %v)", leader, err)
+	}
+	want := []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	}
+	if !reflect.DeepEqual(delays, want) {
+		t.Fatalf("retry delays = %v, want %v", delays, want)
 	}
 }
