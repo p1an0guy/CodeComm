@@ -28,16 +28,19 @@ import (
 )
 
 const (
-	daemonContentPeerRefreshInterval     = 2 * time.Second
-	daemonContentPeerDialTimeout         = 10 * time.Second
-	daemonContentPeerRequestTimeout      = 30 * time.Second
-	daemonContentPeerReplicationTimeout  = 30 * time.Minute
-	daemonContentPeerReplicationFallback = 30 * time.Second
-	daemonContentPeerBootstrapTimeout    = 3 * time.Second
-	daemonContentPeerRetryInitial        = 250 * time.Millisecond
-	daemonContentPeerRetryMaximum        = 30 * time.Second
-	daemonContentPeerDiagnosticMaxBytes  = 1024
+	daemonContentPeerRefreshInterval    = 2 * time.Second
+	daemonContentPeerDialTimeout        = 10 * time.Second
+	daemonContentPeerRequestTimeout     = 30 * time.Second
+	daemonContentPeerReplicationTimeout = 30 * time.Minute
+	daemonContentPeerBootstrapTimeout   = 3 * time.Second
+	daemonContentPeerRetryInitial       = 250 * time.Millisecond
+	daemonContentPeerRetryMaximum       = 30 * time.Second
+	daemonContentPeerDiagnosticMaxBytes = 1024
 )
+
+// Integration subprocesses extend the fallback under instrumentation so
+// their SSE-first assertion retains the same relative deadline.
+var daemonContentPeerReplicationFallback = 30 * time.Second
 
 var errDaemonContentPeerConstruction = errors.New(
 	"codecommd: content peer runtime construction failed",

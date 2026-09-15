@@ -58,6 +58,12 @@ func TestDaemonSettledNonvoterReplicatesAcrossAuthorityHandoffsAndRestart(
 		runDaemonSettledReplicationChild(t)
 		return
 	}
+	previousFallback := daemonContentPeerReplicationFallback
+	daemonContentPeerReplicationFallback =
+		daemonMeshTimeouts.replicationFallback
+	t.Cleanup(func() {
+		daemonContentPeerReplicationFallback = previousFallback
+	})
 	registerDaemonIntegrationChildResult(t)
 	runDaemonSettledReplicationIntegration(t)
 }

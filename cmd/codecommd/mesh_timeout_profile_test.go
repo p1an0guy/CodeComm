@@ -14,9 +14,10 @@ const (
 )
 
 type daemonMeshTimeoutProfile struct {
-	convergence   time.Duration
-	genericChild  time.Duration
-	snapshotChild time.Duration
+	convergence         time.Duration
+	genericChild        time.Duration
+	snapshotChild       time.Duration
+	replicationFallback time.Duration
 }
 
 var daemonMeshTimeouts = mustDaemonMeshTimeoutProfile()
@@ -37,15 +38,17 @@ func newDaemonMeshTimeoutProfile(
 	switch name {
 	case "":
 		return daemonMeshTimeoutProfile{
-			convergence:   90 * time.Second,
-			genericChild:  5 * time.Minute,
-			snapshotChild: 10 * time.Minute,
+			convergence:         90 * time.Second,
+			genericChild:        5 * time.Minute,
+			snapshotChild:       10 * time.Minute,
+			replicationFallback: 30 * time.Second,
 		}, nil
 	case daemonMeshTimeoutProfileInstrumented:
 		return daemonMeshTimeoutProfile{
-			convergence:   270 * time.Second,
-			genericChild:  15 * time.Minute,
-			snapshotChild: 30 * time.Minute,
+			convergence:         270 * time.Second,
+			genericChild:        15 * time.Minute,
+			snapshotChild:       30 * time.Minute,
+			replicationFallback: 90 * time.Second,
 		}, nil
 	default:
 		return daemonMeshTimeoutProfile{}, fmt.Errorf(
@@ -71,17 +74,19 @@ func TestDaemonMeshTimeoutProfiles(t *testing.T) {
 	}{
 		{
 			want: daemonMeshTimeoutProfile{
-				convergence:   90 * time.Second,
-				genericChild:  5 * time.Minute,
-				snapshotChild: 10 * time.Minute,
+				convergence:         90 * time.Second,
+				genericChild:        5 * time.Minute,
+				snapshotChild:       10 * time.Minute,
+				replicationFallback: 30 * time.Second,
 			},
 		},
 		{
 			name: daemonMeshTimeoutProfileInstrumented,
 			want: daemonMeshTimeoutProfile{
-				convergence:   270 * time.Second,
-				genericChild:  15 * time.Minute,
-				snapshotChild: 30 * time.Minute,
+				convergence:         270 * time.Second,
+				genericChild:        15 * time.Minute,
+				snapshotChild:       30 * time.Minute,
+				replicationFallback: 90 * time.Second,
 			},
 		},
 	}

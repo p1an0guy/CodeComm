@@ -65,6 +65,8 @@ jobs:
           cache: true
       - name: Race ${{ matrix.group }} packages
         shell: bash
+        env:
+          CODECOMM_TEST_TIMEOUT_PROFILE: instrumented
         run: |
           case "${{ matrix.group }}" in
             daemon)
