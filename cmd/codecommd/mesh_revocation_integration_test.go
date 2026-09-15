@@ -290,10 +290,10 @@ func runDaemonProductionFullPlaneRevocationComposition(t *testing.T) {
 	)
 	assertDaemonMeshFreshConsensusDenied(t, network, subject, informed[0])
 
-	staleAfter, err := readDaemonMeshIntegrationStatus(stale.localEndpoint)
-	if err != nil {
-		t.Fatalf("read isolated stale voter: %v", err)
-	}
+	staleAfter := waitForDaemonMeshIntegrationCluster(
+		t, []*daemonMeshIntegrationNode{stale},
+		func([]ui.Snapshot) bool { return true },
+	)[0]
 	if staleAfter.Session.EventChainIndex !=
 		staleBefore.Session.EventChainIndex ||
 		staleAfter.Session.ResultIndex !=
