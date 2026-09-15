@@ -14,7 +14,12 @@ import (
 	"github.com/ijonahch/codecomm/internal/testharness/faultnet"
 )
 
-const secureMeshDirectedFaultChild = "directed-faults"
+const (
+	secureMeshDirectedFaultChild = "directed-faults"
+	// Destructive faults force Raft past its exponential replication backoff.
+	// Loaded Windows runners can otherwise exceed the ordinary mesh deadline.
+	secureMeshDirectedFaultRecoveryTimeout = 30 * time.Second
+)
 
 func TestSecureMeshDirectedFaultsHealAndReopen(t *testing.T) {
 	if secureMeshRunsInProcess() ||
@@ -116,7 +121,12 @@ func runSecureMeshDirectedFaultsHealAndReopen(t *testing.T) {
 			signed,
 			taskID,
 		)
-		harness.waitForTask(t, nodes, taskID)
+		harness.waitForTaskWithin(
+			t,
+			nodes,
+			taskID,
+			secureMeshDirectedFaultRecoveryTimeout,
+		)
 		assertMeshViewsConverged(t, nodes)
 	}
 

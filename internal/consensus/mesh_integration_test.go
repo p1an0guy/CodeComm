@@ -1121,7 +1121,17 @@ func (harness *secureMeshHarness) waitForTask(
 	taskID domain.UUIDv7,
 ) {
 	t.Helper()
-	awaitMeshCondition(t, 15*time.Second, "task "+string(taskID), func() bool {
+	harness.waitForTaskWithin(t, candidates, taskID, 15*time.Second)
+}
+
+func (harness *secureMeshHarness) waitForTaskWithin(
+	t *testing.T,
+	candidates []*secureMeshNode,
+	taskID domain.UUIDv7,
+	timeout time.Duration,
+) {
+	t.Helper()
+	awaitMeshCondition(t, timeout, "task "+string(taskID), func() bool {
 		for _, candidate := range candidates {
 			view, err := candidate.node.View(context.Background())
 			if err != nil || !viewContainsTask(view, taskID) {
