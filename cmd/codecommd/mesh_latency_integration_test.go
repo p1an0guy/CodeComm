@@ -409,15 +409,13 @@ func newDaemonLatencyMesh(t *testing.T) *daemonLatencyMesh {
 	t.Helper()
 	selectedAddress, listeners := reserveDaemonMeshIntegrationListeners(t, 8)
 	root := t.TempDir()
-	credentialClock := newDaemonMeshIntegrationCredentialClock(
-		time.Now().UTC().Truncate(time.Second),
-	)
+	credentialNow := time.Now
 	allNodes := newDaemonMeshIntegrationNodes(
 		t,
 		root,
 		selectedAddress,
 		listeners,
-		credentialClock.Now,
+		credentialNow,
 	)
 	voters := append(
 		[]*daemonMeshIntegrationNode(nil),
@@ -491,7 +489,7 @@ func newDaemonLatencyMesh(t *testing.T) *daemonLatencyMesh {
 			voters,
 			leader,
 			replica,
-			credentialClock.Now(),
+			credentialNow(),
 			credentialauthorization.RoleOwner,
 			byte(0xf1+index),
 		)

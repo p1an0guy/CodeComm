@@ -1974,7 +1974,11 @@ func authorizeDaemonSettledCredentialWithSeed(
 	); err != nil {
 		t.Fatalf("persist settled epoch key: %v", err)
 	}
-	waitForDaemonSettledCredential(t, voters, settled.deviceID, now)
+	readinessAt, err := authorization.NotBefore.Time()
+	if err != nil {
+		t.Fatalf("settled credential NotBefore: %v", err)
+	}
+	waitForDaemonSettledCredential(t, voters, settled.deviceID, readinessAt)
 	certificate, contentBinding, err :=
 		transport.IssueContentCertificate(authorization, epochPrivateKey)
 	if err != nil ||
