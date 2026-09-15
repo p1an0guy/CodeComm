@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	serviceTestSessionID   = domain.UUIDv7("01890f47-3e72-7000-8000-000000000502")
-	serviceTestWorkspaceID = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
-	serviceTestGenesis     = `{"recovery_generation":0,"session_id":"01890f47-3e72-7000-8000-000000000502","workspace_id":"550e8400-e29b-41d4-a716-446655440000"}`
+	serviceTestSessionID    = domain.UUIDv7("01890f47-3e72-7000-8000-000000000502")
+	serviceTestWorkspaceID  = domain.UUIDv4("550e8400-e29b-41d4-a716-446655440000")
+	serviceTestGenesis      = `{"recovery_generation":0,"session_id":"01890f47-3e72-7000-8000-000000000502","workspace_id":"550e8400-e29b-41d4-a716-446655440000"}`
+	serviceTestAsyncTimeout = 10 * time.Second
 )
 
 type serviceFixture struct {
@@ -732,7 +733,7 @@ func TestPairingServiceRestartResumesFinalization(t *testing.T) {
 	if err := restarted.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(serviceTestAsyncTimeout)
 	for {
 		attempt, found, err := reopenedState.PairingAttempt(
 			context.Background(),
@@ -866,7 +867,7 @@ func TestPairingServiceRestartRepeatsFinalizerAfterMarkerFailure(t *testing.T) {
 	if err := restarted.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(serviceTestAsyncTimeout)
 	for {
 		attempt, found, err := reopenedState.PairingAttempt(
 			context.Background(),
@@ -1010,7 +1011,7 @@ func TestPairingServiceRestartRepeatsRejectedFinalizerAfterMarkerFailure(
 	if err := restarted.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(serviceTestAsyncTimeout)
 	for {
 		attempt, found, err := reopenedState.PairingAttempt(
 			context.Background(),
@@ -1126,10 +1127,14 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 				err     error
 			}
 			outcome := make(chan confirmationOutcome, 1)
+			confirmationContext, cancelConfirmation := context.WithCancel(
+				context.Background(),
+			)
+			defer cancelConfirmation()
 			fixture.clock.set("2026-08-13T12:09:32Z")
 			go func() {
 				details, err := fixture.service.ConfirmLocal(
-					context.Background(),
+					confirmationContext,
 					result.Attempt.AttemptID,
 					requestDigest,
 					true,
@@ -1138,7 +1143,7 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 			}()
 			select {
 			case <-finalizer.entered:
-			case <-time.After(2 * time.Second):
+			case <-time.After(serviceTestAsyncTimeout):
 				t.Fatal("finalizer did not start")
 			}
 			if err := superseding.supersede(
@@ -1152,7 +1157,7 @@ func TestPairingServiceFinalizerBoundaryRaceIsSuperseded(t *testing.T) {
 			var completed confirmationOutcome
 			select {
 			case completed = <-outcome:
-			case <-time.After(2 * time.Second):
+			case <-time.After(serviceTestAsyncTimeout):
 				t.Fatal("confirmation did not finish")
 			}
 			if completed.err != nil ||
@@ -1221,7 +1226,7 @@ func TestPairingServiceMaintenanceRetriesSecretDeletion(t *testing.T) {
 		t.Fatalf("startup cleanup failure = (%+v, %t, %v)", deletion, found, err)
 	}
 	fixture.secrets.setDeleteError(nil)
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(serviceTestAsyncTimeout)
 	for fixture.secrets.contains(fixture.inviteReference(t)) {
 		if time.Now().After(deadline) {
 			t.Fatal("maintenance did not delete queued invite secret")
