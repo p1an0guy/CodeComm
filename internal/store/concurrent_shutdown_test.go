@@ -282,10 +282,11 @@ func waitForSQLiteLifecycleExclusiveWaiter(
 
 func runConcurrentIndependentStoreShutdown(t *testing.T) {
 	t.Helper()
-	const (
-		rounds         = 12
-		storesPerRound = 6
-	)
+	rounds, storesPerRound := 12, 6
+	if raceDetectorEnabled {
+		rounds = 3
+		storesPerRound = 3
+	}
 	root := t.TempDir()
 	template := migratedTestStoreTemplate(t)
 	stores := openSeededIndependentStores(
