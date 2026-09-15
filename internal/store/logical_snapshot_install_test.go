@@ -22,6 +22,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/replication"
 	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 const logicalSnapshotTailEventID = domain.UUIDv7(
@@ -1867,29 +1868,26 @@ func TestLogicalSnapshotCopyPreservesControlFileDecision(t *testing.T) {
 		t.Fatalf("insert destination approval: %v", err)
 	}
 
-	err := source.withConn(
+	err := withLogicalSnapshotCopyConnections(
 		context.Background(),
-		func(sourceConn *sqlite.Conn) error {
-			return destination.LocalState().withImmediate(
-				context.Background(),
-				func(destinationConn *sqlite.Conn) error {
-					if err := copyLogicalSnapshotTable(
-						sourceConn,
-						destinationConn,
-						"control_file_proposals",
-					); err != nil {
-						return err
-					}
-					if err := mergeLogicalSnapshotControlApprovals(
-						sourceConn,
-						destinationConn,
-					); err != nil {
-						return err
-					}
-					return verifyLogicalSnapshotControlApprovals(
-						destinationConn,
-					)
-				},
+		source,
+		destination,
+		func(sourceConn, destinationConn *sqlite.Conn) error {
+			if err := copyLogicalSnapshotTable(
+				sourceConn,
+				destinationConn,
+				"control_file_proposals",
+			); err != nil {
+				return err
+			}
+			if err := mergeLogicalSnapshotControlApprovals(
+				sourceConn,
+				destinationConn,
+			); err != nil {
+				return err
+			}
+			return verifyLogicalSnapshotControlApprovals(
+				destinationConn,
 			)
 		},
 	)
@@ -1951,23 +1949,80 @@ func TestLogicalSnapshotCopyPreservesControlFileDecision(t *testing.T) {
 		nil,
 	)
 	insertProposal(quarantineTarget)
-	err = source.withConn(
+	err = withLogicalSnapshotCopyConnections(
 		context.Background(),
-		func(sourceConn *sqlite.Conn) error {
-			return quarantineTarget.LocalState().withImmediate(
-				context.Background(),
-				func(destinationConn *sqlite.Conn) error {
-					return mergeLogicalSnapshotControlApprovals(
-						sourceConn,
-						destinationConn,
-					)
-				},
+		source,
+		quarantineTarget,
+		func(sourceConn, destinationConn *sqlite.Conn) error {
+			return mergeLogicalSnapshotControlApprovals(
+				sourceConn,
+				destinationConn,
 			)
 		},
 	)
 	if !errors.Is(err, ErrLogicalSnapshotInstall) {
 		t.Fatalf("merge authoritative quarantine approval error = %v", err)
 	}
+}
+
+func withLogicalSnapshotCopyConnections(
+	ctx context.Context,
+	source *Store,
+	destination *Store,
+	fn func(source, destination *sqlite.Conn) error,
+) error {
+	if ctx == nil ||
+		source == nil ||
+		destination == nil ||
+		source == destination ||
+		fn == nil {
+		return ErrInvalidOptions
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	destinationState := destination.LocalState()
+	if err := destinationState.validate(); err != nil {
+		return err
+	}
+	if source.pool == nil {
+		return ErrInvalidOptions
+	}
+	releaseOperation, err := destinationState.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer releaseOperation()
+
+	destination.applyMu.Lock()
+	defer destination.applyMu.Unlock()
+
+	lease, err := sqliteLifecycle.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+
+	return source.withConnUnderLease(
+		ctx,
+		lease,
+		func(sourceConn *sqlite.Conn) error {
+			return destination.withConnUnderLease(
+				ctx,
+				lease,
+				func(destinationConn *sqlite.Conn) (err error) {
+					previousInterrupt := destinationConn.SetInterrupt(ctx.Done())
+					defer destinationConn.SetInterrupt(previousInterrupt)
+					end, err := sqlitex.ImmediateTransaction(destinationConn)
+					if err != nil {
+						return err
+					}
+					defer end(&err)
+					return fn(sourceConn, destinationConn)
+				},
+			)
+		},
+	)
 }
 
 func TestStandaloneLogicalSnapshotAttestationTamperBlocksReopen(

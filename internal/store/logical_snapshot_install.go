@@ -243,337 +243,351 @@ func (store *Store) installLogicalSnapshot(
 	}
 	defer store.applyMu.Unlock()
 
+	lifecycleLease, err := sqliteLifecycle.beginOperation(ctx)
+	if err != nil {
+		return StandaloneLogicalSnapshotInstallResult{}, err
+	}
+	defer lifecycleLease.release()
+
 	resultHeadChanged := false
-	err = stage.store.withConn(ctx, func(source *sqlite.Conn) (err error) {
-		previousInterrupt := source.SetInterrupt(ctx.Done())
-		defer source.SetInterrupt(previousInterrupt)
-		endSource := sqlitex.Transaction(source)
-		sourceEnded := false
-		defer func() {
-			if sourceEnded {
-				return
-			}
-			rollback := errors.New("abort logical snapshot source read")
-			endSource(&rollback)
-		}()
+	err = stage.store.withConnUnderLease(
+		ctx,
+		lifecycleLease,
+		func(source *sqlite.Conn) (err error) {
+			previousInterrupt := source.SetInterrupt(ctx.Done())
+			defer source.SetInterrupt(previousInterrupt)
+			endSource := sqlitex.Transaction(source)
+			sourceEnded := false
+			defer func() {
+				if sourceEnded {
+					return
+				}
+				rollback := errors.New("abort logical snapshot source read")
+				endSource(&rollback)
+			}()
 
-		if err := verifyLogicalSnapshotStageConnection(
-			source,
-			cut,
-			&root,
-			true,
-		); err != nil {
-			return logicalSnapshotInstallError(
-				"reverify frozen source",
-				err,
-			)
-		}
-		if err := requireLogicalSnapshotInstallSourceLocalState(source); err != nil {
-			return err
-		}
-		derivedDigest, err := logicalSnapshotDerivedViewsDigest(source)
-		if err != nil {
-			return logicalSnapshotInstallError(
-				"revalidate rebuilt local views",
-				err,
-			)
-		}
-		if derivedDigest != stage.derivedViewsDigest {
-			return logicalSnapshotInstallError(
-				"rebuilt local views changed after verification",
-				nil,
-			)
-		}
-		sourceState, found, err := readConsensusState(source)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return logicalSnapshotInstallError(
-				"verified source has no active generation",
-				nil,
-			)
-		}
-
-		return store.withConn(ctx, func(destination *sqlite.Conn) (err error) {
-			previousInterrupt := destination.SetInterrupt(ctx.Done())
-			defer destination.SetInterrupt(previousInterrupt)
-			end, err := sqlitex.ImmediateTransaction(destination)
-			if err != nil {
-				return err
-			}
-			defer end(&err)
-
-			destinationState, destinationFound, err :=
-				readConsensusState(destination)
-			if err != nil {
-				return err
-			}
-			generationChanged, err :=
-				verifyLogicalSnapshotInstallDestination(
-					source,
-					destination,
-					sourceState,
-					cut,
-					options.raft,
-				)
-			if err != nil {
-				return err
-			}
-			resultHeadChanged = !destinationFound ||
-				!sameResultHeadState(destinationState, sourceState)
-			preservedMarker, markerFound, err := readRebootstrapInstallMarker(
-				destination,
-			)
-			if err != nil {
-				return err
-			}
-			if markerFound {
-				if options.raft != nil ||
-					options.RebootstrapDeviceID != "" ||
-					generationChanged ||
-					preservedMarker.SessionID != cut.SessionID ||
-					preservedMarker.WorkspaceID != cut.WorkspaceID ||
-					preservedMarker.RecoveryGeneration !=
-						cut.RecoveryGeneration {
-					return logicalSnapshotInstallError(
-						"rebootstrap marker cannot cross this snapshot transition",
-						ErrRebootstrapInstallMarker,
-					)
-				}
-				if err := deleteRebootstrapInstallMarker(
-					destination,
-					preservedMarker,
-				); err != nil {
-					return err
-				}
-			}
-			preservedRecoveryTimes, err :=
-				readRecoveryBoundaryAuditTimes(destination)
-			if err != nil {
-				return logicalSnapshotInstallError(
-					"read recovery audit observation times",
-					err,
-				)
-			}
-			if generationChanged {
-				if err := clearGenerationLocalState(destination); err != nil {
-					return logicalSnapshotInstallError(
-						"clear predecessor generation local state",
-						err,
-					)
-				}
-			}
-			if err := clearLogicalSnapshotDestination(
-				destination,
-				cut,
-			); err != nil {
-				return err
-			}
-			for _, table := range logicalSnapshotCopiedTables() {
-				if err := copyLogicalSnapshotTable(
-					source,
-					destination,
-					table,
-				); err != nil {
-					return logicalSnapshotInstallError(
-						"copy "+table,
-						err,
-					)
-				}
-			}
-			if err := resetCommandResultPayloadMigrationMarker(
-				destination,
-			); err != nil {
-				return logicalSnapshotInstallError(
-					"reset command-result migration marker",
-					err,
-				)
-			}
-			if generationChanged {
-				if err := clearSuccessorGitArtifacts(destination); err != nil {
-					return logicalSnapshotInstallError(
-						"reconcile successor Git artifacts",
-						err,
-					)
-				}
-			}
-			if err := rebuildLogicalSnapshotDerivedViews(
-				source,
-				destination,
-			); err != nil {
-				return err
-			}
-			if err := restoreRecoveryBoundaryAuditTimes(
-				destination,
-				preservedRecoveryTimes,
-			); err != nil {
-				return err
-			}
-			if err := mergeLogicalSnapshotControlApprovals(
-				source,
-				destination,
-			); err != nil {
-				return err
-			}
-			if err := verifyLogicalSnapshotControlApprovals(
-				destination,
-			); err != nil {
-				return err
-			}
-			if err := rearmLeaseDeadlines(
-				destination,
-				options.OriginBootID,
-				installedAt,
-				options.MonotonicNowNS,
-			); err != nil {
-				return logicalSnapshotInstallError(
-					"rearm imported leases",
-					err,
-				)
-			}
-			if err := reconcileLogicalSnapshotLocalState(
-				destination,
-				cut,
-			); err != nil {
-				return err
-			}
-			if err := store.reachApplyStage(applyAfterOutbox); err != nil {
-				return err
-			}
-			var sourceEndErr error
-			endSource(&sourceEndErr)
-			sourceEnded = true
-			if sourceEndErr != nil {
-				return logicalSnapshotInstallError(
-					"close verified source snapshot",
-					sourceEndErr,
-				)
-			}
-			if err := writeLogicalSnapshotAttestation(
-				destination,
-				root,
-				options.VerifiedAt,
-			); err != nil {
-				return err
-			}
-			if err := writeCheckpointCadenceSnapshot(
-				destination,
-				cut,
-				options.InstalledAt,
-			); err != nil {
-				return err
-			}
 			if err := verifyLogicalSnapshotStageConnection(
-				destination,
+				source,
 				cut,
 				&root,
-				false,
+				true,
 			); err != nil {
 				return logicalSnapshotInstallError(
-					"verify installed state",
+					"reverify frozen source",
 					err,
 				)
 			}
-			if options.raft == nil {
-				if err := writeStandaloneSettledNonvoterState(
-					destination,
-					cut,
-					options.VerifiedAt,
-				); err != nil {
-					return err
-				}
-				if options.RebootstrapDeviceID != "" {
-					if err := writeRebootstrapInstallMarker(
-						destination,
-						cut,
-						options.RebootstrapDeviceID,
-						attestationID,
-						options.InstalledAt,
-					); err != nil {
-						return err
-					}
-				} else if markerFound {
-					preservedMarker.SnapshotAttestationID =
-						attestationID
-					preservedMarker.InstalledAt =
-						options.InstalledAt
-					if err := insertRebootstrapInstallMarker(
-						destination,
-						preservedMarker,
-					); err != nil {
-						return err
-					}
-				}
-			} else if err := writeRaftLogicalSnapshotEvidence(
-				destination,
-				cut,
-				*options.raft,
-			); err != nil {
+			if err := requireLogicalSnapshotInstallSourceLocalState(source); err != nil {
 				return err
 			}
-			state, found, err := readConsensusState(destination)
+			derivedDigest, err := logicalSnapshotDerivedViewsDigest(source)
+			if err != nil {
+				return logicalSnapshotInstallError(
+					"revalidate rebuilt local views",
+					err,
+				)
+			}
+			if derivedDigest != stage.derivedViewsDigest {
+				return logicalSnapshotInstallError(
+					"rebuilt local views changed after verification",
+					nil,
+				)
+			}
+			sourceState, found, err := readConsensusState(source)
 			if err != nil {
 				return err
 			}
 			if !found {
 				return logicalSnapshotInstallError(
-					"installed consensus state is missing",
+					"verified source has no active generation",
 					nil,
 				)
 			}
-			if options.raft == nil {
-				settled, found, err := readSettledNonvoterState(destination)
-				if err != nil {
-					return err
-				}
-				if !found {
-					return logicalSnapshotInstallError(
-						"installed settled-nonvoter evidence is missing",
-						nil,
+
+			return store.withConnUnderLease(
+				ctx,
+				lifecycleLease,
+				func(destination *sqlite.Conn) (err error) {
+					previousInterrupt := destination.SetInterrupt(ctx.Done())
+					defer destination.SetInterrupt(previousInterrupt)
+					end, err := sqlitex.ImmediateTransaction(destination)
+					if err != nil {
+						return err
+					}
+					defer end(&err)
+
+					destinationState, destinationFound, err :=
+						readConsensusState(destination)
+					if err != nil {
+						return err
+					}
+					generationChanged, err :=
+						verifyLogicalSnapshotInstallDestination(
+							source,
+							destination,
+							sourceState,
+							cut,
+							options.raft,
+						)
+					if err != nil {
+						return err
+					}
+					resultHeadChanged = !destinationFound ||
+						!sameResultHeadState(destinationState, sourceState)
+					preservedMarker, markerFound, err := readRebootstrapInstallMarker(
+						destination,
 					)
-				}
-				if err := verifySettledNonvoterEvidence(
-					destination,
-					state,
-					settled,
-				); err != nil {
-					return logicalSnapshotInstallError(
-						"verify installed replication evidence",
-						err,
-					)
-				}
-			} else if err := verifyRaftSnapshotInstallEvidence(
-				destination,
-				state,
-			); err != nil {
-				return logicalSnapshotInstallError(
-					"verify installed Raft snapshot evidence",
-					err,
-				)
-			}
-			if err := verifyHistoricalReplicationAttestations(
-				destination,
-				state,
-			); err != nil {
-				return logicalSnapshotInstallError(
-					"verify installed predecessor replication evidence",
-					err,
-				)
-			}
-			if options.raft == nil {
-				if err := requireNoStandaloneSnapshotRaftEvidence(
-					destination,
-				); err != nil {
-					return err
-				}
-			}
-			if err := checkForeignKeys(destination); err != nil {
-				return err
-			}
-			return store.reachApplyStage(applyAfterConsensus)
-		})
-	})
+					if err != nil {
+						return err
+					}
+					if markerFound {
+						if options.raft != nil ||
+							options.RebootstrapDeviceID != "" ||
+							generationChanged ||
+							preservedMarker.SessionID != cut.SessionID ||
+							preservedMarker.WorkspaceID != cut.WorkspaceID ||
+							preservedMarker.RecoveryGeneration !=
+								cut.RecoveryGeneration {
+							return logicalSnapshotInstallError(
+								"rebootstrap marker cannot cross this snapshot transition",
+								ErrRebootstrapInstallMarker,
+							)
+						}
+						if err := deleteRebootstrapInstallMarker(
+							destination,
+							preservedMarker,
+						); err != nil {
+							return err
+						}
+					}
+					preservedRecoveryTimes, err :=
+						readRecoveryBoundaryAuditTimes(destination)
+					if err != nil {
+						return logicalSnapshotInstallError(
+							"read recovery audit observation times",
+							err,
+						)
+					}
+					if generationChanged {
+						if err := clearGenerationLocalState(destination); err != nil {
+							return logicalSnapshotInstallError(
+								"clear predecessor generation local state",
+								err,
+							)
+						}
+					}
+					if err := clearLogicalSnapshotDestination(
+						destination,
+						cut,
+					); err != nil {
+						return err
+					}
+					for _, table := range logicalSnapshotCopiedTables() {
+						if err := copyLogicalSnapshotTable(
+							source,
+							destination,
+							table,
+						); err != nil {
+							return logicalSnapshotInstallError(
+								"copy "+table,
+								err,
+							)
+						}
+					}
+					if err := resetCommandResultPayloadMigrationMarker(
+						destination,
+					); err != nil {
+						return logicalSnapshotInstallError(
+							"reset command-result migration marker",
+							err,
+						)
+					}
+					if generationChanged {
+						if err := clearSuccessorGitArtifacts(destination); err != nil {
+							return logicalSnapshotInstallError(
+								"reconcile successor Git artifacts",
+								err,
+							)
+						}
+					}
+					if err := rebuildLogicalSnapshotDerivedViews(
+						source,
+						destination,
+					); err != nil {
+						return err
+					}
+					if err := restoreRecoveryBoundaryAuditTimes(
+						destination,
+						preservedRecoveryTimes,
+					); err != nil {
+						return err
+					}
+					if err := mergeLogicalSnapshotControlApprovals(
+						source,
+						destination,
+					); err != nil {
+						return err
+					}
+					if err := verifyLogicalSnapshotControlApprovals(
+						destination,
+					); err != nil {
+						return err
+					}
+					if err := rearmLeaseDeadlines(
+						destination,
+						options.OriginBootID,
+						installedAt,
+						options.MonotonicNowNS,
+					); err != nil {
+						return logicalSnapshotInstallError(
+							"rearm imported leases",
+							err,
+						)
+					}
+					if err := reconcileLogicalSnapshotLocalState(
+						destination,
+						cut,
+					); err != nil {
+						return err
+					}
+					if err := store.reachApplyStage(applyAfterOutbox); err != nil {
+						return err
+					}
+					var sourceEndErr error
+					endSource(&sourceEndErr)
+					sourceEnded = true
+					if sourceEndErr != nil {
+						return logicalSnapshotInstallError(
+							"close verified source snapshot",
+							sourceEndErr,
+						)
+					}
+					if err := writeLogicalSnapshotAttestation(
+						destination,
+						root,
+						options.VerifiedAt,
+					); err != nil {
+						return err
+					}
+					if err := writeCheckpointCadenceSnapshot(
+						destination,
+						cut,
+						options.InstalledAt,
+					); err != nil {
+						return err
+					}
+					if err := verifyLogicalSnapshotStageConnection(
+						destination,
+						cut,
+						&root,
+						false,
+					); err != nil {
+						return logicalSnapshotInstallError(
+							"verify installed state",
+							err,
+						)
+					}
+					if options.raft == nil {
+						if err := writeStandaloneSettledNonvoterState(
+							destination,
+							cut,
+							options.VerifiedAt,
+						); err != nil {
+							return err
+						}
+						if options.RebootstrapDeviceID != "" {
+							if err := writeRebootstrapInstallMarker(
+								destination,
+								cut,
+								options.RebootstrapDeviceID,
+								attestationID,
+								options.InstalledAt,
+							); err != nil {
+								return err
+							}
+						} else if markerFound {
+							preservedMarker.SnapshotAttestationID =
+								attestationID
+							preservedMarker.InstalledAt =
+								options.InstalledAt
+							if err := insertRebootstrapInstallMarker(
+								destination,
+								preservedMarker,
+							); err != nil {
+								return err
+							}
+						}
+					} else if err := writeRaftLogicalSnapshotEvidence(
+						destination,
+						cut,
+						*options.raft,
+					); err != nil {
+						return err
+					}
+					state, found, err := readConsensusState(destination)
+					if err != nil {
+						return err
+					}
+					if !found {
+						return logicalSnapshotInstallError(
+							"installed consensus state is missing",
+							nil,
+						)
+					}
+					if options.raft == nil {
+						settled, found, err := readSettledNonvoterState(destination)
+						if err != nil {
+							return err
+						}
+						if !found {
+							return logicalSnapshotInstallError(
+								"installed settled-nonvoter evidence is missing",
+								nil,
+							)
+						}
+						if err := verifySettledNonvoterEvidence(
+							destination,
+							state,
+							settled,
+						); err != nil {
+							return logicalSnapshotInstallError(
+								"verify installed replication evidence",
+								err,
+							)
+						}
+					} else if err := verifyRaftSnapshotInstallEvidence(
+						destination,
+						state,
+					); err != nil {
+						return logicalSnapshotInstallError(
+							"verify installed Raft snapshot evidence",
+							err,
+						)
+					}
+					if err := verifyHistoricalReplicationAttestations(
+						destination,
+						state,
+					); err != nil {
+						return logicalSnapshotInstallError(
+							"verify installed predecessor replication evidence",
+							err,
+						)
+					}
+					if options.raft == nil {
+						if err := requireNoStandaloneSnapshotRaftEvidence(
+							destination,
+						); err != nil {
+							return err
+						}
+					}
+					if err := checkForeignKeys(destination); err != nil {
+						return err
+					}
+					return store.reachApplyStage(applyAfterConsensus)
+				},
+			)
+		},
+	)
 	if err != nil {
 		return StandaloneLogicalSnapshotInstallResult{}, err
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,6 +42,241 @@ func TestConcurrentIndependentStoreShutdown(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("concurrent shutdown subprocess: %v\n%s", err, output)
+	}
+}
+
+func TestCloseWaitsWithoutBlockingIndependentStoreDependency(t *testing.T) {
+	root := t.TempDir()
+	stores := openSeededIndependentStores(
+		t,
+		root,
+		migratedTestStoreTemplate(t),
+		"lifecycle",
+		2,
+	)
+	defer func() {
+		if errs := closeIndependentStores(stores); len(errs) != 0 {
+			t.Errorf("cleanup stores: %v", errs)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := sqliteLifecycle.beginOperation(ctx)
+	if err != nil {
+		t.Fatalf("begin independent-store operation: %v", err)
+	}
+
+	entered := make(chan struct{})
+	runDependency := make(chan struct{})
+	operationDone := make(chan error, 1)
+	go func() {
+		defer lease.release()
+		operationDone <- stores[0].withConnUnderLease(
+			ctx,
+			lease,
+			func(*sqlite.Conn) error {
+				close(entered)
+				select {
+				case <-runDependency:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				return stores[1].withConnUnderLease(
+					ctx,
+					lease,
+					func(*sqlite.Conn) error { return nil },
+				)
+			},
+		)
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("independent store operation did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- stores[1].Close()
+	}()
+	waitForSQLiteLifecycleExclusiveWaiter(t, ctx, sqliteLifecycle)
+	select {
+	case err := <-closeDone:
+		t.Fatalf("independent close completed during active operation: %v", err)
+	default:
+	}
+
+	close(runDependency)
+	select {
+	case err := <-operationDone:
+		if err != nil {
+			t.Fatalf("dependent independent-store operation: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("dependent operation blocked behind independent close")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("independent close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("independent close did not run after operation release")
+	}
+	if err := stores[1].withConn(
+		ctx,
+		func(*sqlite.Conn) error { return nil },
+	); !errors.Is(err, ErrClosed) {
+		t.Fatalf("operation after independent close = %v, want ErrClosed", err)
+	}
+}
+
+func TestSQLiteLifecycleActiveGenerationPrecedesQueuedExclusive(t *testing.T) {
+	gate := newSQLiteLifecycleGate()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	active, err := gate.beginOperation(ctx)
+	if err != nil {
+		t.Fatalf("begin active operation: %v", err)
+	}
+	exclusiveAcquired := make(chan struct{})
+	releaseExclusive := make(chan struct{})
+	exclusiveDone := make(chan error, 1)
+	go func() {
+		release, err := gate.beginExclusive(ctx)
+		if err != nil {
+			exclusiveDone <- err
+			return
+		}
+		close(exclusiveAcquired)
+		select {
+		case <-releaseExclusive:
+		case <-ctx.Done():
+		}
+		release()
+		exclusiveDone <- nil
+	}()
+	waitForSQLiteLifecycleExclusiveWaiter(t, ctx, gate)
+
+	joined, err := gate.beginOperation(ctx)
+	if err != nil {
+		t.Fatalf("join active operation generation: %v", err)
+	}
+	select {
+	case <-exclusiveAcquired:
+		t.Fatal("queued exclusive interrupted an active operation generation")
+	default:
+	}
+	active.release()
+	select {
+	case <-exclusiveAcquired:
+		t.Fatal("exclusive acquired before the active generation drained")
+	default:
+	}
+	joined.release()
+
+	operationAcquired := make(chan struct{})
+	operationDone := make(chan error, 1)
+	go func() {
+		lease, err := gate.beginOperation(ctx)
+		if err != nil {
+			operationDone <- err
+			return
+		}
+		close(operationAcquired)
+		lease.release()
+		operationDone <- nil
+	}()
+
+	select {
+	case <-exclusiveAcquired:
+	case <-operationAcquired:
+		t.Fatal("operation entered between generation zero and exclusive grant")
+	case <-ctx.Done():
+		t.Fatal("queued exclusive was not granted when the generation drained")
+	}
+	select {
+	case <-operationAcquired:
+		t.Fatal("later operation acquired while lifecycle work was exclusive")
+	default:
+	}
+	close(releaseExclusive)
+	select {
+	case err := <-exclusiveDone:
+		if err != nil {
+			t.Fatalf("exclusive lifecycle work: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("exclusive lifecycle work did not finish")
+	}
+	select {
+	case <-operationAcquired:
+	case <-ctx.Done():
+		t.Fatal("later operation did not resume after exclusive lifecycle work")
+	}
+	select {
+	case err := <-operationDone:
+		if err != nil {
+			t.Fatalf("operation after exclusive lifecycle work: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("later operation did not finish")
+	}
+}
+
+func TestSQLiteLifecycleWaitHonorsContext(t *testing.T) {
+	gate := newSQLiteLifecycleGate()
+	releaseExclusive, err := gate.beginExclusive(context.Background())
+	if err != nil {
+		t.Fatalf("begin exclusive lifecycle work: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := gate.beginOperation(ctx); !errors.Is(
+		err,
+		context.DeadlineExceeded,
+	) {
+		t.Fatalf("operation wait = %v, want context deadline", err)
+	}
+	releaseExclusive()
+
+	lease, err := gate.beginOperation(context.Background())
+	if err != nil {
+		t.Fatalf("begin lifecycle operation: %v", err)
+	}
+	defer lease.release()
+	ctx, cancel = context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := gate.beginExclusive(ctx); !errors.Is(
+		err,
+		context.DeadlineExceeded,
+	) {
+		t.Fatalf("exclusive wait = %v, want context deadline", err)
+	}
+}
+
+func waitForSQLiteLifecycleExclusiveWaiter(
+	t *testing.T,
+	ctx context.Context,
+	gate *sqliteLifecycleGate,
+) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		gate.mu.Lock()
+		queued := len(gate.exclusiveWaiters) > 0
+		gate.mu.Unlock()
+		if queued {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal("exclusive lifecycle work did not enter the wait queue")
+		}
 	}
 }
 

@@ -15,10 +15,202 @@ import (
 
 const defaultPoolSize = 4
 
-// sqliteLifecycleMu prevents connection construction and preparation from
-// overlapping pool teardown across independent stores. The SQLite backend has
-// faulted during those concurrent lifecycle operations on supported platforms.
-var sqliteLifecycleMu sync.Mutex
+// sqliteLifecycle prevents connection use from overlapping pool construction
+// or teardown in another store. Operations may join an active generation; the
+// first transition to zero grants the oldest queued lifecycle waiter before a
+// new operation can start. Snapshot installation reuses one explicit operation
+// lease while accessing its source and destination stores.
+var sqliteLifecycle = newSQLiteLifecycleGate()
+
+type sqliteLifecycleGate struct {
+	mu               sync.Mutex
+	activeOperations int
+	exclusive        bool
+	exclusiveWaiters []*sqliteLifecycleExclusiveWaiter
+	operationsReady  chan struct{}
+}
+
+type sqliteLifecycleExclusiveWaiter struct {
+	ready   chan struct{}
+	granted bool
+}
+
+type sqliteLifecycleLease struct {
+	gate     *sqliteLifecycleGate
+	released atomic.Bool
+}
+
+func newSQLiteLifecycleGate() *sqliteLifecycleGate {
+	operationsReady := make(chan struct{})
+	close(operationsReady)
+	return &sqliteLifecycleGate{operationsReady: operationsReady}
+}
+
+func (gate *sqliteLifecycleGate) beginOperation(
+	ctx context.Context,
+) (*sqliteLifecycleLease, error) {
+	if gate == nil {
+		return nil, ErrInvalidOptions
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidOptions)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		gate.mu.Lock()
+		if gate.operationsReady == nil {
+			gate.mu.Unlock()
+			return nil, ErrInvalidOptions
+		}
+		if !gate.exclusive {
+			if gate.activeOperations == 0 &&
+				len(gate.exclusiveWaiters) > 0 {
+				gate.grantNextExclusiveLocked()
+			} else {
+				gate.activeOperations++
+				gate.mu.Unlock()
+				return &sqliteLifecycleLease{gate: gate}, nil
+			}
+		}
+		operationsReady := gate.operationsReady
+		gate.mu.Unlock()
+		select {
+		case <-operationsReady:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (lease *sqliteLifecycleLease) release() {
+	if lease == nil || lease.gate == nil {
+		return
+	}
+	if !lease.released.CompareAndSwap(false, true) {
+		panic("store: SQLite lifecycle lease released more than once")
+	}
+	lease.gate.endOperation()
+}
+
+func (lease *sqliteLifecycleLease) validFor(
+	gate *sqliteLifecycleGate,
+) bool {
+	return lease != nil &&
+		lease.gate == gate &&
+		!lease.released.Load()
+}
+
+func (gate *sqliteLifecycleGate) beginExclusive(
+	ctx context.Context,
+) (func(), error) {
+	if gate == nil {
+		return nil, ErrInvalidOptions
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidOptions)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	waiter := &sqliteLifecycleExclusiveWaiter{ready: make(chan struct{})}
+	gate.mu.Lock()
+	if gate.operationsReady == nil {
+		gate.mu.Unlock()
+		return nil, ErrInvalidOptions
+	}
+	if err := ctx.Err(); err != nil {
+		gate.mu.Unlock()
+		return nil, err
+	}
+	gate.exclusiveWaiters = append(gate.exclusiveWaiters, waiter)
+	gate.grantNextExclusiveLocked()
+	gate.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+	case <-ctx.Done():
+		gate.mu.Lock()
+		if !waiter.granted {
+			gate.removeExclusiveWaiterLocked(waiter)
+			gate.grantNextExclusiveLocked()
+			gate.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		gate.mu.Unlock()
+	}
+
+	var releaseOnce sync.Once
+	return func() {
+		releaseOnce.Do(gate.endExclusive)
+	}, nil
+}
+
+func (gate *sqliteLifecycleGate) endOperation() {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.activeOperations <= 0 {
+		panic("store: SQLite lifecycle operation count underflow")
+	}
+	gate.activeOperations--
+	if gate.activeOperations == 0 {
+		gate.grantNextExclusiveLocked()
+	}
+}
+
+func (gate *sqliteLifecycleGate) endExclusive() {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if !gate.exclusive {
+		panic("store: SQLite lifecycle exclusive release without ownership")
+	}
+	if len(gate.exclusiveWaiters) > 0 {
+		gate.grantQueuedExclusiveLocked()
+		return
+	}
+	gate.exclusive = false
+	close(gate.operationsReady)
+}
+
+func (gate *sqliteLifecycleGate) grantNextExclusiveLocked() {
+	if gate.exclusive ||
+		gate.activeOperations != 0 ||
+		len(gate.exclusiveWaiters) == 0 {
+		return
+	}
+	gate.exclusive = true
+	gate.operationsReady = make(chan struct{})
+	gate.grantQueuedExclusiveLocked()
+}
+
+func (gate *sqliteLifecycleGate) grantQueuedExclusiveLocked() {
+	waiter := gate.exclusiveWaiters[0]
+	copy(gate.exclusiveWaiters, gate.exclusiveWaiters[1:])
+	last := len(gate.exclusiveWaiters) - 1
+	gate.exclusiveWaiters[last] = nil
+	gate.exclusiveWaiters = gate.exclusiveWaiters[:last]
+	waiter.granted = true
+	close(waiter.ready)
+}
+
+func (gate *sqliteLifecycleGate) removeExclusiveWaiterLocked(
+	waiter *sqliteLifecycleExclusiveWaiter,
+) {
+	for index, queued := range gate.exclusiveWaiters {
+		if queued != waiter {
+			continue
+		}
+		copy(
+			gate.exclusiveWaiters[index:],
+			gate.exclusiveWaiters[index+1:],
+		)
+		last := len(gate.exclusiveWaiters) - 1
+		gate.exclusiveWaiters[last] = nil
+		gate.exclusiveWaiters = gate.exclusiveWaiters[:last]
+		return
+	}
+}
 
 var (
 	ErrInvalidOptions     = errors.New("store: invalid options")
@@ -81,8 +273,11 @@ func Open(ctx context.Context, options Options) (_ *Store, err error) {
 	}
 	path := filepath.Clean(options.Path)
 
-	sqliteLifecycleMu.Lock()
-	defer sqliteLifecycleMu.Unlock()
+	releaseLifecycle, err := sqliteLifecycle.beginExclusive(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -252,6 +447,13 @@ func (store *Store) Close() error {
 	if store == nil || store.pool == nil {
 		return ErrInvalidOptions
 	}
+	releaseLifecycle, err := sqliteLifecycle.beginExclusive(
+		context.Background(),
+	)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
@@ -259,8 +461,6 @@ func (store *Store) Close() error {
 	}
 	store.closed = true
 	store.resultHeadChanges.close()
-	sqliteLifecycleMu.Lock()
-	defer sqliteLifecycleMu.Unlock()
 	store.closeErr = store.pool.Close()
 	if store.closeErr != nil {
 		store.closeErr = fmt.Errorf("store: close: %w", store.closeErr)
@@ -272,7 +472,23 @@ func (store *Store) withConn(
 	ctx context.Context,
 	fn func(*sqlite.Conn) error,
 ) error {
+	lease, err := sqliteLifecycle.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer lease.release()
+	return store.withConnUnderLease(ctx, lease, fn)
+}
+
+func (store *Store) withConnUnderLease(
+	ctx context.Context,
+	lease *sqliteLifecycleLease,
+	fn func(*sqlite.Conn) error,
+) error {
 	if store == nil || store.pool == nil || fn == nil {
+		return ErrInvalidOptions
+	}
+	if !lease.validFor(sqliteLifecycle) {
 		return ErrInvalidOptions
 	}
 	if ctx == nil {
@@ -285,6 +501,9 @@ func (store *Store) withConn(
 	defer store.mu.RUnlock()
 	if store.closed {
 		return ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	conn, err := store.pool.Take(ctx)
 	if err != nil {
