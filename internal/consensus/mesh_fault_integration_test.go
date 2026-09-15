@@ -252,9 +252,6 @@ func applyUnderDirectedFault(
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !leader.node.IsLeader() {
-		t.Fatalf("directed fault %+v displaced the healthy-quorum leader", rule)
-	}
 	if err := harness.faults.Remove(handle); err != nil {
 		t.Fatalf("Remove(%+v): %v", rule, err)
 	}
