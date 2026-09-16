@@ -273,7 +273,7 @@ func runSecureThreeVoterConsensusMesh(t *testing.T) {
 	); !errors.Is(err, ErrCheckpointProofRejected) {
 		t.Fatalf("voter staging-proof request error = %v", err)
 	}
-	harness.proveStagingCheckpoint(t, leader, proofTarget)
+	leader = harness.proveStagingCheckpoint(t, leader, proofTarget)
 	harness.proveCredentialEndorsement(t, leader, proofTarget)
 
 	first := harness.taskEvent(
@@ -1329,12 +1329,17 @@ func (harness *secureMeshHarness) proveStagingCheckpoint(
 	t *testing.T,
 	leader *secureMeshNode,
 	target *secureMeshNode,
-) {
+) *secureMeshNode {
 	t.Helper()
 	if leader == nil || target == nil || leader == target {
 		t.Fatal("invalid staging-proof participants")
 	}
-	harness.changeMeshSuffrage(t, leader, target, raft.Nonvoter)
+	leader = harness.changeMeshSuffrage(
+		t,
+		leader,
+		target,
+		raft.Nonvoter,
+	)
 
 	record := harness.checkpointRecord(t, leader)
 	expectation := stagingCheckpointExpectation{
@@ -1398,7 +1403,7 @@ func (harness *secureMeshHarness) proveStagingCheckpoint(
 	); !errors.Is(err, ErrCheckpointProofRejected) {
 		t.Fatalf("mismatched staging-proof request error = %v", err)
 	}
-	harness.changeMeshSuffrage(t, leader, target, raft.Voter)
+	return harness.changeMeshSuffrage(t, leader, target, raft.Voter)
 }
 
 func (harness *secureMeshHarness) proveAuthorityCheckpointSigning(
@@ -1617,7 +1622,7 @@ func (harness *secureMeshHarness) changeMeshSuffrage(
 	leader *secureMeshNode,
 	target *secureMeshNode,
 	suffrage raft.ServerSuffrage,
-) {
+) *secureMeshNode {
 	t.Helper()
 	configuration := leader.node.fsm.committedConfiguration()
 	if configuration == nil {
@@ -1664,6 +1669,7 @@ func (harness *secureMeshHarness) changeMeshSuffrage(
 			return true
 		},
 	)
+	return harness.waitForLeader(t, harness.runningNodes())
 }
 
 func configurationHasSuffrage(
