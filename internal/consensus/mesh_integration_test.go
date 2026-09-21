@@ -39,6 +39,7 @@ import (
 	"github.com/ijonahch/codecomm/internal/event"
 	"github.com/ijonahch/codecomm/internal/logicalsnapshot"
 	"github.com/ijonahch/codecomm/internal/peerauth"
+	"github.com/ijonahch/codecomm/internal/reducer"
 	"github.com/ijonahch/codecomm/internal/store"
 	"github.com/ijonahch/codecomm/internal/testharness/faultnet"
 	"github.com/ijonahch/codecomm/internal/transport"
@@ -473,6 +474,9 @@ func (origin *secureMeshCheckpointOrigin) RunExclusive(
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	if err := origin.refreshNextSequence(ctx); err != nil {
+		return err
+	}
 	return operation(func(
 		ctx context.Context,
 		checkpoint domain.Checkpoint,
@@ -537,6 +541,15 @@ func (origin *secureMeshCheckpointOrigin) SubmitCredentialAuthorization(
 	if err != nil {
 		return store.CommandOutcome{}, err
 	}
+	select {
+	case origin.exclusive <- struct{}{}:
+		defer func() { <-origin.exclusive }()
+	case <-ctx.Done():
+		return store.CommandOutcome{}, ctx.Err()
+	}
+	if err := origin.refreshNextSequence(ctx); err != nil {
+		return store.CommandOutcome{}, err
+	}
 	signed, err := secureMeshSignedCommand(
 		origin.candidate,
 		event.ActorDaemon,
@@ -554,6 +567,50 @@ func (origin *secureMeshCheckpointOrigin) SubmitCredentialAuthorization(
 		return store.CommandOutcome{}, err
 	}
 	return result.Outcome, nil
+}
+
+func (origin *secureMeshCheckpointOrigin) refreshNextSequence(
+	ctx context.Context,
+) error {
+	if origin == nil ||
+		origin.candidate == nil ||
+		origin.candidate.node == nil ||
+		ctx == nil {
+		return ErrCheckpointOriginUnavailable
+	}
+	view, err := origin.candidate.node.View(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: read committed origin sequence: %v",
+			ErrCheckpointOriginUnavailable,
+			err,
+		)
+	}
+	snapshot, _, err := decodeReducerStateView(view)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: decode committed origin sequence: %v",
+			ErrCheckpointOriginUnavailable,
+			err,
+		)
+	}
+	next := uint64(1)
+	scope, found := snapshot.OriginScopes[reducer.OriginScopeKey{
+		DeviceID: origin.candidate.identity.deviceID,
+		Kind:     reducer.ScopeBoot,
+		ScopeID:  origin.bootID,
+	}]
+	if found {
+		if scope.LastSequence == domain.MaxSafeInteger {
+			return fmt.Errorf(
+				"%w: boot origin sequence exhausted",
+				ErrCheckpointOriginUnavailable,
+			)
+		}
+		next = scope.LastSequence + 1
+	}
+	origin.candidate.nextSequence = next
+	return nil
 }
 
 func secureMeshCredentialAuthorizationPayload(

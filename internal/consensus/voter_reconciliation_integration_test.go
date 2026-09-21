@@ -735,6 +735,9 @@ func (origin *secureMeshCheckpointOrigin) SubmitVoterSetActivation(
 	case <-ctx.Done():
 		return store.CommandOutcome{}, ctx.Err()
 	}
+	if err := origin.refreshNextSequence(ctx); err != nil {
+		return store.CommandOutcome{}, err
+	}
 	signed, err := secureMeshSignedCommand(
 		origin.candidate,
 		event.ActorDaemon,
