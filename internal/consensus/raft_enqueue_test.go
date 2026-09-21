@@ -92,12 +92,12 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 		"DemoteVoter":                configurationAdapter,
 		"RemoveServer":               configurationAdapter,
 		"LeadershipTransferToServer": "invokeRaftLeadershipTransfer",
+		"LeadershipTransfer":         "invokeRaftLeadershipTransferBeforeClose",
 	}
 	forbidden := map[string]struct{}{
-		"ApplyLog":           {},
-		"AddPeer":            {},
-		"RemovePeer":         {},
-		"LeadershipTransfer": {},
+		"ApplyLog":   {},
+		"AddPeer":    {},
+		"RemovePeer": {},
 	}
 	counts := make(map[string]int, len(allowed))
 	forbiddenCounts := make(map[string]int, len(forbidden))
@@ -114,11 +114,12 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 		},
 		"enqueueRaftBarrier": {
 			functions: map[string]struct{}{
-				"waitRaftBarrier":         {},
-				"changeRaftConfiguration": {},
-				"transferLeadership":      {},
+				"waitRaftBarrier":               {},
+				"changeRaftConfiguration":       {},
+				"transferLeadership":            {},
+				"transferLeadershipBeforeClose": {},
 			},
-			count: 3,
+			count: 4,
 		},
 		"waitRaftBarrier": {
 			functions: map[string]struct{}{
@@ -146,6 +147,12 @@ func TestDirectRaftEnqueuesStayInsideAdapters(t *testing.T) {
 		"invokeRaftLeadershipTransfer": {
 			functions: map[string]struct{}{
 				"transferLeadership": {},
+			},
+			count: 1,
+		},
+		"invokeRaftLeadershipTransferBeforeClose": {
+			functions: map[string]struct{}{
+				"transferLeadershipBeforeClose": {},
 			},
 			count: 1,
 		},

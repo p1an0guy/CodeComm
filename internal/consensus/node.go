@@ -197,12 +197,14 @@ type SingleNode struct {
 	monitorStop chan struct{}
 	monitorDone chan struct{}
 
-	lifecycleMu  sync.Mutex
-	closing      bool
-	closeStarted chan struct{}
-	active       sync.WaitGroup
-	lineageGate  chan struct{}
-	raftEnqueue  chan struct{}
+	lifecycleMu   sync.Mutex
+	quiescing     bool
+	closing       bool
+	operationStop chan struct{}
+	closeStarted  chan struct{}
+	active        sync.WaitGroup
+	lineageGate   chan struct{}
+	raftEnqueue   chan struct{}
 
 	readLeadershipEpoch func() (raftLeadershipEpoch, error)
 
@@ -759,6 +761,7 @@ func openNode(
 		proposalIngress:          newProposalIngressLimiter(time.Now),
 		monitorStop:              make(chan struct{}),
 		monitorDone:              make(chan struct{}),
+		operationStop:            make(chan struct{}),
 		closeStarted:             make(chan struct{}),
 		lineageGate:              make(chan struct{}, 1),
 		raftEnqueue:              make(chan struct{}, 1),
@@ -2255,7 +2258,7 @@ func (node *SingleNode) beginOperation() error {
 	}
 	node.lifecycleMu.Lock()
 	defer node.lifecycleMu.Unlock()
-	if node.closing {
+	if node.quiescing || node.closing {
 		return ErrNodeClosed
 	}
 	node.active.Add(1)
@@ -2333,11 +2336,30 @@ func (node *SingleNode) IsLeader() bool {
 		return false
 	}
 	node.lifecycleMu.Lock()
+	unavailable := node.quiescing || node.closing
+	node.lifecycleMu.Unlock()
+	if unavailable {
+		return false
+	}
+	return node.ownsRaftLeadership()
+}
+
+// isRaftLeaderForTransport keeps the final barrier and handoff authorized
+// after public operations quiesce but before transport shutdown begins.
+func (node *SingleNode) isRaftLeaderForTransport() bool {
+	if node == nil || node.raft == nil || node.FatalError() != nil {
+		return false
+	}
+	node.lifecycleMu.Lock()
 	closing := node.closing
 	node.lifecycleMu.Unlock()
 	if closing {
 		return false
 	}
+	return node.ownsRaftLeadership()
+}
+
+func (node *SingleNode) ownsRaftLeadership() bool {
 	_, id := node.raft.LeaderWithID()
 	return node.raft.State() == raft.Leader && id == node.serverID
 }
@@ -2350,9 +2372,9 @@ func (node *SingleNode) LocalTime() (domain.Timestamp, int64, error) {
 		return "", 0, ErrInvalidNodeOptions
 	}
 	node.lifecycleMu.Lock()
-	closing := node.closing
+	unavailable := node.quiescing || node.closing
 	node.lifecycleMu.Unlock()
-	if closing {
+	if unavailable {
 		return "", 0, ErrNodeClosed
 	}
 	if err := node.FatalError(); err != nil {
@@ -2618,6 +2640,8 @@ func (node *SingleNode) operationContext(
 	go func() {
 		defer close(watcherDone)
 		select {
+		case <-node.operationStop:
+			cancel()
 		case <-node.closeStarted:
 			cancel()
 		case <-node.fatalSet:
@@ -3016,6 +3040,18 @@ func (node *SingleNode) PeerAdmissionSnapshot() (*peerauth.Snapshot, error) {
 		return nil, err
 	}
 	defer node.endOperation()
+	return node.peerAdmissionSnapshotForTransport()
+}
+
+// peerAdmissionSnapshotForTransport reads the already-published immutable
+// admission cut while local operations are quiesced for graceful handoff.
+func (node *SingleNode) peerAdmissionSnapshotForTransport() (
+	*peerauth.Snapshot,
+	error,
+) {
+	if node == nil || node.fsm == nil || node.state == nil {
+		return nil, ErrInvalidNodeOptions
+	}
 	if err := node.FatalError(); err != nil {
 		return nil, err
 	}
@@ -3293,9 +3329,9 @@ func (node *SingleNode) LocalState() (store.LocalState, error) {
 		return store.LocalState{}, ErrInvalidNodeOptions
 	}
 	node.lifecycleMu.Lock()
-	closing := node.closing
+	unavailable := node.quiescing || node.closing
 	node.lifecycleMu.Unlock()
-	if closing {
+	if unavailable {
 		return store.LocalState{}, ErrNodeClosed
 	}
 	if err := node.FatalError(); err != nil {
@@ -3343,9 +3379,27 @@ func (node *SingleNode) Close() error {
 	}
 	node.closeOnce.Do(func() {
 		node.lifecycleMu.Lock()
-		node.closing = true
-		close(node.closeStarted)
+		node.quiescing = true
 		node.lifecycleMu.Unlock()
+		if node.operationStop != nil {
+			close(node.operationStop)
+		}
+		gracefulContext, cancelGraceful := context.WithTimeout(
+			context.Background(),
+			gracefulLeadershipTransferTimeout,
+		)
+		gracefulGuard := node.acquireGracefulCloseGuard(gracefulContext)
+		if gracefulGuard != nil {
+			node.transferLeadershipBeforeClose(gracefulContext)
+		}
+		node.lifecycleMu.Lock()
+		node.closing = true
+		node.lifecycleMu.Unlock()
+		close(node.closeStarted)
+		if gracefulGuard != nil {
+			gracefulGuard.release()
+		}
+		cancelGraceful()
 		if node.fsm != nil {
 			node.fsm.closePeerAdmissionChanges()
 		}

@@ -123,6 +123,79 @@ func TestSecureThreeVoterColdCommitRecovery(t *testing.T) {
 	}
 }
 
+func TestSecureMeshGracefulLeaderRestart(t *testing.T) {
+	const childMode = "graceful-leader-restart"
+	if secureMeshRunsInProcess() ||
+		os.Getenv(secureMeshChild) == childMode {
+		runSecureMeshGracefulLeaderRestart(t)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx,
+		os.Args[0],
+		"-test.run=^TestSecureMeshGracefulLeaderRestart$",
+		"-test.count=1",
+	)
+	command.Env = secureMeshChildEnvironmentWithMode(
+		os.Environ(),
+		childMode,
+	)
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("graceful-restart child timed out: %v\n%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("graceful-restart child failed: %v\n%s", err, output)
+	}
+}
+
+func runSecureMeshGracefulLeaderRestart(t *testing.T) {
+	harness := newSecureMeshHarness(t)
+	defer harness.close(t)
+
+	nodes := harness.runningNodes()
+	leader := harness.waitForLeader(t, nodes)
+	harness.waitForCommittedConfiguration(t, nodes)
+	remaining := secureMeshNodesExcept(nodes, leader)
+	if len(remaining) != 2 {
+		t.Fatalf("remaining voters = %d, want 2", len(remaining))
+	}
+
+	if err := leader.node.Close(); err != nil {
+		t.Fatalf("Close(leader %s): %v", leader.identity.deviceID, err)
+	}
+	awaitMeshCondition(
+		t,
+		500*time.Millisecond,
+		"graceful leadership transfer",
+		func() bool {
+			for _, candidate := range remaining {
+				if candidate.node.raft.State() == raft.Leader {
+					return true
+				}
+			}
+			return false
+		},
+	)
+	harness.stopNode(t, leader)
+	harness.startNode(t, leader, false)
+
+	restarted := harness.runningNodes()
+	harness.waitForLeader(t, restarted)
+	for _, candidate := range restarted {
+		if err := candidate.node.WaitForLeader(meshTestContext(t)); err != nil {
+			t.Fatalf(
+				"WaitForLeader after graceful restart (%s): %v",
+				candidate.identity.deviceID,
+				err,
+			)
+		}
+	}
+	assertMeshViewsConverged(t, restarted)
+}
+
 func runSecureThreeVoterColdCommitRecovery(t *testing.T) {
 	harness := newSecureMeshHarness(t)
 	defer harness.close(t)

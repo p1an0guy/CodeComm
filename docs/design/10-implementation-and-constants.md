@@ -97,6 +97,7 @@ defect.
 | `advertisement_interval_seconds` | 20; multicast base cadence `min(value, 48 s)` with independently sampled uniform jitter ±25%; TTL/hop-limit 1; ≤1200 bytes | Committed |
 | `endpoint_hint_ttl_seconds` | `8 * advertisement_interval_seconds` | Derived |
 | `voter_reconcile_deadline` | 30 s; an unfinished voter-set transit past this surfaces the `reconciling` state (§3, §9) | Local |
+| Graceful consensus handoff timeout | 3 s for the final barrier and one leadership-transfer attempt | Local |
 | HTTPS port | 47831 default, configurable; per session, so concurrent sessions take the next free port | Local |
 | Invite TTL / outstanding cap | 15 min / 8 | Local at issue |
 | Owner-recovery challenge TTL / outstanding cap | 5 min from durable reservation creation / 1 per device | Local |
@@ -206,8 +207,9 @@ Production quality is a release criterion:
   and child resources.
 - Use backpressure; never silently drop durable work. Retry only transient errors with
   capped exponential backoff and jitter.
-- Make startup/shutdown idempotent and crash-safe: drain accepted work, close listeners,
-  persist/checkpoint, reap children, and recover every boundary.
+- Make startup/shutdown idempotent and crash-safe: quiesce new consensus writes, drain accepted
+  work through a Raft barrier, attempt one bounded leadership transfer before stopping a leader,
+  close listeners, persist/checkpoint, reap children, and recover every boundary.
 - Use atomic replacement, explicit modes/ACLs, canonical paths, trusted-root filesystem operations
   that reject symlink/reparse components, required directory durability, direct argv, and sanitized
   child environments.

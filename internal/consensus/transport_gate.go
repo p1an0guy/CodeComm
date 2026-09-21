@@ -135,7 +135,7 @@ func (gate *nodeTransportGate) PeerAdmissionSnapshot() (
 	if err != nil {
 		return nil, err
 	}
-	return node.PeerAdmissionSnapshot()
+	return node.peerAdmissionSnapshotForTransport()
 }
 
 // ConsensusControlHandler returns the late-bound fail-closed handler used by
@@ -185,7 +185,7 @@ func (gate *nodeTransportGate) authorizeAppliedPeer(
 	deviceID domain.DeviceID,
 	configurationIndex uint64,
 ) error {
-	admission, err := node.PeerAdmissionSnapshot()
+	admission, err := node.peerAdmissionSnapshotForTransport()
 	if err != nil {
 		return fmt.Errorf(
 			"%w: %v",
@@ -248,7 +248,7 @@ func (gate *nodeTransportGate) authorizeReplication(
 		return fmt.Errorf("%w: %w", ErrConsensusReplicationUnauthorized, err)
 	}
 	for range consensusAuthorizationReadAttempts {
-		if !node.IsLeader() {
+		if !node.isRaftLeaderForTransport() {
 			return ErrConsensusReplicationUnauthorized
 		}
 		commitIndex := node.raft.CommitIndex()
@@ -279,7 +279,7 @@ func (gate *nodeTransportGate) authorizeReplication(
 			)
 		}
 		if node.raft.CommitIndex() == commitIndex &&
-			node.IsLeader() {
+			node.isRaftLeaderForTransport() {
 			return nil
 		}
 	}

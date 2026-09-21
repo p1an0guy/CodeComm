@@ -295,6 +295,8 @@ Required unit/component subjects:
   committed is refused owner-level operations for the remainder of that epoch;
 - leader-only replication (§4.6): a non-leader serves no entries/snapshot, asserted on exchanged
   bytes; an elected leader that has not applied through committed membership replicates nothing;
+  planned leader shutdown quiesces new writes, commits a final barrier, attempts one bounded
+  handoff, and a restarted former leader rejoins without a private content-bearing tail;
   after cold restart with a zero volatile commit index and a shared unapplied committed tail, only
   payload-empty no-op/barrier-only commit probes flow, while mixed, payload-bearing, command,
   configuration, and snapshot transfer remains blocked; the quorum then re-establishes commitment
