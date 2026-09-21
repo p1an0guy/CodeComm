@@ -462,6 +462,94 @@ func testConsensusReplicationAuthorization(t *testing.T) {
 	if got := commitProbeCalls.Load(); got != 1 {
 		t.Fatalf("commit-probe authorization calls = %d, want 1", got)
 	}
+	recovery := &raft.AppendEntriesRequest{
+		Term: 1,
+		Entries: []*raft.Log{
+			{
+				Index: 2,
+				Term:  1,
+				Type:  raft.LogBarrier,
+			},
+			{
+				Index: 3,
+				Term:  1,
+				Type:  raft.LogNoop,
+			},
+		},
+	}
+	if err := clientTransport.AppendEntries(
+		targetID,
+		targetAddress,
+		recovery,
+		&raft.AppendEntriesResponse{},
+	); err != nil {
+		t.Fatalf("barrier commit-recovery AppendEntries(): %v", err)
+	}
+	assertConsensusRPCReceived(t, received, "append:2")
+	if got := commitProbeCalls.Load(); got != 2 {
+		t.Fatalf("commit-recovery authorization calls = %d, want 2", got)
+	}
+	mixedRecovery := &raft.AppendEntriesRequest{
+		Term: 1,
+		Entries: []*raft.Log{
+			{
+				Index: 4,
+				Term:  1,
+				Type:  raft.LogBarrier,
+			},
+			{
+				Index: 5,
+				Term:  1,
+				Type:  raft.LogCommand,
+				Data:  []byte("command"),
+			},
+		},
+	}
+	if err := clientTransport.AppendEntries(
+		targetID,
+		targetAddress,
+		mixedRecovery,
+		&raft.AppendEntriesResponse{},
+	); !errors.Is(err, ErrConsensusReplicationDenied) {
+		t.Fatalf("mixed commit-recovery AppendEntries() error = %v", err)
+	}
+	assertNoConsensusRPC(t, received)
+	if got := commitProbeCalls.Load(); got != 2 {
+		t.Fatalf("mixed recovery used commit authorization %d times, want 2", got)
+	}
+	for _, malformedRecovery := range []*raft.AppendEntriesRequest{
+		{
+			Term: 1,
+			Entries: []*raft.Log{{
+				Index: 6,
+				Term:  1,
+				Type:  raft.LogBarrier,
+				Data:  []byte("payload"),
+			}},
+		},
+		{
+			Term: 1,
+			Entries: []*raft.Log{{
+				Index:      6,
+				Term:       1,
+				Type:       raft.LogNoop,
+				Extensions: []byte("payload"),
+			}},
+		},
+	} {
+		if err := clientTransport.AppendEntries(
+			targetID,
+			targetAddress,
+			malformedRecovery,
+			&raft.AppendEntriesResponse{},
+		); !errors.Is(err, ErrConsensusReplicationDenied) {
+			t.Fatalf("payload-bearing commit recovery error = %v", err)
+		}
+		assertNoConsensusRPC(t, received)
+	}
+	if got := commitProbeCalls.Load(); got != 2 {
+		t.Fatalf("payload recovery used commit authorization %d times, want 2", got)
+	}
 
 	authorizationMode.Store(1)
 	if err := clientTransport.AppendEntries(
@@ -490,6 +578,33 @@ func testConsensusReplicationAuthorization(t *testing.T) {
 	}
 	_ = pipeline.Close()
 	assertNoConsensusRPC(t, received)
+
+	pipeline, err = clientTransport.AppendEntriesPipeline(
+		targetID,
+		targetAddress,
+	)
+	if err != nil {
+		t.Fatalf("AppendEntriesPipeline(commit recovery setup): %v", err)
+	}
+	if _, err := pipeline.AppendEntries(
+		recovery,
+		&raft.AppendEntriesResponse{},
+	); err != nil {
+		t.Fatalf("commit-recovery pipeline AppendEntries(): %v", err)
+	}
+	select {
+	case future := <-pipeline.Consumer():
+		if err := future.Error(); err != nil {
+			t.Fatalf("commit-recovery pipeline future: %v", err)
+		}
+	case <-time.After(consensusTestTimeout):
+		t.Fatal("commit-recovery pipeline response timed out")
+	}
+	assertConsensusRPCReceived(t, received, "append:2")
+	if got := commitProbeCalls.Load(); got != 3 {
+		t.Fatalf("commit-recovery authorization calls = %d, want 3", got)
+	}
+	_ = pipeline.Close()
 
 	authorizationMode.Store(1)
 	pipeline, err = clientTransport.AppendEntriesPipeline(

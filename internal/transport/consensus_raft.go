@@ -38,8 +38,9 @@ var (
 // and may replicate to the target in the live Raft configuration.
 type ConsensusReplicationAuthorizer func(domain.DeviceID) error
 
-// ConsensusCommitProbeAuthorizer authorizes the no-op-only AppendEntries class
-// used to recover Raft's volatile commit index after restart.
+// ConsensusCommitProbeAuthorizer authorizes the non-mutating no-op/barrier
+// AppendEntries class used to recover Raft's volatile commit index after
+// restart.
 type ConsensusCommitProbeAuthorizer func(domain.DeviceID) error
 
 // ConsensusNetworkTransportOptions configures guarded HashiCorp Raft framing.
@@ -460,7 +461,14 @@ func commitProbeEntries(entries []*raft.Log) bool {
 		return false
 	}
 	for _, entry := range entries {
-		if entry == nil || entry.Type != raft.LogNoop {
+		if entry == nil ||
+			len(entry.Data) != 0 ||
+			len(entry.Extensions) != 0 {
+			return false
+		}
+		switch entry.Type {
+		case raft.LogNoop, raft.LogBarrier:
+		default:
 			return false
 		}
 	}

@@ -206,6 +206,100 @@ func runSecureThreeVoterColdCommitRecovery(t *testing.T) {
 	harness.waitForLeader(t, restarted)
 	harness.waitForTask(t, restarted, nodeTestTaskID1)
 	assertMeshViewsConverged(t, restarted)
+
+	barrierLeader := harness.waitForLeader(t, restarted)
+	barrierLastIndex, err := barrierLeader.node.stable.LastIndex()
+	if err != nil {
+		t.Fatalf("barrier leader LastIndex(): %v", err)
+	}
+	var barrierLast raft.Log
+	if err := barrierLeader.node.stable.GetLog(
+		barrierLastIndex,
+		&barrierLast,
+	); err != nil {
+		t.Fatalf("barrier leader GetLog(%d): %v", barrierLastIndex, err)
+	}
+	for _, candidate := range harness.nodes {
+		harness.stopNode(t, candidate)
+	}
+	barrierIndex := barrierLastIndex + 1
+	appendColdCommitLog(
+		t,
+		barrierLeader.consensusDir,
+		&raft.Log{
+			Index: barrierIndex,
+			Term:  barrierLast.Term,
+			Type:  raft.LogBarrier,
+		},
+	)
+	var (
+		laggingVoter *secureMeshNode
+		thirdVoter   *secureMeshNode
+	)
+	for _, candidate := range harness.nodes {
+		if candidate == barrierLeader {
+			continue
+		}
+		if laggingVoter == nil {
+			laggingVoter = candidate
+		} else {
+			thirdVoter = candidate
+		}
+	}
+	if laggingVoter == nil || thirdVoter == nil {
+		t.Fatal("cold recovery requires two lagging voters")
+	}
+	harness.startNode(t, barrierLeader, false)
+	harness.startNode(t, laggingVoter, false)
+	restarted = []*secureMeshNode{barrierLeader, laggingVoter}
+	if elected := harness.waitForLeader(t, restarted); elected != barrierLeader {
+		t.Fatalf(
+			"cold barrier leader = %s, want %s",
+			elected.identity.deviceID,
+			barrierLeader.identity.deviceID,
+		)
+	}
+	for _, candidate := range restarted {
+		if err := candidate.node.WaitForLeader(meshTestContext(t)); err != nil {
+			t.Fatalf(
+				"WaitForLeader after divergent barrier (%s): %v",
+				candidate.identity.deviceID,
+				err,
+			)
+		}
+		var barrier raft.Log
+		if err := candidate.node.stable.GetLog(
+			barrierIndex,
+			&barrier,
+		); err != nil {
+			t.Fatalf(
+				"GetLog divergent barrier (%s): %v",
+				candidate.identity.deviceID,
+				err,
+			)
+		}
+		if barrier.Type != raft.LogBarrier ||
+			barrier.Term != barrierLast.Term {
+			t.Fatalf(
+				"divergent barrier on %s = %#v",
+				candidate.identity.deviceID,
+				barrier,
+			)
+		}
+	}
+	harness.startNode(t, thirdVoter, false)
+	restarted = harness.runningNodes()
+	harness.waitForLeader(t, restarted)
+	for _, candidate := range restarted {
+		if err := candidate.node.WaitForLeader(meshTestContext(t)); err != nil {
+			t.Fatalf(
+				"WaitForLeader after third voter restart (%s): %v",
+				candidate.identity.deviceID,
+				err,
+			)
+		}
+	}
+	assertMeshViewsConverged(t, restarted)
 }
 
 func appendColdCommitLog(

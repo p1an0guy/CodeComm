@@ -226,9 +226,10 @@ func (gate *nodeTransportGate) AuthorizeReplication(
 	return gate.authorizeReplication(deviceID, false)
 }
 
-// AuthorizeCommitProbe permits only the no-op-only AppendEntries class enforced
-// by the maintained transport. It lets an elected leader re-establish a
-// volatile commit index without disclosing an unapplied command tail.
+// AuthorizeCommitProbe permits only the non-mutating no-op/barrier AppendEntries
+// class enforced by the maintained transport. It lets an elected leader
+// re-establish a volatile commit index without disclosing an unapplied command
+// tail.
 func (gate *nodeTransportGate) AuthorizeCommitProbe(
 	deviceID domain.DeviceID,
 ) error {
